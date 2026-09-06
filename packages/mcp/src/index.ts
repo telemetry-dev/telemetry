@@ -98,10 +98,6 @@ function requestId(message: JsonRecord): JsonRpcId | undefined {
   return typeof id === "string" || typeof id === "number" ? id : undefined;
 }
 
-function idKey(id: JsonRpcId): string {
-  return `${typeof id}:${String(id)}`;
-}
-
 function requestMethod(message: JsonRecord): string | undefined {
   return typeof message.method === "string" ? message.method : undefined;
 }
@@ -273,8 +269,8 @@ function finishResponse(
 }
 
 function completePending(
-  requests: Map<string, PendingRequest>,
-  key: string,
+  requests: Map<JsonRpcId, PendingRequest>,
+  key: JsonRpcId,
   pending: PendingRequest,
   update?: () => void,
 ): void {
@@ -291,14 +287,13 @@ function completePending(
 }
 
 function completeAs(
-  requests: Map<string, PendingRequest>,
+  requests: Map<JsonRpcId, PendingRequest>,
   id: JsonRpcId,
   type: "cancelled" | "connection_error",
 ): void {
-  const key = idKey(id);
-  const pending = requests.get(key);
+  const pending = requests.get(id);
   if (pending !== undefined) {
-    completePending(requests, key, pending, () => setFailure(pending, type));
+    completePending(requests, id, pending, () => setFailure(pending, type));
   }
 }
 
@@ -326,8 +321,8 @@ export function instrumentMcpTransport<T extends McpTransport>(
   const target = transport as T & InstrumentableTransport;
   const originalSend = target.send.bind(target);
   const originalSetProtocolVersion = target.setProtocolVersion?.bind(target);
-  const outgoing = new Map<string, PendingRequest>();
-  const incoming = new Map<string, PendingRequest>();
+  const outgoing = new Map<JsonRpcId, PendingRequest>();
+  const incoming = new Map<JsonRpcId, PendingRequest>();
   const sendingResponses = new Set<PendingRequest>();
   const dispatching = new WeakSet<object>();
   const capturePayloads = options.capturePayloads === true;
@@ -350,7 +345,7 @@ export function instrumentMcpTransport<T extends McpTransport>(
     const values = Array.isArray(value) ? value : [value];
     let messages: Array<ParsedMessage | undefined> = [];
     let cancellations: Array<JsonRpcId | undefined> = [];
-    let started: Array<{ index: number; key: string; pending: PendingRequest }> = [];
+    let started: Array<{ index: number; key: JsonRpcId; pending: PendingRequest }> = [];
     let requestSignal: AbortSignal | undefined;
     let sent = value;
     let forwardedOptions = sendOptions;
@@ -367,11 +362,11 @@ export function instrumentMcpTransport<T extends McpTransport>(
         copiedOptions.resumptionToken.length > 0;
       requestSignal = copiedOptions?.requestSignal;
       const originalStreamEnd = copiedOptions?.onRequestStreamEnd;
-      const requestCounts = new Map<string, number>();
+      const requestCounts = new Map<JsonRpcId, number>();
       if (!resumeOnly) {
         for (const message of messages) {
           if (!isRequest(message)) continue;
-          const key = idKey(message.id);
+          const key = message.id;
           requestCounts.set(key, (requestCounts.get(key) ?? 0) + 1);
         }
       }
@@ -379,20 +374,19 @@ export function instrumentMcpTransport<T extends McpTransport>(
       const transformed = [...values];
       const prepared: Array<{
         index: number;
-        key: string;
+        key: JsonRpcId;
         parsed: ParsedMessage;
         message: InjectedRequest;
         meta: JsonRecord;
       }> = [];
-      const cancelledKeys = new Set<string>();
+      const cancelledKeys = new Set<JsonRpcId>();
       for (const [index, message] of messages.entries()) {
         const cancelled = cancellations[index];
         if (cancelled !== undefined) {
-          const key = idKey(cancelled);
-          cancelledKeys.add(key);
+          cancelledKeys.add(cancelled);
         }
         if (!isRequest(message) || resumeOnly) continue;
-        const key = idKey(message.id);
+        const key = message.id;
         if (requestCounts.get(key) !== 1 || (outgoing.has(key) && !cancelledKeys.has(key))) {
           continue;
         }
@@ -474,11 +468,12 @@ export function instrumentMcpTransport<T extends McpTransport>(
       }
     }
 
-    const responses: Array<{ key: string; pending: PendingRequest; message: ParsedMessage }> = [];
+    const responses: Array<{ key: JsonRpcId; pending: PendingRequest; message: ParsedMessage }> =
+      [];
     for (const message of messages) {
       if (message === undefined || message.method !== undefined || message.id === undefined)
         continue;
-      const key = idKey(message.id);
+      const key = message.id;
       const pending = incoming.get(key);
       if (pending === undefined || sendingResponses.has(pending)) continue;
       sendingResponses.add(pending);
@@ -536,7 +531,7 @@ export function instrumentMcpTransport<T extends McpTransport>(
                 invoked = true;
                 return handler.call(target, value, extra);
               };
-              const received: Array<{ key: string; pending: PendingRequest }> = [];
+              const received: Array<{ key: JsonRpcId; pending: PendingRequest }> = [];
               const completeFailure = (error: unknown) => {
                 for (const { key, pending } of received) {
                   completePending(incoming, key, pending, () => pending.handle.update({ error }));
@@ -561,10 +556,10 @@ export function instrumentMcpTransport<T extends McpTransport>(
                 try {
                   const values = Array.isArray(value) ? value : [value];
                   const messages = values.map(parseMessage);
-                  const requestCounts = new Map<string, number>();
+                  const requestCounts = new Map<JsonRpcId, number>();
                   for (const message of messages) {
                     if (!isRequest(message)) continue;
-                    const key = idKey(message.id);
+                    const key = message.id;
                     requestCounts.set(key, (requestCounts.get(key) ?? 0) + 1);
                   }
 
@@ -574,7 +569,7 @@ export function instrumentMcpTransport<T extends McpTransport>(
                     if (cancelled !== undefined) completeAs(incoming, cancelled, "cancelled");
 
                     if (isRequest(message)) {
-                      const key = idKey(message.id);
+                      const key = message.id;
                       if (requestCounts.get(key) !== 1 || incoming.has(key)) continue;
                       const pending = startRequest(
                         target,
@@ -588,7 +583,7 @@ export function instrumentMcpTransport<T extends McpTransport>(
                         received.push({ key, pending });
                       }
                     } else if (message.method === undefined && message.id !== undefined) {
-                      const key = idKey(message.id);
+                      const key = message.id;
                       const pending = outgoing.get(key);
                       if (pending !== undefined) {
                         completePending(outgoing, key, pending, () =>

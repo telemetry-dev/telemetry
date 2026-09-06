@@ -8,7 +8,6 @@ import {
   SpanStatusCode,
   trace,
 } from "@opentelemetry/api";
-import { withSessionParent } from "@telemetry-dev/otel";
 import type {
   AbortInfo,
   AfterToolCallInfo,
@@ -22,10 +21,15 @@ import type {
   ToolPhaseCompleteInfo,
   UsageInfo,
 } from "@tanstack/ai";
-import { jsonAttr, omitUndefined } from "@telemetry-dev/otel";
+import {
+  createGenerationEmitter,
+  type GenerationEmitterOverrides,
+  jsonAttr,
+  omitUndefined,
+  withSessionParent,
+} from "@telemetry-dev/otel";
 
 import { resolveConfig, type TelemetryDevOptions } from "./config.ts";
-import { createEmitter, type EmitterOverrides } from "./otel.ts";
 
 type JsonValue =
   | string
@@ -161,7 +165,7 @@ interface RunState {
  */
 export function telemetryDev(
   options?: TelemetryDevOptions,
-  overrides?: EmitterOverrides,
+  overrides?: GenerationEmitterOverrides,
 ): ChatMiddleware {
   const config = resolveConfig(options);
 
@@ -170,8 +174,17 @@ export function telemetryDev(
     return { name: "telemetry-dev" };
   }
 
-  const emitter = createEmitter(config, overrides);
   const onError = config.onError;
+  const emitter = createGenerationEmitter(
+    {
+      ...config,
+      sdkName: "@telemetry-dev/tanstack-ai",
+      onError: onError
+        ? (error) => onError(error instanceof Error ? error : new Error(error))
+        : undefined,
+    },
+    overrides,
+  );
   const states = new WeakMap<ChatMiddlewareContext, RunState>();
 
   const closeIteration = (state: RunState): void => {

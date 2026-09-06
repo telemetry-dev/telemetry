@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from itertools import chain
 from typing import Final, cast
 
 _DEFAULT_MAX_BYTES: Final = 64 * 1024
@@ -133,33 +134,7 @@ class CaptureBudget:
                 mapping = cast("dict[object, object]", attributes)
 
         if mapping is not None:
-            for key, child in mapping.items():
-                measured = cls._measure(
-                    key,
-                    remaining_bytes=remaining_bytes - byte_count,
-                    remaining_items=remaining_items - item_count,
-                    depth=depth + 1,
-                    seen=seen,
-                )
-                if measured is None:
-                    return None
-                child_bytes, child_items = measured
-                byte_count += child_bytes
-                item_count += child_items
-
-                measured = cls._measure(
-                    child,
-                    remaining_bytes=remaining_bytes - byte_count,
-                    remaining_items=remaining_items - item_count,
-                    depth=depth + 1,
-                    seen=seen,
-                )
-                if measured is None:
-                    return None
-                child_bytes, child_items = measured
-                byte_count += child_bytes
-                item_count += child_items
-            return byte_count, item_count
+            children = chain.from_iterable(mapping.items())
 
         for child in children:
             measured = cls._measure(

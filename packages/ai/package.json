@@ -64,13 +64,11 @@
   },
   "dependencies": {
     "@opentelemetry/api": "catalog:",
-    "@opentelemetry/core": "catalog:",
-    "@opentelemetry/resources": "catalog:",
-    "@opentelemetry/sdk-metrics": "catalog:",
     "@opentelemetry/sdk-trace-base": "catalog:",
     "@telemetry-dev/otel": "workspace:^"
   },
   "devDependencies": {
+    "@opentelemetry/core": "catalog:",
     "@types/node": "^25.5.0",
     "@typescript/native-preview": "7.0.0-dev.20260328.1",
     "ai": "7.0.13",

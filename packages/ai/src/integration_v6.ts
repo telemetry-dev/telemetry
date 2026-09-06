@@ -8,10 +8,16 @@ import {
   SpanStatusCode,
   trace,
 } from "@opentelemetry/api";
-import { jsonAttr, omitUndefined, withSessionParent } from "@telemetry-dev/otel";
+import {
+  createGenerationEmitter,
+  type GenerationEmitter,
+  type GenerationEmitterOverrides,
+  jsonAttr,
+  omitUndefined,
+  withSessionParent,
+} from "@telemetry-dev/otel";
 
 import { resolveConfig, type ResolvedConfig, type TelemetryDevOptions } from "./config.ts";
-import { createEmitter, type Emitter, type EmitterOverrides } from "./otel.ts";
 import {
   providerLabel,
   readId,
@@ -111,7 +117,7 @@ export interface TelemetryDevIntegration {
  */
 export function telemetryDev(
   options?: TelemetryDevOptions,
-  overrides?: EmitterOverrides,
+  overrides?: GenerationEmitterOverrides,
 ): TelemetryDevIntegration {
   const config = resolveConfig(options);
 
@@ -121,7 +127,10 @@ export function telemetryDev(
     return {};
   }
 
-  const emitter = createEmitter(config, overrides);
+  const emitter = createGenerationEmitter(
+    { ...config, sdkName: "@telemetry-dev/ai-sdk" },
+    overrides,
+  );
   const v6 = createV6Hooks(config, emitter);
 
   // The public parameters are loose supertypes; the ai@6 dispatcher guarantees these shapes.
@@ -137,7 +146,7 @@ export function telemetryDev(
 
 // The ai@6 hook set, exactly as shipped for `ai >=6.0.111 <7`: closure state per integration
 // instance, one trace per generation, flushed at onFinish.
-function createV6Hooks(config: ResolvedConfig, emitter: Emitter) {
+function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
   const onError = config.onError;
 
   // Per-generation state. Reset on every onStart.

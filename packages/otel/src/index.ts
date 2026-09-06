@@ -21,6 +21,11 @@ export {
 } from "./context.ts";
 export { diag, reportError, setLogLevel } from "./debug.ts";
 export {
+  createGenerationEmitter,
+  type GenerationEmitter,
+  type GenerationEmitterOverrides,
+} from "./generation.ts";
+export {
   BATCHED_METRIC_INTERVAL_MS,
   createMetricsPipeline,
   DORMANT_INTERVAL_MS,
