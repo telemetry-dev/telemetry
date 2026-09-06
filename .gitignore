@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.vite-hooks/
 .venv/
 __pycache__/
 .pytest_cache/
