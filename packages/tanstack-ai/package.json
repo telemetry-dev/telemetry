@@ -1,0 +1,72 @@
+{
+  "name": "@telemetry-dev/tanstack-ai",
+  "version": "0.1.2",
+  "description": "TanStack AI telemetry integration for telemetry.dev: chat() middleware emitting OpenTelemetry GenAI spans.",
+  "keywords": [
+    "genai",
+    "llm",
+    "observability",
+    "opentelemetry",
+    "tanstack",
+    "telemetry",
+    "tracing"
+  ],
+  "homepage": "https://telemetry.dev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/telemetry-dev/sdks.git",
+    "directory": "packages/tanstack-ai"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "default": "./dist/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.mts",
+        "import": "./dist/index.mjs",
+        "default": "./dist/index.mjs"
+      },
+      "./package.json": "./package.json"
+    }
+  },
+  "scripts": {
+    "build": "pnpm exec vp pack",
+    "dev": "pnpm exec vp pack --watch",
+    "test": "vp test",
+    "check": "vp check",
+    "prepublishOnly": "vp run build"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "catalog:",
+    "@opentelemetry/core": "catalog:",
+    "@opentelemetry/resources": "catalog:",
+    "@opentelemetry/sdk-metrics": "catalog:",
+    "@opentelemetry/sdk-trace-base": "catalog:",
+    "@telemetry-dev/otel": "workspace:^"
+  },
+  "devDependencies": {
+    "@tanstack/ai": "0.28.0",
+    "@types/node": "^25.5.0",
+    "@typescript/native-preview": "7.0.0-dev.20260328.1",
+    "typescript": "^6.0.2",
+    "vite-plus": "0.1.20",
+    "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "@tanstack/ai": ">=0.28.0 <1"
+  }
+}

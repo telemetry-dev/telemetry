@@ -1,0 +1,190 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/v17.6.0/schemas/config.json",
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": true,
+  "include-component-in-tag": true,
+  "separate-pull-requests": false,
+  "always-link-local": false,
+  "plugins": [
+    {
+      "type": "node-workspace",
+      "updatePeerDependencies": true
+    }
+  ],
+  "packages": {
+    "packages/otel": {
+      "component": "otel",
+      "release-type": "node"
+    },
+    "packages/sdk": {
+      "component": "sdk",
+      "release-type": "node"
+    },
+    "packages/ai": {
+      "component": "ai-sdk",
+      "release-type": "node"
+    },
+    "packages/anthropic": {
+      "component": "anthropic",
+      "release-type": "node"
+    },
+    "packages/bedrock": {
+      "component": "bedrock",
+      "release-type": "node"
+    },
+    "packages/cursor": {
+      "component": "cursor",
+      "release-type": "node"
+    },
+    "packages/eve": {
+      "component": "eve",
+      "release-type": "node"
+    },
+    "packages/google-genai": {
+      "component": "google-genai",
+      "release-type": "node"
+    },
+    "packages/mcp": {
+      "component": "mcp",
+      "release-type": "node"
+    },
+    "packages/omp": {
+      "component": "omp",
+      "release-type": "node"
+    },
+    "packages/openai": {
+      "component": "openai",
+      "release-type": "node"
+    },
+    "packages/opencode": {
+      "component": "opencode",
+      "release-type": "node"
+    },
+    "packages/openrouter": {
+      "component": "openrouter",
+      "release-type": "node"
+    },
+    "packages/pi": {
+      "component": "pi",
+      "release-type": "node"
+    },
+    "packages/tanstack-ai": {
+      "component": "tanstack-ai",
+      "release-type": "node"
+    },
+    "sdks/python": {
+      "component": "python",
+      "package-name": "telemetry-dev",
+      "release-type": "python",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='telemetry-dev')].version"
+        },
+        {
+          "type": "toml",
+          "path": "/sdks/python-anthropic/uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='telemetry-dev')].version"
+        },
+        {
+          "type": "toml",
+          "path": "/sdks/python-bedrock/uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='telemetry-dev')].version"
+        },
+        {
+          "type": "toml",
+          "path": "/sdks/python-google-genai/uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='telemetry-dev')].version"
+        },
+        {
+          "type": "toml",
+          "path": "/sdks/python-litellm/uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='telemetry-dev')].version"
+        },
+        {
+          "type": "toml",
+          "path": "/sdks/python-openai/uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='telemetry-dev')].version"
+        },
+        {
+          "type": "toml",
+          "path": "/sdks/python-openrouter/uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='telemetry-dev')].version"
+        }
+      ]
+    },
+    "sdks/python-anthropic": {
+      "component": "python-anthropic",
+      "package-name": "telemetry-dev-anthropic",
+      "release-type": "python",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='telemetry-dev-anthropic')].version"
+        }
+      ]
+    },
+    "sdks/python-bedrock": {
+      "component": "python-bedrock",
+      "package-name": "telemetry-dev-bedrock",
+      "release-type": "python",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='telemetry-dev-bedrock')].version"
+        }
+      ]
+    },
+    "sdks/python-google-genai": {
+      "component": "python-google-genai",
+      "package-name": "telemetry-dev-google-genai",
+      "release-type": "python",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='telemetry-dev-google-genai')].version"
+        }
+      ]
+    },
+    "sdks/python-litellm": {
+      "component": "python-litellm",
+      "package-name": "telemetry-dev-litellm",
+      "release-type": "python",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='telemetry-dev-litellm')].version"
+        }
+      ]
+    },
+    "sdks/python-openai": {
+      "component": "python-openai",
+      "package-name": "telemetry-dev-openai",
+      "release-type": "python",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='telemetry-dev-openai')].version"
+        }
+      ]
+    },
+    "sdks/python-openrouter": {
+      "component": "python-openrouter",
+      "package-name": "telemetry-dev-openrouter",
+      "release-type": "python",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='telemetry-dev-openrouter')].version"
+        }
+      ]
+    }
+  }
+}

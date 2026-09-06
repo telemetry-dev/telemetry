@@ -1,0 +1,93 @@
+{
+  "name": "@telemetry-dev/pi",
+  "version": "0.1.2",
+  "description": "Pi coding-agent telemetry integration for telemetry.dev.",
+  "keywords": [
+    "agents",
+    "coding-agent",
+    "genai",
+    "llm",
+    "observability",
+    "opentelemetry",
+    "pi",
+    "telemetry",
+    "tracing"
+  ],
+  "homepage": "https://telemetry.dev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/telemetry-dev/sdks.git",
+    "directory": "packages/pi"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "default": "./dist/index.mjs"
+    },
+    "./register": {
+      "bun": "./src/register.ts",
+      "types": "./src/register.ts",
+      "development": "./src/register.ts",
+      "default": "./dist/register.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.mts",
+        "import": "./dist/index.mjs",
+        "default": "./dist/index.mjs"
+      },
+      "./register": {
+        "types": "./dist/register.d.mts",
+        "import": "./dist/register.mjs",
+        "default": "./dist/register.mjs"
+      },
+      "./package.json": "./package.json"
+    }
+  },
+  "scripts": {
+    "build": "pnpm exec vp pack",
+    "dev": "pnpm exec vp pack --watch",
+    "test": "vp test",
+    "check": "vp check",
+    "prepublishOnly": "vp run build"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "catalog:",
+    "@telemetry-dev/sdk": "workspace:^"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.82.1",
+    "@opentelemetry/sdk-logs": "catalog:",
+    "@opentelemetry/sdk-trace-base": "catalog:",
+    "@types/node": "^25.5.0",
+    "@typescript/native-preview": "7.0.0-dev.20260328.1",
+    "typescript": "^6.0.2",
+    "vite-plus": "0.1.20",
+    "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.4"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "pi": {
+    "extensions": [
+      "./dist/register.mjs"
+    ]
+  }
+}

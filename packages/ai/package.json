@@ -1,0 +1,86 @@
+{
+  "name": "@telemetry-dev/ai-sdk",
+  "version": "0.1.2",
+  "description": "Vercel AI SDK telemetry integration for telemetry.dev, with entries for ai@7 and ai@6.",
+  "keywords": [
+    "ai-sdk",
+    "genai",
+    "llm",
+    "observability",
+    "opentelemetry",
+    "telemetry",
+    "tracing",
+    "vercel"
+  ],
+  "homepage": "https://telemetry.dev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/telemetry-dev/sdks.git",
+    "directory": "packages/ai"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "default": "./dist/index.mjs"
+    },
+    "./v6": {
+      "bun": "./src/v6.ts",
+      "types": "./src/v6.ts",
+      "development": "./src/v6.ts",
+      "default": "./dist/v6.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.mts",
+        "import": "./dist/index.mjs",
+        "default": "./dist/index.mjs"
+      },
+      "./v6": {
+        "types": "./dist/v6.d.mts",
+        "import": "./dist/v6.mjs",
+        "default": "./dist/v6.mjs"
+      },
+      "./package.json": "./package.json"
+    }
+  },
+  "scripts": {
+    "build": "pnpm exec vp pack",
+    "dev": "pnpm exec vp pack --watch",
+    "test": "vp test",
+    "check": "vp check",
+    "prepublishOnly": "vp run build"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "catalog:",
+    "@opentelemetry/core": "catalog:",
+    "@opentelemetry/resources": "catalog:",
+    "@opentelemetry/sdk-metrics": "catalog:",
+    "@opentelemetry/sdk-trace-base": "catalog:",
+    "@telemetry-dev/otel": "workspace:^"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@typescript/native-preview": "7.0.0-dev.20260328.1",
+    "ai": "7.0.13",
+    "ai-v6": "npm:ai@6.0.219",
+    "typescript": "^6.0.2",
+    "vite-plus": "0.1.20",
+    "vitest": "catalog:",
+    "zod": "catalog:"
+  },
+  "peerDependencies": {
+    "ai": ">=6.0.111 <8"
+  }
+}

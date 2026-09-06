@@ -1,0 +1,59 @@
+[project]
+name = "telemetry-dev-anthropic"
+version = "0.1.0"
+description = "Anthropic integration for telemetry.dev Python SDK"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "telemetry.dev" }]
+keywords = ["telemetry", "opentelemetry", "anthropic", "claude", "llm", "genai", "tracing"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = [
+  "telemetry-dev>=0.2.0",
+  "anthropic>=0.116,<1",
+]
+
+[project.urls]
+Homepage = "https://telemetry.dev"
+Repository = "https://github.com/telemetry-dev/sdks"
+
+[tool.uv.sources]
+telemetry-dev = { path = "../python", editable = true }
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.25",
+  "ruff>=0.9",
+  "pyright>=1.1.390",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.0,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "RUF"]
+
+[tool.pyright]
+include = ["src", "tests"]
+typeCheckingMode = "strict"
+pythonVersion = "3.10"

@@ -1,0 +1,91 @@
+{
+  "name": "@telemetry-dev/bedrock",
+  "version": "0.1.2",
+  "description": "AWS Bedrock instrumentation for telemetry.dev: Converse, InvokeModel, and Bedrock Agents spans for AWS SDK v3 clients.",
+  "keywords": [
+    "aws",
+    "bedrock",
+    "genai",
+    "llm",
+    "observability",
+    "opentelemetry",
+    "telemetry",
+    "tracing"
+  ],
+  "homepage": "https://telemetry.dev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/telemetry-dev/sdks.git",
+    "directory": "packages/bedrock"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "default": "./dist/index.mjs"
+    },
+    "./agents": {
+      "bun": "./src/agents.ts",
+      "types": "./src/agents.ts",
+      "development": "./src/agents.ts",
+      "default": "./dist/agents.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.mts",
+        "import": "./dist/index.mjs",
+        "default": "./dist/index.mjs"
+      },
+      "./agents": {
+        "types": "./dist/agents.d.mts",
+        "import": "./dist/agents.mjs",
+        "default": "./dist/agents.mjs"
+      },
+      "./package.json": "./package.json"
+    }
+  },
+  "scripts": {
+    "build": "pnpm exec vp pack",
+    "dev": "pnpm exec vp pack --watch",
+    "test": "vp test",
+    "check": "vp check",
+    "prepublishOnly": "vp run build"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-bedrock-agent-runtime": "^3.1000.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.1000.0",
+    "@opentelemetry/api": "catalog:",
+    "@opentelemetry/sdk-logs": "catalog:",
+    "@opentelemetry/sdk-trace-base": "catalog:",
+    "@smithy/eventstream-codec": "^4.2.5",
+    "@smithy/protocol-http": "^5.3.10",
+    "@smithy/types": "^4.12.0",
+    "@telemetry-dev/sdk": "workspace:^",
+    "@types/node": "^25.5.0",
+    "@typescript/native-preview": "7.0.0-dev.20260328.1",
+    "typescript": "^6.0.2",
+    "vite-plus": "0.1.20",
+    "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "@aws-sdk/client-bedrock-agent-runtime": ">=3.600.0 <4",
+    "@aws-sdk/client-bedrock-runtime": ">=3.600.0 <4",
+    "@telemetry-dev/sdk": "workspace:^"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-bedrock-agent-runtime": {
+      "optional": true
+    }
+  }
+}

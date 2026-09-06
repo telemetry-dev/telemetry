@@ -1,0 +1,57 @@
+[project]
+name = "telemetry-dev"
+version = "0.2.2"
+description = "telemetry.dev SDK for Python — OpenTelemetry-native GenAI tracing, logs, and metrics"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "telemetry.dev" }]
+keywords = ["telemetry", "opentelemetry", "llm", "genai", "tracing", "observability"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = [
+  "opentelemetry-api>=1.35.0,<2",
+  "opentelemetry-sdk>=1.35.0,<2",
+  "opentelemetry-exporter-otlp-proto-http>=1.35.0,<2",
+]
+
+[project.urls]
+Homepage = "https://telemetry.dev"
+Repository = "https://github.com/telemetry-dev/sdks"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.25",
+  "ruff>=0.9",
+  "pyright>=1.1.390",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.0,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "RUF"]
+
+[tool.pyright]
+include = ["src", "tests", "examples"]
+typeCheckingMode = "strict"
+pythonVersion = "3.10"

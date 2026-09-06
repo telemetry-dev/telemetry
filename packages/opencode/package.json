@@ -1,0 +1,92 @@
+{
+  "name": "@telemetry-dev/opencode",
+  "version": "0.1.2",
+  "description": "opencode coding-agent telemetry integration for telemetry.dev.",
+  "keywords": [
+    "agents",
+    "coding-agent",
+    "genai",
+    "llm",
+    "observability",
+    "opencode",
+    "opentelemetry",
+    "telemetry",
+    "tracing"
+  ],
+  "homepage": "https://telemetry.dev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/telemetry-dev/sdks.git",
+    "directory": "packages/opencode"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "default": "./dist/index.mjs"
+    },
+    "./server": {
+      "bun": "./src/server.ts",
+      "types": "./src/server.ts",
+      "development": "./src/server.ts",
+      "default": "./dist/server.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.mts",
+        "import": "./dist/index.mjs",
+        "default": "./dist/index.mjs"
+      },
+      "./server": {
+        "types": "./dist/server.d.mts",
+        "import": "./dist/server.mjs",
+        "default": "./dist/server.mjs"
+      },
+      "./package.json": "./package.json"
+    }
+  },
+  "scripts": {
+    "build": "pnpm exec vp pack",
+    "dev": "pnpm exec vp pack --watch",
+    "test": "vp test",
+    "check": "vp check",
+    "prepublishOnly": "vp run build"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "catalog:",
+    "@telemetry-dev/sdk": "workspace:^"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.9",
+    "@opencode-ai/sdk": "1.18.9",
+    "@opentelemetry/sdk-logs": "catalog:",
+    "@opentelemetry/sdk-trace-base": "catalog:",
+    "@types/node": "^25.5.0",
+    "@typescript/native-preview": "7.0.0-dev.20260328.1",
+    "typescript": "^6.0.2",
+    "vite-plus": "0.1.20",
+    "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.15.11"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "opencode": ">=1.15.11"
+  }
+}

@@ -1,0 +1,94 @@
+{
+  "name": "@telemetry-dev/omp",
+  "version": "0.1.2",
+  "description": "Oh My Pi (omp) coding-agent telemetry integration for telemetry.dev.",
+  "keywords": [
+    "agents",
+    "coding-agent",
+    "genai",
+    "llm",
+    "observability",
+    "oh-my-pi",
+    "omp",
+    "opentelemetry",
+    "telemetry",
+    "tracing"
+  ],
+  "homepage": "https://telemetry.dev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/telemetry-dev/sdks.git",
+    "directory": "packages/omp"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "default": "./dist/index.mjs"
+    },
+    "./register": {
+      "bun": "./src/register.ts",
+      "types": "./src/register.ts",
+      "development": "./src/register.ts",
+      "default": "./dist/register.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.mts",
+        "import": "./dist/index.mjs",
+        "default": "./dist/index.mjs"
+      },
+      "./register": {
+        "types": "./dist/register.d.mts",
+        "import": "./dist/register.mjs",
+        "default": "./dist/register.mjs"
+      },
+      "./package.json": "./package.json"
+    }
+  },
+  "scripts": {
+    "build": "pnpm exec vp pack",
+    "dev": "pnpm exec vp pack --watch",
+    "test": "vp test",
+    "check": "vp check",
+    "prepublishOnly": "vp run build"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "catalog:",
+    "@telemetry-dev/sdk": "workspace:^"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "17.1.8",
+    "@opentelemetry/sdk-logs": "catalog:",
+    "@opentelemetry/sdk-trace-base": "catalog:",
+    "@types/node": "^25.5.0",
+    "@typescript/native-preview": "7.0.0-dev.20260328.1",
+    "typescript": "^6.0.2",
+    "vite-plus": "0.1.20",
+    "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": ">=17"
+  },
+  "peerDependenciesMeta": {
+    "@oh-my-pi/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "omp": {
+    "extensions": [
+      "./dist/register.mjs"
+    ]
+  }
+}

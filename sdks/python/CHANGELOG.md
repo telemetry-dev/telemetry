@@ -1,0 +1,15 @@
+# Changelog
+
+## [0.2.2](https://github.com/telemetry-dev/sdks/compare/python-v0.2.1...python-v0.2.2) (2026-09-05)
+
+
+### Features
+
+* one trace per session, with turn-by-turn session replay ([#226](https://github.com/telemetry-dev/sdks/issues/226)) ([44e2e75](https://github.com/telemetry-dev/sdks/commit/44e2e7510bc5073df89a0135cac9e986aeade5c6))
+
+## [0.2.1](https://github.com/telemetry-dev/sdks/compare/python-v0.2.0...python-v0.2.1) (2026-09-02)
+
+
+### Features
+
+* **sdk:** add telemetry.dev request header ([#181](https://github.com/telemetry-dev/sdks/issues/181)) ([23d5141](https://github.com/telemetry-dev/sdks/commit/23d5141764b9e7b1640f7ea6f836686146a24822))

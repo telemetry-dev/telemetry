@@ -1,0 +1,66 @@
+packages:
+  - packages/*
+allowBuilds:
+  "@google/genai": false
+  "@openrouter/sdk": false
+  "@parcel/watcher": false
+  esbuild: true
+  msgpackr-extract: false
+  msw: true
+  onnxruntime-node: false
+  protobufjs: true
+  sharp: true
+
+catalog:
+  "@opentelemetry/api": ^1.9.1
+  "@opentelemetry/api-logs": ^0.218.0
+  "@opentelemetry/core": ^2.7.1
+  "@opentelemetry/otlp-transformer": ^0.218.0
+  "@opentelemetry/resources": ^2.7.1
+  "@opentelemetry/sdk-logs": ^0.218.0
+  "@opentelemetry/sdk-metrics": ^2.7.1
+  "@opentelemetry/sdk-trace-base": ^2.7.1
+  "@types/node": ^24
+  typescript: ^5
+  vite: npm:@voidzero-dev/vite-plus-core@0.1.20
+  vite-plus: 0.1.20
+  vitest: npm:@voidzero-dev/vite-plus-test@0.1.20
+  zod: ^4.4.3
+
+catalogMode: prefer
+minimumReleaseAgeExclude:
+  - "@oh-my-pi/hashline@17.1.8"
+  - "@oh-my-pi/omp-stats@17.1.8"
+  - "@oh-my-pi/pi-agent-core@17.1.8"
+  - "@oh-my-pi/pi-ai@17.1.8"
+  - "@oh-my-pi/pi-catalog@17.1.8"
+  - "@oh-my-pi/pi-coding-agent@17.1.8"
+  - "@oh-my-pi/pi-mnemopi@17.1.8"
+  - "@oh-my-pi/pi-natives-darwin-arm64@17.1.8"
+  - "@oh-my-pi/pi-natives-darwin-x64@17.1.8"
+  - "@oh-my-pi/pi-natives-linux-arm64@17.1.8"
+  - "@oh-my-pi/pi-natives-linux-x64@17.1.8"
+  - "@oh-my-pi/pi-natives-win32-x64@17.1.8"
+  - "@oh-my-pi/pi-natives@17.1.8"
+  - "@oh-my-pi/pi-tui@17.1.8"
+  - "@oh-my-pi/pi-utils@17.1.8"
+  - "@oh-my-pi/pi-wire@17.1.8"
+  - "@oh-my-pi/snapcompact@17.1.8"
+  - "@opencode-ai/plugin@1.18.9"
+  - "@opencode-ai/sdk@1.18.9"
+  - "@types/bun@1.4.0"
+  - "bun-types@1.4.0"
+  - "@openrouter/sdk@1.2.11"
+  - eve@0.50.0
+overrides:
+  fast-uri: ">=3.1.2"
+  shell-quote: ">=1.8.4"
+  vite: "catalog:"
+  vitest: "catalog:"
+peerDependencyRules:
+  allowAny:
+    - vite
+    - vitest
+  allowedVersions:
+    vite: "*"
+    vitest: "*"
