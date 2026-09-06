@@ -8,10 +8,16 @@ import {
   SpanStatusCode,
   trace,
 } from "@opentelemetry/api";
-import { jsonAttr, omitUndefined, withSessionParent } from "@telemetry-dev/otel";
+import {
+  createGenerationEmitter,
+  type GenerationEmitter,
+  type GenerationEmitterOverrides,
+  jsonAttr,
+  omitUndefined,
+  withSessionParent,
+} from "@telemetry-dev/otel";
 
 import { resolveConfig, type ResolvedConfig, type TelemetryDevOptions } from "./config.ts";
-import { createEmitter, type Emitter, type EmitterOverrides } from "./otel.ts";
 import {
   providerLabel,
   readId,
@@ -69,7 +75,7 @@ export interface TelemetryDevIntegration {
  */
 export function telemetryDev(
   options?: TelemetryDevOptions,
-  overrides?: EmitterOverrides,
+  overrides?: GenerationEmitterOverrides,
 ): TelemetryDevIntegration {
   const config = resolveConfig(options);
 
@@ -79,7 +85,10 @@ export function telemetryDev(
     return {};
   }
 
-  return createV7Hooks(config, createEmitter(config, overrides));
+  return createV7Hooks(
+    config,
+    createGenerationEmitter({ ...config, sdkName: "@telemetry-dev/ai-sdk" }, overrides),
+  );
 }
 
 // Structural shapes of the ai@7 telemetry events the v7 hooks read, grounded in
@@ -305,7 +314,10 @@ interface CallState {
  * onEnd/onError/onAbort). The emitted span/metric shape intentionally matches the v6 path so
  * ingest and the UI see a single format.
  */
-export function createV7Hooks(config: ResolvedConfig, emitter: Emitter): TelemetryDevIntegration {
+export function createV7Hooks(
+  config: ResolvedConfig,
+  emitter: GenerationEmitter,
+): TelemetryDevIntegration {
   const onError = config.onError;
   const calls = new Map<string, CallState>();
 

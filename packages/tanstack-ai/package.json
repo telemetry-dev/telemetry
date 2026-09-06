@@ -52,9 +52,6 @@
   },
   "dependencies": {
     "@opentelemetry/api": "catalog:",
-    "@opentelemetry/core": "catalog:",
-    "@opentelemetry/resources": "catalog:",
-    "@opentelemetry/sdk-metrics": "catalog:",
     "@opentelemetry/sdk-trace-base": "catalog:",
     "@telemetry-dev/otel": "workspace:^"
   },
