@@ -2,14 +2,13 @@
 
 ## [0.1.3](https://github.com/telemetry-dev/sdks/compare/openai-v0.1.2...openai-v0.1.3) (2026-09-07)
 
-
 ### Dependencies
 
-* The following workspace dependencies were updated
-  * devDependencies
-    * @telemetry-dev/sdk bumped to 0.1.3
-  * peerDependencies
-    * @telemetry-dev/sdk bumped to 0.1.3
+- The following workspace dependencies were updated
+  - devDependencies
+    - @telemetry-dev/sdk bumped to 0.1.3
+  - peerDependencies
+    - @telemetry-dev/sdk bumped to 0.1.3
 
 ## [0.1.2](https://github.com/telemetry-dev/sdks/compare/openai-v0.1.1...openai-v0.1.2) (2026-09-05)
 
