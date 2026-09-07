@@ -125,24 +125,24 @@ For Python, use `capture_input=False` and `capture_output=False`.
 
 Each integration links to its installation instructions and API coverage.
 
-| Integration | TypeScript | Python |
-| --- | --- | --- |
-| Core SDK | [SDK](packages/sdk) | [SDK](sdks/python) |
-| Existing OpenTelemetry setup | [Span processor](packages/otel) | [Span processor](sdks/python) |
-| OpenAI | [OpenAI](packages/openai) | [OpenAI](sdks/python-openai) |
-| Anthropic | [Anthropic](packages/anthropic) | [Anthropic](sdks/python-anthropic) |
-| Amazon Bedrock | [Bedrock](packages/bedrock) | [Bedrock](sdks/python-bedrock) |
-| Google GenAI | [Google GenAI](packages/google-genai) | [Google GenAI](sdks/python-google-genai) |
-| OpenRouter | [OpenRouter](packages/openrouter) | [OpenRouter](sdks/python-openrouter) |
-| Vercel AI SDK | [AI SDK](packages/ai) | |
-| TanStack AI | [TanStack AI](packages/tanstack-ai) | |
-| LiteLLM | | [LiteLLM](sdks/python-litellm) |
-| MCP | [MCP](packages/mcp) | |
-| Eve | [Eve](packages/eve) | |
-| Cursor | [Cursor](packages/cursor) | |
-| OpenCode | [OpenCode](packages/opencode) | |
-| Oh My Pi | [Oh My Pi](packages/omp) | |
-| Pi | [Pi](packages/pi) | |
+| Integration                  | TypeScript                            | Python                                   |
+| ---------------------------- | ------------------------------------- | ---------------------------------------- |
+| Core SDK                     | [SDK](packages/sdk)                   | [SDK](sdks/python)                       |
+| Existing OpenTelemetry setup | [Span processor](packages/otel)       | [Span processor](sdks/python)            |
+| OpenAI                       | [OpenAI](packages/openai)             | [OpenAI](sdks/python-openai)             |
+| Anthropic                    | [Anthropic](packages/anthropic)       | [Anthropic](sdks/python-anthropic)       |
+| Amazon Bedrock               | [Bedrock](packages/bedrock)           | [Bedrock](sdks/python-bedrock)           |
+| Google GenAI                 | [Google GenAI](packages/google-genai) | [Google GenAI](sdks/python-google-genai) |
+| OpenRouter                   | [OpenRouter](packages/openrouter)     | [OpenRouter](sdks/python-openrouter)     |
+| Vercel AI SDK                | [AI SDK](packages/ai)                 |                                          |
+| TanStack AI                  | [TanStack AI](packages/tanstack-ai)   |                                          |
+| LiteLLM                      |                                       | [LiteLLM](sdks/python-litellm)           |
+| MCP                          | [MCP](packages/mcp)                   |                                          |
+| Eve                          | [Eve](packages/eve)                   |                                          |
+| Cursor                       | [Cursor](packages/cursor)             |                                          |
+| OpenCode                     | [OpenCode](packages/opencode)         |                                          |
+| Oh My Pi                     | [Oh My Pi](packages/omp)              |                                          |
+| Pi                           | [Pi](packages/pi)                     |                                          |
 
 Other languages can use an existing OTLP/HTTP exporter.
 The [documentation](https://docs.telemetry.dev) describes endpoint configuration and authentication.
