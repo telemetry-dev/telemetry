@@ -1,3 +1,9 @@
+<p align="center">
+  <a href="https://telemetry.dev">
+    <img src="https://telemetry.dev/icon.svg" alt="telemetry.dev logo" width="64" height="64">
+  </a>
+</p>
+
 <h1 align="center">telemetry.dev</h1>
 
 <h3 align="center">LLM observability for AI applications and agents</h3>
