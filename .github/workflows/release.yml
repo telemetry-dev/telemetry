@@ -1,0 +1,248 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published release tag to retry from main
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.release_tag || github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  release-please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - env:
+          RELEASE_PLEASE_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+        run: |
+          if [[ -z "$RELEASE_PLEASE_TOKEN" ]]; then
+            echo "RELEASE_PLEASE_TOKEN is required" >&2
+            exit 1
+          fi
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+
+  discover-release:
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      npm-packages: ${{ steps.packages.outputs.npm }}
+      python-packages: ${{ steps.packages.outputs.python }}
+      source-sha: ${{ steps.packages.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - id: packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || github.ref_name }}
+        run: |
+          npm=()
+          python=()
+          matches=0
+          source_sha=$(.github/scripts/release-source.sh)
+
+          draft=$(gh release view --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' -- "$RELEASE_TAG")
+          if [[ "$draft" != "false" ]]; then
+            echo "Release $RELEASE_TAG is still a draft" >&2
+            exit 1
+          fi
+
+          while IFS= read -r path; do
+            component=$(jq -er --arg path "$path" '.packages[$path].component' release-please-config.json)
+            release_type=$(jq -er --arg path "$path" '.packages[$path]["release-type"]' release-please-config.json)
+            version=$(jq -er --arg path "$path" '.[$path]' .release-please-manifest.json)
+            tag="$component-v$version"
+
+            [[ "$tag" == "$RELEASE_TAG" ]] || continue
+
+            case "$release_type" in
+              node) npm+=("$path") ;;
+              python) python+=("$path") ;;
+              *)
+                echo "Unsupported release type for $path: $release_type" >&2
+                exit 1
+                ;;
+            esac
+            matches=$((matches + 1))
+          done < <(jq -r '.packages | to_entries[] | .key' release-please-config.json)
+
+          if [[ "$matches" != 1 ]]; then
+            echo "Expected one package for $RELEASE_TAG, found $matches" >&2
+            exit 1
+          fi
+
+          npm_json=$(printf '%s\n' "${npm[@]}" | jq --raw-input --slurp --compact-output 'split("\n") | map(select(length > 0))')
+          python_json=$(printf '%s\n' "${python[@]}" | jq --raw-input --slurp --compact-output 'split("\n") | map(select(length > 0))')
+          {
+            echo "npm=$npm_json"
+            echo "python=$python_json"
+            echo "sha=$source_sha"
+          } >> "$GITHUB_OUTPUT"
+
+  build-npm:
+    needs: discover-release
+    if: needs.discover-release.outputs.npm-packages != '[]'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3
+        with:
+          version: 11.25.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.discover-release.outputs.source-sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+      - run: pnpm install --frozen-lockfile
+      - env:
+          PACKAGES: ${{ needs.discover-release.outputs.npm-packages }}
+        run: |
+          output="$RUNNER_TEMP/npm"
+          mkdir -p "$output"
+          while IFS= read -r package; do
+            pnpm --dir "$package" run build
+            metadata=$(pnpm --dir "$package" pack --pack-destination "$output" --json)
+            tarball=$(jq -r '.filename' <<< "$metadata")
+            .github/scripts/release-artifact.sh "$package" "$tarball"
+            basename "$tarball" >> "$output/publish-order.txt"
+          done < <(jq -r '.[]' <<< "$PACKAGES")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: npm-packages
+          path: ${{ runner.temp }}/npm
+          retention-days: 30
+          if-no-files-found: error
+
+  publish-npm:
+    needs: [discover-release, build-npm]
+    if: needs.discover-release.outputs.npm-packages != '[]'
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: npm-packages
+          path: npm
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+          registry-url: https://registry.npmjs.org
+      - run: npm install --global npm@12.0.2
+      - env:
+          NPM_CONFIG_PROVENANCE: ${{ github.event.repository.private && 'false' || 'true' }}
+        run: |
+          while IFS= read -r tarball; do
+            metadata=$(tar -xOf "npm/$tarball" package/package.json)
+            name=$(jq -r '.name' <<< "$metadata")
+            version=$(jq -r '.version' <<< "$metadata")
+            remote_integrity=$(npm view "$name@$version" dist.integrity 2>/dev/null || true)
+            if [[ -n "$remote_integrity" ]]; then
+              local_integrity="sha512-$(openssl dgst -sha512 -binary "npm/$tarball" | openssl base64 -A)"
+              if [[ "$remote_integrity" != "$local_integrity" ]]; then
+                echo "Integrity mismatch for $name@$version" >&2
+                exit 1
+              fi
+              echo "$name@$version is already published with matching integrity"
+              continue
+            fi
+            while IFS=$'\t' read -r dependency range; do
+              for attempt in {1..12}; do
+                dependency_error=$(npm view "${dependency}@${range}" version --json 2>&1) && continue 2
+                [[ "$attempt" == 12 ]] || sleep 10
+              done
+              echo "Cannot publish $name@$version: unable to verify that published $dependency satisfies $range" >&2
+              printf '%s\n' "$dependency_error" >&2
+              exit 1
+            done < <(jq -r '
+              ((.dependencies // {}), (.peerDependencies // {})) | to_entries[] |
+              select(.key | startswith("@telemetry-dev/")) |
+              [.key, .value] | @tsv
+            ' <<< "$metadata")
+            npm publish "./npm/$tarball" --access public
+          done < npm/publish-order.txt
+
+  build-python:
+    needs: discover-release
+    if: needs.discover-release.outputs.python-packages != '[]'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.discover-release.outputs.source-sha }}
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: 0.12.5
+          enable-cache: false
+      - env:
+          PACKAGES: ${{ needs.discover-release.outputs.python-packages }}
+        run: |
+          output="$RUNNER_TEMP/python"
+          mkdir -p "$output"
+          while IFS= read -r package; do
+            name=${package#sdks/}
+            uv build --no-sources "$package" --out-dir "$output/$name"
+            for artifact in "$output/$name"/*; do
+              .github/scripts/release-artifact.sh "$package" "$artifact"
+            done
+            echo "$name" >> "$output/publish-order.txt"
+          done < <(jq -r '.[]' <<< "$PACKAGES")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: python-packages
+          path: ${{ runner.temp }}/python
+          retention-days: 30
+          if-no-files-found: error
+
+  publish-python:
+    needs: [discover-release, build-python]
+    if: needs.discover-release.outputs.python-packages != '[]'
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: python-packages
+          path: python
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: 0.12.5
+          enable-cache: false
+      - run: |
+          while IFS= read -r package; do
+            uv publish --trusted-publishing always --check-url https://pypi.org/simple "python/$package"/*
+          done < python/publish-order.txt
