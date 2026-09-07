@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3](https://github.com/telemetry-dev/sdks/compare/sdk-v0.1.2...sdk-v0.1.3) (2026-09-07)
+
+### Dependencies
+
+- The following workspace dependencies were updated
+  - dependencies
+    - @telemetry-dev/otel bumped to 0.1.3
+
 ## [0.1.2](https://github.com/telemetry-dev/sdks/compare/sdk-v0.1.1...sdk-v0.1.2) (2026-09-05)
 
 ### Features

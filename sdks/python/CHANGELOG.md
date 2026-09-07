@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/telemetry-dev/sdks/compare/python-v0.2.2...python-v0.2.3) (2026-09-07)
+
+
+### Bug Fixes
+
+* include shared instrumentation and capture refactors in published SDKs ([7c82386](https://github.com/telemetry-dev/sdks/commit/7c82386e139303a49f4cb3b6a39affac85763e88))
+
 ## [0.2.2](https://github.com/telemetry-dev/sdks/compare/python-v0.2.1...python-v0.2.2) (2026-09-05)
 
 
