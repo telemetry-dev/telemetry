@@ -5,7 +5,7 @@ import { Embeddings } from "@openrouter/sdk/sdk/embeddings.js";
 import { EventStream } from "@openrouter/sdk/lib/event-streams.js";
 import { Responses } from "@openrouter/sdk/sdk/responses.js";
 import { flush, init, type MaskFn, shutdown, startActiveSpan } from "@telemetry-dev/sdk";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 
 import { instrumentOpenRouter, uninstrumentOpenRouter, wrapOpenRouter } from "../src/index.ts";
 
@@ -265,6 +265,7 @@ function prototypeMethod<T extends object>(target: T, key: string) {
 afterEach(async () => {
   uninstrumentOpenRouter();
   await shutdown();
+  vi.restoreAllMocks();
 });
 
 test("chat maps request, response, usage, primary cost, provider, and sampling fields", async () => {
@@ -362,6 +363,189 @@ test("cost falls back to upstream inference cost when usage cost is absent", asy
 
   const span = await exportedSpan(spans);
   expect(span.attributes["gen_ai.usage.cost"]).toBe(0.009);
+});
+
+test("chat output chunks recognize decoded reasoning text but not opaque metadata", async () => {
+  const spans = setupSpans();
+
+  const fake = createFakeFetcher(
+    sseResponse([
+      chatChunk("tool_timing", { role: "assistant", content: "" }),
+      chatChunk("tool_timing", {
+        reasoning_details: [{ type: "reasoning.text", text: "Inspect" }],
+      }),
+      chatChunk("tool_timing", {
+        content: "once",
+        reasoning_details: [{ type: "reasoning.summary", summary: "Summary" }],
+      }),
+      chatChunk("tool_timing", {
+        reasoning_details: [{ type: "reasoning.summary", summary: "Summary only" }],
+      }),
+      chatChunk("tool_timing", {
+        reasoning_details: [{ type: "reasoning.summary", summary: "" }],
+      }),
+      chatChunk("tool_timing", {
+        reasoning_details: [
+          { type: "reasoning.encrypted", data: "opaque" },
+          { type: "reasoning.text", signature: "signed", text: "" },
+        ],
+      }),
+      chatChunk("tool_timing", {
+        tool_calls: [
+          {
+            index: 0,
+            id: "call_1",
+            type: "function",
+            function: { name: "weather", arguments: '{"city":' },
+          },
+        ],
+      }),
+      chatChunk("tool_timing", { tool_calls: [{ index: 0, function: { arguments: "" } }] }),
+      chatChunk("tool_timing", { content: null }),
+      chatChunk("tool_timing", { tool_calls: [{ index: 0, function: { arguments: '"Paris"}' } }] }),
+    ]),
+  );
+
+  const stream = await clientWith(fake.fetcher).chat.send({
+    chatRequest: {
+      model: "openai/gpt-4o",
+      messages: [{ role: "user", content: "Weather" }],
+      stream: true,
+    },
+  });
+
+  if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
+  expect(await collectStream(stream)).toHaveLength(10);
+  const span = await exportedSpan(spans);
+  expect(span).toMatchObject({
+    [Symbol.for("telemetry.dev.outputChunkHistogram")]: { count: 4 },
+  });
+});
+
+test("Responses output timing accepts code, MCP, and audio transcript deltas but excludes done snapshots", async () => {
+  const spans = setupSpans();
+
+  const outputEvents = [
+    { type: "response.code_interpreter_call_code.delta", delta: "print(1)" },
+    { type: "response.code_interpreter_call_code.done", code: "print(1)" },
+    { type: "response.mcp_call_arguments.delta", delta: '{"city":"Paris"}' },
+    { type: "response.mcp_call_arguments.delta", delta: "" },
+    { type: "response.mcp_call_arguments.done", arguments: '{"city":"Paris"}' },
+    { type: "response.audio.transcript.delta", delta: "Hello" },
+    { type: "response.audio.transcript.delta", delta: "" },
+    { type: "response.audio.transcript.delta", delta: " world" },
+    { type: "response.audio.transcript.done", transcript: "Hello world" },
+  ];
+
+  const fake = createFakeFetcher(
+    sseResponse([
+      ...outputEvents,
+      { type: "response.completed", response: responsesBody("resp_metric") },
+    ]),
+    openSseResponse(outputEvents),
+  );
+
+  const client = clientWith(fake.fetcher);
+
+  const completed = await client.responses.send({
+    responsesRequest: { model: "openai/gpt-4o", input: "Run", stream: true },
+  });
+
+  if (!(completed instanceof ReadableStream)) throw new Error("expected a readable stream");
+  await collectStream(completed);
+
+  const interrupted = await client.responses.send({
+    responsesRequest: { model: "openai/gpt-4o", input: "Run", stream: true },
+  });
+
+  if (!(interrupted instanceof ReadableStream)) throw new Error("expected a readable stream");
+  const reader = interrupted.getReader();
+
+  for (const _event of outputEvents) expect((await reader.read()).done).toBe(false);
+  await reader.cancel("caller stopped");
+
+  const finished = await finishedSpans(spans, 2);
+  expect(finished).toHaveLength(2);
+
+  for (const span of finished) {
+    expect(span).toMatchObject({
+      [Symbol.for("telemetry.dev.outputChunkHistogram")]: { count: 3 },
+    });
+  }
+});
+
+test.each(["chat", "responses"])("%s timestamps precede telemetry mapping", async (operation) => {
+  const spans = setupSpans();
+  let now = 0;
+  vi.spyOn(performance, "now").mockImplementation(() => now);
+
+  const timings = [
+    [100, 30],
+    [240, 90],
+  ] as const;
+
+  let index = 0;
+
+  const source = new ReadableStream(
+    {
+      pull(controller) {
+        const timing = timings[index++];
+
+        if (!timing) {
+          controller.close();
+
+          return;
+        }
+
+        const [receivedAt, mappingMs] = timing;
+        now = receivedAt;
+        controller.enqueue(
+          operation === "chat"
+            ? {
+                get choices() {
+                  now = receivedAt + mappingMs;
+
+                  return [{ index: 0, delta: { content: "A" } }];
+                },
+              }
+            : {
+                get type() {
+                  now = receivedAt + mappingMs;
+
+                  return "response.output_text.delta";
+                },
+                delta: "A",
+              },
+        );
+      },
+    },
+    { highWaterMark: 0 },
+  );
+
+  const client = wrapOpenRouter({
+    chat: { send: async (_params: unknown) => source },
+    responses: { send: async (_params: unknown) => source },
+    embeddings: {},
+  });
+
+  const stream =
+    operation === "chat"
+      ? await client.chat.send({
+          chatRequest: { model: "openai/gpt-4o", messages: [], stream: true },
+        })
+      : await client.responses.send({
+          responsesRequest: { model: "openai/gpt-4o", input: "Hi", stream: true },
+        });
+
+  expect(await collectStream(stream)).toHaveLength(2);
+  expect(await exportedSpan(spans)).toMatchObject({
+    [Symbol.for("telemetry.dev.outputChunkHistogram")]: {
+      count: 1,
+      sum: 0.14,
+      min: 0.14,
+      max: 0.14,
+    },
+  });
 });
 
 test("consumed chat streams remain readable, reconstruct tool calls, and use final usage without request mutation", async () => {

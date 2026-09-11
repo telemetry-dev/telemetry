@@ -254,7 +254,7 @@ export function parseJson<T>(value: T): JsonValue {
 }
 
 export interface StreamState {
-  feed<T>(event: T): void;
+  feed<T>(event: T): boolean | void;
   finish(partial: boolean): SpanFields;
 }
 
@@ -264,6 +264,7 @@ export function wrapAsyncIterable<T>(
   span: SpanHandle,
   t0: number,
   baseFields: SpanFields,
+  trackOutputChunks = true,
 ): T {
   if (!iterable || !isAsyncIterable(iterable)) {
     endSpan(span, baseFields);
@@ -284,11 +285,18 @@ export function wrapAsyncIterable<T>(
     let completed = false;
     try {
       for await (const event of iterable) {
+        const receivedAt = performance.now();
+
         if (!first) {
           first = true;
-          updateSpan(span, { timeToFirstChunkMs: performance.now() - t0 });
+          updateSpan(span, { timeToFirstChunkMs: receivedAt - t0 });
         }
-        safe(() => state.feed(event));
+
+        const stateHasOutput = safe(() => state.feed(event));
+
+        if (trackOutputChunks && (stateHasOutput ?? bedrockEventHasOutput(event))) {
+          safe(() => span.recordOutputChunk?.(receivedAt));
+        }
         yield event;
       }
       completed = true;
@@ -318,6 +326,70 @@ export function wrapAsyncIterable<T>(
   };
   STREAM_FINALIZER?.register(wrapped, finishAbandoned, unregisterToken);
   return wrapped as T;
+}
+
+function bedrockEventHasOutput(event: unknown): boolean {
+  const record = isRecord(event) ? event : undefined;
+
+  if (!record) return false;
+  const output = isRecord(record.output) ? record.output : undefined;
+
+  if (typeof output?.text === "string" && output.text.length > 0) return true;
+  const block = isRecord(record.contentBlockDelta) ? record.contentBlockDelta : undefined;
+  const delta = isRecord(block?.delta) ? block.delta : undefined;
+  const reasoning = isRecord(delta?.reasoningContent) ? delta.reasoningContent : undefined;
+  const toolUse = isRecord(delta?.toolUse) ? delta.toolUse : undefined;
+
+  if (
+    (typeof delta?.text === "string" && delta.text.length > 0) ||
+    (typeof reasoning?.text === "string" && reasoning.text.length > 0) ||
+    (typeof toolUse?.input === "string" && toolUse.input.length > 0)
+  )
+    return true;
+  const chunk = isRecord(record.chunk) ? record.chunk : undefined;
+  const raw = chunk?.bytes;
+
+  if (raw === undefined) return false;
+
+  const text =
+    typeof raw === "string"
+      ? raw
+      : raw instanceof Uint8Array
+        ? new TextDecoder().decode(raw)
+        : undefined;
+
+  if (!text) return false;
+  const parsed = parseJson(text);
+
+  if (parsed === undefined) return text.length > 0;
+
+  if (!isRecord(parsed)) return false;
+  const parsedDelta = isRecord(parsed.delta) ? parsed.delta : undefined;
+
+  const contentDelta = isRecord(parsed.contentBlockDelta ?? parsed.content_block_delta)
+    ? (parsed.contentBlockDelta ?? parsed.content_block_delta)
+    : undefined;
+
+  const nested =
+    isRecord(contentDelta) && isRecord(contentDelta.delta) ? contentDelta.delta : undefined;
+
+  const generations = Array.isArray(parsed.generations) ? parsed.generations : [];
+  const generation = isRecord(generations[0]) ? generations[0] : undefined;
+  const outputs = Array.isArray(parsed.outputs) ? parsed.outputs : [];
+  const firstOutput = isRecord(outputs[0]) ? outputs[0] : undefined;
+
+  return [
+    parsed.outputText,
+    parsed.generation,
+    parsed.completion,
+    parsed.text,
+    parsedDelta?.text,
+    parsedDelta?.thinking,
+    parsedDelta?.partial_json,
+    nested?.text,
+    firstOutput?.text,
+    generation?.text,
+  ].some((value) => typeof value === "string" && value.length > 0);
 }
 
 function isAsyncIterable<T>(value: T): value is T & AsyncIterable<unknown> {

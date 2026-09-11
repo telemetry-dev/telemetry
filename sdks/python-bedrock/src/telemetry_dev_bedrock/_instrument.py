@@ -164,7 +164,9 @@ def _call_with_span(
 
         return {
             **response,
-            stream_key: InstrumentedEventStream(response[stream_key], state, finish, started_at),
+            stream_key: InstrumentedEventStream(
+                response[stream_key], state, finish, started_at, handle
+            ),
         }
 
     end(**merge_fields(metadata_fields(response), spec.response_fields(api_params, response)))

@@ -12,11 +12,53 @@ from ._messages import normalize_content_block
 
 
 class StreamState:
-    def feed(self, event: Any) -> None:
+    def feed(self, event: Any) -> bool | None:
         raise NotImplementedError
 
     def finish(self, *, partial: bool) -> dict[str, Any]:
         raise NotImplementedError
+
+
+def _event_has_output(event: Any) -> bool:
+    if not isinstance(event, dict):
+        return False
+    output = event.get("output") if isinstance(event.get("output"), dict) else {}
+    if isinstance(output.get("text"), str) and output["text"]:
+        return True
+    block = (
+        event.get("contentBlockDelta") if isinstance(event.get("contentBlockDelta"), dict) else {}
+    )
+    delta = block.get("delta") if isinstance(block.get("delta"), dict) else {}
+    reasoning = (
+        delta.get("reasoningContent") if isinstance(delta.get("reasoningContent"), dict) else {}
+    )
+    tool_use = delta.get("toolUse") if isinstance(delta.get("toolUse"), dict) else {}
+    if any(
+        isinstance(value, str) and bool(value)
+        for value in (delta.get("text"), reasoning.get("text"), tool_use.get("input"))
+    ):
+        return True
+    chunk = event.get("chunk") if isinstance(event.get("chunk"), dict) else {}
+    raw = chunk.get("bytes")
+    if isinstance(raw, bytes | bytearray):
+        text = bytes(raw).decode("utf-8", errors="replace")
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        return False
+    if not text:
+        return False
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return True
+    if isinstance(parsed, dict) and isinstance(parsed.get("delta"), dict):
+        if any(
+            isinstance(value, str) and bool(value)
+            for value in (parsed["delta"].get("thinking"), parsed["delta"].get("partial_json"))
+        ):
+            return True
+    return bool(_text_from_provider_chunk(parsed))
 
 
 class ConverseStreamState(StreamState):
@@ -215,9 +257,9 @@ class InvokeModelStreamState(StreamState):
         self.usage: dict[str, int] = {}
         self.finish_reason: str | None = None
 
-    def feed(self, event: Any) -> None:
+    def feed(self, event: Any) -> bool:
         if not isinstance(event, dict):
-            return
+            return False
         chunk = event.get("chunk") if isinstance(event.get("chunk"), dict) else {}
         raw = chunk.get("bytes")
         if isinstance(raw, bytes | bytearray):
@@ -225,11 +267,11 @@ class InvokeModelStreamState(StreamState):
         elif isinstance(raw, str):
             text = raw
         else:
-            return
+            return False
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:
-            return
+            return bool(text)
         if self.budget.accept(parsed):
             self.chunks.append(parsed)
         if isinstance(parsed, dict):
@@ -282,6 +324,14 @@ class InvokeModelStreamState(StreamState):
                     }
                 )
             )
+        if isinstance(parsed, dict) and isinstance(parsed.get("delta"), dict):
+            delta = parsed["delta"]
+            if any(
+                isinstance(value, str) and bool(value)
+                for value in (delta.get("thinking"), delta.get("partial_json"))
+            ):
+                return True
+        return bool(_text_from_provider_chunk(parsed))
 
     def finish(self, *, partial: bool) -> dict[str, Any]:
         del partial
@@ -499,27 +549,40 @@ class InstrumentedEventStream:
         state: StreamState,
         finish: Callable[[dict[str, Any]], None],
         started_at: float,
+        handle: Any,
     ) -> None:
         self._stream = stream
         self._state = state
         self._finish_callback = finish
         self._started_at = started_at
+        self._handle = handle
         self._ended = False
         self._first = False
+        self._track_output_chunks = isinstance(state, ConverseStreamState | InvokeModelStreamState)
 
     def __iter__(self) -> Iterator[Any]:
         completed = False
         try:
             for event in self._stream:
+                received_at = time.perf_counter()
                 if not self._first:
                     self._first = True
                     self._finish_callback(
-                        {"time_to_first_chunk_ms": (time.perf_counter() - self._started_at) * 1000}
+                        {"time_to_first_chunk_ms": (received_at - self._started_at) * 1000}
                     )
                 try:
-                    self._state.feed(event)
+                    state_has_output = self._state.feed(event)
                 except Exception:
-                    pass
+                    state_has_output = None
+                if self._track_output_chunks and (
+                    state_has_output if state_has_output is not None else _event_has_output(event)
+                ):
+                    try:
+                        record_output_chunk = getattr(self._handle, "record_output_chunk", None)
+                        if callable(record_output_chunk):
+                            record_output_chunk(received_at * 1000)
+                    except Exception:
+                        pass
                 yield event
             completed = True
         except GeneratorExit:

@@ -71,6 +71,8 @@ class FakeTransport:
         self.calls.append(request_dict)
         payloads = self._next()
         for payload in payloads:
+            if isinstance(payload, BaseException):
+                raise payload
             yield types.HttpResponse(headers={}, body=json.dumps(payload))
 
     async def async_request(
@@ -94,6 +96,8 @@ class FakeTransport:
 
         async def async_generator() -> AsyncIterator[types.HttpResponse]:
             for payload in payloads:
+                if isinstance(payload, BaseException):
+                    raise payload
                 yield types.HttpResponse(headers={}, body=json.dumps(payload))
 
         return async_generator()
@@ -448,6 +452,142 @@ def test_streaming_aggregates_output_usage_and_first_chunk(
         {"role": "model", "parts": [{"text": "Hello world"}]}
     ]
     assert a["gen_ai.usage.total_tokens"] == 7
+
+
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("interrupted", [False, True], ids=["completed", "interrupted"])
+@pytest.mark.parametrize(
+    "partial_args",
+    [
+        [{"jsonPath": "$.enabled", "boolValue": False}],
+        [{"jsonPath": "$.retries", "numberValue": 0}],
+        [
+            {"jsonPath": "$.enabled", "boolValue": False},
+            {"jsonPath": "$.retries", "numberValue": 0},
+        ],
+    ],
+)
+def test_vertex_streaming_counts_partial_function_argument_values(
+    memory: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    async_mode: bool,
+    interrupted: bool,
+    partial_args: list[dict[str, Any]],
+) -> None:
+    recorded: list[telemetry_dev.SpanHandle] = []
+    original = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        assert timestamp_ms is not None
+        recorded.append(handle)
+        return original(handle, timestamp_ms)
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
+    shell = {
+        "candidates": [
+            {
+                "index": 0,
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "set_flags",
+                                "partialArgs": [
+                                    {"jsonPath": "$.enabled", "willContinue": True},
+                                    {"jsonPath": "$.label", "stringValue": ""},
+                                ],
+                            }
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+    partial_values = {
+        "candidates": [
+            {
+                "index": 0,
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "set_flags",
+                                "partialArgs": partial_args,
+                            }
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+    null_value = {
+        "candidates": [
+            {
+                "index": 0,
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "set_flags",
+                                "partialArgs": [
+                                    {"jsonPath": "$.fallback", "nullValue": "NULL_VALUE"}
+                                ],
+                            }
+                        }
+                    ],
+                },
+                "finishReason": "STOP",
+            }
+        ]
+    }
+    payloads: list[dict[str, Any] | RuntimeError] = [shell, partial_values, null_value]
+    if interrupted:
+        payloads.append(RuntimeError("stream interrupted"))
+    client = genai.Client(api_key="test", vertexai=True)
+    transport = FakeTransport([payloads])
+    client._api_client.request_streamed = transport.request_streamed
+    client._api_client.async_request_streamed = transport.async_request_streamed
+    wrapped = wrap_google_genai(client)
+    chunks: list[Any] = []
+
+    if async_mode:
+        import asyncio
+
+        async def run() -> list[Any]:
+            stream = await wrapped.aio.models.generate_content_stream(
+                model="gemini-2.5-flash", contents=USER_CONTENT
+            )
+            return [chunk async for chunk in stream]
+
+        if interrupted:
+            with pytest.raises(RuntimeError, match="stream interrupted"):
+                asyncio.run(run())
+        else:
+            chunks = asyncio.run(run())
+    else:
+        stream = wrapped.models.generate_content_stream(
+            model="gemini-2.5-flash", contents=USER_CONTENT
+        )
+        if interrupted:
+            with pytest.raises(RuntimeError, match="stream interrupted"):
+                list(stream)
+        else:
+            chunks = list(stream)
+
+    assert len(recorded) == 2
+    if not interrupted:
+        decoded_partial_args = chunks[1].candidates[0].content.parts[0].function_call.partial_args
+        assert decoded_partial_args == [
+            types.PartialArg.model_validate(part) for part in partial_args
+        ]
+    span = only_span(memory)
+    assert attrs(span)["gen_ai.provider.name"] == "gcp.vertex_ai"
+    assert span.status.status_code == (StatusCode.ERROR if interrupted else StatusCode.UNSET)
 
 
 @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])

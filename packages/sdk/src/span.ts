@@ -19,7 +19,10 @@ import {
 
 import {
   activeContext,
+  DURATION_BUCKETS,
   omitUndefined,
+  OUTPUT_CHUNK_HISTOGRAM,
+  type OutputChunkHistogram,
   PROPAGATED_KEY,
   propagatedFromContext,
   reportError,
@@ -67,6 +70,8 @@ export interface SpanHandle {
   readonly traceparent: string | null;
   readonly isRecording: boolean;
   update(fields: SpanFields): SpanHandle;
+  /** Records an output chunk arrival. Pull-based streams include consumer delay between pulls. */
+  recordOutputChunk(timestampMs?: number): void;
   end(fields?: SpanFields & { endTime?: Date | number }): void;
 }
 
@@ -205,6 +210,7 @@ export function createSpanHandle(
   if (options.error !== undefined) applyError(span, options.error);
 
   const spanContext = span.spanContext();
+  let previousOutputChunkTime: number | undefined;
   const flags = (spanContext.traceFlags & 0xff).toString(16).padStart(2, "0");
   const handle: SpanHandle = {
     span,
@@ -222,6 +228,41 @@ export function createSpanHandle(
         reportError(meta.onError, error instanceof Error ? error : new Error(String(error)));
       }
       return handle;
+    },
+    recordOutputChunk(timestampMs) {
+      const now = timestampMs ?? performance.now();
+
+      if (
+        !span.isRecording() ||
+        !Number.isFinite(now) ||
+        (previousOutputChunkTime !== undefined && now < previousOutputChunkTime)
+      )
+        return;
+
+      if (previousOutputChunkTime !== undefined) {
+        const seconds = Math.max(0, now - previousOutputChunkTime) / 1000;
+
+        const target = span as Span & {
+          [OUTPUT_CHUNK_HISTOGRAM]?: OutputChunkHistogram;
+        };
+
+        const histogram = (target[OUTPUT_CHUNK_HISTOGRAM] ??= {
+          count: 0,
+          sum: 0,
+          min: seconds,
+          max: seconds,
+          bucketCounts: Array.from({ length: DURATION_BUCKETS.length + 1 }, () => 0),
+        });
+
+        histogram.count++;
+        histogram.sum += seconds;
+        histogram.min = Math.min(histogram.min, seconds);
+        histogram.max = Math.max(histogram.max, seconds);
+        const bucket = DURATION_BUCKETS.findIndex((boundary) => seconds <= boundary);
+        histogram.bucketCounts[bucket < 0 ? DURATION_BUCKETS.length : bucket]++;
+      }
+
+      previousOutputChunkTime = now;
     },
     end(fields) {
       try {

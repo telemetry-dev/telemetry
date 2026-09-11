@@ -170,7 +170,7 @@ export const AGENT_HANDLERS = {
       }
       return {
         ...response,
-        stream: wrapAsyncIterable(response.stream, new RagStreamState(), span, t0, base),
+        stream: wrapAsyncIterable(response.stream, new RagStreamState(), span, t0, base, false),
       };
     },
   },
@@ -192,6 +192,7 @@ export const AGENT_HANDLERS = {
           span,
           t0,
           awsMetadataFields(response.$metadata),
+          false,
         ),
       };
     },
@@ -224,7 +225,7 @@ function streamAgentResult(key: "completion") {
     }
     return {
       ...response,
-      [key]: wrapAsyncIterable(response[key], new AgentStreamState(options), span, t0, base),
+      [key]: wrapAsyncIterable(response[key], new AgentStreamState(options), span, t0, base, false),
     };
   };
 }

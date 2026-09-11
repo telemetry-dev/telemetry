@@ -435,8 +435,11 @@ function createObservedMessagesStream(
     let terminalError: Value;
     try {
       for await (const event of source) {
+        const receivedAt = performance.now();
         const fields = recordStreamEvent(event, state);
         setFirstStreamUpdate(span, startedAt, sawFirst, fields);
+
+        if (streamEventHasOutput(event)) span.recordOutputChunk?.(receivedAt);
         yield event;
       }
     } catch (error) {
@@ -452,6 +455,23 @@ function createObservedMessagesStream(
   }
   return new Stream(() => iterator(), source.controller);
 }
+
+function streamEventHasOutput(event: unknown): boolean {
+  const record = asRecord(event);
+  const type = record?.type;
+
+  if (!record || (type !== "content_block_start" && type !== "content_block_delta")) return false;
+  const value = asRecord(type === "content_block_delta" ? record.delta : record.content_block);
+  const input = asRecord(value?.input);
+
+  return (
+    [value?.text, value?.thinking, value?.partial_json].some(
+      (part) => typeof part === "string" && part.length > 0,
+    ) ||
+    (input !== undefined && Object.keys(input).length > 0)
+  );
+}
+
 function wrapStream<T>(
   value: T,
   span: SpanHandle,

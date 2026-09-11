@@ -7,7 +7,7 @@ import {
   InvokeModelWithResponseStreamCommand,
   type ConverseCommandInput,
 } from "@aws-sdk/client-bedrock-runtime";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 
 import { instrumentBedrock, uninstrumentBedrock, wrapBedrock } from "../src/index.ts";
 import { FakeClient, bytes, collect, jsonAttr, setup, streamOf, teardown } from "./helpers.ts";
@@ -372,6 +372,8 @@ test("InvokeModelWithResponseStream preserves optional invocation metrics", asyn
         body: streamOf([
           { chunk: { bytes: bytes({ message: { usage: { input_tokens: 2 } } }) } },
           { chunk: { bytes: bytes({ delta: { text: "hi", stop_reason: "end_turn" } }) } },
+          { chunk: { bytes: bytes({ delta: { thinking: "reasoning" } }) } },
+          { chunk: { bytes: bytes({ delta: { partial_json: '{"city":' } }) } },
           { chunk: { bytes: bytes({ completion: " legacy" }) } },
           { chunk: { bytes: bytes({ outputs: [{ text: " mistral", stop_reason: "stop" }] }) } },
           {
@@ -395,6 +397,42 @@ test("InvokeModelWithResponseStream preserves optional invocation metrics", asyn
   expect(span.attributes["gen_ai.usage.output_tokens"]).toBeUndefined();
   expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
   expect(jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content).toBe("hi legacy mistral");
+  expect(span).toMatchObject({
+    [Symbol.for("telemetry.dev.outputChunkHistogram")]: { count: 4 },
+  });
+});
+
+test("InvokeModelWithResponseStream parses each payload once and delivers malformed payloads", async () => {
+  const spans = setup();
+  const parse = vi.spyOn(JSON, "parse");
+  const malformed = new TextEncoder().encode("not-json");
+
+  const events = [
+    { chunk: { bytes: bytes({ delta: { text: "hi" } }) } },
+    { chunk: { bytes: new Uint8Array() } },
+    { chunk: { bytes: bytes({ delta: { text: "there" } }) } },
+    { chunk: { bytes: malformed } },
+  ];
+
+  const client = wrapBedrock(new FakeClient([{ body: streamOf(events) }]));
+
+  const response = (await client.send(
+    new InvokeModelWithResponseStreamCommand({
+      modelId: "anthropic.claude",
+      contentType: "application/json",
+      body: bytes({ messages: [], max_tokens: 10 }),
+    }),
+  )) as { body: AsyncIterable<unknown> };
+
+  const before = parse.mock.calls.length;
+
+  expect(await collect(response.body)).toEqual(events);
+  expect(parse.mock.calls.length - before).toBe(4);
+  parse.mockRestore();
+  const [span] = spans.getFinishedSpans();
+  expect(span).toMatchObject({
+    [Symbol.for("telemetry.dev.outputChunkHistogram")]: { count: 2 },
+  });
 });
 
 test("InvokeModelWithResponseStream captures Titan token counts and Cohere generations", async () => {

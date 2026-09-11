@@ -1,8 +1,12 @@
-import type { Attributes } from "@opentelemetry/api";
+import { ValueType, type Attributes } from "@opentelemetry/api";
+import { millisToHrTime } from "@opentelemetry/core";
 import type { Resource } from "@opentelemetry/resources";
 import {
   MeterProvider,
   PeriodicExportingMetricReader,
+  AggregationTemporality,
+  DataPointType,
+  type MetricProducer,
   type PushMetricExporter,
 } from "@opentelemetry/sdk-metrics";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
@@ -25,6 +29,20 @@ const TOKEN_OPERATIONS = new Set(["chat", "invoke_agent", "embeddings"]);
 export const DORMANT_INTERVAL_MS = 2 ** 31 - 1;
 export const BATCHED_METRIC_INTERVAL_MS = 60_000;
 
+export interface OutputChunkHistogram {
+  count: number;
+  sum: number;
+  min: number;
+  max: number;
+  bucketCounts: number[];
+}
+
+export const OUTPUT_CHUNK_HISTOGRAM = Symbol.for("telemetry.dev.outputChunkHistogram");
+
+type SpanWithOutputChunks = ReadableSpan & {
+  [OUTPUT_CHUNK_HISTOGRAM]?: OutputChunkHistogram;
+};
+
 export interface MetricsPipeline {
   record(span: ReadableSpan): void;
   forceFlush(): Promise<void>;
@@ -44,7 +62,65 @@ export function createMetricsPipeline({
   exporter: PushMetricExporter;
   exportIntervalMillis: number;
 }): MetricsPipeline {
-  const reader = new PeriodicExportingMetricReader({ exporter, exportIntervalMillis });
+  const pending = new Map<string, { attributes: Attributes; value: OutputChunkHistogram }>();
+  let collectionStart = millisToHrTime(Date.now());
+
+  const producer: MetricProducer = {
+    collect: () => {
+      const endTime = millisToHrTime(Date.now());
+
+      const points = [...pending.values()].map(({ attributes, value }) => ({
+        attributes,
+        startTime: collectionStart,
+        endTime,
+        value: {
+          count: value.count,
+          sum: value.sum,
+          min: value.min,
+          max: value.max,
+          buckets: { boundaries: [...DURATION_BUCKETS], counts: [...value.bucketCounts] },
+        },
+      }));
+
+      pending.clear();
+      collectionStart = endTime;
+
+      return Promise.resolve({
+        errors: [],
+        resourceMetrics: {
+          resource,
+          scopeMetrics: [
+            {
+              scope: { name: SCOPE_NAME, version: SCOPE_VERSION },
+              metrics:
+                points.length === 0
+                  ? []
+                  : [
+                      {
+                        descriptor: {
+                          name: "gen_ai.client.operation.time_per_output_chunk",
+                          description: "",
+                          unit: "s",
+                          valueType: ValueType.DOUBLE,
+                        },
+                        aggregationTemporality: AggregationTemporality.DELTA,
+                        dataPointType: DataPointType.HISTOGRAM,
+                        dataPoints: points,
+                      },
+                    ],
+            },
+          ],
+        },
+      });
+    },
+  };
+
+  const reader = new PeriodicExportingMetricReader({
+    exporter,
+    exportIntervalMillis,
+    metricProducers: [producer],
+  });
+
   const meterProvider = new MeterProvider({ resource, readers: [reader] });
   const meter = meterProvider.getMeter(SCOPE_NAME, SCOPE_VERSION);
 
@@ -55,6 +131,11 @@ export function createMetricsPipeline({
   const tokenHistogram = meter.createHistogram("gen_ai.client.token.usage", {
     unit: "{token}",
     advice: { explicitBucketBoundaries: TOKEN_BUCKETS },
+  });
+
+  const firstChunkHistogram = meter.createHistogram("gen_ai.client.operation.time_to_first_chunk", {
+    unit: "s",
+    advice: { explicitBucketBoundaries: DURATION_BUCKETS },
   });
 
   const record = (span: ReadableSpan): void => {
@@ -72,6 +153,46 @@ export function createMetricsPipeline({
       durationSec,
       errorType !== undefined ? { ...attrs, "error.type": errorType } : attrs,
     );
+    const firstChunkSeconds = span.attributes["gen_ai.response.time_to_first_chunk"];
+
+    if (
+      operation === "chat" &&
+      typeof firstChunkSeconds === "number" &&
+      Number.isFinite(firstChunkSeconds) &&
+      firstChunkSeconds >= 0
+    ) {
+      firstChunkHistogram.record(firstChunkSeconds, attrs);
+    }
+
+    const outputChunks = (span as SpanWithOutputChunks)[OUTPUT_CHUNK_HISTOGRAM];
+
+    if (operation === "chat" && outputChunks?.count) {
+      let key = JSON.stringify(attrs);
+      let chunkAttrs = attrs;
+
+      if (!pending.has(key) && pending.size >= 1999) {
+        key = "overflow";
+        chunkAttrs = { "otel.metric.overflow": true };
+      }
+
+      const existing = pending.get(key);
+
+      if (existing) {
+        existing.value.count += outputChunks.count;
+        existing.value.sum += outputChunks.sum;
+        existing.value.min = Math.min(existing.value.min, outputChunks.min);
+        existing.value.max = Math.max(existing.value.max, outputChunks.max);
+        outputChunks.bucketCounts.forEach((count, index) => {
+          existing.value.bucketCounts[index] += count;
+        });
+      } else {
+        pending.set(key, {
+          attributes: chunkAttrs,
+          value: { ...outputChunks, bucketCounts: [...outputChunks.bucketCounts] },
+        });
+      }
+    }
+
     if (!TOKEN_OPERATIONS.has(operation)) return;
     const inputTokens = span.attributes["gen_ai.usage.input_tokens"];
     if (inputTokens?.constructor === Number) {

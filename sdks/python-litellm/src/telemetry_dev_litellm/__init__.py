@@ -415,13 +415,14 @@ class _InstrumentedStream:
     def __next__(self) -> Any:
         try:
             chunk = next(self._inner)
+            received_at = time.perf_counter()
         except StopIteration:
             self.close()
             raise
         except BaseException as exc:
             self._finish(error=exc)
             raise
-        self._record(chunk)
+        self._record(chunk, received_at)
         return chunk
 
     def __aiter__(self) -> AsyncIterator[Any]:
@@ -430,13 +431,14 @@ class _InstrumentedStream:
     async def __anext__(self) -> Any:
         try:
             chunk = await self._inner.__anext__()
+            received_at = time.perf_counter()
         except StopAsyncIteration:
             await self.aclose()
             raise
         except BaseException as exc:
             self._finish(error=exc)
             raise
-        self._record(chunk)
+        self._record(chunk, received_at)
         return chunk
 
     def __enter__(self) -> _InstrumentedStream:
@@ -469,7 +471,7 @@ class _InstrumentedStream:
             return bool(await _maybe_await(exit_method(exc_type, exc, tb)))
         return False
 
-    def _record(self, chunk: Any) -> None:
+    def _record(self, chunk: Any, received_at: float) -> None:
         response_id = _string(_field(chunk, "id"))
         if self._response_id is None and response_id is not None:
             self._response_id = response_id
@@ -479,13 +481,42 @@ class _InstrumentedStream:
         usage = _usage_from(_field(chunk, "usage"))
         if usage is not None:
             self._usage = usage
+        has_output = False
         for fallback_index, choice in enumerate(_sequence_items(_field(chunk, "choices"))):
+            delta = _field(choice, "delta")
+            has_output = (
+                has_output
+                or any(
+                    isinstance(value, str) and bool(value)
+                    for value in (
+                        _field(delta, "content"),
+                        _field(delta, "reasoning_content"),
+                        _field(delta, "refusal"),
+                        _field(_field(delta, "audio"), "data"),
+                    )
+                )
+                or (
+                    isinstance(_field(_field(delta, "function_call"), "arguments"), str)
+                    and bool(_field(_field(delta, "function_call"), "arguments"))
+                )
+                or any(
+                    isinstance(arguments, str) and bool(arguments)
+                    for arguments in (
+                        _field(_field(tool, "function"), "arguments")
+                        for tool in _sequence_items(_field(delta, "tool_calls"))
+                    )
+                )
+            )
             finish_reason = _string(_field(choice, "finish_reason"))
             if finish_reason is not None:
                 choice_index = _number(_field(choice, "index"))
                 self._finish_reasons[
                     int(choice_index) if choice_index is not None else fallback_index
                 ] = finish_reason
+        if has_output:
+            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
+            if callable(record_output_chunk):
+                record_output_chunk(received_at * 1000)
         if not self._saw_first:
             self._saw_first = True
             self._handle.update(

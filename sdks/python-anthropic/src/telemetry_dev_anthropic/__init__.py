@@ -366,6 +366,24 @@ def _record_stream_event(event: Any, state: _StreamState) -> dict[str, Any]:
     return update
 
 
+def _stream_event_has_output(event: Any) -> bool:
+    event_type = _string(_field(event, "type"))
+    value = (
+        _field(event, "delta")
+        if event_type == "content_block_delta"
+        else _field(event, "content_block")
+    )
+    if event_type not in ("content_block_start", "content_block_delta"):
+        return False
+    if any(
+        isinstance(_field(value, key), str) and bool(_field(value, key))
+        for key in ("text", "thinking", "partial_json")
+    ):
+        return True
+    input_value = _field(value, "input")
+    return input_value not in (None, "", [], {})
+
+
 class _InstrumentedStream:
     def __init__(self, inner: Any, handle: telemetry_dev.SpanHandle, started_at: float) -> None:
         self._inner = inner
@@ -397,6 +415,7 @@ class _InstrumentedStream:
             while True:
                 try:
                     event = next(self._inner)
+                    received_at = time.perf_counter()
                 except StopIteration:
                     break
                 except BaseException as exc:
@@ -409,6 +428,10 @@ class _InstrumentedStream:
                     if client is not None:
                         client.report("failed to map Anthropic stream event", exc)
                     update = {}
+                if _stream_event_has_output(event):
+                    record_output_chunk = getattr(self._handle, "record_output_chunk", None)
+                    if callable(record_output_chunk):
+                        record_output_chunk(received_at * 1000)
                 self._update_first(update)
                 yield event
         finally:
@@ -476,6 +499,7 @@ class _InstrumentedAsyncStream:
             while True:
                 try:
                     event = await self._inner.__anext__()
+                    received_at = time.perf_counter()
                 except StopAsyncIteration:
                     break
                 except BaseException as exc:
@@ -488,6 +512,10 @@ class _InstrumentedAsyncStream:
                     if client is not None:
                         client.report("failed to map Anthropic stream event", exc)
                     update = {}
+                if _stream_event_has_output(event):
+                    record_output_chunk = getattr(self._handle, "record_output_chunk", None)
+                    if callable(record_output_chunk):
+                        record_output_chunk(received_at * 1000)
                 self._update_first(update)
                 yield event
         finally:

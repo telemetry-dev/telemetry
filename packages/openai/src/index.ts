@@ -446,10 +446,29 @@ function chatPartialFields(
 
 function recordChatChunk<T>(chunk: T, states: Map<number, ChatChoiceState>) {
   const c = asRecord(chunk) ?? {};
+  let hasOutput = false;
+
   for (const choice of asArray(c.choices) ?? []) {
     const choiceRecord = asRecord(choice) ?? {};
     const state = getChoiceState(states, readNumber(choiceRecord.index) ?? 0);
     const delta = asRecord(choiceRecord.delta) ?? {};
+    const audio = asRecord(delta.audio);
+    const legacyFunction = asRecord(delta.function_call);
+
+    if (
+      (typeof delta.content === "string" && delta.content.length > 0) ||
+      (typeof delta.refusal === "string" && delta.refusal.length > 0) ||
+      (typeof audio?.data === "string" && audio.data.length > 0) ||
+      (typeof legacyFunction?.arguments === "string" && legacyFunction.arguments.length > 0) ||
+      (asArray(delta.tool_calls) ?? []).some((toolCall) => {
+        const fn = asRecord(asRecord(toolCall)?.function);
+
+        return typeof fn?.arguments === "string" && fn.arguments.length > 0;
+      })
+    ) {
+      hasOutput = true;
+    }
+
     if (String(delta.role) === delta.role) state.role = delta.role;
     if (String(delta.content) === delta.content) state.content += delta.content;
     if (String(delta.refusal) === delta.refusal) state.refusal += delta.refusal;
@@ -464,6 +483,7 @@ function recordChatChunk<T>(chunk: T, states: Map<number, ChatChoiceState>) {
     responseId: readString(c.id),
     responseModel: readString(c.model),
     usage: chatUsage(c.usage),
+    hasOutput,
   };
 }
 
@@ -486,7 +506,11 @@ function createObservedChatStream(
     let terminalError: Error | undefined;
     try {
       for await (const chunk of source) {
+        const receivedAt = performance.now();
         const update = recordChatChunk(chunk, states);
+
+        if (update.hasOutput) span.recordOutputChunk?.(receivedAt);
+
         if (!sawFirst) {
           sawFirst = true;
           span.update({
@@ -522,7 +546,10 @@ function createObservedResponsesStream(
     let terminalError: Error | undefined;
     try {
       for await (const event of source) {
+        const receivedAt = performance.now();
         const e = asRecord(event) ?? {};
+
+        if (responseEventHasOutput(e)) span.recordOutputChunk?.(receivedAt);
         const response = asRecord(e.response);
         if (!sawFirst) {
           sawFirst = true;
@@ -549,6 +576,27 @@ function createObservedResponsesStream(
     }
   }
   return new Stream(() => iterator(), source.controller);
+}
+
+function responseEventHasOutput(event: JsonRecord): boolean {
+  return (
+    typeof event.type === "string" &&
+    [
+      "response.output_text.delta",
+      "response.refusal.delta",
+      "response.reasoning_text.delta",
+      "response.reasoning_summary_text.delta",
+      "response.function_call_arguments.delta",
+      "response.custom_tool_call_input.delta",
+      "response.code_interpreter_call_code.delta",
+      "response.mcp_call_arguments.delta",
+      "response.output_audio.delta",
+      "response.audio.delta",
+      "response.audio.transcript.delta",
+    ].includes(event.type) &&
+    typeof event.delta === "string" &&
+    event.delta.length > 0
+  );
 }
 
 function wrapStream<T>(

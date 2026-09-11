@@ -1,4 +1,10 @@
 import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
+import {
+  AggregationTemporality,
+  DataPointType,
+  type PushMetricExporter,
+  type ResourceMetrics,
+} from "@opentelemetry/sdk-metrics";
 import { flush, init, shutdown } from "@telemetry-dev/sdk";
 import {
   FunctionCallingConfigMode,
@@ -45,14 +51,16 @@ function sseResponse(chunks: JsonValue[]): Response {
   });
 }
 
-function erroringSseResponse(chunk: JsonValue, error: Error): Response {
+function erroringSseResponse(chunks: JsonValue | JsonValue[], error: Error): Response {
   const encoder = new TextEncoder();
-  let sent = false;
+  const pending = Array.isArray(chunks) ? [...chunks] : [chunks];
+
   const body = new ReadableStream<Uint8Array>(
     {
       pull(controller) {
-        if (!sent) {
-          sent = true;
+        const chunk = pending.shift();
+
+        if (chunk !== undefined) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
           return;
         }
@@ -103,6 +111,53 @@ function setupSpans(): InMemorySpanExporter {
   return spanExporter;
 }
 
+function setupSpansAndMetrics() {
+  const spanExporter = new InMemorySpanExporter();
+  const metricBatches: ResourceMetrics[] = [];
+
+  const metricExporter: PushMetricExporter = {
+    export: (resourceMetrics, resultCallback) => {
+      metricBatches.push(resourceMetrics);
+      resultCallback({ code: 0 });
+    },
+    selectAggregationTemporality: () => AggregationTemporality.DELTA,
+    forceFlush: () => Promise.resolve(),
+    shutdown: () => Promise.resolve(),
+  };
+
+  init(
+    {
+      apiKey: "td_live_test",
+      serviceName: "google-genai-tests",
+      environment: "test",
+      exportMode: "immediate",
+      logLevel: "silent",
+      fetch: async () => new Response(null, { status: 200 }),
+    },
+    { spanExporter, metricExporter },
+  );
+
+  return { spanExporter, metricBatches };
+}
+
+function outputChunkIntervalCount(metricBatches: ResourceMetrics[]): number {
+  let count = 0;
+
+  for (const batch of metricBatches) {
+    for (const scope of batch.scopeMetrics) {
+      for (const metric of scope.metrics) {
+        if (metric.descriptor.name !== "gen_ai.client.operation.time_per_output_chunk") continue;
+
+        if (metric.dataPointType !== DataPointType.HISTOGRAM) throw new Error("expected histogram");
+
+        for (const point of metric.dataPoints) count += point.value.count;
+      }
+    }
+  }
+
+  return count;
+}
+
 function clientWith(): GoogleGenAI {
   return wrapGoogleGenAI(new GoogleGenAI({ apiKey: "test" }));
 }
@@ -140,6 +195,7 @@ function messagesAttr(span: ReadableSpan, key: "gen_ai.input.messages" | "gen_ai
 afterEach(async () => {
   vi.unstubAllGlobals();
   await shutdown();
+  vi.restoreAllMocks();
 });
 
 test("generateContent maps request, response, usage, finish reason, provider, and sampling attributes", async () => {
@@ -703,6 +759,229 @@ test("streaming mid-stream error records error status with partial output", asyn
     { role: "model", parts: [{ text: "partial" }] },
   ]);
 });
+
+test.each<{ partialArgs: JsonValue[] }>([
+  { partialArgs: [{ jsonPath: "$.enabled", boolValue: false }] },
+  { partialArgs: [{ jsonPath: "$.retries", numberValue: 0 }] },
+  {
+    partialArgs: [
+      { jsonPath: "$.enabled", boolValue: false },
+      { jsonPath: "$.retries", numberValue: 0 },
+    ],
+  },
+])("Vertex streaming counts partial values once but not shells: %j", async ({ partialArgs }) => {
+  const { spanExporter, metricBatches } = setupSpansAndMetrics();
+
+  const chunks: JsonValue[] = [
+    {
+      candidates: [
+        {
+          content: {
+            role: "model",
+            parts: [
+              {
+                functionCall: {
+                  name: "set_flags",
+                  partialArgs: [
+                    { jsonPath: "$.enabled", willContinue: true },
+                    { jsonPath: "$.label", stringValue: "" },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      candidates: [
+        {
+          content: {
+            role: "model",
+            parts: [
+              {
+                functionCall: {
+                  name: "set_flags",
+                  partialArgs,
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      candidates: [
+        {
+          content: {
+            role: "model",
+            parts: [
+              {
+                functionCall: {
+                  name: "set_flags",
+                  partialArgs: [{ jsonPath: "$.fallback", nullValue: "NULL_VALUE" }],
+                },
+              },
+            ],
+          },
+          finishReason: "STOP",
+        },
+      ],
+    },
+  ];
+
+  const fake = createFakeFetch(sseResponse(chunks));
+  vi.stubGlobal("fetch", fake.fetch);
+  const client = wrapGoogleGenAI(new GoogleGenAI({ vertexai: true, apiKey: "test" }));
+
+  const stream = await client.models.generateContentStream({
+    model: "gemini-2.5-flash",
+    contents: "Set flags",
+  });
+
+  const received = [];
+
+  for await (const chunk of stream) received.push(chunk);
+
+  expect(received).toHaveLength(3);
+  expect(received[1]!.candidates?.[0]?.content?.parts?.[0]?.functionCall?.partialArgs).toEqual(
+    partialArgs,
+  );
+  await exportedSpan(spanExporter);
+  await flush();
+  expect(outputChunkIntervalCount(metricBatches)).toBe(1);
+});
+
+test("Vertex streaming retains partial argument chunk intervals when interrupted", async () => {
+  const { spanExporter, metricBatches } = setupSpansAndMetrics();
+
+  const first = {
+    candidates: [
+      {
+        content: {
+          role: "model",
+          parts: [
+            {
+              functionCall: {
+                name: "lookup",
+                partialArgs: [{ jsonPath: "$.query", stringValue: "north" }],
+              },
+            },
+          ],
+        },
+      },
+    ],
+  };
+
+  const second = {
+    candidates: [
+      {
+        content: {
+          role: "model",
+          parts: [
+            {
+              functionCall: {
+                name: "lookup",
+                partialArgs: [{ jsonPath: "$.limit", numberValue: 0 }],
+              },
+            },
+          ],
+        },
+      },
+    ],
+  };
+
+  const fake = createFakeFetch(
+    erroringSseResponse([first, second], new Error("stream interrupted")),
+  );
+
+  vi.stubGlobal("fetch", fake.fetch);
+  const client = wrapGoogleGenAI(new GoogleGenAI({ vertexai: true, apiKey: "test" }));
+
+  const stream = await client.models.generateContentStream({
+    model: "gemini-2.5-flash",
+    contents: "Lookup",
+  });
+
+  const iterator = stream[Symbol.asyncIterator]();
+  expect(
+    (await iterator.next()).value.candidates[0].content.parts[0].functionCall.partialArgs,
+  ).toEqual([{ jsonPath: "$.query", stringValue: "north" }]);
+  expect(
+    (await iterator.next()).value.candidates[0].content.parts[0].functionCall.partialArgs,
+  ).toEqual([{ jsonPath: "$.limit", numberValue: 0 }]);
+  await expect(iterator.next()).rejects.toThrow("stream interrupted");
+
+  const span = await exportedSpan(spanExporter);
+  expect(span.status.code).toBe(SPAN_STATUS_ERROR);
+  await flush();
+  expect(outputChunkIntervalCount(metricBatches)).toBe(1);
+});
+
+test.each(["next", "return", "throw"] as const)(
+  "streaming %s timestamps precede telemetry classification",
+  async (method) => {
+    const spans = setupSpans();
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+
+    const timings = [
+      [100, 30],
+      [240, 90],
+    ] as const;
+
+    let index = 0;
+
+    const pull = async () => {
+      const timing = timings[index++];
+
+      if (!timing) return { done: true as const, value: undefined };
+      const [receivedAt, mappingMs] = timing;
+      now = receivedAt;
+
+      return {
+        done: false as const,
+        value: {
+          get candidates() {
+            now = receivedAt + mappingMs;
+
+            return [{ content: { role: "model", parts: [{ text: "A" }] } }];
+          },
+        },
+      };
+    };
+
+    const source = {
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+      next: pull,
+      return: pull,
+      throw: pull,
+    };
+
+    const client = wrapGoogleGenAI({
+      models: { generateContentStream: async (_params: unknown) => source },
+    });
+
+    const stream = await client.models.generateContentStream({
+      model: "gemini-2.5-flash",
+      contents: "Hi",
+    });
+
+    expect((await stream.next()).done).toBe(false);
+    expect((await stream[method]()).done).toBe(false);
+    expect((await stream.return()).done).toBe(true);
+    expect(await exportedSpan(spans)).toMatchObject({
+      [Symbol.for("telemetry.dev.outputChunkHistogram")]: {
+        count: 1,
+        sum: 0.14,
+        min: 0.14,
+        max: 0.14,
+      },
+    });
+  },
+);
 
 test("streaming early break ends span with partial aggregate", async () => {
   const spans = setupSpans();

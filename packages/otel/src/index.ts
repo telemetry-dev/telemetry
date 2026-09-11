@@ -30,6 +30,8 @@ export {
   createMetricsPipeline,
   DORMANT_INTERVAL_MS,
   DURATION_BUCKETS,
+  OUTPUT_CHUNK_HISTOGRAM,
+  type OutputChunkHistogram,
   type MetricsPipeline,
   TOKEN_BUCKETS,
 } from "./metrics.ts";

@@ -12,6 +12,114 @@ afterEach(async () => {
   await shutdown();
 });
 
+test("streaming generations record first-chunk seconds without inventing missing timings", async () => {
+  const { batches, exporter } = makeMetricCapture();
+  setup({}, { metricExporter: exporter });
+  startSpan("stream", { type: "generation", model: "gpt-4o", provider: "openai" }).end({
+    timeToFirstChunkMs: 250,
+    error: new Error("failed after first chunk"),
+  });
+  startSpan("instant", { type: "generation", timeToFirstChunkMs: 0 }).end();
+  startSpan("nonstream", { type: "generation" }).end();
+
+  for (const timeToFirstChunkMs of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    startSpan("invalid", { type: "generation", timeToFirstChunkMs }).end();
+  }
+
+  startSpan("tool", { type: "tool", timeToFirstChunkMs: 900 }).end();
+  startSpan("agent", { type: "agent", timeToFirstChunkMs: 800 }).end();
+  await flush();
+
+  const points = histogramPoints(batches, "gen_ai.client.operation.time_to_first_chunk");
+  expect(points).toHaveLength(2);
+  const streamed = points.find((p) => p.attributes["gen_ai.request.model"] === "gpt-4o")!;
+  expect(streamed.value.count).toBe(1);
+  expect(streamed.value.sum).toBe(0.25);
+  expect(streamed.attributes).toEqual({
+    "gen_ai.operation.name": "chat",
+    "gen_ai.request.model": "gpt-4o",
+    "gen_ai.provider.name": "openai",
+  });
+  expect(points.find((p) => p !== streamed)!.value.sum).toBe(0);
+});
+
+test("output chunk intervals export their bounded aggregate only after an accepted span ends", async () => {
+  const { batches, exporter } = makeMetricCapture();
+  setup({ spanFilter: (span) => span.name !== "rejected" }, { metricExporter: exporter });
+  const kept = startSpan("kept", { type: "generation", model: "model", provider: "provider" });
+  kept.recordOutputChunk(0);
+  kept.recordOutputChunk(15);
+  kept.recordOutputChunk(55);
+  await flush();
+  expect(histogramPoints(batches, "gen_ai.client.operation.time_per_output_chunk")).toHaveLength(0);
+  kept.end();
+
+  const rejected = startSpan("rejected", { type: "generation" });
+  rejected.recordOutputChunk(100);
+  rejected.recordOutputChunk(200);
+  rejected.end();
+  startSpan("zero", { type: "generation" }).end();
+  const one = startSpan("one", { type: "generation" });
+  one.recordOutputChunk();
+  one.end();
+  await flush();
+
+  const points = histogramPoints(batches, "gen_ai.client.operation.time_per_output_chunk");
+  expect(points).toHaveLength(1);
+  expect(points[0]!.attributes).toEqual({
+    "gen_ai.operation.name": "chat",
+    "gen_ai.provider.name": "provider",
+    "gen_ai.request.model": "model",
+  });
+  expect(points[0]!.value).toEqual({
+    count: 2,
+    sum: 0.055,
+    min: 0.015,
+    max: 0.04,
+    buckets: {
+      boundaries: [
+        0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92,
+      ],
+      counts: [0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    },
+  });
+});
+
+test("output chunks merge series, cap cardinality, and reset after collection", async () => {
+  const { batches, exporter } = makeMetricCapture();
+  setup({}, { metricExporter: exporter });
+
+  for (let index = 0; index < 2001; index++) {
+    const span = startSpan("stream", { type: "generation", model: `model-${index}` });
+    span.recordOutputChunk(100);
+    span.recordOutputChunk(110);
+    span.end();
+    span.recordOutputChunk(1000);
+  }
+
+  const same = startSpan("same", { type: "generation", model: "model-0" });
+
+  for (const timestamp of [100, 100, Number.NaN, 90, Number.POSITIVE_INFINITY, 140]) {
+    same.recordOutputChunk(timestamp);
+  }
+
+  same.end({ error: new Error("stream interrupted") });
+  await flush();
+  const points = histogramPoints(batches, "gen_ai.client.operation.time_per_output_chunk");
+  expect(points).toHaveLength(2000);
+  const merged = points.find((point) => point.attributes["gen_ai.request.model"] === "model-0")!;
+  expect(merged.value.count).toBe(3);
+  expect(merged.value.sum).toBeCloseTo(0.05);
+  expect(merged.value.min).toBe(0);
+  expect(merged.value.max).toBe(0.04);
+  expect(merged.value.buckets.counts.slice(0, 3)).toEqual([2, 0, 1]);
+  expect(merged.attributes["error.type"]).toBeUndefined();
+  expect(points.find((point) => point.attributes["otel.metric.overflow"])!.value.count).toBe(2);
+  batches.length = 0;
+  await flush();
+  expect(histogramPoints(batches, "gen_ai.client.operation.time_per_output_chunk")).toHaveLength(0);
+});
+
 function histogramPoints(batches: ReturnType<typeof makeMetricCapture>["batches"], name: string) {
   return batches
     .flatMap((rm) => rm.scopeMetrics)
@@ -119,13 +227,19 @@ test("filter-rejected spans record no metrics", async () => {
     { spanFilter: (span) => span.name !== "rejected" },
     { metricExporter: exporter },
   );
-  startSpan("rejected", { type: "generation", usage: { inputTokens: 5 } }).end();
+
+  startSpan("rejected", {
+    type: "generation",
+    usage: { inputTokens: 5 },
+    timeToFirstChunkMs: 300,
+  }).end();
   startSpan("kept", { type: "generation", usage: { inputTokens: 3 } }).end();
   await flush();
   expect(spans.getFinishedSpans().map((s) => s.name)).toEqual(["kept"]);
   const tokens = histogramPoints(batches, "gen_ai.client.token.usage");
   expect(tokens).toHaveLength(1);
   expect(tokens[0]!.value.sum).toBe(3);
+  expect(histogramPoints(batches, "gen_ai.client.operation.time_to_first_chunk")).toHaveLength(0);
 });
 
 test("quiet intervals collect zero data points", async () => {

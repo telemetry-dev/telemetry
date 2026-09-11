@@ -1,7 +1,14 @@
 import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
+import {
+  AggregationTemporality,
+  InMemoryMetricExporter,
+  type PushMetricExporter,
+} from "@opentelemetry/sdk-metrics";
 import { flush, init, shutdown } from "@telemetry-dev/sdk";
+import * as sdk from "@telemetry-dev/sdk";
 import OpenAI, { AzureOpenAI } from "openai";
-import { afterEach, expect, test } from "vitest";
+import { Stream } from "openai/core/streaming";
+import { afterEach, expect, test, vi } from "vitest";
 
 import {
   instrumentOpenAI,
@@ -127,7 +134,7 @@ function createFakeFetch(...responses: Response[]): FakeFetch {
   return { fetch: fetchImpl, requests };
 }
 
-function setupSpans(): InMemorySpanExporter {
+function setupSpans(metricExporter?: PushMetricExporter): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
   init(
     {
@@ -138,7 +145,7 @@ function setupSpans(): InMemorySpanExporter {
       logLevel: "silent",
       fetch: async () => new Response(null, { status: 200 }),
     },
-    { spanExporter },
+    { spanExporter, metricExporter },
   );
   return spanExporter;
 }
@@ -193,6 +200,7 @@ async function collectStream(stream: AsyncIterable<unknown>): Promise<unknown[]>
 afterEach(async () => {
   uninstrumentOpenAI();
   await shutdown();
+  vi.restoreAllMocks();
 });
 
 test("chat completions map request, response, usage, finish reason, provider, and sampling attributes", async () => {
@@ -524,6 +532,120 @@ test("chat completions record finish reasons for single and multi-choice respons
   expect(multi?.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop", "length"]);
 });
 
+test.each([false, true])("chunk timing preserves delivery with old core=%s", async (oldCore) => {
+  const spans = setupSpans();
+
+  if (oldCore) {
+    const start = sdk.startSpan;
+    vi.spyOn(sdk, "startSpan").mockImplementation((...args) => {
+      const handle = start(...args);
+      Reflect.deleteProperty(handle, "recordOutputChunk");
+
+      return handle;
+    });
+  }
+
+  const deltas = [
+    { role: "assistant" },
+    { content: "A" },
+    { content: null },
+    { content: "" },
+    { tool_calls: [] },
+    { tool_calls: [{ index: 0, function: { arguments: "" } }] },
+    { content: "B" },
+    { function_call: { name: "weather" } },
+    { function_call: { arguments: "" } },
+    { function_call: { arguments: '{"city":' } },
+    {
+      content: "mixed",
+      function_call: { arguments: '"Paris"}' },
+      tool_calls: [{ index: 0, function: { arguments: "{}" } }],
+    },
+    {},
+  ];
+
+  const fake = createFakeFetch(
+    sseResponse(
+      deltas.map((delta) => ({
+        id: "chatcmpl_timing",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-4o",
+        choices: [{ index: 0, delta, finish_reason: null }],
+      })),
+    ),
+  );
+
+  const stream = await clientWith(fake.fetch).chat.completions.create({
+    model: "gpt-4o",
+    messages: [{ role: "user", content: "Hi" }],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toHaveLength(deltas.length);
+  const span = await exportedSpan(spans);
+  expect(span.status.code).toBe(SPAN_STATUS_UNSET);
+
+  if (oldCore) expect(Symbol.for("telemetry.dev.outputChunkHistogram") in span).toBe(false);
+  else {
+    expect(span).toMatchObject({
+      [Symbol.for("telemetry.dev.outputChunkHistogram")]: { count: 3 },
+    });
+  }
+});
+
+test.each(["chat", "responses"])("%s timestamps precede telemetry mapping", async (operation) => {
+  const spans = setupSpans();
+  let now = 0;
+  vi.spyOn(performance, "now").mockImplementation(() => now);
+
+  const source = new Stream(async function* () {
+    for (const [receivedAt, mappingMs] of [
+      [100, 30],
+      [240, 90],
+    ] as const) {
+      now = receivedAt;
+      yield operation === "chat"
+        ? {
+            get choices() {
+              now = receivedAt + mappingMs;
+
+              return [{ index: 0, delta: { content: "A" } }];
+            },
+          }
+        : {
+            get type() {
+              now = receivedAt + mappingMs;
+
+              return "response.output_text.delta";
+            },
+            delta: "A",
+          };
+    }
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create: async (_params: unknown) => source },
+    embeddings: {},
+  });
+
+  const stream =
+    operation === "chat"
+      ? await client.chat.completions.create({ model: "gpt-4o", messages: [], stream: true })
+      : await client.responses.create({ model: "gpt-4o", input: "Hi", stream: true });
+
+  expect(await collectStream(stream)).toHaveLength(2);
+  expect(await exportedSpan(spans)).toMatchObject({
+    [Symbol.for("telemetry.dev.outputChunkHistogram")]: {
+      count: 1,
+      sum: 0.14,
+      min: 0.14,
+      max: 0.14,
+    },
+  });
+});
+
 test("chat streams preserve tool-call-only output with null content", async () => {
   const spans = setupSpans();
   const toolCall = {
@@ -595,6 +717,9 @@ test("chat streams preserve tool-call-only output with null content", async () =
     { role: "assistant", content: null, tool_calls: [toolCall] },
   ]);
   expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["tool_calls"]);
+  expect(span).toMatchObject({
+    [Symbol.for("telemetry.dev.outputChunkHistogram")]: { count: 1 },
+  });
 });
 
 test("chat streams record finish reasons for every choice", async () => {
@@ -993,6 +1118,70 @@ test("responses create failed body records error while completed body stays OK",
   expect(success?.events.some((event) => event.name === "exception")).toBe(false);
   expect(success?.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
   expect(jsonAttr(success!, "gen_ai.output.messages")).toEqual(successOutput);
+});
+
+test.each([
+  "response.custom_tool_call_input",
+  "response.code_interpreter_call_code",
+  "response.mcp_call_arguments",
+  "response.audio.transcript",
+])("%s deltas retain timing after completion and interruption", async (eventType) => {
+  const metricExporter = new InMemoryMetricExporter(AggregationTemporality.DELTA);
+  const spans = setupSpans(metricExporter);
+
+  const outputEvents = [
+    { type: `${eventType}.delta`, delta: "first", item_id: "item_1", output_index: 0 },
+    { type: `${eventType}.delta`, delta: "", item_id: "item_1", output_index: 0 },
+    { type: `${eventType}.delta`, delta: "second", item_id: "item_1", output_index: 0 },
+    {
+      type: `${eventType}.done`,
+      input: "firstsecond",
+      code: "firstsecond",
+      arguments: "firstsecond",
+      transcript: "firstsecond",
+    },
+  ];
+
+  const completed = {
+    type: "response.completed",
+    response: { id: "resp_timing", model: "gpt-4.1", status: "completed", output: [] },
+  };
+
+  const fake = createFakeFetch(
+    sseResponse([...outputEvents, completed]),
+    countedSseResponse([...outputEvents, completed]).response,
+  );
+
+  const client = clientWith(fake.fetch);
+  const stream = await client.responses.create({ model: "gpt-4.1", input: "Run", stream: true });
+  expect(await collectStream(stream)).toEqual([...outputEvents, completed]);
+
+  const interrupted = await client.responses.create({
+    model: "gpt-4.1",
+    input: "Run",
+    stream: true,
+  });
+
+  const iterator = interrupted[Symbol.asyncIterator]();
+
+  for (const event of outputEvents) expect((await iterator.next()).value).toEqual(event);
+  await iterator.return?.();
+
+  expect(await finishedSpans(spans, 2)).toHaveLength(2);
+
+  const metrics = metricExporter
+    .getMetrics()
+    .flatMap((batch) => batch.scopeMetrics.flatMap((scope) => scope.metrics));
+
+  const histogram = metrics.find(
+    (metric) => metric.descriptor.name === "gen_ai.client.operation.time_per_output_chunk",
+  );
+
+  expect(histogram?.dataPoints).toHaveLength(2);
+  expect(histogram?.dataPoints).toEqual([
+    expect.objectContaining({ value: expect.objectContaining({ count: 1 }) }),
+    expect.objectContaining({ value: expect.objectContaining({ count: 1 }) }),
+  ]);
 });
 
 test("responses streams end from response.completed terminal event", async () => {

@@ -75,7 +75,7 @@ later `init()` generates a new ID. It is not persisted across processes.
 | `init(**options) -> Client` | Initialize the SDK (see options below). Calling again replaces the previous client. |
 | `@observe` / `@observe(name=, type=, capture_input=, capture_output=, attributes=)` | Wrap a sync/async function (or generator) in a span. Arguments become `input` (param-name dict, `self`/`cls` dropped), the return value becomes `output`, exceptions are captured and re-raised. |
 | `start_span(name, *, type="span", ...) -> SpanHandle` | Start a span. `with` activates it in the current context; without `with` it is a detached handle you must `.end()`. |
-| `SpanHandle.update(**fields)` / `.end(**fields, end_time=)` / `.traceparent()` | Update attributes, end (accepts the full update field set), or read the W3C traceparent. |
+| `SpanHandle.update(**fields)` / `.end(**fields, end_time=)` / `.record_output_chunk(timestamp_ms=None)` / `.traceparent()` | Update attributes, end, record arrival of a non-empty output chunk, or read the W3C traceparent. |
 | `update_current_span(**fields)` | Apply the update field set to the currently active span (no-op without one). |
 | `propagate_attributes(*, user_id=, session_id=, metadata=)` | Context manager stamping `user.id` / `gen_ai.conversation.id` / `td.metadata.*` on every span and log record started inside (threads/asyncio included via contextvars). |
 | `log(message, *, level="info", event_name=None, attributes=None)` | Emit an OTLP log record to `/v1/logs`, correlated with the current trace. Levels: `debug`/`info`/`warn`/`error` (`"warning"` is accepted as an alias of `warn`). |
@@ -83,6 +83,18 @@ later `init()` generates a new ID. It is not persisted across processes.
 | `flush(timeout_s=10.0)` / `shutdown(timeout_s=10.0)` | Force-flush / tear down traces + logs + metrics. Shutdown also runs atexit unless `disable_atexit=True`. |
 | `TelemetrySpanProcessor` / `telemetry_dev.otel.create_telemetry_span_exporter` | Bring-your-own-OTel helpers (below). |
 | `MaskContext`, `Usage`, `SpanHandle`, `Client`, `NOT_GIVEN` | Supporting types. |
+
+`record_output_chunk()` measures intervals at the point the consumer pulls each chunk. If a
+consumer waits between pulls, that delay is included and cannot be separated from provider latency.
+The exact `gen_ai.client.operation.time_per_output_chunk` histogram is supported by the built-in
+OTLP metric exporter. OpenTelemetry Python does not expose an aggregate-input API for arbitrary
+metric readers, so supplying `metric_reader=` disables this histogram. Duration, token usage, and
+time-to-first-chunk metrics remain available; the first accepted streamed span with two or more
+recorded chunks reports this limitation once through `on_error` and the SDK logger.
+
+Provider integrations feature-detect `record_output_chunk`. Older core SDKs without that method
+continue delivering streams and tracing normally, but do not emit chunk-interval metrics. Upgrade
+the core SDK with provider integrations to enable the new metric.
 
 ### Span types
 
@@ -136,12 +148,17 @@ The built-in Python and TypeScript ratio samplers can select different sessions 
 
 ## Auto-metrics
 
-Ended spans automatically record two histograms (DELTA temporality, exported every 60s):
+Ended spans automatically record histograms (DELTA temporality, exported every 60s):
 
 - `gen_ai.client.operation.duration` (unit `s`) for `chat`, `invoke_agent`, `embeddings`,
   `execute_tool`
 - `gen_ai.client.token.usage` (unit `{token}`, attribute `gen_ai.token.type=input|output`) for
   `chat`, `invoke_agent`, `embeddings`
+- `gen_ai.client.operation.time_to_first_chunk` (unit `s`) for `chat` when a finite, non-negative
+  first-chunk timing is available.
+- `gen_ai.client.operation.time_per_output_chunk` (unit `s`) for `chat` with two or more recorded
+  output chunks, using the built-in OTLP exporter. Filtering applies before either streaming metric
+  is emitted, including streams interrupted after receiving output.
 
 Plain spans (`function`) record no metrics. Quiet intervals produce zero metric requests.
 

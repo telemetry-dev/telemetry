@@ -6,6 +6,7 @@ from typing import Any, cast
 
 import litellm
 import pytest
+import telemetry_dev
 from litellm.exceptions import MidStreamFallbackError
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import StatusCode
@@ -284,6 +285,17 @@ def test_streaming_accumulates_content_ttfc_and_usage(memory: SimpleNamespace) -
 def test_streaming_bounds_retained_chunks_without_dropping_output(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    calls: list[telemetry_dev.SpanHandle] = []
+    original = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        assert timestamp_ms is not None
+        calls.append(handle)
+        return original(handle, timestamp_ms)
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
     chunks = [
         SimpleNamespace(
             id=None,
@@ -298,6 +310,38 @@ def test_streaming_bounds_retained_chunks_without_dropping_output(
         )
         for _ in range(1100)
     ]
+    chunks.extend(
+        [
+            SimpleNamespace(
+                id=None,
+                model=None,
+                choices=[
+                    SimpleNamespace(
+                        index=0,
+                        delta=SimpleNamespace(
+                            content=None,
+                            function_call=SimpleNamespace(name="lookup", arguments=""),
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+            ),
+            SimpleNamespace(
+                id=None,
+                model=None,
+                choices=[
+                    SimpleNamespace(
+                        index=0,
+                        delta=SimpleNamespace(
+                            content=None,
+                            function_call=SimpleNamespace(name=None, arguments='{"city":'),
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+            ),
+        ]
+    )
     chunks.append(
         SimpleNamespace(
             id="bounded-stream",
@@ -305,7 +349,7 @@ def test_streaming_bounds_retained_chunks_without_dropping_output(
             choices=[
                 SimpleNamespace(
                     index=0,
-                    delta=SimpleNamespace(content=None),
+                    delta=SimpleNamespace(content="tail"),
                     finish_reason="length",
                 ),
                 SimpleNamespace(
@@ -345,6 +389,7 @@ def test_streaming_bounds_retained_chunks_without_dropping_output(
     assert a["gen_ai.usage.input_tokens"] == 11
     assert a["gen_ai.usage.output_tokens"] == 7
     assert a["gen_ai.usage.total_tokens"] == 18
+    assert len(calls) == 1102
 
 
 def test_streaming_exposes_litellm_stream_attributes(memory: SimpleNamespace) -> None:
@@ -482,7 +527,20 @@ def test_streaming_mid_stream_error_records_error(memory: SimpleNamespace) -> No
     assert a["gen_ai.provider.name"] == "anthropic"
 
 
-async def test_async_completion_and_stream(memory: SimpleNamespace) -> None:
+async def test_async_completion_and_stream(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timestamps: list[float] = []
+    original = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        assert timestamp_ms is not None
+        timestamps.append(timestamp_ms)
+        return original(handle, timestamp_ms)
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
     instrument_litellm()
     completion = await llm.acompletion(
         model="gpt-4o-mini",
@@ -504,6 +562,7 @@ async def test_async_completion_and_stream(memory: SimpleNamespace) -> None:
     assert json_attr(attrs(stream_span)["gen_ai.output.messages"]) == [
         {"content": "Async stream", "role": "assistant"}
     ]
+    assert timestamps
 
 
 async def test_async_streaming_bounds_retained_chunks_without_dropping_output(

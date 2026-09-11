@@ -41,7 +41,7 @@ from ._config import (
     resolve_config,
 )
 from ._context import SessionSampler
-from ._metrics import GuardedOTLPMetricExporter, MetricsRecorder
+from ._metrics import GuardedOTLPMetricExporter, MetricsRecorder, OutputChunkAggregation
 from ._processor import ExportMode, StampingSpanProcessor
 from ._semconv import SCOPE_NAME
 from ._serialize import Mask, serialize_content
@@ -160,6 +160,7 @@ class Client:
         self._tracer_provider: TracerProvider | None = None
         self._logger_provider: LoggerProvider | None = None
         self._meter_provider: MeterProvider | None = None
+        self._output_chunks: OutputChunkAggregation | None = None
 
         if not enabled:
             return
@@ -191,6 +192,7 @@ class Client:
         # Without an api key (enabled via a test seam), never construct real network
         # exporters — they would POST to the ingest with a bogus Authorization header.
         if metric_reader is None and config.api_key is not None:
+            self._output_chunks = OutputChunkAggregation()
             metric_exporter = GuardedOTLPMetricExporter(
                 endpoint=f"{config.base_url}/v1/metrics",
                 headers=headers,
@@ -199,6 +201,7 @@ class Client:
                 preferred_temporality={Histogram: AggregationTemporality.DELTA},
                 on_error=on_error,
             )
+            metric_exporter.output_chunks = self._output_chunks
             metric_reader = PeriodicExportingMetricReader(
                 metric_exporter, export_interval_millis=60_000
             )
@@ -208,7 +211,9 @@ class Client:
                 metric_readers=[metric_reader], resource=resource, shutdown_on_exit=False
             )
             meter = self._meter_provider.get_meter(SCOPE_NAME, SDK_VERSION)
-            metrics_recorder = MetricsRecorder(meter, on_error=on_error)
+            metrics_recorder = MetricsRecorder(
+                meter, on_error=on_error, output_chunks=self._output_chunks
+            )
 
         if span_exporter is None:
             span_exporter = _ReportingSpanExporter(

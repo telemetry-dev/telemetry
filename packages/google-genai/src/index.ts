@@ -735,7 +735,9 @@ function createObservedStream(
   let sawFirst = false;
   let ended = false;
 
-  const recordChunk = (chunk: unknown): void => {
+  const recordChunk = (chunk: unknown, receivedAt: number): void => {
+    if (chunkHasOutput(chunk)) span.recordOutputChunk?.(receivedAt);
+
     if (!sawFirst) {
       sawFirst = true;
       const record = asRecord(chunk) ?? {};
@@ -772,8 +774,9 @@ function createObservedStream(
     async next(value?: unknown) {
       try {
         const step = await iterator.next(value);
+        const receivedAt = performance.now();
         if (step.done) finish();
-        else recordChunk(step.value);
+        else recordChunk(step.value, receivedAt);
         return step;
       } catch (error) {
         finish(error);
@@ -784,7 +787,9 @@ function createObservedStream(
       try {
         if (iterator.return) {
           const step = await iterator.return(value);
-          if (!step.done) recordChunk(step.value);
+          const receivedAt = performance.now();
+
+          if (!step.done) recordChunk(step.value, receivedAt);
           else finish();
           return step;
         }
@@ -802,8 +807,9 @@ function createObservedStream(
       }
       try {
         const step = await iterator.throw(error);
+        const receivedAt = performance.now();
         if (step.done) finish();
-        else recordChunk(step.value);
+        else recordChunk(step.value, receivedAt);
         return step;
       } catch (thrown) {
         finish(thrown);
@@ -814,6 +820,41 @@ function createObservedStream(
       await this.return(undefined);
     },
   };
+}
+
+function chunkHasOutput(chunk: unknown): boolean {
+  return (asArray(asRecord(chunk)?.candidates) ?? []).some((candidate) =>
+    (asArray(asRecord(asRecord(candidate)?.content)?.parts) ?? []).some((part) => {
+      const value = asRecord(part);
+      const inlineData = asRecord(value?.inlineData ?? value?.inline_data);
+      const functionCall = asRecord(value?.functionCall ?? value?.function_call);
+      const args = asRecord(functionCall?.args);
+      const partialArgs = asArray(functionCall?.partialArgs ?? functionCall?.partial_args) ?? [];
+
+      return (
+        (typeof value?.text === "string" && value.text.length > 0) ||
+        (args !== undefined && Object.keys(args).length > 0) ||
+        partialArgs.some((partialArg) => {
+          const partial = asRecord(partialArg);
+          const stringValue = partial?.stringValue ?? partial?.string_value;
+
+          return (
+            typeof partial?.boolValue === "boolean" ||
+            typeof partial?.bool_value === "boolean" ||
+            typeof partial?.numberValue === "number" ||
+            typeof partial?.number_value === "number" ||
+            (typeof stringValue === "string" && stringValue.length > 0) ||
+            partial?.nullValue === "NULL_VALUE" ||
+            partial?.null_value === "NULL_VALUE"
+          );
+        }) ||
+        (typeof inlineData?.mimeType === "string" &&
+          inlineData.mimeType.startsWith("audio/") &&
+          typeof inlineData.data === "string" &&
+          inlineData.data.length > 0)
+      );
+    }),
+  );
 }
 
 function wrapStream(

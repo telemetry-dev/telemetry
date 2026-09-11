@@ -131,14 +131,19 @@ def main() -> int:
             ).end()
             # C16b: mask hook redaction.
             start_span("masked-step", type="generation", input="SECRET stuff").end()
-            start_span(
+            streamed = start_span(
                 "streamed-chat",
                 type="generation",
                 model="gpt-4o",
                 provider="openai",
                 input=[{"role": "user", "content": "Stream please"}],
+            )
+            for timestamp in (1000, 1010, 1050, 1210):
+                streamed.record_output_chunk(timestamp)
+            streamed.end(
                 time_to_first_chunk_ms=250,
-            ).end(output={"role": "assistant", "content": "chunk..."})
+                output={"role": "assistant", "content": "chunk..."},
+            )
 
         # C13: continue the trace from a serialized W3C traceparent.
         start_span("background-job", parent=agent_traceparent).end()

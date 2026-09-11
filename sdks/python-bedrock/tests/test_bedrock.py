@@ -14,6 +14,7 @@ from botocore.client import BaseClient
 from botocore.exceptions import ClientError, EventStreamError
 from botocore.response import StreamingBody
 
+import telemetry_dev_bedrock._streams as bedrock_streams
 from telemetry_dev_bedrock import instrument_bedrock, uninstrument_bedrock, wrap_bedrock
 
 
@@ -305,6 +306,41 @@ def test_converse_stream_bounds_retained_state_without_dropping_events(
     assert list(span.attributes["gen_ai.response.finish_reasons"]) == ["max_tokens"]
 
 
+def test_chunk_timing_includes_reasoning_and_tool_arguments_not_usage(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[float | None] = []
+    original = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        calls.append(timestamp_ms)
+        return original(handle, timestamp_ms)
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
+    events = [
+        {"chunk": {"bytes": _body(payload)}}
+        for payload in [
+            {"message": {"usage": {"input_tokens": 2}}},
+            {"delta": {"thinking": "reasoning"}},
+            {"delta": {"signature": "signature"}},
+            {"delta": {"partial_json": '{"city":'}},
+            {"delta": {"partial_json": ""}},
+        ]
+    ]
+    client = _client("bedrock-runtime")
+    _stub_api_call(client, [{"body": FakeEventStream(events)}], monkeypatch)
+    wrap_bedrock(client)
+    response = cast(Any, client).invoke_model_with_response_stream(
+        modelId="anthropic.claude-3-haiku",
+        contentType="application/json",
+        body=_body({"messages": [], "max_tokens": 10}),
+    )
+    assert list(response["body"]) == events
+    assert len(calls) == 2
+
+
 def test_invoke_model_stream_bounds_content_but_keeps_terminal_metadata(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -526,6 +562,37 @@ def test_invoke_model_provider_native_and_streaming_body(
     assert mistral_span.attributes["gen_ai.usage.output_tokens"] == 12
     assert failed_read_span.attributes["gen_ai.response.id"] == "invoke-read-failed"
     assert _json_attr(stream_span, "gen_ai.output.messages")[0]["finish_reason"] == "end_turn"
+
+
+def test_invoke_stream_decodes_once_and_delivers_malformed_payload(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = [
+        {"chunk": {"bytes": _body({"delta": {"text": "hi"}})}},
+        {"chunk": {"bytes": b"not-json"}},
+    ]
+    client = _client("bedrock-runtime")
+    _stub_api_call(client, [{"body": FakeEventStream(events)}], monkeypatch)
+    loads = bedrock_streams.json.loads
+    calls = 0
+
+    def counting_loads(value: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return loads(value)
+
+    monkeypatch.setattr(bedrock_streams.json, "loads", counting_loads)
+    wrap_bedrock(client)
+    response = client.invoke_model_with_response_stream(  # type: ignore[attr-defined]
+        modelId="anthropic.claude-3-haiku",
+        contentType="application/json",
+        body=_body({"messages": [], "max_tokens": 10}),
+    )
+    before = calls
+
+    assert list(response["body"]) == events
+    assert calls - before == 2
+    assert len(memory.span_exporter.get_finished_spans()) == 1
 
 
 def test_invoke_model_streaming_body_preserves_read_all_and_context_manager(

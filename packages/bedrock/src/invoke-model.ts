@@ -224,17 +224,24 @@ export class InvokeModelStreamState implements StreamState {
   private finishReason: string | undefined;
   private error: Error | undefined;
   private errorFields: SpanFields | undefined;
-  feed<T>(event: T): void {
-    if (!isRecord(event)) return;
+  feed<T>(event: T): boolean {
+    if (!isRecord(event)) return false;
     const streamError = modeledStreamError(event);
     if (streamError) {
       this.error = streamError.error;
       this.errorFields = streamError.fields;
-      return;
+
+      return false;
     }
     const chunk = isRecord(event.chunk) ? event.chunk : undefined;
     const parsed = parseJson(chunk?.bytes);
-    if (parsed === undefined) return;
+
+    if (parsed === undefined) {
+      const raw = chunk?.bytes;
+
+      return (typeof raw === "string" || raw instanceof Uint8Array) && raw.length > 0;
+    }
+
     this.chunks.push(parsed);
     this.text += textFromProviderChunk(parsed);
     if (isRecord(parsed)) {
@@ -279,6 +286,8 @@ export class InvokeModelStreamState implements StreamState {
           this.usage?.cacheCreationInputTokens,
       });
     }
+
+    return providerChunkHasOutput(parsed);
   }
 
   finish(): SpanFields {
@@ -327,5 +336,16 @@ function textFromProviderChunk<T>(value: T): string {
       : undefined) ??
     stringValue(generation?.text) ??
     ""
+  );
+}
+
+function providerChunkHasOutput<T>(value: T): boolean {
+  if (!isRecord(value)) return false;
+  const delta = isRecord(value.delta) ? value.delta : undefined;
+
+  return (
+    textFromProviderChunk(value).length > 0 ||
+    (typeof delta?.thinking === "string" && delta.thinking.length > 0) ||
+    (typeof delta?.partial_json === "string" && delta.partial_json.length > 0)
   );
 }

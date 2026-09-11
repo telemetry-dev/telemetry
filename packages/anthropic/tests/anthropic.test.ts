@@ -1,7 +1,7 @@
 import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import { flush, init, shutdown } from "@telemetry-dev/sdk";
 import Anthropic from "@anthropic-ai/sdk";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 
 import { instrumentAnthropic, uninstrumentAnthropic, wrapAnthropic } from "../src/index.ts";
 
@@ -225,6 +225,7 @@ function streamEvents(): JsonRecord[] {
 afterEach(async () => {
   uninstrumentAnthropic();
   await shutdown();
+  vi.restoreAllMocks();
 });
 
 test("messages.create maps request, response, usage, finish reason, provider, and sampling attributes", async () => {
@@ -422,6 +423,54 @@ test("messages.create streaming observes duck-typed stream responses", async () 
   ]);
   expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(9);
   expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(2);
+});
+
+test("message timestamps precede telemetry mapping", async () => {
+  const spans = setupSpans();
+  let now = 0;
+  vi.spyOn(performance, "now").mockImplementation(() => now);
+
+  const source = {
+    controller: new AbortController(),
+    async *[Symbol.asyncIterator]() {
+      for (const [receivedAt, mappingMs] of [
+        [100, 30],
+        [240, 90],
+      ] as const) {
+        now = receivedAt;
+        yield {
+          type: "content_block_delta",
+          index: 0,
+          get delta() {
+            now = receivedAt + mappingMs;
+
+            return { type: "text_delta", text: "A" };
+          },
+        };
+      }
+    },
+  };
+
+  const client = wrapAnthropic({
+    messages: { create: async (_params: unknown) => source },
+  });
+
+  const stream = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toHaveLength(2);
+  expect(await exportedSpan(spans)).toMatchObject({
+    [Symbol.for("telemetry.dev.outputChunkHistogram")]: {
+      count: 1,
+      sum: 0.14,
+      min: 0.14,
+      max: 0.14,
+    },
+  });
 });
 
 test("messages.create streaming preserves citation deltas", async () => {

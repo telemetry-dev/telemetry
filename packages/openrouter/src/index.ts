@@ -609,7 +609,7 @@ function recordChatChunk<T>(
 }
 
 interface StreamObserver {
-  record(value: JsonValue): SpanFields | undefined;
+  record(value: JsonValue, receivedAt: number): SpanFields | undefined;
   finish(cause?: unknown): SpanFields;
 }
 
@@ -634,13 +634,15 @@ function observeStream(
       async pull(controller) {
         try {
           const result = await getReader().read();
+          const receivedAt = performance.now();
           if (result.done) {
             release();
             end(observer.finish());
             controller.close();
             return;
           }
-          const terminal = observer.record(result.value);
+
+          const terminal = observer.record(result.value, receivedAt);
           if (terminal) end(terminal);
           controller.enqueue(result.value);
         } catch (error) {
@@ -684,8 +686,43 @@ function createObservedChatStream(
   return observeStream(
     source,
     {
-      record(chunk) {
+      record(chunk, receivedAt) {
         const update = recordChatChunk(chunk, states, budget);
+
+        if (
+          (asArray(asRecord(chunk)?.choices) ?? []).some((choice) => {
+            const delta = asRecord(asRecord(choice)?.delta);
+            const audio = asRecord(delta?.audio);
+
+            const reasoningDetails = [
+              ...(asArray(delta?.reasoningDetails) ?? []),
+              ...(asArray(delta?.reasoning_details) ?? []),
+            ];
+
+            return (
+              delta &&
+              ((typeof delta.content === "string" && delta.content.length > 0) ||
+                (typeof delta.reasoning === "string" && delta.reasoning.length > 0) ||
+                (typeof delta.refusal === "string" && delta.refusal.length > 0) ||
+                (typeof audio?.data === "string" && audio.data.length > 0) ||
+                reasoningDetails.some((detail) => {
+                  const record = asRecord(detail);
+
+                  return (
+                    (typeof record?.text === "string" && record.text.length > 0) ||
+                    (typeof record?.summary === "string" && record.summary.length > 0)
+                  );
+                }) ||
+                (asArray(delta.toolCalls) ?? []).some((toolCall) => {
+                  const fn = asRecord(asRecord(toolCall)?.function);
+
+                  return typeof fn?.arguments === "string" && fn.arguments.length > 0;
+                }))
+            );
+          })
+        )
+          span().recordOutputChunk?.(receivedAt);
+
         if (!sawFirst) {
           sawFirst = true;
           span().update({
@@ -1172,8 +1209,10 @@ function createObservedResponsesStream(
   return observeStream(
     source,
     {
-      record(event) {
+      record(event, receivedAt) {
         const e = eventRecord(event);
+
+        if (responseEventHasOutput(e)) span().recordOutputChunk?.(receivedAt);
         const response = asRecord(e.response);
         if (!sawFirst) {
           sawFirst = true;
@@ -1262,6 +1301,30 @@ function createObservedResponsesStream(
       },
     },
     end,
+  );
+}
+
+function responseEventHasOutput(event: JsonRecord): boolean {
+  return (
+    typeof event.type === "string" &&
+    [
+      "response.output_text.delta",
+      "response.refusal.delta",
+      "response.reasoning_text.delta",
+      "response.reasoning_summary_text.delta",
+      "response.function_call_arguments.delta",
+      "response.custom_tool_call_input.delta",
+      "response.code_interpreter_call_code.delta",
+      "response.mcp_call_arguments.delta",
+      "response.apply_patch_call_operation_diff.delta",
+      "response.fusion_call.panel.delta",
+      "response.fusion_call.panel.reasoning.delta",
+      "response.output_audio.delta",
+      "response.audio.delta",
+      "response.audio.transcript.delta",
+    ].includes(event.type) &&
+    typeof event.delta === "string" &&
+    event.delta.length > 0
   );
 }
 
