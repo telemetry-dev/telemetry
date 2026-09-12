@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/telemetry-dev/telemetry/compare/python-v0.2.3...python-v0.2.4) (2026-09-12)
+
+
+### Features
+
+* **sdk:** add streaming latency metrics ([#5](https://github.com/telemetry-dev/telemetry/issues/5)) ([f1a7261](https://github.com/telemetry-dev/telemetry/commit/f1a72617ed1f802d68ee71baf767cec934827f98))
+
 ## [0.2.3](https://github.com/telemetry-dev/sdks/compare/python-v0.2.2...python-v0.2.3) (2026-09-07)
 
 

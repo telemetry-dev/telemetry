@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.4](https://github.com/telemetry-dev/telemetry/compare/eve-v0.1.3...eve-v0.1.4) (2026-09-12)
+
+### Features
+
+- **sdk:** add streaming latency metrics ([#5](https://github.com/telemetry-dev/telemetry/issues/5)) ([f1a7261](https://github.com/telemetry-dev/telemetry/commit/f1a72617ed1f802d68ee71baf767cec934827f98))
+
+### Dependencies
+
+- The following workspace dependencies were updated
+  - dependencies
+    - @telemetry-dev/sdk bumped to 0.1.4
+
 ## [0.1.3](https://github.com/telemetry-dev/sdks/compare/eve-v0.1.2...eve-v0.1.3) (2026-09-07)
 
 ### Dependencies

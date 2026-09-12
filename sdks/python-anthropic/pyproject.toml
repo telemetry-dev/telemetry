@@ -1,6 +1,6 @@
 [project]
 name = "telemetry-dev-anthropic"
-version = "0.1.0"
+version = "0.1.1"
 description = "Anthropic integration for telemetry.dev Python SDK"
 readme = "README.md"
 license = "MIT"

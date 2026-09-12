@@ -18,7 +18,7 @@ import telemetry_dev
 from google.genai import _extra_utils
 from google.genai.models import AsyncModels, Models
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 ProviderResolver = Callable[[object | None], str]
 RequestMapper = Callable[[Any, Any, Any], tuple[str, dict[str, Any]]]

@@ -11,7 +11,7 @@ import anthropic
 import telemetry_dev
 from anthropic.resources.messages import AsyncMessages, Messages
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 ProviderResolver = Callable[[object | None], str]
 RequestMapper = Callable[[Mapping[str, Any]], tuple[str, dict[str, Any]]]

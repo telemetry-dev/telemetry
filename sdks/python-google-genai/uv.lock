@@ -812,7 +812,7 @@ wheels = [
 
 [[package]]
 name = "telemetry-dev"
-version = "0.2.3"
+version = "0.2.4"
 source = { editable = "../python" }
 dependencies = [
     { name = "opentelemetry-api" },
@@ -837,7 +837,7 @@ dev = [
 
 [[package]]
 name = "telemetry-dev-google-genai"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "google-genai" },

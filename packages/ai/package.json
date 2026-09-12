@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/ai-sdk",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Vercel AI SDK telemetry integration for telemetry.dev, with entries for ai@7 and ai@6.",
   "keywords": [
     "ai-sdk",
