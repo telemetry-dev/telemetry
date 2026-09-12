@@ -2,10 +2,9 @@
 
 ## [0.1.5](https://github.com/telemetry-dev/telemetry/compare/otel-v0.1.4...otel-v0.1.5) (2026-09-12)
 
-
 ### Bug Fixes
 
-* correct package repository metadata ([#7](https://github.com/telemetry-dev/telemetry/issues/7)) ([23f74ea](https://github.com/telemetry-dev/telemetry/commit/23f74ea1480d02f4d3e34380dfb61ce149f12c86))
+- correct package repository metadata ([#7](https://github.com/telemetry-dev/telemetry/issues/7)) ([23f74ea](https://github.com/telemetry-dev/telemetry/commit/23f74ea1480d02f4d3e34380dfb61ce149f12c86))
 
 ## [0.1.4](https://github.com/telemetry-dev/telemetry/compare/otel-v0.1.3...otel-v0.1.4) (2026-09-12)
 
