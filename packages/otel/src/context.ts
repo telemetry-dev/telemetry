@@ -12,6 +12,7 @@ import { jsonAttr } from "./attrs.ts";
 import { diag } from "./debug.ts";
 
 type AlsConstructor = new <T>() => AsyncLocalStorage<T>;
+
 type RuntimeGlobal = typeof globalThis & {
   AsyncLocalStorage?: AlsConstructor;
   process?: {
@@ -24,10 +25,13 @@ type RuntimeGlobal = typeof globalThis & {
 // Node >= 20.19 and Workers with nodejs_compat expose process.getBuiltinModule.
 function loadAls(): AlsConstructor | undefined {
   const g: RuntimeGlobal = globalThis;
+
   if (g.AsyncLocalStorage) return g.AsyncLocalStorage;
+
   try {
     return g.process?.getBuiltinModule?.("node:async_hooks")?.AsyncLocalStorage;
   } catch {}
+
   return undefined;
 }
 
@@ -48,6 +52,7 @@ export function activeContext(): Context {
 /** Run `fn` with `ctx` active in both our ALS and the global OTel context manager. */
 export function withContext<T>(ctx: Context, fn: () => T): T {
   const run = () => apiContext.with(ctx, fn);
+
   return als ? als.run(ctx, run) : run();
 }
 
@@ -66,8 +71,11 @@ const RESERVED_METADATA_KEYS = new Set(["userId", "sessionId", "user_id", "sessi
 
 export function buildPropagatedAttributes(attrs: PropagatedAttributes): Attributes {
   const out: Attributes = {};
+
   if (attrs.userId !== undefined) out["user.id"] = attrs.userId;
+
   if (attrs.sessionId !== undefined) out["gen_ai.conversation.id"] = attrs.sessionId;
+
   if (attrs.metadata) {
     for (const [key, value] of Object.entries(attrs.metadata)) {
       if (RESERVED_METADATA_KEYS.has(key)) {
@@ -76,10 +84,13 @@ export function buildPropagatedAttributes(attrs: PropagatedAttributes): Attribut
         );
         continue;
       }
+
       const attr = typeof value === "string" ? value : jsonAttr(value);
+
       if (attr !== undefined) out[`td.metadata.${key}`] = attr;
     }
   }
+
   return out;
 }
 
@@ -94,6 +105,7 @@ export function propagatedFromContext(ctx: Context): Attributes | undefined {
 export function propagateAttributes<T>(attributes: PropagatedAttributes, fn: () => T): T {
   const base = activeContext();
   const merged = { ...propagatedFromContext(base), ...buildPropagatedAttributes(attributes) };
+
   return withContext(base.setValue(PROPAGATED_KEY, merged), fn);
 }
 
@@ -112,19 +124,23 @@ export class AlsContextManager implements ContextManager {
     ...args: A
   ): ReturnType<F> {
     const cb = thisArg == null ? fn : fn.bind(thisArg);
+
     return this.storage.run(context, cb as (...args: A) => ReturnType<F>, ...args);
   }
 
   bind<T>(context: Context, target: T): T {
     if (typeof target === "function") {
       const storage = this.storage;
+
       const bound = function (this: unknown, ...args: unknown[]) {
         return storage.run(context, () =>
           (target as (...a: unknown[]) => unknown).apply(this, args),
         );
       };
+
       return bound as T;
     }
+
     return target;
   }
 
@@ -134,6 +150,7 @@ export class AlsContextManager implements ContextManager {
 
   disable(): this {
     this.storage.disable();
+
     return this;
   }
 }

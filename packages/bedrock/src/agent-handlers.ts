@@ -20,6 +20,7 @@ import {
 
 export function agentInputMessages<T>(inputText: T): JsonValue {
   const text = stringValue(inputText);
+
   return text ? [{ role: "user", parts: [{ type: "text", content: text }] }] : undefined;
 }
 
@@ -63,35 +64,47 @@ export class AgentStreamState implements StreamState {
 
   feed<T>(event: T): void {
     const raw: unknown = event;
+
     if (!isRecord(raw)) return;
     const streamError = modeledStreamError(raw);
+
     if (streamError) {
       this.error = streamError.error;
       this.errorFields = streamError.fields;
+
       return;
     }
+
     const chunk = isRecord(raw.chunk) ? raw.chunk : undefined;
     const bytes = chunk?.bytes;
+
     if (bytes !== undefined) this.text += bytesToString(bytes) ?? "";
     const attribution = isRecord(chunk?.attribution) ? chunk.attribution : undefined;
     const citations = arrayValue<unknown>(attribution?.citations);
+
     if (citations) this.citationCount += citations.length;
 
     const files = isRecord(raw.files) ? arrayValue<JsonValue>(raw.files.files) : undefined;
+
     if (files) this.outputFiles.push(...files.map(sanitizeOutputFile));
 
     const returnControl = isRecord(raw.returnControl) ? raw.returnControl : undefined;
+
     if (returnControl) this.returnControl = returnControl;
 
     const traceEvent = isRecord(raw.trace) ? raw.trace : undefined;
+
     if (traceEvent) {
       this.traceEventCount += 1;
+
       if (this.options.captureAgentTrace) this.traces.push(traceEvent);
       collectTrace(traceEvent, (usage) => this.addUsage(usage));
       const failure = findKey(traceEvent, "failureTrace");
+
       if (isRecord(failure))
         this.failureReason = stringValue(failure.failureReason) ?? this.failureReason;
       const guardrail = findKey(traceEvent, "guardrailTrace");
+
       if (isRecord(guardrail))
         this.guardrailAction = stringValue(guardrail.action) ?? this.guardrailAction;
     }
@@ -108,6 +121,7 @@ export class AgentStreamState implements StreamState {
       agent_trace:
         this.options.captureAgentTrace && this.traces.length > 0 ? this.traces : undefined,
     });
+
     return mergeFields(
       omitUndefined({
         output: this.returnControl
@@ -124,14 +138,18 @@ export class AgentStreamState implements StreamState {
   }
   private addUsage<T>(value: T): void {
     const raw: unknown = value;
+
     if (!isRecord(raw)) return;
     const inputTokens = numberValue(raw.inputTokens);
     const outputTokens = numberValue(raw.outputTokens);
     const totalTokens = numberValue(raw.totalTokens);
+
     if (inputTokens !== undefined)
       this.usage.inputTokens = (this.usage.inputTokens ?? 0) + inputTokens;
+
     if (outputTokens !== undefined)
       this.usage.outputTokens = (this.usage.outputTokens ?? 0) + outputTokens;
+
     if (totalTokens !== undefined)
       this.usage.totalTokens = (this.usage.totalTokens ?? 0) + totalTokens;
     else if (inputTokens !== undefined || outputTokens !== undefined) {
@@ -142,7 +160,9 @@ export class AgentStreamState implements StreamState {
 
 function sanitizeOutputFile<T>(value: T): JsonValue {
   const raw: unknown = value;
+
   if (!isRecord(raw)) return undefined;
+
   return omitUndefined({
     name: stringValue(raw.name),
     type: stringValue(raw.type),
@@ -161,6 +181,7 @@ export function retrieveResponseFields<T>(output: T): SpanFields {
   const raw: unknown = output;
   const result = isRecord(raw) ? raw : {};
   const retrievalResults = arrayValue<unknown>(result.retrievalResults);
+
   return mergeFields(awsMetadataFields(result.$metadata), {
     output: retrievalResults,
     metadata: omitUndefined({
@@ -174,17 +195,21 @@ export function ragModel(input: JsonRecord): string | undefined {
   const config = isRecord(input.retrieveAndGenerateConfiguration)
     ? input.retrieveAndGenerateConfiguration
     : undefined;
+
   const kb = isRecord(config?.knowledgeBaseConfiguration)
     ? config?.knowledgeBaseConfiguration
     : undefined;
+
   const external = isRecord(config?.externalSourcesConfiguration)
     ? config?.externalSourcesConfiguration
     : undefined;
+
   return stringValue(kb?.modelArn) ?? stringValue(external?.modelArn);
 }
 
 export function ragRequestFields(input: JsonRecord): SpanFields {
   const text = isRecord(input.input) ? stringValue(input.input.text) : undefined;
+
   return omitUndefined({
     provider: PROVIDER,
     model: ragModel(input),
@@ -197,6 +222,7 @@ export function ragResponseFields<T>(output: T): SpanFields {
   const raw: unknown = output;
   const result = isRecord(raw) ? raw : {};
   const text = isRecord(result.output) ? stringValue(result.output.text) : undefined;
+
   return mergeFields(awsMetadataFields(result.$metadata), {
     output: text ? [{ role: "assistant", parts: [{ type: "text", content: text }] }] : undefined,
     metadata: omitUndefined({
@@ -216,15 +242,20 @@ export class RagStreamState implements StreamState {
 
   feed<T>(event: T): void {
     const raw: unknown = event;
+
     if (!isRecord(raw)) return;
     const streamError = modeledStreamError(raw);
+
     if (streamError) {
       this.error = streamError.error;
       this.errorFields = streamError.fields;
+
       return;
     }
+
     const output = isRecord(raw.output) ? raw.output : undefined;
     this.text += stringValue(output?.text) ?? "";
+
     if (raw.citation) this.citationCount += 1;
     const guardrail = isRecord(raw.guardrail) ? raw.guardrail : undefined;
     this.guardrailAction = stringValue(guardrail?.action) ?? this.guardrailAction;
@@ -263,18 +294,25 @@ export class FlowStreamState implements StreamState {
 
   feed<T>(event: T): void {
     const raw: unknown = event;
+
     if (!isRecord(raw)) return;
     const streamError = modeledStreamError(raw);
+
     if (streamError) {
       this.error = streamError.error;
       this.errorFields = streamError.fields;
+
       return;
     }
+
     const output = isRecord(raw.flowOutputEvent) ? raw.flowOutputEvent : undefined;
+
     if (output) this.outputs.push(output.content);
+
     const inputRequest = isRecord(raw.flowMultiTurnInputRequestEvent)
       ? raw.flowMultiTurnInputRequestEvent
       : undefined;
+
     if (inputRequest) this.outputs.push(inputRequest.content);
     const completion = isRecord(raw.flowCompletionEvent) ? raw.flowCompletionEvent : undefined;
     this.completionReason = stringValue(completion?.completionReason) ?? this.completionReason;
@@ -302,12 +340,15 @@ export function ragName(input: JsonRecord): string {
 
 function collectTrace<T>(value: T, onUsage: <TUsage>(usage: TUsage) => void): void {
   const raw: unknown = value;
+
   if (!isRecord(raw)) return;
   const output = isRecord(raw.modelInvocationOutput) ? raw.modelInvocationOutput : undefined;
+
   if (output) {
     const metadata = isRecord(output.metadata) ? output.metadata : undefined;
     onUsage(metadata?.usage);
   }
+
   for (const child of Object.values(raw)) {
     if (isRecord(child)) collectTrace(child, onUsage);
     else if (Array.isArray(child)) child.forEach((item) => collectTrace(item, onUsage));
@@ -316,11 +357,16 @@ function collectTrace<T>(value: T, onUsage: <TUsage>(usage: TUsage) => void): vo
 
 function findKey<T>(value: T, key: string): JsonValue {
   const raw: unknown = value;
+
   if (!isRecord(raw)) return undefined;
+
   if (raw[key] !== undefined) return raw[key];
+
   for (const child of Object.values(raw)) {
     const found = findKey(child, key);
+
     if (found !== undefined) return found;
   }
+
   return undefined;
 }

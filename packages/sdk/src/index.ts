@@ -6,7 +6,9 @@ export type {
   TokenUsage,
   ToolFields,
 } from "./attrs.ts";
+
 export { type ClientOverrides, flush, init, shutdown, type TelemetryClient } from "./client.ts";
+
 export type {
   BatchOptions,
   ExportMode,
@@ -15,6 +17,7 @@ export type {
   SdkLogLevel,
   TelemetryOptions,
 } from "./config.ts";
+
 export {
   propagateAttributes,
   type PropagatedAttributes,
@@ -22,8 +25,11 @@ export {
   TelemetrySpanProcessor,
   type TelemetrySpanProcessorOptions,
 } from "@telemetry-dev/otel";
+
 export { log, type LogOptions } from "./logs.ts";
+
 export { observe, type ObserveOptions } from "./observe.ts";
+
 export {
   activeContext,
   extractW3cContext,

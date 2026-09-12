@@ -1,7 +1,14 @@
 import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
+import {
+  AggregationTemporality,
+  InMemoryMetricExporter,
+  type PushMetricExporter,
+} from "@opentelemetry/sdk-metrics";
 import { flush, init, shutdown } from "@telemetry-dev/sdk";
+import * as sdk from "@telemetry-dev/sdk";
 import OpenAI, { AzureOpenAI } from "openai";
-import { afterEach, expect, test } from "vitest";
+import { Stream } from "openai/core/streaming";
+import { afterEach, expect, test, vi } from "vitest";
 
 import {
   instrumentOpenAI,
@@ -38,6 +45,7 @@ function jsonErrorResponse(status: number, message: string): Response {
 
 function sseResponse(events: unknown[]): Response {
   const body = `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`;
+
   return new Response(body, {
     status: 200,
     headers: { "content-type": "text/event-stream", "x-request-id": "req_stream" },
@@ -47,19 +55,23 @@ function sseResponse(events: unknown[]): Response {
 function erroringSseResponse<TEvent, TError>(event: TEvent, error: TError): Response {
   const encoder = new TextEncoder();
   let sent = false;
+
   const body = new ReadableStream<Uint8Array>(
     {
       pull(controller) {
         if (!sent) {
           sent = true;
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+
           return;
         }
+
         controller.error(error);
       },
     },
     { highWaterMark: 0 },
   );
+
   return new Response(body, {
     status: 200,
     headers: { "content-type": "text/event-stream", "x-request-id": "req_stream_error" },
@@ -74,20 +86,26 @@ interface CountedResponse {
 
 function countedSseResponse(events: unknown[]): CountedResponse {
   const encoder = new TextEncoder();
+
   const parts = [
     ...events.map((event) => `data: ${JSON.stringify(event)}\n\n`),
     "data: [DONE]\n\n",
   ];
+
   let index = 0;
   let pulled = 0;
+
   const body = new ReadableStream<Uint8Array>(
     {
       pull(controller) {
         const part = parts[index];
+
         if (part === undefined) {
           controller.close();
+
           return;
         }
+
         index += 1;
         pulled += 1;
         controller.enqueue(encoder.encode(part));
@@ -95,6 +113,7 @@ function countedSseResponse(events: unknown[]): CountedResponse {
     },
     { highWaterMark: 0 },
   );
+
   return {
     response: new Response(body, {
       status: 200,
@@ -112,22 +131,26 @@ interface FakeFetch {
 
 function createFakeFetch(...responses: Response[]): FakeFetch {
   const requests: CapturedRequest[] = [];
+
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = input instanceof Request ? input.url : String(input);
-    const bodyText = String(init?.body) === init?.body ? init.body : undefined;
+    const bodyText = typeof init?.body === "string" ? init.body : undefined;
     requests.push({
       method: init?.method,
       path: new URL(url).pathname,
       body: bodyText ? JSON.parse(bodyText) : undefined,
     });
     const response = responses.shift();
+
     if (!response) throw new Error(`unexpected request to ${url}`);
+
     return response;
   };
+
   return { fetch: fetchImpl, requests };
 }
 
-function setupSpans(): InMemorySpanExporter {
+function setupSpans(metricExporter?: PushMetricExporter): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
   init(
     {
@@ -138,8 +161,9 @@ function setupSpans(): InMemorySpanExporter {
       logLevel: "silent",
       fetch: async () => new Response(null, { status: 200 }),
     },
-    { spanExporter },
+    { spanExporter, metricExporter },
   );
+
   return spanExporter;
 }
 
@@ -154,22 +178,28 @@ async function finishedSpans(
   for (let attempt = 0; attempt < 20; attempt += 1) {
     await flush();
     const spans = exporter.getFinishedSpans();
+
     if (spans.length === expectedCount) return spans;
+
     if (spans.length > expectedCount) expect(spans).toHaveLength(expectedCount);
     await Promise.resolve();
   }
+
   expect(exporter.getFinishedSpans()).toHaveLength(expectedCount);
+
   return exporter.getFinishedSpans();
 }
 
 async function exportedSpan(exporter: InMemorySpanExporter): Promise<ReadableSpan> {
   const spans = await finishedSpans(exporter, 1);
+
   return spans[0]!;
 }
 
 function jsonAttr<T>(span: ReadableSpan, key: string): T {
   const value = span.attributes[key];
   expect(String(value) === value).toBe(true);
+
   return JSON.parse(String(value)) as T;
 }
 
@@ -179,28 +209,36 @@ function isObject<T>(value: T): value is T & object {
 
 function hasSyntheticUsageChunk<T>(value: T): boolean {
   const raw: unknown = value;
+
   if (!isObject(raw) || Array.isArray(raw)) return false;
+
   if (!("usage" in raw) || !("choices" in raw)) return false;
+
   return raw.usage !== undefined && Array.isArray(raw.choices) && raw.choices.length === 0;
 }
 
 async function collectStream(stream: AsyncIterable<unknown>): Promise<unknown[]> {
   const chunks: unknown[] = [];
+
   for await (const chunk of stream) chunks.push(chunk);
+
   return chunks;
 }
 
 afterEach(async () => {
   uninstrumentOpenAI();
   await shutdown();
+  vi.restoreAllMocks();
 });
 
 test("chat completions map request, response, usage, finish reason, provider, and sampling attributes", async () => {
   const spans = setupSpans();
+
   const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
     { role: "system", content: "Be terse" },
     { role: "user", content: "Say hello" },
   ];
+
   const fake = createFakeFetch(
     jsonResponse({
       id: "chatcmpl_1",
@@ -219,6 +257,7 @@ test("chat completions map request, response, usage, finish reason, provider, an
       },
     }),
   );
+
   const client = clientWith(fake.fetch);
 
   await client.chat.completions.create({
@@ -263,6 +302,7 @@ test("chat completions map request, response, usage, finish reason, provider, an
 
 test("wrapped chat completion APIPromise keeps parse helper and promise identity", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     jsonResponse({
       id: "chatcmpl_parse",
@@ -280,7 +320,9 @@ test("wrapped chat completion APIPromise keeps parse helper and promise identity
     model: "gpt-4o",
     messages: [{ role: "user", content: "Parse this" }],
   });
+
   const rawResult: unknown = result;
+
   const resultWithPrivateParse = rawResult as {
     parse(): Promise<Awaited<typeof result>>;
   };
@@ -326,9 +368,11 @@ test("chat completions record one error span when the OpenAI API returns 4xx", a
 test("chat completions record non-Error promise rejections", async () => {
   const spans = setupSpans();
   const rejection = "request rejected";
+
   const fetch: typeof globalThis.fetch = async () => {
     throw new Error("unexpected fetch");
   };
+
   const client = new OpenAI({ apiKey: "test", fetch, maxRetries: 0 });
   Object.assign(client.chat.completions, {
     create<T>(_body: T) {
@@ -352,9 +396,11 @@ test("chat completions record non-Error promise rejections", async () => {
 
 test("synchronous create and retrieve failures end spans and preserve thrown values", async () => {
   const spans = setupSpans();
+
   const unusedFetch: typeof fetch = async () => {
     throw new Error("unexpected fetch");
   };
+
   const client = new OpenAI({ apiKey: "test", fetch: unusedFetch, maxRetries: 0 });
   const createFailure = "create failed";
   const retrieveFailure = { message: "retrieve failed" };
@@ -371,6 +417,7 @@ test("synchronous create and retrieve failures end spans and preserve thrown val
   const wrapped = wrapOpenAI(client);
 
   let caughtCreate = false;
+
   try {
     void wrapped.chat.completions.create({
       model: "gpt-4o",
@@ -380,15 +427,18 @@ test("synchronous create and retrieve failures end spans and preserve thrown val
     caughtCreate = true;
     expect(error).toBe(createFailure);
   }
+
   expect(caughtCreate).toBe(true);
 
   let caughtRetrieve = false;
+
   try {
     void wrapped.responses.retrieve("resp_sync", { stream: true });
   } catch (error) {
     caughtRetrieve = true;
     expect(error).toBe(retrieveFailure);
   }
+
   expect(caughtRetrieve).toBe(true);
 
   const finished = await finishedSpans(spans, 2);
@@ -403,11 +453,13 @@ test("synchronous create and retrieve failures end spans and preserve thrown val
 
 test("chat completions preserve tool-call messages in output", async () => {
   const spans = setupSpans();
+
   const toolCall = {
     id: "call_1",
     type: "function",
     function: { name: "get_weather", arguments: '{"location":"Paris"}' },
   };
+
   const fake = createFakeFetch(
     jsonResponse({
       id: "chatcmpl_tool",
@@ -448,6 +500,7 @@ test("chat completions preserve tool-call messages in output", async () => {
 
 test("chat completions capture every returned choice", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     jsonResponse({
       id: "chatcmpl_two",
@@ -478,6 +531,7 @@ test("chat completions capture every returned choice", async () => {
 
 test("chat completions record finish reasons for single and multi-choice responses", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     jsonResponse({
       id: "chatcmpl_single_finish",
@@ -501,6 +555,7 @@ test("chat completions record finish reasons for single and multi-choice respons
       usage: { prompt_tokens: 10, completion_tokens: 8, total_tokens: 18 },
     }),
   );
+
   const client = clientWith(fake.fetch);
 
   await client.chat.completions.create({
@@ -514,23 +569,142 @@ test("chat completions record finish reasons for single and multi-choice respons
   });
 
   const finished = await finishedSpans(spans, 2);
+
   const single = finished.find(
     (span) => span.attributes["gen_ai.response.id"] === "chatcmpl_single_finish",
   );
+
   const multi = finished.find(
     (span) => span.attributes["gen_ai.response.id"] === "chatcmpl_multi_finish",
   );
+
   expect(single?.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
   expect(multi?.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop", "length"]);
 });
 
+test.each([false, true])("chunk timing preserves delivery with old core=%s", async (oldCore) => {
+  const spans = setupSpans();
+
+  if (oldCore) {
+    const start = sdk.startSpan;
+    vi.spyOn(sdk, "startSpan").mockImplementation((...args) => {
+      const handle = start(...args);
+      Reflect.deleteProperty(handle, "recordOutputChunk");
+
+      return handle;
+    });
+  }
+
+  const deltas = [
+    { role: "assistant" },
+    { content: "A" },
+    { content: null },
+    { content: "" },
+    { tool_calls: [] },
+    { tool_calls: [{ index: 0, function: { arguments: "" } }] },
+    { content: "B" },
+    { function_call: { name: "weather" } },
+    { function_call: { arguments: "" } },
+    { function_call: { arguments: '{"city":' } },
+    {
+      content: "mixed",
+      function_call: { arguments: '"Paris"}' },
+      tool_calls: [{ index: 0, function: { arguments: "{}" } }],
+    },
+    {},
+  ];
+
+  const fake = createFakeFetch(
+    sseResponse(
+      deltas.map((delta) => ({
+        id: "chatcmpl_timing",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-4o",
+        choices: [{ index: 0, delta, finish_reason: null }],
+      })),
+    ),
+  );
+
+  const stream = await clientWith(fake.fetch).chat.completions.create({
+    model: "gpt-4o",
+    messages: [{ role: "user", content: "Hi" }],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toHaveLength(deltas.length);
+  const span = await exportedSpan(spans);
+  expect(span.status.code).toBe(SPAN_STATUS_UNSET);
+
+  if (oldCore) expect(Symbol.for("telemetry.dev.outputChunkHistogram") in span).toBe(false);
+  else {
+    expect(span).toMatchObject({
+      [Symbol.for("telemetry.dev.outputChunkHistogram")]: { count: 3 },
+    });
+  }
+});
+
+test.each(["chat", "responses"])("%s timestamps precede telemetry mapping", async (operation) => {
+  const spans = setupSpans();
+  let now = 0;
+  vi.spyOn(performance, "now").mockImplementation(() => now);
+
+  const source = new Stream(async function* () {
+    for (const [receivedAt, mappingMs] of [
+      [100, 30],
+      [240, 90],
+    ] as const) {
+      now = receivedAt;
+      yield operation === "chat"
+        ? {
+            get choices() {
+              now = receivedAt + mappingMs;
+
+              return [{ index: 0, delta: { content: "A" } }];
+            },
+          }
+        : {
+            get type() {
+              now = receivedAt + mappingMs;
+
+              return "response.output_text.delta";
+            },
+            delta: "A",
+          };
+    }
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create: async (_params: unknown) => source },
+    embeddings: {},
+  });
+
+  const stream =
+    operation === "chat"
+      ? await client.chat.completions.create({ model: "gpt-4o", messages: [], stream: true })
+      : await client.responses.create({ model: "gpt-4o", input: "Hi", stream: true });
+
+  expect(await collectStream(stream)).toHaveLength(2);
+  expect(await exportedSpan(spans)).toMatchObject({
+    [Symbol.for("telemetry.dev.outputChunkHistogram")]: {
+      count: 1,
+      sum: 0.14,
+      min: 0.14,
+      max: 0.14,
+    },
+  });
+});
+
 test("chat streams preserve tool-call-only output with null content", async () => {
   const spans = setupSpans();
+
   const toolCall = {
     id: "call_stream",
     type: "function",
     function: { name: "get_weather", arguments: '{"location":"Paris"}' },
   };
+
   const fake = createFakeFetch(
     sseResponse([
       {
@@ -588,6 +762,7 @@ test("chat streams preserve tool-call-only output with null content", async () =
       },
     ],
   });
+
   await collectStream(stream);
 
   const span = await exportedSpan(spans);
@@ -595,10 +770,14 @@ test("chat streams preserve tool-call-only output with null content", async () =
     { role: "assistant", content: null, tool_calls: [toolCall] },
   ]);
   expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["tool_calls"]);
+  expect(span).toMatchObject({
+    [Symbol.for("telemetry.dev.outputChunkHistogram")]: { count: 1 },
+  });
 });
 
 test("chat streams record finish reasons for every choice", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     sseResponse([
       {
@@ -628,6 +807,7 @@ test("chat streams record finish reasons for every choice", async () => {
     stream: true,
     n: 2,
   });
+
   await collectStream(stream);
 
   const span = await exportedSpan(spans);
@@ -640,6 +820,7 @@ test("chat streams record finish reasons for every choice", async () => {
 
 test("chat streams leave the request unchanged and capture no usage by default", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     sseResponse([
       {
@@ -664,6 +845,7 @@ test("chat streams leave the request unchanged and capture no usage by default",
     messages: [{ role: "user", content: "Say hello" }],
     stream: true,
   });
+
   const visibleChunks = await collectStream(stream);
   const rawRequestBody: unknown = fake.requests[0]?.body;
   const requestBody = rawRequestBody as { stream?: boolean; stream_options?: object } | undefined;
@@ -680,6 +862,7 @@ test("chat streams leave the request unchanged and capture no usage by default",
 
 test("chat stream helper routes through wrapped create and ends span", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     sseResponse([
       {
@@ -703,6 +886,7 @@ test("chat stream helper routes through wrapped create and ends span", async () 
     model: "gpt-4o",
     messages: [{ role: "user", content: "Say hi" }],
   });
+
   const events = await collectStream(runner);
 
   expect(events.length).toBeGreaterThan(0);
@@ -715,6 +899,7 @@ test("chat stream helper routes through wrapped create and ends span", async () 
 
 test("chat streams inject include_usage when opted in and hide only the synthetic usage chunk", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     sseResponse([
       {
@@ -747,6 +932,7 @@ test("chat streams inject include_usage when opted in and hide only the syntheti
     messages: [{ role: "user", content: "Say hello" }],
     stream: true,
   });
+
   const visibleChunks = await collectStream(stream);
 
   expect(fake.requests[0]?.body).toMatchObject({
@@ -776,6 +962,7 @@ test("chat streams inject include_usage when opted in and hide only the syntheti
 
 test("chat streams end once with partial output when the caller stops early", async () => {
   const spans = setupSpans();
+
   const counted = countedSseResponse([
     {
       id: "chatcmpl_abandoned",
@@ -800,6 +987,7 @@ test("chat streams end once with partial output when the caller stops early", as
       usage: { prompt_tokens: 9, completion_tokens: 2, total_tokens: 11 },
     },
   ]);
+
   const fake = createFakeFetch(counted.response);
 
   const stream = await clientWith(fake.fetch).chat.completions.create({
@@ -809,6 +997,7 @@ test("chat streams end once with partial output when the caller stops early", as
   });
 
   let visibleChunks = 0;
+
   for await (const chunk of stream) {
     visibleChunks += 1;
     expect(chunk.choices[0]?.delta.content).toBe("Hel");
@@ -835,6 +1024,7 @@ test("chat streams end once with partial output when the caller stops early", as
 test("chat streams record one error span with partial output when the SSE body errors", async () => {
   const spans = setupSpans();
   const streamError = "stream exploded";
+
   const firstChunk = {
     id: "chatcmpl_stream_error",
     object: "chat.completion.chunk",
@@ -842,6 +1032,7 @@ test("chat streams record one error span with partial output when the SSE body e
     model: "gpt-4o-2024-11-20",
     choices: [{ index: 0, delta: { role: "assistant", content: "Hel" }, finish_reason: null }],
   };
+
   const fake = createFakeFetch(erroringSseResponse(firstChunk, streamError));
 
   const stream = await clientWith(fake.fetch).chat.completions.create({
@@ -849,6 +1040,7 @@ test("chat streams record one error span with partial output when the SSE body e
     messages: [{ role: "user", content: "Say hello" }],
     stream: true,
   });
+
   const visibleChunks: OpenAI.Chat.Completions.ChatCompletionChunk[] = [];
 
   await expect(
@@ -869,6 +1061,7 @@ test("chat streams record one error span with partial output when the SSE body e
 
 test("chat streams preserve caller-requested usage chunks", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     sseResponse([
       {
@@ -895,6 +1088,7 @@ test("chat streams preserve caller-requested usage chunks", async () => {
     stream: true,
     stream_options: { include_usage: true },
   });
+
   const visibleChunks = await collectStream(stream);
 
   expect(fake.requests[0]?.body).toMatchObject({
@@ -908,9 +1102,11 @@ test("chat streams preserve caller-requested usage chunks", async () => {
 
 test("responses create maps instructions to system instructions", async () => {
   const spans = setupSpans();
+
   const output = [
     { type: "message", role: "assistant", content: [{ type: "output_text", text: "No." }] },
   ];
+
   const fake = createFakeFetch(
     jsonResponse({
       id: "resp_1",
@@ -952,9 +1148,11 @@ test("responses create maps instructions to system instructions", async () => {
 test("responses create failed body records error while completed body stays OK", async () => {
   const spans = setupSpans();
   const failedError = { code: "server_error", message: "model exploded" };
+
   const successOutput = [
     { type: "message", role: "assistant", content: [{ type: "output_text", text: "Recovered" }] },
   ];
+
   const fake = createFakeFetch(
     jsonResponse({
       id: "resp_failed",
@@ -973,6 +1171,7 @@ test("responses create failed body records error while completed body stays OK",
       usage: { input_tokens: 3, output_tokens: 2, total_tokens: 5 },
     }),
   );
+
   const client = clientWith(fake.fetch);
 
   await client.responses.create({ model: "gpt-4.1", input: "fail" });
@@ -995,8 +1194,73 @@ test("responses create failed body records error while completed body stays OK",
   expect(jsonAttr(success!, "gen_ai.output.messages")).toEqual(successOutput);
 });
 
+test.each([
+  "response.custom_tool_call_input",
+  "response.code_interpreter_call_code",
+  "response.mcp_call_arguments",
+  "response.audio.transcript",
+])("%s deltas retain timing after completion and interruption", async (eventType) => {
+  const metricExporter = new InMemoryMetricExporter(AggregationTemporality.DELTA);
+  const spans = setupSpans(metricExporter);
+
+  const outputEvents = [
+    { type: `${eventType}.delta`, delta: "first", item_id: "item_1", output_index: 0 },
+    { type: `${eventType}.delta`, delta: "", item_id: "item_1", output_index: 0 },
+    { type: `${eventType}.delta`, delta: "second", item_id: "item_1", output_index: 0 },
+    {
+      type: `${eventType}.done`,
+      input: "firstsecond",
+      code: "firstsecond",
+      arguments: "firstsecond",
+      transcript: "firstsecond",
+    },
+  ];
+
+  const completed = {
+    type: "response.completed",
+    response: { id: "resp_timing", model: "gpt-4.1", status: "completed", output: [] },
+  };
+
+  const fake = createFakeFetch(
+    sseResponse([...outputEvents, completed]),
+    countedSseResponse([...outputEvents, completed]).response,
+  );
+
+  const client = clientWith(fake.fetch);
+  const stream = await client.responses.create({ model: "gpt-4.1", input: "Run", stream: true });
+  expect(await collectStream(stream)).toEqual([...outputEvents, completed]);
+
+  const interrupted = await client.responses.create({
+    model: "gpt-4.1",
+    input: "Run",
+    stream: true,
+  });
+
+  const iterator = interrupted[Symbol.asyncIterator]();
+
+  for (const event of outputEvents) expect((await iterator.next()).value).toEqual(event);
+  await iterator.return?.();
+
+  expect(await finishedSpans(spans, 2)).toHaveLength(2);
+
+  const metrics = metricExporter
+    .getMetrics()
+    .flatMap((batch) => batch.scopeMetrics.flatMap((scope) => scope.metrics));
+
+  const histogram = metrics.find(
+    (metric) => metric.descriptor.name === "gen_ai.client.operation.time_per_output_chunk",
+  );
+
+  expect(histogram?.dataPoints).toHaveLength(2);
+  expect(histogram?.dataPoints).toEqual([
+    expect.objectContaining({ value: expect.objectContaining({ count: 1 }) }),
+    expect.objectContaining({ value: expect.objectContaining({ count: 1 }) }),
+  ]);
+});
+
 test("responses streams end from response.completed terminal event", async () => {
   const spans = setupSpans();
+
   const completed = {
     id: "resp_stream",
     object: "response",
@@ -1007,6 +1271,7 @@ test("responses streams end from response.completed terminal event", async () =>
     ],
     usage: { input_tokens: 8, output_tokens: 2, total_tokens: 10 },
   };
+
   const fake = createFakeFetch(
     sseResponse([
       { type: "response.created", response: { id: "resp_stream", status: "in_progress" } },
@@ -1019,6 +1284,7 @@ test("responses streams end from response.completed terminal event", async () =>
     input: "Finish",
     stream: true,
   });
+
   const events = await collectStream(stream);
 
   expect(events).toHaveLength(2);
@@ -1038,6 +1304,7 @@ test("responses streams end from response.completed terminal event", async () =>
 
 test("responses stream helper routes through wrapped create and ends span", async () => {
   const spans = setupSpans();
+
   const completed = {
     id: "resp_stream_helper",
     object: "response",
@@ -1048,6 +1315,7 @@ test("responses stream helper routes through wrapped create and ends span", asyn
     ],
     usage: { input_tokens: 8, output_tokens: 2, total_tokens: 10 },
   };
+
   const fake = createFakeFetch(
     sseResponse([
       {
@@ -1062,6 +1330,7 @@ test("responses stream helper routes through wrapped create and ends span", asyn
     model: "gpt-4.1",
     input: "Finish",
   });
+
   const events = await collectStream(runner);
 
   expect(events.length).toBeGreaterThan(0);
@@ -1074,6 +1343,7 @@ test("responses stream helper routes through wrapped create and ends span", asyn
 
 test("responses stream helper traces response-id retrieval streams", async () => {
   const spans = setupSpans();
+
   const completed = {
     id: "resp_existing",
     object: "response",
@@ -1084,6 +1354,7 @@ test("responses stream helper traces response-id retrieval streams", async () =>
     ],
     usage: { input_tokens: 8, output_tokens: 2, total_tokens: 10 },
   };
+
   const fake = createFakeFetch(
     sseResponse([
       {
@@ -1097,6 +1368,7 @@ test("responses stream helper traces response-id retrieval streams", async () =>
   const runner = clientWith(fake.fetch).responses.stream({
     response_id: "resp_existing",
   });
+
   const events = await collectStream(runner);
 
   expect(events.length).toBeGreaterThan(0);
@@ -1110,6 +1382,7 @@ test("responses stream helper traces response-id retrieval streams", async () =>
 
 test("responses streams end from terminal event before reading the stream sentinel", async () => {
   const spans = setupSpans();
+
   const completed = {
     id: "resp_stream_terminal",
     object: "response",
@@ -1120,10 +1393,12 @@ test("responses streams end from terminal event before reading the stream sentin
     ],
     usage: { input_tokens: 8, output_tokens: 2, total_tokens: 10 },
   };
+
   const counted = countedSseResponse([
     { type: "response.created", response: { id: "resp_stream_terminal", status: "in_progress" } },
     { type: "response.completed", response: completed },
   ]);
+
   const fake = createFakeFetch(counted.response);
 
   const stream = await clientWith(fake.fetch).responses.create({
@@ -1131,6 +1406,7 @@ test("responses streams end from terminal event before reading the stream sentin
     input: "Finish",
     stream: true,
   });
+
   const iterator = stream[Symbol.asyncIterator]();
 
   try {
@@ -1164,6 +1440,7 @@ test("responses streams record error status from bare error events", async () =>
     input: "Stream",
     stream: true,
   });
+
   const events = await collectStream(stream);
 
   expect(events).toEqual([errorEvent]);
@@ -1185,6 +1462,7 @@ test("responses streams record error status from bare error events", async () =>
 
 test("responses streams record error status from response.failed terminal events", async () => {
   const spans = setupSpans();
+
   const failedResponse = {
     id: "resp_stream_failed",
     object: "response",
@@ -1193,7 +1471,9 @@ test("responses streams record error status from response.failed terminal events
     output: [],
     error: { code: "server_error", message: "stream failed" },
   };
+
   const failedEvent = { type: "response.failed", response: failedResponse };
+
   const fake = createFakeFetch(
     sseResponse([
       { type: "response.created", response: { id: "resp_stream_failed" } },
@@ -1206,6 +1486,7 @@ test("responses streams record error status from response.failed terminal events
     input: "Stream",
     stream: true,
   });
+
   const events = await collectStream(stream);
 
   expect(events).toEqual([
@@ -1228,10 +1509,12 @@ test("responses streams record error status from response.failed terminal events
 test("responses streams record non-Error iterator failures", async () => {
   const spans = setupSpans();
   const streamError = "responses stream exploded";
+
   const firstEvent = {
     type: "response.created",
     response: { id: "resp_stream_error", status: "in_progress", output: [] },
   };
+
   const fake = createFakeFetch(erroringSseResponse(firstEvent, streamError));
 
   const stream = await clientWith(fake.fetch).responses.create({
@@ -1239,6 +1522,7 @@ test("responses streams record non-Error iterator failures", async () => {
     input: "Stream",
     stream: true,
   });
+
   await expect(collectStream(stream)).rejects.toBe(streamError);
 
   const span = await exportedSpan(spans);
@@ -1247,8 +1531,10 @@ test("responses streams record non-Error iterator failures", async () => {
   const exception = span.events.find((event) => event.name === "exception");
   expect(exception?.attributes?.["exception.message"]).toBe(streamError);
 });
+
 test("embeddings map token usage without capturing embedding vectors as output", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     jsonResponse({
       object: "list",
@@ -1278,9 +1564,11 @@ test("embeddings map token usage without capturing embedding vectors as output",
 test("global instrumentation records responses and embeddings with wrapOpenAI parity attributes", async () => {
   const spans = setupSpans();
   instrumentOpenAI();
+
   const output = [
     { type: "message", role: "assistant", content: [{ type: "output_text", text: "No." }] },
   ];
+
   const fake = createFakeFetch(
     jsonResponse({
       id: "resp_global",
@@ -1303,6 +1591,7 @@ test("global instrumentation records responses and embeddings with wrapOpenAI pa
       usage: { prompt_tokens: 6, total_tokens: 6 },
     }),
   );
+
   const client = new OpenAI({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 });
 
   await client.responses.create({
@@ -1343,6 +1632,7 @@ test("global instrumentation records responses and embeddings with wrapOpenAI pa
 test("instrumentOpenAI threads injectStreamUsage into chat streams", async () => {
   const spans = setupSpans();
   instrumentOpenAI({ injectStreamUsage: true });
+
   const fake = createFakeFetch(
     sseResponse([
       {
@@ -1362,6 +1652,7 @@ test("instrumentOpenAI threads injectStreamUsage into chat streams", async () =>
       },
     ]),
   );
+
   const client = new OpenAI({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 });
 
   const stream = await client.chat.completions.create({
@@ -1369,6 +1660,7 @@ test("instrumentOpenAI threads injectStreamUsage into chat streams", async () =>
     messages: [{ role: "user", content: "Greet" }],
     stream: true,
   });
+
   const visibleChunks = await collectStream(stream);
 
   expect(fake.requests[0]?.body).toMatchObject({
@@ -1382,6 +1674,7 @@ test("instrumentOpenAI threads injectStreamUsage into chat streams", async () =>
 test("wrapOpenAI shadows global instrumentation and survives uninstrumentOpenAI", async () => {
   const spans = setupSpans();
   instrumentOpenAI();
+
   const fake = createFakeFetch(
     jsonResponse({
       id: "chatcmpl_global_wrapped",
@@ -1404,6 +1697,7 @@ test("wrapOpenAI shadows global instrumentation and survives uninstrumentOpenAI"
       usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
     }),
   );
+
   const client = wrapOpenAI(new OpenAI({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 }));
 
   await client.chat.completions.create({
@@ -1428,6 +1722,7 @@ test("wrapOpenAI shadows global instrumentation and survives uninstrumentOpenAI"
 
 test("AzureOpenAI clients report Azure provider for wrapped and global instrumentation", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     jsonResponse({
       id: "chatcmpl_azure_wrapped",
@@ -1450,6 +1745,7 @@ test("AzureOpenAI clients report Azure provider for wrapped and global instrumen
       usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
     }),
   );
+
   const azureOptions = {
     apiKey: "test",
     apiVersion: "2024-10-21",
@@ -1469,18 +1765,22 @@ test("AzureOpenAI clients report Azure provider for wrapped and global instrumen
   });
 
   const finished = await finishedSpans(spans, 2);
+
   const wrapped = finished.find(
     (span) => span.attributes["gen_ai.response.id"] === "chatcmpl_azure_wrapped",
   );
+
   const global = finished.find(
     (span) => span.attributes["gen_ai.response.id"] === "chatcmpl_azure_global",
   );
+
   expect(wrapped?.attributes["gen_ai.provider.name"]).toBe("azure.ai.openai");
   expect(global?.attributes["gen_ai.provider.name"]).toBe("azure.ai.openai");
 });
 
 test("clients with an OpenRouter base URL report the openrouter provider", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     jsonResponse({
       id: "chatcmpl_or_wrapped",
@@ -1503,6 +1803,7 @@ test("clients with an OpenRouter base URL report the openrouter provider", async
       usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
     }),
   );
+
   const openRouterOptions = {
     apiKey: "test",
     baseURL: "https://openrouter.ai/api/v1",
@@ -1521,12 +1822,15 @@ test("clients with an OpenRouter base URL report the openrouter provider", async
   });
 
   const finished = await finishedSpans(spans, 2);
+
   const wrapped = finished.find(
     (span) => span.attributes["gen_ai.response.id"] === "chatcmpl_or_wrapped",
   );
+
   const global = finished.find(
     (span) => span.attributes["gen_ai.response.id"] === "chatcmpl_or_global",
   );
+
   expect(wrapped?.attributes["gen_ai.provider.name"]).toBe("openrouter");
   expect(global?.attributes["gen_ai.provider.name"]).toBe("openrouter");
 });
@@ -1540,6 +1844,7 @@ test.each([
   "clients with an OpenRouter %s report the expected provider",
   async (_case, baseURL, provider) => {
     const spans = setupSpans();
+
     const fake = createFakeFetch(
       jsonResponse({
         id: "chatcmpl_or_host",
@@ -1567,6 +1872,7 @@ test.each([
 
 test("wrapOpenAI resolves the provider from the current base URL for each operation", async () => {
   const spans = setupSpans();
+
   const completed = {
     id: "resp_dynamic_provider",
     object: "response",
@@ -1575,6 +1881,7 @@ test("wrapOpenAI resolves the provider from the current base URL for each operat
     output: [],
     usage: { input_tokens: 4, output_tokens: 2, total_tokens: 6 },
   };
+
   const fake = createFakeFetch(
     jsonResponse({
       id: "chatcmpl_dynamic_provider",
@@ -1594,6 +1901,7 @@ test("wrapOpenAI resolves the provider from the current base URL for each operat
       { type: "response.completed", response: completed },
     ]),
   );
+
   const client = wrapOpenAI(
     new OpenAI({
       apiKey: "test",
@@ -1612,12 +1920,15 @@ test("wrapOpenAI resolves the provider from the current base URL for each operat
   await collectStream(client.responses.stream({ response_id: "resp_dynamic_provider" }));
 
   const finished = await finishedSpans(spans, 2);
+
   const chat = finished.find(
     (span) => span.attributes["gen_ai.response.id"] === "chatcmpl_dynamic_provider",
   );
+
   const retrieve = finished.find(
     (span) => span.attributes["gen_ai.response.id"] === "resp_dynamic_provider",
   );
+
   expect(chat?.attributes["gen_ai.provider.name"]).toBe("openai");
   expect(retrieve?.attributes["gen_ai.provider.name"]).toBe("openrouter");
 });
@@ -1625,6 +1936,7 @@ test("wrapOpenAI resolves the provider from the current base URL for each operat
 test("wrapped clients fail open when telemetry is not initialized", async () => {
   await shutdown();
   uninstrumentOpenAI();
+
   const fake = createFakeFetch(
     jsonResponse({
       id: "chatcmpl_no_telemetry",
@@ -1653,6 +1965,7 @@ test("instrumentOpenAI and wrapOpenAI are idempotent and uninstrumentOpenAI rest
   const spans = setupSpans();
   instrumentOpenAI();
   instrumentOpenAI();
+
   const instrumented = createFakeFetch(
     jsonResponse({
       id: "chatcmpl_global",
@@ -1681,6 +1994,7 @@ test("instrumentOpenAI and wrapOpenAI are idempotent and uninstrumentOpenAI rest
   await finishedSpans(spans, 1);
 
   uninstrumentOpenAI();
+
   const wrapped = createFakeFetch(
     jsonResponse({
       id: "chatcmpl_wrapped",
@@ -1693,6 +2007,7 @@ test("instrumentOpenAI and wrapOpenAI are idempotent and uninstrumentOpenAI rest
       usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
     }),
   );
+
   await wrapOpenAI(
     wrapOpenAI(new OpenAI({ apiKey: "test", fetch: wrapped.fetch, maxRetries: 0 })),
   ).chat.completions.create({

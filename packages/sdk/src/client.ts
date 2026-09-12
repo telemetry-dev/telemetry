@@ -89,6 +89,7 @@ export function init(options?: TelemetryOptions, overrides?: ClientOverrides): T
   } catch (error) {
     reportError(options?.onError, error instanceof Error ? error : new Error(String(error)));
     activeClient = NOOP_CLIENT;
+
     return NOOP_CLIENT;
   }
 }
@@ -104,11 +105,14 @@ function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): Tel
   }
 
   const enabled = config.enabled && Boolean(config.apiKey ?? overrides?.spanExporter);
+
   if (!enabled) {
     if (config.enabled && !config.apiKey) {
       diag.debug("no api key (apiKey option or TELEMETRY_DEV_API_KEY); telemetry disabled");
     }
+
     activeClient = NOOP_CLIENT;
+
     return NOOP_CLIENT;
   }
 
@@ -119,6 +123,7 @@ function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): Tel
     "deployment.environment.name": config.environment,
     ...config.resourceAttributes,
   });
+
   const transport: Transport = { fetchImpl: config.fetchImpl, onError: config.onError };
   const headers = config.apiKey ? otlpHeaders(config.apiKey, config.sdkName) : undefined;
 
@@ -131,6 +136,7 @@ function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): Tel
     (headers
       ? createMetricExporter({ url: `${config.baseUrl}/v1/metrics`, headers }, transport)
       : undefined);
+
   const metrics = metricExporter
     ? createMetricsPipeline({
         resource,
@@ -161,21 +167,26 @@ function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): Tel
     spanProcessors: [processor],
     spanLimits: { attributeValueLengthLimit: config.maxAttributeLength },
   });
+
   const tracer = provider.getTracer(SCOPE_NAME, SCOPE_VERSION);
 
   let registeredTrace = false;
   let registeredContext = false;
   let registeredPropagation = false;
+
   if (config.registerGlobal) {
     registeredTrace = trace.setGlobalTracerProvider(
       config.sessionRootOf
         ? sessionRootTracerProvider(provider, config.apiKey, config.sessionRootOf, config.onError)
         : provider,
     );
+
     if (als) {
       registeredContext = apiContext.setGlobalContextManager(new AlsContextManager(als));
     }
+
     registeredPropagation = propagation.setGlobalPropagator(new W3CTraceContextPropagator());
+
     if (!registeredTrace) {
       diag.warn(
         "a global TracerProvider is already registered; attach the TelemetrySpanProcessor from '@telemetry-dev/otel' to your own provider instead",
@@ -188,43 +199,56 @@ function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): Tel
     (headers
       ? createLogExporter({ url: `${config.baseUrl}/v1/logs`, headers }, transport)
       : undefined);
+
   // Lazy: the log pipeline only exists once log() is first called.
   let logs: { logger: Logger; forceFlush(): Promise<void>; shutdown(): Promise<void> } | undefined;
+
   const ensureLogger = (): Logger | undefined => {
     if (!logExporter) return undefined;
+
     if (!logs) {
       const logProcessor =
         config.exportMode === "immediate"
           ? new SimpleLogRecordProcessor(logExporter)
           : new BatchLogRecordProcessor(logExporter);
+
       const loggerProvider = new LoggerProvider({
         resource,
         logRecordLimits: { attributeValueLengthLimit: config.maxAttributeLength },
         processors: [logProcessor],
       });
+
       logs = {
         logger: loggerProvider.getLogger(SCOPE_NAME, SCOPE_VERSION),
         forceFlush: () => loggerProvider.forceFlush(),
         shutdown: () => loggerProvider.shutdown(),
       };
     }
+
     return logs.logger;
   };
 
   let torn = false;
+
   const collect = (op: "forceFlush" | "shutdown"): Promise<void> => {
     const parts: Promise<void>[] = [provider[op]()];
+
     if (logs) parts.push(logs[op]());
+
     if (metrics) parts.push(metrics[op]());
+
     return Promise.all(parts)
       .then(() => undefined)
       .catch((error: Error) => reportError(config.onError, error));
   };
+
   const handoff = (p: Promise<void>): Promise<void> => {
     if (config.waitUntil) {
       config.waitUntil(p);
+
       return Promise.resolve();
     }
+
     return p;
   };
 
@@ -236,14 +260,20 @@ function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): Tel
     shutdown: () => {
       if (torn) return Promise.resolve();
       torn = true;
+
       if (registeredTrace) trace.disable();
+
       if (registeredContext) apiContext.disable();
+
       if (registeredPropagation) propagation.disable();
       handle.core = undefined;
+
       return handoff(collect("shutdown"));
     },
   };
+
   handle.core = { config, tracer, ensureLogger };
   activeClient = handle;
+
   return handle;
 }

@@ -461,6 +461,123 @@ def test_chat_streaming_captures_reasoning_details_and_refusal(memory: SimpleNam
     ]
 
 
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_chat_output_timing_decodes_reasoning_details_once_per_chunk(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, async_mode: bool
+) -> None:
+    calls: list[telemetry_dev.SpanHandle] = []
+    original = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        assert timestamp_ms is not None
+        calls.append(handle)
+        return original(handle, timestamp_ms)
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
+    events = [
+        chat_chunk({"role": "assistant", "content": ""}),
+        chat_chunk({"reasoning_details": [{"type": "reasoning.text", "text": "Inspect"}]}),
+        chat_chunk(
+            {
+                "content": "once",
+                "reasoning_details": [{"type": "reasoning.summary", "summary": "Summary"}],
+            }
+        ),
+        chat_chunk(
+            {"reasoning_details": [{"type": "reasoning.summary", "summary": "Summary only"}]}
+        ),
+        chat_chunk({"reasoning_details": [{"type": "reasoning.summary", "summary": ""}]}),
+        chat_chunk(
+            {
+                "reasoning_details": [
+                    {"type": "reasoning.encrypted", "data": "opaque"},
+                    {"type": "reasoning.text", "signature": "signed", "text": ""},
+                ]
+            }
+        ),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    async def async_handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    if async_mode:
+        client = wrap_open_router(async_client(async_handler))
+        stream = await cast(Any, client.chat.send_async)(
+            model="openai/gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+        assert len([chunk async for chunk in stream]) == len(events)
+    else:
+        client = wrap_open_router(sync_client(handler))
+        stream = cast(Any, client.chat.send)(
+            model="openai/gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+        assert len(list(stream)) == len(events)
+
+    assert len(calls) == 3
+    assert len(memory.span_exporter.get_finished_spans()) == 1
+    assert memory.metric_reader.get_metrics_data() is not None
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_responses_output_timing_accepts_code_and_mcp_deltas_until_stream_end(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, async_mode: bool
+) -> None:
+    calls: list[telemetry_dev.SpanHandle] = []
+    original = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        assert timestamp_ms is not None
+        calls.append(handle)
+        return original(handle, timestamp_ms)
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
+    events = [
+        {"type": "response.code_interpreter_call_code.delta", "delta": "print(1)"},
+        {"type": "response.code_interpreter_call_code.done", "code": "print(1)"},
+        {"type": "response.mcp_call_arguments.delta", "delta": '{"city":"Paris"}'},
+        {"type": "response.mcp_call_arguments.delta", "delta": ""},
+        {"type": "response.mcp_call_arguments.done", "arguments": '{"city":"Paris"}'},
+        {"type": "response.audio.transcript.delta", "delta": "hello"},
+        {"type": "response.audio.transcript.delta", "delta": ""},
+        {"type": "response.audio.transcript.done", "transcript": "hello"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    async def async_handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    if async_mode:
+        client = wrap_open_router(async_client(async_handler))
+        stream = await cast(Any, client.responses.send_async)(
+            model="openai/gpt-4o-mini", input="Run", stream=True
+        )
+        iterator = stream.__aiter__()
+        for _ in events:
+            await iterator.__anext__()
+        await stream.close()
+    else:
+        client = wrap_open_router(sync_client(handler))
+        stream = cast(Any, client.responses.send)(
+            model="openai/gpt-4o-mini", input="Run", stream=True
+        )
+        for _ in events:
+            next(stream)
+        stream.close()
+
+    assert len(calls) == 3
+    assert len(memory.span_exporter.get_finished_spans()) == 1
+    assert memory.metric_reader.get_metrics_data() is not None
+
+
 def test_chat_stream_capture_is_bounded_without_losing_terminal_metadata(
     memory: SimpleNamespace,
 ) -> None:

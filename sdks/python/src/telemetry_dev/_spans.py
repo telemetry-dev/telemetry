@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import math
+import threading
+import time
 import traceback
+from bisect import bisect_left
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import Token
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal, TypedDict
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from opentelemetry import context as otel_context
 from opentelemetry import trace
@@ -42,6 +46,7 @@ from ._semconv import (
     ATTR_TOOL_CALL_ID,
     ATTR_TOOL_DESCRIPTION,
     ATTR_TOOL_NAME,
+    DURATION_BUCKETS,
     METADATA_PREFIX,
     RESERVED_METADATA_KEYS,
     SAMPLING_ATTRS,
@@ -86,9 +91,42 @@ class _SpanState:
     operation: str
     capture_input: bool
     capture_output: bool
+    output_chunk_last_ms: float | None = None
+    output_chunk_count: int = 0
+    output_chunk_sum_s: float = 0
+    output_chunk_min_s: float | None = None
+    output_chunk_max_s: float | None = None
+    output_chunk_buckets: list[int] | None = None
 
 
 _SPAN_STATES: WeakKeyDictionary[Span, _SpanState] = WeakKeyDictionary()
+_OUTPUT_CHUNK_STATES: WeakValueDictionary[tuple[int, int], _SpanState] = WeakValueDictionary()
+_OUTPUT_CHUNK_STATES_LOCK = threading.Lock()
+
+
+def _span_key(span: Any) -> tuple[int, int]:
+    context = span.get_span_context() if hasattr(span, "get_span_context") else span.context
+    return context.trace_id, context.span_id
+
+
+def output_chunk_aggregate(span: Any) -> tuple[int, float, float, float, tuple[int, ...]] | None:
+    with _OUTPUT_CHUNK_STATES_LOCK:
+        state = _OUTPUT_CHUNK_STATES.pop(_span_key(span), None)
+        if (
+            state is None
+            or state.output_chunk_count == 0
+            or state.output_chunk_min_s is None
+            or state.output_chunk_max_s is None
+            or state.output_chunk_buckets is None
+        ):
+            return None
+        return (
+            state.output_chunk_count,
+            state.output_chunk_sum_s,
+            state.output_chunk_min_s,
+            state.output_chunk_max_s,
+            tuple(state.output_chunk_buckets),
+        )
 
 
 def _to_ns(value: TimeInput) -> int | None:
@@ -413,6 +451,45 @@ class SpanHandle:
             self._client.report("SpanHandle.update failed", exc)
         return self
 
+    def record_output_chunk(self, timestamp_ms: float | None = None) -> SpanHandle:
+        """Record arrival of a non-empty output chunk using a monotonic millisecond timestamp."""
+        if not self._recording():
+            return self
+        assert self._state is not None and self._client is not None
+        try:
+            now = time.perf_counter() * 1000 if timestamp_ms is None else float(timestamp_ms)
+            if not math.isfinite(now):
+                return self
+            with _OUTPUT_CHUNK_STATES_LOCK:
+                if not self._recording():
+                    return self
+                previous = self._state.output_chunk_last_ms
+                if previous is not None and now < previous:
+                    return self
+                self._state.output_chunk_last_ms = now
+                _OUTPUT_CHUNK_STATES[_span_key(self.span)] = self._state
+                if previous is None:
+                    return self
+                interval_s = max(now - previous, 0) / 1000
+                self._state.output_chunk_count += 1
+                self._state.output_chunk_sum_s += interval_s
+                self._state.output_chunk_min_s = (
+                    interval_s
+                    if self._state.output_chunk_min_s is None
+                    else min(self._state.output_chunk_min_s, interval_s)
+                )
+                self._state.output_chunk_max_s = (
+                    interval_s
+                    if self._state.output_chunk_max_s is None
+                    else max(self._state.output_chunk_max_s, interval_s)
+                )
+                if self._state.output_chunk_buckets is None:
+                    self._state.output_chunk_buckets = [0] * (len(DURATION_BUCKETS) + 1)
+                self._state.output_chunk_buckets[bisect_left(DURATION_BUCKETS, interval_s)] += 1
+        except BaseException as exc:
+            self._client.report("SpanHandle.record_output_chunk failed", exc)
+        return self
+
     def end(
         self,
         *,
@@ -480,7 +557,10 @@ class SpanHandle:
             attributes=attributes,
             error=error,
         )
-        self._ended = True
+        with _OUTPUT_CHUNK_STATES_LOCK:
+            if self._ended:
+                return
+            self._ended = True
         self.span.end(_to_ns(end_time))
 
     def traceparent(self) -> str | None:

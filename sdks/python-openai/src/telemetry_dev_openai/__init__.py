@@ -360,6 +360,46 @@ def _synthetic_usage_chunk(chunk: Any) -> bool:
     return _field(chunk, "usage") is not None and len(choices) == 0
 
 
+def _chat_chunk_has_output(chunk: Any) -> bool:
+    for choice in _sequence_items(_field(chunk, "choices")):
+        delta = _field(choice, "delta")
+        for key in ("content", "refusal"):
+            value = _field(delta, key)
+            if isinstance(value, str) and value:
+                return True
+        audio = _field(delta, "audio")
+        if isinstance(_field(audio, "data"), str) and _field(audio, "data"):
+            return True
+        legacy_arguments = _field(_field(delta, "function_call"), "arguments")
+        if isinstance(legacy_arguments, str) and legacy_arguments:
+            return True
+        for tool_call in _sequence_items(_field(delta, "tool_calls")):
+            arguments = _field(_field(tool_call, "function"), "arguments")
+            if isinstance(arguments, str) and arguments:
+                return True
+    return False
+
+
+def _response_event_has_output(event: Any) -> bool:
+    event_type = _string(_field(event, "type")) or ""
+    if event_type not in {
+        "response.output_text.delta",
+        "response.refusal.delta",
+        "response.reasoning_text.delta",
+        "response.reasoning_summary_text.delta",
+        "response.function_call_arguments.delta",
+        "response.custom_tool_call_input.delta",
+        "response.code_interpreter_call_code.delta",
+        "response.mcp_call_arguments.delta",
+        "response.output_audio.delta",
+        "response.audio.delta",
+        "response.audio.transcript.delta",
+    }:
+        return False
+    delta = _field(event, "delta")
+    return isinstance(delta, str) and bool(delta)
+
+
 def _response_failed_error(response: Any) -> RuntimeError:
     error = _field(response, "error")
     if error is None:
@@ -449,6 +489,7 @@ class _InstrumentedStream:
                 self._in_next = True
                 try:
                     chunk = next(self._inner)
+                    received_at = time.perf_counter()
                 except StopIteration:
                     break
                 except BaseException as exc:
@@ -456,7 +497,7 @@ class _InstrumentedStream:
                     raise
                 finally:
                     self._in_next = False
-                self._record(chunk)
+                self._record(chunk, received_at)
                 if self._injected_usage and _synthetic_usage_chunk(chunk):
                     continue
                 yield chunk
@@ -502,8 +543,12 @@ class _InstrumentedStream:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
-    def _record(self, chunk: Any) -> None:
+    def _record(self, chunk: Any, received_at: float) -> None:
         update = _record_chat_chunk(chunk, self._states, self._budget)
+        if _chat_chunk_has_output(chunk):
+            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
+            if callable(record_output_chunk):
+                record_output_chunk(received_at * 1000)
         if not self._saw_first:
             self._saw_first = True
             self._handle.update(
@@ -542,6 +587,7 @@ class _InstrumentedAsyncStream:
                 self._in_next = True
                 try:
                     chunk = await self._inner.__anext__()
+                    received_at = time.perf_counter()
                 except StopAsyncIteration:
                     break
                 except BaseException as exc:
@@ -549,7 +595,7 @@ class _InstrumentedAsyncStream:
                     raise
                 finally:
                     self._in_next = False
-                self._record(chunk)
+                self._record(chunk, received_at)
                 if self._injected_usage and _synthetic_usage_chunk(chunk):
                     continue
                 yield chunk
@@ -600,8 +646,12 @@ class _InstrumentedAsyncStream:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
-    def _record(self, chunk: Any) -> None:
+    def _record(self, chunk: Any, received_at: float) -> None:
         update = _record_chat_chunk(chunk, self._states, self._budget)
+        if _chat_chunk_has_output(chunk):
+            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
+            if callable(record_output_chunk):
+                record_output_chunk(received_at * 1000)
         if not self._saw_first:
             self._saw_first = True
             self._handle.update(
@@ -632,6 +682,7 @@ class _InstrumentedResponsesStream:
                 self._in_next = True
                 try:
                     event = next(self._inner)
+                    received_at = time.perf_counter()
                 except StopIteration:
                     break
                 except BaseException as exc:
@@ -639,7 +690,7 @@ class _InstrumentedResponsesStream:
                     raise
                 finally:
                     self._in_next = False
-                self._record(event)
+                self._record(event, received_at)
                 yield event
         finally:
             self.close()
@@ -683,7 +734,11 @@ class _InstrumentedResponsesStream:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
-    def _record(self, event: Any) -> None:
+    def _record(self, event: Any, received_at: float) -> None:
+        if _response_event_has_output(event):
+            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
+            if callable(record_output_chunk):
+                record_output_chunk(received_at * 1000)
         if not self._saw_first:
             self._saw_first = True
             self._handle.update(
@@ -734,6 +789,7 @@ class _InstrumentedAsyncResponsesStream:
                 self._in_next = True
                 try:
                     event = await self._inner.__anext__()
+                    received_at = time.perf_counter()
                 except StopAsyncIteration:
                     break
                 except BaseException as exc:
@@ -741,7 +797,7 @@ class _InstrumentedAsyncResponsesStream:
                     raise
                 finally:
                     self._in_next = False
-                self._record(event)
+                self._record(event, received_at)
                 yield event
         finally:
             await self.close()
@@ -790,7 +846,11 @@ class _InstrumentedAsyncResponsesStream:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
-    def _record(self, event: Any) -> None:
+    def _record(self, event: Any, received_at: float) -> None:
+        if _response_event_has_output(event):
+            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
+            if callable(record_output_chunk):
+                record_output_chunk(received_at * 1000)
         if not self._saw_first:
             self._saw_first = True
             self._handle.update(

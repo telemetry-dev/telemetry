@@ -13,5 +13,6 @@ export const NOOP_SPAN_HANDLE: SpanHandle = {
   traceparent: null,
   isRecording: false,
   update: () => NOOP_SPAN_HANDLE,
+  recordOutputChunk: () => {},
   end: () => {},
 };

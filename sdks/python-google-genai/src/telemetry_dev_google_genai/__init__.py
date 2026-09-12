@@ -735,6 +735,49 @@ def _first_chunk_update(chunk: Any, handle: telemetry_dev.SpanHandle, started_at
         return
 
 
+def _chunk_has_output(chunk: Any) -> bool:
+    for candidate in _sequence_items(_field(chunk, "candidates")):
+        content = _field(candidate, "content")
+        for part in _sequence_items(_field(content, "parts")):
+            text = _field(part, "text")
+            function_call = _field(part, "function_call") or _field(part, "functionCall")
+            args = _field(function_call, "args")
+            partial_args = _field(function_call, "partial_args") or _field(
+                function_call, "partialArgs"
+            )
+            inline_data = _field(part, "inline_data") or _field(part, "inlineData")
+            mime_type = _string(_field(inline_data, "mime_type")) or _string(
+                _field(inline_data, "mimeType")
+            )
+            data = _field(inline_data, "data")
+            has_partial_arg_value = any(
+                isinstance(_field(partial_arg, "bool_value"), bool)
+                or isinstance(_field(partial_arg, "boolValue"), bool)
+                or isinstance(_field(partial_arg, "number_value"), int | float)
+                or isinstance(_field(partial_arg, "numberValue"), int | float)
+                or bool(
+                    _string(_field(partial_arg, "string_value"))
+                    or _string(_field(partial_arg, "stringValue"))
+                )
+                or _field(partial_arg, "null_value") == "NULL_VALUE"
+                or _field(partial_arg, "nullValue") == "NULL_VALUE"
+                for partial_arg in _sequence_items(partial_args)
+            )
+            if (
+                (isinstance(text, str) and bool(text))
+                or args not in (None, "", [], {})
+                or has_partial_arg_value
+                or (
+                    mime_type is not None
+                    and mime_type.startswith("audio/")
+                    and isinstance(data, str | bytes)
+                    and bool(data)
+                )
+            ):
+                return True
+    return False
+
+
 class _ObservedStream:
     def __init__(
         self,
@@ -792,6 +835,7 @@ class _ObservedStream:
         )
         try:
             chunk = pull()
+            received_at = time.perf_counter()
         except StopIteration:
             self._end(**_clean_fields(self._fields()))
             raise
@@ -802,6 +846,10 @@ class _ObservedStream:
         finally:
             if token is not None:
                 _AFC_USAGE_STATE.reset(token)
+        if _chunk_has_output(chunk):
+            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
+            if callable(record_output_chunk):
+                record_output_chunk(received_at * 1000)
         if not self._saw_first:
             self._saw_first = True
             _first_chunk_update(chunk, self._handle, self._started_at)
@@ -875,6 +923,7 @@ class _ObservedAsyncStream:
         )
         try:
             chunk = await pull()
+            received_at = time.perf_counter()
         except StopAsyncIteration:
             self._end(**_clean_fields(self._fields()))
             raise
@@ -885,6 +934,10 @@ class _ObservedAsyncStream:
         finally:
             if token is not None:
                 _AFC_USAGE_STATE.reset(token)
+        if _chunk_has_output(chunk):
+            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
+            if callable(record_output_chunk):
+                record_output_chunk(received_at * 1000)
         if not self._saw_first:
             self._saw_first = True
             _first_chunk_update(chunk, self._handle, self._started_at)

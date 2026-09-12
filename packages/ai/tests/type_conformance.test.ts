@@ -10,8 +10,11 @@ import { telemetryDev as telemetryDevV6 } from "../src/v6.ts";
 // was removed in v7; v7 `Telemetry` does not exist in v6). A break here fails typecheck, not
 // runtime.
 const integ = telemetryDev({ apiKey: "td_live_t" });
+
 void (integ satisfies Telemetry);
+
 const integV6 = telemetryDevV6({ apiKey: "td_live_t" });
+
 void (integV6 satisfies TelemetryIntegration);
 
 test("each entry's telemetryDev satisfies its ai major's integration type", () => {

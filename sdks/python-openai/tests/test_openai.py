@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any, cast
@@ -12,6 +13,7 @@ from openai import AsyncOpenAI, OpenAI
 from openai.resources.chat.completions.completions import AsyncCompletions, Completions
 from openai.resources.embeddings import AsyncEmbeddings, Embeddings
 from openai.resources.responses.responses import AsyncResponses, Responses
+from openai.types.chat import ChatCompletionChunk
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import StatusCode
 from pydantic import BaseModel
@@ -487,6 +489,289 @@ def test_chat_streaming_injects_usage_when_opted_in_and_filters_synthetic_chunk(
     assert a["gen_ai.usage.input_tokens"] == 5
     assert a["gen_ai.usage.output_tokens"] == 2
     assert list(cast(Any, a["gen_ai.response.finish_reasons"])) == ["stop"]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_chunk_timing_excludes_control_and_empty_deltas(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, async_mode: bool
+) -> None:
+    calls: list[telemetry_dev.SpanHandle] = []
+    original = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        assert timestamp_ms is not None
+        calls.append(handle)
+        return original(handle, timestamp_ms)
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
+    deltas: list[dict[str, Any]] = [
+        {"role": "assistant"},
+        {"content": "A"},
+        {"content": None},
+        {"content": ""},
+        {"tool_calls": []},
+        {"tool_calls": [{"index": 0, "function": {"arguments": '{"city":'}}]},
+        {"tool_calls": [{"index": 0, "function": {"arguments": ""}}]},
+        {"tool_calls": [{"index": 0, "function": {"arguments": '"Paris"}'}}]},
+        {"function_call": {"name": "lookup", "arguments": ""}},
+        {"function_call": {"name": "lookup"}},
+        {"function_call": {"arguments": '{"city":'}},
+        {"content": "once", "function_call": {"arguments": '"Paris"}'}},
+        {"content": "B"},
+        {},
+    ]
+    events: list[dict[str, Any]] = [
+        {
+            "id": "chatcmpl_timing",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": delta}],
+        }
+        for delta in deltas
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    async def async_handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    if async_mode:
+        async_wrapped = wrap_openai(async_client(async_handler))
+        async_stream = await cast(Any, async_wrapped.chat.completions.create)(
+            model="gpt-4o", messages=CHAT_MESSAGES, stream=True
+        )
+        received = [chunk async for chunk in async_stream]
+        await async_wrapped.close()
+    else:
+        wrapped = wrap_openai(sync_client(handler))
+        stream = cast(Any, wrapped.chat.completions.create)(
+            model="gpt-4o", messages=CHAT_MESSAGES, stream=True
+        )
+        received = list(stream)
+        wrapped.close()
+    assert len(received) == len(events)
+    assert len(calls) == 6
+    assert memory.metric_reader.get_metrics_data() is not None
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_chunk_receipt_time_precedes_mapping(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, async_mode: bool
+) -> None:
+    clock = 12.0
+    recorded: list[float] = []
+    original_record = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float
+    ) -> telemetry_dev.SpanHandle:
+        recorded.append(timestamp_ms)
+        return original_record(handle, timestamp_ms)
+
+    def perf_counter() -> float:
+        return clock
+
+    original_getattribute = ChatCompletionChunk.__getattribute__
+
+    def delayed_choices(chunk: ChatCompletionChunk, name: str) -> Any:
+        nonlocal clock
+        if name == "choices":
+            clock = 47.0
+        return original_getattribute(chunk, name)
+
+    monkeypatch.setattr(time, "perf_counter", perf_counter)
+    monkeypatch.setattr(ChatCompletionChunk, "__getattribute__", delayed_choices)
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
+    events = [
+        {
+            "id": "chatcmpl_receipt",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {"content": text}}],
+        }
+        for text in ["hello", " world"]
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    async def async_handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    if async_mode:
+        async_wrapped = wrap_openai(async_client(async_handler))
+        async_stream = await async_wrapped.chat.completions.create(
+            model="gpt-4o", messages=[], stream=True
+        )
+        received = [chunk async for chunk in async_stream]
+        await async_wrapped.close()
+    else:
+        wrapped = wrap_openai(sync_client(handler))
+        stream = wrapped.chat.completions.create(model="gpt-4o", messages=[], stream=True)
+        received = list(stream)
+        wrapped.close()
+    assert len(received) == 2
+    assert recorded == [12_000.0, 47_000.0]
+    assert only_span(memory).status.status_code == StatusCode.UNSET
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("interrupted", [False, True])
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "response.custom_tool_call_input",
+        "response.code_interpreter_call_code",
+        "response.mcp_call_arguments",
+        "response.audio.transcript",
+    ],
+)
+async def test_responses_output_timing(
+    memory: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    async_mode: bool,
+    interrupted: bool,
+    event_type: str,
+) -> None:
+    calls: list[telemetry_dev.SpanHandle] = []
+    original = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        assert timestamp_ms is not None
+        calls.append(handle)
+        return original(handle, timestamp_ms)
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
+    output_events = [
+        {"type": f"{event_type}.delta", "delta": "first"},
+        {"type": f"{event_type}.delta", "delta": ""},
+        {"type": f"{event_type}.delta", "delta": "second"},
+        {
+            "type": f"{event_type}.done",
+            "input": "firstsecond",
+            "code": "firstsecond",
+            "arguments": "firstsecond",
+        },
+    ]
+    events = [
+        *output_events,
+        {"type": "response.completed", "response": response_payload()},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    async def async_handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    if async_mode:
+        client = wrap_openai(async_client(async_handler))
+        stream = await cast(Any, client.responses.create)(
+            model="gpt-4o-mini", input="Run", stream=True
+        )
+        received = [await stream.__anext__() for _ in output_events]
+        if not interrupted:
+            received.extend([event async for event in stream])
+        await stream.close()
+        await client.close()
+    else:
+        client = wrap_openai(sync_client(handler))
+        stream = cast(Any, client.responses.create)(model="gpt-4o-mini", input="Run", stream=True)
+        received = [next(stream) for _ in output_events]
+        if not interrupted:
+            received.extend(stream)
+        stream.close()
+        client.close()
+
+    assert len(received) == len(output_events if interrupted else events)
+    assert received[0].delta == "first"
+    assert received[2].delta == "second"
+    assert len(calls) == 2
+    assert calls[0] is calls[1]
+    assert only_span(memory).status.status_code == StatusCode.UNSET
+
+
+@pytest.mark.parametrize(
+    "stream_kind", ["sync-chat", "async-chat", "sync-responses", "async-responses"]
+)
+async def test_streaming_preserves_tracing_without_output_chunk_support(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, stream_kind: str
+) -> None:
+    monkeypatch.delattr(telemetry_dev.SpanHandle, "record_output_chunk")
+
+    if stream_kind == "sync-chat":
+
+        def sync_chat_handler(request: httpx.Request) -> httpx.Response:
+            return sse_response(chat_stream_events())
+
+        client = wrap_openai(sync_client(sync_chat_handler))
+        received = list(
+            cast(Any, client.chat.completions.create)(
+                model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+            )
+        )
+        client.close()
+    elif stream_kind == "async-chat":
+
+        async def async_chat_handler(request: httpx.Request) -> httpx.Response:
+            return sse_response(chat_stream_events())
+
+        client = wrap_openai(async_client(async_chat_handler))
+        stream = await cast(Any, client.chat.completions.create)(
+            model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+        received = [chunk async for chunk in stream]
+        await client.close()
+    else:
+        delta = {
+            "type": "response.output_text.delta",
+            "sequence_number": 0,
+            "item_id": "item_old_core",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "Still traced.",
+        }
+        response = {
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": response_payload(response_id="resp_old_core", text="Still traced."),
+        }
+        events = [("response.output_text.delta", delta), ("response.completed", response)]
+        if stream_kind == "sync-responses":
+
+            def sync_responses_handler(request: httpx.Request) -> httpx.Response:
+                return named_sse_response(events)
+
+            client = wrap_openai(sync_client(sync_responses_handler))
+            received = list(
+                cast(Any, client.responses.create)(model="gpt-4o-mini", input="stream", stream=True)
+            )
+            client.close()
+        else:
+
+            async def async_responses_handler(request: httpx.Request) -> httpx.Response:
+                return named_sse_response(events)
+
+            client = wrap_openai(async_client(async_responses_handler))
+            stream = await cast(Any, client.responses.create)(
+                model="gpt-4o-mini", input="stream", stream=True
+            )
+            received = [event async for event in stream]
+            await client.close()
+        assert len(received) == 2
+        assert received[0].delta == "Still traced."
+
+    assert received
+    span = only_span(memory)
+    assert span.status.status_code == StatusCode.UNSET
+    assert attrs(span)["gen_ai.response.id"] in {"chatcmpl_stream", "resp_old_core"}
 
 
 def test_chat_streaming_default_leaves_request_unchanged(memory: SimpleNamespace) -> None:

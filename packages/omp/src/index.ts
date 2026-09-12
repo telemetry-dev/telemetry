@@ -1,4 +1,5 @@
 export type { TelemetryDevOmpOptions } from "./config.ts";
+
 export {
   telemetryDevExtension,
   type TelemetryDevExtension,

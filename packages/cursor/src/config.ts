@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { init, shutdown, type ClientOverrides, type TelemetryOptions } from "@telemetry-dev/sdk";
 
 type JsonValue = string | number | boolean | null | undefined | JsonValue[] | JsonRecord;
+
 interface JsonRecord {
   [key: string]: JsonValue;
 }
@@ -34,16 +35,21 @@ export function configPath(): string {
  */
 export function fileConfig(): TelemetryDevCursorOptions {
   let parsed: unknown;
+
   try {
     parsed = JSON.parse(readFileSync(configPath(), "utf8"));
   } catch {
     // A missing or malformed file must never crash the daemon.
     return {};
   }
+
   const record = asRecord(parsed);
+
   if (!record) return {};
+
   const pick = (key: string, envVar: string): string | undefined =>
     process.env[envVar] === undefined ? readString(record[key]) : undefined;
+
   return {
     apiKey: pick("apiKey", "TELEMETRY_DEV_API_KEY"),
     baseUrl: pick("baseUrl", "TELEMETRY_DEV_BASE_URL"),
@@ -87,5 +93,6 @@ function asRecord<T>(value: T): JsonRecord | undefined {
 
 function readString<T>(value: T): string | undefined {
   const raw: unknown = value;
+
   return String(raw) === raw ? raw : undefined;
 }

@@ -21,11 +21,15 @@ interface MetricRecord {
   attributes: Attributes;
 }
 
+const requestUrl = (input: string | Request | URL): string =>
+  input instanceof Request ? input.url : input.toString();
+
 // Inject a capturing transport via the otel.ts test seam: spans are captured as the real
 // ReadableSpans the emitter would serialize, and metric points are captured in-process.
 function makeCapture() {
   const spanBatches: ReadableSpan[][] = [];
   const metrics: MetricRecord[] = [];
+
   const overrides = {
     sendSpans: async (spans: ReadableSpan[]) => {
       spanBatches.push(spans);
@@ -37,6 +41,7 @@ function makeCapture() {
       metrics.push({ metric: "tokens", tokenType, value, attributes });
     },
   };
+
   return { spanBatches, metrics, overrides };
 }
 
@@ -44,13 +49,16 @@ const model = { provider: "openai", modelId: "gpt-4o" } as const;
 
 const spanId = (s: ReadableSpan) => s.spanContext().spanId;
 const traceId = (s: ReadableSpan) => s.spanContext().traceId;
+
 const byOperation = (spans: ReadableSpan[], operation: string) =>
   spans.filter((s) => s.attributes["gen_ai.operation.name"] === operation);
+
 const eventNames = (s: ReadableSpan) => s.events.map((ev) => ev.name);
 const event = (s: ReadableSpan, name: string) => s.events.find((ev) => ev.name === name);
 
 test("single-step generateText emits a chat root + chat child with all five token kinds", async () => {
   const { spanBatches, metrics, overrides } = makeCapture();
+
   const integ = telemetryDev(
     { apiKey: "td_live_test", environment: "test", serviceName: "svc" },
     overrides,
@@ -88,6 +96,7 @@ test("single-step generateText emits a chat root + chat child with all five toke
 
   const [root] = byOperation(spans, "chat").filter((s) => s.kind === SpanKind.INTERNAL);
   const child = spans.find((s) => s.kind === SpanKind.CLIENT);
+
   if (!root || !child) throw new Error("missing spans");
 
   // Resource + scope ride along on every span (proves they serialize as gen_ai OTLP).
@@ -125,6 +134,7 @@ test("single-step generateText emits a chat root + chat child with all five toke
     expect(traceId(s)).toMatch(/^[0-9a-f]{32}$/);
     expect(spanId(s)).toMatch(/^[0-9a-f]{16}$/);
   }
+
   // One trace per call: every span shares the root trace id.
   expect(traceId(child)).toBe(traceId(root));
 
@@ -147,10 +157,12 @@ test("single-step generateText emits a chat root + chat child with all five toke
 
 test("multi-step run with a tool yields invoke_agent root and parents the tool to its step", async () => {
   const { spanBatches, metrics, overrides } = makeCapture();
+
   const integ = telemetryDev(
     { apiKey: "td_live_test", environment: "test", serviceName: "svc" },
     overrides,
   );
+
   const toolCall = { toolCallId: "call_1", toolName: "getWeather", input: { city: "SF" } };
 
   integ.onStart?.({
@@ -191,6 +203,7 @@ test("multi-step run with a tool yields invoke_agent root and parents the tool t
   const chatSteps = byOperation(spans, "chat").filter((s) => s.kind === SpanKind.CLIENT);
   const tool = byOperation(spans, "execute_tool")[0];
   expect(chatSteps).toHaveLength(2);
+
   if (!tool) throw new Error("missing tool span");
 
   // Tools push the root operation to invoke_agent.
@@ -212,15 +225,18 @@ test("multi-step run with a tool yields invoke_agent root and parents the tool t
   // Per-step duration + tokens (x2 steps) and a per-tool duration with operation=execute_tool.
   const durations = metrics.filter((m) => m.metric === "duration");
   expect(durations.filter((m) => m.attributes["gen_ai.operation.name"] === "chat")).toHaveLength(2);
+
   const toolDurations = durations.filter(
     (m) => m.attributes["gen_ai.operation.name"] === "execute_tool",
   );
+
   expect(toolDurations).toHaveLength(1);
   expect(metrics.filter((m) => m.metric === "tokens")).toHaveLength(4);
 });
 
 test("error finishReason marks root and step ERROR and emits an exception event", async () => {
   const { spanBatches, overrides } = makeCapture();
+
   const integ = telemetryDev(
     { apiKey: "td_live_test", environment: "test", serviceName: "svc" },
     overrides,
@@ -254,10 +270,12 @@ test("error finishReason marks root and step ERROR and emits an exception event"
 
 test("a failed tool call records ERROR status and an exception event", async () => {
   const { spanBatches, overrides } = makeCapture();
+
   const integ = telemetryDev(
     { apiKey: "td_live_test", environment: "test", serviceName: "svc" },
     overrides,
   );
+
   const callA = { toolCallId: "a", toolName: "t1", input: { n: 1 } };
   const callB = { toolCallId: "b", toolName: "t2", input: { n: 2 } };
 
@@ -293,10 +311,12 @@ test("a failed tool call records ERROR status and an exception event", async () 
   const tools = byOperation(spans, "execute_tool");
   const step = spans.find((s) => s.kind === SpanKind.CLIENT)!;
   expect(tools).toHaveLength(2);
+
   // Both tools parent to their step.
   for (const t of tools) {
     expect(t.parentSpanContext?.spanId).toBe(spanId(step));
   }
+
   const failed = tools.find((t) => t.attributes["gen_ai.tool.name"] === "t2")!;
   expect(failed.status.code).toBe(SpanStatusCode.ERROR);
   expect(failed.attributes["error.type"]).toBe("Error");
@@ -308,6 +328,7 @@ test("a failed tool call records ERROR status and an exception event", async () 
 
 test("gateway provider is relabeled to Vercel AI Gateway on every span", async () => {
   const { spanBatches, overrides } = makeCapture();
+
   const integ = telemetryDev(
     { apiKey: "td_live_test", environment: "test", serviceName: "svc" },
     overrides,
@@ -339,9 +360,11 @@ test("gateway provider is relabeled to Vercel AI Gateway on every span", async (
   // Every span that carries a provider carries the product name, never the bare slug.
   const withProvider = spans.filter((s) => "gen_ai.provider.name" in s.attributes);
   expect(withProvider.length).toBeGreaterThanOrEqual(2);
+
   for (const s of withProvider) {
     expect(s.attributes["gen_ai.provider.name"]).toBe("Vercel AI Gateway");
   }
+
   // The upstream model slug is left untouched (it still drives pricing lookups server-side).
   const step = spans.find((s) => s.kind === SpanKind.CLIENT)!;
   expect(step.attributes["gen_ai.request.model"]).toBe("openai/gpt-4o");
@@ -349,6 +372,7 @@ test("gateway provider is relabeled to Vercel AI Gateway on every span", async (
 
 test("non-gateway providers pass through unchanged", async () => {
   const { spanBatches, overrides } = makeCapture();
+
   const integ = telemetryDev(
     { apiKey: "td_live_test", environment: "test", serviceName: "svc" },
     overrides,
@@ -375,10 +399,12 @@ test("non-gateway providers pass through unchanged", async () => {
 
 test("model warnings become model.warning events at severity 13", async () => {
   const { spanBatches, overrides } = makeCapture();
+
   const integ = telemetryDev(
     { apiKey: "td_live_test", environment: "test", serviceName: "svc" },
     overrides,
   );
+
   integ.onStart?.({ model, prompt: "hi" });
   integ.onStepStart?.({ stepNumber: 0, model });
   integ.onStepFinish?.({
@@ -422,6 +448,7 @@ test("no apiKey is a complete no-op (transport never invoked)", async () => {
 
 test("a step with missing usage records no token metric and no summary usage attrs", async () => {
   const { spanBatches, metrics, overrides } = makeCapture();
+
   const integ = telemetryDev(
     { apiKey: "td_live_test", environment: "test", serviceName: "svc" },
     overrides,
@@ -454,6 +481,7 @@ test("a step with missing usage records no token metric and no summary usage att
 test("export failure reaches onError even on the waitUntil path", async () => {
   const errors: unknown[] = [];
   let handed: Promise<unknown> | undefined;
+
   const integ = telemetryDev(
     {
       apiKey: "td_live_test",
@@ -500,10 +528,12 @@ test("spans use each emitter's own transport (no cross-talk on a shared cached c
   const traceCalls: string[] = [];
   const aErrors: unknown[] = [];
   const bErrors: unknown[] = [];
+
   const makeFetch =
     (tag: string): typeof fetch =>
     async (url: string | Request | URL, _init?: RequestInit) => {
-      if (String(url).endsWith("/v1/traces")) traceCalls.push(tag);
+      if (requestUrl(url).endsWith("/v1/traces")) traceCalls.push(tag);
+
       return new Response(null, { status: 200 });
     };
 
@@ -515,6 +545,7 @@ test("spans use each emitter's own transport (no cross-talk on a shared cached c
     fetch: makeFetch("A"),
     onError: (e) => aErrors.push(e),
   });
+
   // Second emitter reuses that cached core but supplies fetch B.
   telemetryDev({
     apiKey: "td_live_dup",
@@ -547,15 +578,18 @@ test("spans use each emitter's own transport (no cross-talk on a shared cached c
 test("trace export retries a transient ingest failure", async () => {
   const errors: unknown[] = [];
   let traceCalls = 0;
+
   const integ = telemetryDev({
     apiKey: "td_live_trace_retry",
     environment: "test",
     serviceName: "trace-retry",
     fetch: async (url: string | Request | URL, _init?: RequestInit) => {
-      if (String(url).endsWith("/v1/traces")) {
+      if (requestUrl(url).endsWith("/v1/traces")) {
         traceCalls += 1;
+
         return new Response(null, { status: traceCalls === 1 ? 503 : 200 });
       }
+
       return new Response(null, { status: 200 });
     },
     onError: (e) => errors.push(e),
@@ -580,15 +614,18 @@ test("trace export retries a transient ingest failure", async () => {
 test("trace export retries a transient network error", async () => {
   const errors: unknown[] = [];
   let traceCalls = 0;
+
   const integ = telemetryDev({
     apiKey: "td_live_trace_network_retry",
     environment: "test",
     serviceName: "trace-network-retry",
     fetch: async (url: string | Request | URL, _init?: RequestInit) => {
-      if (String(url).endsWith("/v1/traces")) {
+      if (requestUrl(url).endsWith("/v1/traces")) {
         traceCalls += 1;
+
         if (traceCalls === 1) throw new Error("socket closed");
       }
+
       return new Response(null, { status: 200 });
     },
     onError: (e) => errors.push(e),
@@ -614,15 +651,17 @@ test("trace export reports one error after exhausting network failures", async (
   const errors: unknown[] = [];
   let traceCalls = 0;
   const networkError = new Error("socket closed");
+
   const integ = telemetryDev({
     apiKey: "td_live_trace_network_exhausted",
     environment: "test",
     serviceName: "trace-network-exhausted",
     fetch: async (url: string | Request | URL, _init?: RequestInit) => {
-      if (String(url).endsWith("/v1/traces")) {
+      if (requestUrl(url).endsWith("/v1/traces")) {
         traceCalls += 1;
         throw networkError;
       }
+
       return new Response(null, { status: 200 });
     },
     onError: (e) => errors.push(e),
@@ -648,15 +687,18 @@ test("trace export reports one error after exhausting network failures", async (
 test("trace export does not retry non-retryable ingest failures", async () => {
   const errors: unknown[] = [];
   let traceCalls = 0;
+
   const integ = telemetryDev({
     apiKey: "td_live_trace_no_retry",
     environment: "test",
     serviceName: "trace-no-retry",
     fetch: async (url: string | Request | URL, _init?: RequestInit) => {
-      if (String(url).endsWith("/v1/traces")) {
+      if (requestUrl(url).endsWith("/v1/traces")) {
         traceCalls += 1;
+
         return new Response(null, { status: 400 });
       }
+
       return new Response(null, { status: 200 });
     },
     onError: (e) => errors.push(e),
@@ -684,15 +726,18 @@ test("trace export does not retry non-retryable ingest failures", async () => {
 test("trace export reports one error after exhausting retryable failures", async () => {
   const errors: unknown[] = [];
   let traceCalls = 0;
+
   const integ = telemetryDev({
     apiKey: "td_live_trace_retry_exhausted",
     environment: "test",
     serviceName: "trace-retry-exhausted",
     fetch: async (url: string | Request | URL, _init?: RequestInit) => {
-      if (String(url).endsWith("/v1/traces")) {
+      if (requestUrl(url).endsWith("/v1/traces")) {
         traceCalls += 1;
+
         return new Response(null, { status: 503 });
       }
+
       return new Response(null, { status: 200 });
     },
     onError: (e) => errors.push(e),
@@ -719,10 +764,12 @@ test("trace export reports one error after exhausting retryable failures", async
 
 test("step metrics attribute tokens and duration to each step's own model, not the root", async () => {
   const { metrics, overrides } = makeCapture();
+
   const integ = telemetryDev(
     { apiKey: "td_live_test", environment: "test", serviceName: "svc" },
     overrides,
   );
+
   const modelB = { provider: "anthropic", modelId: "claude-3-5-sonnet" } as const;
 
   // Root/step 0 run on openai/gpt-4o; step 1 falls back to anthropic/claude (mixed-model run).
@@ -753,9 +800,11 @@ test("step metrics attribute tokens and duration to each step's own model, not t
   // Each step's metric carries the model/provider that actually ran it — not the root's. Before the
   // fix every step inherited the root metricBase (gpt-4o), so the claude point below would not exist.
   const openaiDur = durations.find((m) => m.attributes["gen_ai.request.model"] === "gpt-4o");
+
   const claudeDur = durations.find(
     (m) => m.attributes["gen_ai.request.model"] === "claude-3-5-sonnet",
   );
+
   if (!openaiDur || !claudeDur) throw new Error("missing per-model duration metric");
   expect(openaiDur.attributes["gen_ai.provider.name"]).toBe("openai");
   expect(openaiDur.attributes["gen_ai.response.model"]).toBe("gpt-4o-2024-11-20");
@@ -764,13 +813,17 @@ test("step metrics attribute tokens and duration to each step's own model, not t
 
   // Tokens line up with their owning model too (20 in belongs to claude, 5 out to openai).
   const tokens = metrics.filter((m) => m.metric === "tokens");
+
   const claudeInput = tokens.find(
     (m) => m.tokenType === "input" && m.attributes["gen_ai.request.model"] === "claude-3-5-sonnet",
   );
+
   expect(claudeInput?.value).toBe(20);
+
   const openaiOutput = tokens.find(
     (m) => m.tokenType === "output" && m.attributes["gen_ai.request.model"] === "gpt-4o",
   );
+
   expect(openaiOutput?.value).toBe(5);
 });
 
@@ -778,10 +831,12 @@ test("metrics use each emitter's own transport (no cross-talk on a shared cached
   const metricCalls: string[] = [];
   const aErrors: unknown[] = [];
   const bErrors: unknown[] = [];
+
   const makeFetch =
     (tag: string): typeof fetch =>
     async (url: string | Request | URL, _init?: RequestInit) => {
-      if (String(url).endsWith("/v1/metrics")) metricCalls.push(tag);
+      if (requestUrl(url).endsWith("/v1/metrics")) metricCalls.push(tag);
+
       return new Response(null, { status: 200 });
     };
 
@@ -793,6 +848,7 @@ test("metrics use each emitter's own transport (no cross-talk on a shared cached
     fetch: makeFetch("A"),
     onError: (e) => aErrors.push(e),
   });
+
   // Second emitter reuses that cached core but supplies fetch B.
   telemetryDev({
     apiKey: "td_live_dupm",
@@ -825,15 +881,18 @@ test("metrics use each emitter's own transport (no cross-talk on a shared cached
 test("metric export retries a transient ingest failure", async () => {
   const errors: unknown[] = [];
   let metricCalls = 0;
+
   const integ = telemetryDev({
     apiKey: "td_live_metric_retry",
     environment: "test",
     serviceName: "metric-retry",
     fetch: async (url: string | Request | URL, _init?: RequestInit) => {
-      if (String(url).endsWith("/v1/metrics")) {
+      if (requestUrl(url).endsWith("/v1/metrics")) {
         metricCalls += 1;
+
         return new Response(null, { status: metricCalls === 1 ? 503 : 200 });
       }
+
       return new Response(null, { status: 200 });
     },
     onError: (e) => errors.push(e),
@@ -862,15 +921,17 @@ test("a non-OK /v1/metrics response is reported as a failed export, not a succes
   // Capture OTel's global error handler: the metric reader only routes here when the export result
   // is FAILED (code 1). A success (code 0) report — the pre-fix behavior — never reaches it.
   setGlobalErrorHandler((e) => exportErrors.push(e));
+
   try {
     const integ = telemetryDev({
       apiKey: "td_live_metricfail",
       environment: "test",
       serviceName: "metricfail",
       fetch: async (url: string | Request | URL, _init?: RequestInit) => {
-        if (String(url).endsWith("/v1/metrics")) metricCalls += 1;
+        if (requestUrl(url).endsWith("/v1/metrics")) metricCalls += 1;
+
         return new Response(null, {
-          status: String(url).endsWith("/v1/metrics") ? 503 : 200,
+          status: requestUrl(url).endsWith("/v1/metrics") ? 503 : 200,
         });
       },
       onError: (e) => errors.push(e),
@@ -905,6 +966,7 @@ test("a non-OK /v1/metrics response is reported as a failed export, not a succes
 
 test("each step span records its own per-step input messages, not the root input", async () => {
   const { spanBatches, overrides } = makeCapture();
+
   const integ = telemetryDev(
     { apiKey: "td_live_test", environment: "test", serviceName: "svc" },
     overrides,
@@ -912,6 +974,7 @@ test("each step span records its own per-step input messages, not the root input
 
   const toolCall = { toolCallId: "call_1", toolName: "getWeather", input: { city: "SF" } };
   const step0Messages = [{ role: "user", content: "weather in SF?" }];
+
   // The tool loop appends the assistant tool-call and the tool result before the next step runs, so
   // step 1's request differs from both step 0 and the root input.
   const step1Messages = [
@@ -966,6 +1029,7 @@ test("each step span records its own per-step input messages, not the root input
 
 test("a step finishing without onStepStart omits input messages", async () => {
   const { spanBatches, overrides } = makeCapture();
+
   const integ = telemetryDev(
     { apiKey: "td_live_test", environment: "test", serviceName: "svc" },
     overrides,
@@ -989,10 +1053,12 @@ test("a step finishing without onStepStart omits input messages", async () => {
 
 test("calls that share a sessionId share one trace under the session parent", async () => {
   const { spanBatches, overrides } = makeCapture();
+
   const integ = telemetryDev(
     { apiKey: "td_live_test", environment: "test", serviceName: "svc" },
     overrides,
   );
+
   const run = async (sessionId?: string) => {
     integ.onStart?.({ model, prompt: "hi", metadata: sessionId ? { sessionId } : undefined });
     integ.onStepStart?.({ stepNumber: 0, model });
@@ -1006,17 +1072,21 @@ test("calls that share a sessionId share one trace under the session parent", as
     });
     await integ.onFinish?.({ text: "ok", finishReason: "stop" });
   };
+
   await run("s1");
   await run("s1");
   await run();
 
   const session = sessionSpanContext("td_live_test", "s1");
   const [batch1, batch2, batch3] = spanBatches;
+
   for (const s of [...batch1!, ...batch2!]) expect(s.spanContext().traceId).toBe(session.traceId);
+
   for (const batch of [batch1!, batch2!]) {
     const root = batch.find((s) => s.kind === SpanKind.INTERNAL)!;
     expect(root.parentSpanContext?.spanId).toBe(session.spanId);
   }
+
   expect(batch3![0]!.spanContext().traceId).not.toBe(session.traceId);
 });
 
@@ -1027,10 +1097,12 @@ test("v6 exports session spans only when the configured sampler selects them", a
     new TraceIdRatioBasedSampler(0.5),
     { shouldSample: () => ({ decision: SamplingDecision.RECORD }), toString: () => "RecordOnly" },
   ];
+
   for (const root of roots) {
     const sampler = new ParentBasedSampler({ root });
     const { spanBatches, overrides } = makeCapture();
     const errors: unknown[] = [];
+
     const integ = telemetryDev(
       {
         apiKey: "td_live_test",
@@ -1040,10 +1112,13 @@ test("v6 exports session spans only when the configured sampler selects them", a
       },
       overrides,
     );
+
     const expected: string[] = [];
+
     for (let i = 0; i < 20; i++) {
       const sessionId = `session-${i}`;
       const id = sessionSpanContext("td_live_test", sessionId).traceId;
+
       if (
         sampler.shouldSample(ROOT_CONTEXT, id, "chat", SpanKind.INTERNAL, {}, []).decision ===
         SamplingDecision.RECORD_AND_SAMPLED
@@ -1060,6 +1135,7 @@ test("v6 exports session spans only when the configured sampler selects them", a
       });
       await integ.onFinish?.({ text: "ok", finishReason: "stop" });
     }
+
     expect(spanBatches.flat().map(traceId)).toEqual(expected);
     expect(errors).toEqual([]);
   }

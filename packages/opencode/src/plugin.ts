@@ -58,14 +58,17 @@ type PendingTool = {
 
 function stringField(record: JsonObject | undefined, key: string): string | undefined {
   const value = record?.[key];
+
   if (value instanceof Object) return undefined;
   const parsed = String(value);
+
   return parsed === value && parsed.length > 0 ? parsed : undefined;
 }
 
 function numberField(record: JsonObject | undefined, key: string): number | undefined {
   const value = record?.[key];
   const parsed = Number(value);
+
   return parsed === value && Number.isFinite(parsed) ? parsed : undefined;
 }
 
@@ -80,13 +83,17 @@ function reportError(onError: ((cause: Error) => void) | undefined, cause: unkno
 function textParts<T>(parts: T): string | undefined {
   if (!Array.isArray(parts)) return undefined;
   const text: string[] = [];
+
   for (const part of parts) {
     const record = asJsonObject(part);
+
     if (stringField(record, "type") === "text") {
       const value = stringField(record, "text");
+
       if (value !== undefined) text.push(value);
     }
   }
+
   return text.length > 0 ? text.join("\n") : undefined;
 }
 
@@ -94,6 +101,7 @@ function textParts<T>(parts: T): string | undefined {
 function failureError(name: string, message: string | undefined): Error {
   const error = new Error(message ?? name);
   error.name = name;
+
   return error;
 }
 
@@ -121,6 +129,7 @@ function messageError(message: JsonObject): Error | undefined {
   if (message.error === undefined || message.error === null) return undefined;
   const error = asJsonObject(message.error);
   const data = asJsonObject(error?.data);
+
   return failureError(
     stringField(error, "name") ?? "AssistantMessageError",
     stringField(data, "message"),
@@ -140,11 +149,14 @@ export function telemetryDevPlugin(
       ...options,
       ...configuredOptions,
     };
+
     const { agentName: configuredAgentName, ...sdkOptions } = mergedOptions;
+
     const agentName =
       String(configuredAgentName) === configuredAgentName && configuredAgentName.length > 0
         ? configuredAgentName
         : "opencode";
+
     const onError = sdkOptions.onError;
 
     try {
@@ -196,6 +208,7 @@ export function telemetryDevPlugin(
         open.span.end({ error, finishReason: error ? undefined : "incomplete" });
         openChats.delete(messageID);
       }
+
       chatBySession.delete(sessionID);
     }
 
@@ -208,6 +221,7 @@ export function telemetryDevPlugin(
       for (const [key, pending] of pendingTools) {
         if (pending.sessionID !== sessionID) continue;
         pendingTools.delete(key);
+
         const span = startSpan(`execute_tool ${pending.tool}`, {
           type: "tool",
           parent: chatBySession.get(sessionID) ?? agentSpans.get(sessionID),
@@ -217,6 +231,7 @@ export function telemetryDevPlugin(
           input: pending.args,
           attributes: conversationAttributes(sessionID),
         });
+
         span.end({ error });
       }
     }
@@ -227,14 +242,17 @@ export function telemetryDevPlugin(
         toolCallByPart.delete(sessionID);
         const error = pendingErrors.get(sessionID);
         pendingErrors.delete(sessionID);
+
         if (error) endPendingTools(sessionID, error);
         endOpenChats(sessionID, error);
         const span = agentSpans.get(sessionID);
+
         if (span) {
           span.end({ error });
           agentSpans.delete(sessionID);
         }
       }
+
       void flush().catch((error) => reportError(onError, error));
     }
 
@@ -243,10 +261,13 @@ export function telemetryDevPlugin(
         try {
           if (agentSpans.has(input.sessionID)) return;
           const parentID = parentSession.get(input.sessionID);
+
           const parent = parentID
             ? (chatBySession.get(parentID) ?? agentSpans.get(parentID))
             : undefined;
+
           const attributes: Record<string, string> = conversationAttributes(input.sessionID);
+
           if (input.agent) attributes["opencode.agent"] = input.agent;
           agentSpans.set(
             input.sessionID,
@@ -277,6 +298,7 @@ export function telemetryDevPlugin(
               const messageID = stringField(info, "id");
               const sessionID = stringField(info, "sessionID");
               const model = stringField(info, "modelID");
+
               if (
                 stringField(info, "role") !== "assistant" ||
                 messageID === undefined ||
@@ -289,6 +311,7 @@ export function telemetryDevPlugin(
 
               // Open the chat span on first sight so tool spans can nest under it.
               let open = openChats.get(messageID);
+
               if (!open) {
                 open = {
                   span: startSpan(`chat ${model}`, {
@@ -304,10 +327,12 @@ export function telemetryDevPlugin(
                 openChats.set(messageID, open);
                 chatBySession.set(sessionID, open.span);
               }
+
               if (completed === undefined) return;
 
               completedMessages.add(messageID);
               openChats.delete(messageID);
+
               if (chatBySession.get(sessionID) === open.span) chatBySession.delete(sessionID);
               open.span.end({
                 endTime: completed,
@@ -317,11 +342,13 @@ export function telemetryDevPlugin(
                 usage: usageFields(info ?? {}),
                 error: messageError(info ?? {}),
               });
+
               return;
             }
 
             case "message.part.updated": {
               const part = asJsonObject(properties?.part);
+
               if (stringField(part, "type") !== "tool") return;
               const state = asJsonObject(part?.state);
               const status = stringField(state, "status");
@@ -329,6 +356,7 @@ export function telemetryDevPlugin(
               const callID = stringField(part, "callID");
               const partID = stringField(part, "id");
               const tool = stringField(part, "tool");
+
               if (!sessionID || !callID || !tool) return;
 
               if (status === "running") {
@@ -336,8 +364,10 @@ export function telemetryDevPlugin(
                 const calls = toolCallByPart.get(sessionID) ?? new Map<string, string>();
                 calls.set(partID, callID);
                 toolCallByPart.set(sessionID, calls);
+
                 return;
               }
+
               if (status !== "error") return;
 
               // The synthetic Task path keys its hook calls by part id, not by
@@ -345,11 +375,14 @@ export function telemetryDevPlugin(
               const callKey = `${sessionID}:${callID}` as const;
               const partKey = `${sessionID}:${partID}` as const;
               const pending = pendingTools.get(callKey) ?? pendingTools.get(partKey);
+
               if (!pending) return;
               pendingTools.delete(callKey);
               pendingTools.delete(partKey);
+
               if (partID) toolCallByPart.get(sessionID)?.delete(partID);
               const timing = asJsonObject(state?.time);
+
               const span = startSpan(`execute_tool ${tool}`, {
                 type: "tool",
                 parent: chatBySession.get(sessionID) ?? agentSpans.get(sessionID),
@@ -359,6 +392,7 @@ export function telemetryDevPlugin(
                 input: state?.input,
                 attributes: conversationAttributes(sessionID),
               });
+
               span.end({
                 endTime: numberField(timing, "end"),
                 error: failureError(
@@ -366,11 +400,13 @@ export function telemetryDevPlugin(
                   stringField(state, "error") ?? "tool execution failed",
                 ),
               });
+
               return;
             }
 
             case "session.idle": {
               settleSession(stringField(properties, "sessionID"));
+
               return;
             }
 
@@ -381,6 +417,7 @@ export function telemetryDevPlugin(
               if (stringField(asJsonObject(properties?.status), "type") === "idle") {
                 settleSession(stringField(properties, "sessionID"));
               }
+
               return;
             }
 
@@ -391,13 +428,16 @@ export function telemetryDevPlugin(
               const errorName = stringField(hostError, "name") ?? "SessionError";
               const errorMessage = stringField(errorData, "message");
               const attributes = { "opencode.error.name": errorName };
+
               if (errorMessage)
                 Object.assign(attributes, { "opencode.error.message": errorMessage });
               emit("session.error", sessionID, "error", "Session error", attributes);
+
               // Not always terminal: a context overflow publishes this event,
               // then compacts and continues the same prompt. Record the error
               // and apply it when the session settles.
               if (sessionID) pendingErrors.set(sessionID, failureError(errorName, errorMessage));
+
               return;
             }
 
@@ -406,20 +446,26 @@ export function telemetryDevPlugin(
               const sessionID = stringField(info, "id");
               const parentID = stringField(info, "parentID");
               const attributes: Attrs = {};
+
               if (parentID) {
                 attributes["opencode.session.parent_id"] = parentID;
+
                 if (sessionID) parentSession.set(sessionID, parentID);
               }
+
               emit("session.created", sessionID, "info", "Session created", attributes);
+
               return;
             }
 
             case "session.compacted": {
               const sessionID = stringField(properties, "sessionID");
+
               // Compaction after a context-overflow session.error means the
               // host recovered and the prompt continues; drop the stale error.
               if (sessionID) pendingErrors.delete(sessionID);
               emit("session.compacted", sessionID, "info", "Session compacted");
+
               return;
             }
           }
@@ -453,6 +499,7 @@ export function telemetryDevPlugin(
           pendingTools.delete(key);
           const mappedCallID = toolCallByPart.get(input.sessionID)?.get(input.callID);
           toolCallByPart.get(input.sessionID)?.delete(input.callID);
+
           const span = startSpan(`execute_tool ${input.tool}`, {
             type: "tool",
             parent: chatBySession.get(input.sessionID) ?? agentSpans.get(input.sessionID),
@@ -467,6 +514,7 @@ export function telemetryDevPlugin(
             },
             attributes: conversationAttributes(input.sessionID),
           });
+
           span.end();
         } catch (error) {
           reportError(onError, error);
@@ -478,16 +526,20 @@ export function telemetryDevPlugin(
           // Disposal is not gated on session idle; apply each session's
           // deferred session.error instead of ending spans as merely incomplete.
           for (const [sessionID, error] of pendingErrors) endPendingTools(sessionID, error);
+
           for (const [messageID, open] of openChats) {
             const error = pendingErrors.get(open.sessionID);
             open.span.end({ error, finishReason: error ? undefined : "incomplete" });
             openChats.delete(messageID);
           }
+
           chatBySession.clear();
+
           for (const [sessionID, span] of agentSpans) {
             const error = pendingErrors.get(sessionID);
             span.end({ error, finishReason: error ? undefined : "incomplete" });
           }
+
           agentSpans.clear();
           parentSession.clear();
           pendingTools.clear();

@@ -27,10 +27,13 @@ afterEach(async () => {
 
 test("stamps user.id, gen_ai.conversation.id, and td.metadata.* on every span in scope", async () => {
   const { spans } = setup();
+
   const traced = observe(function worker() {
     startSpan("manual-in-scope").end();
+
     return "ok";
   });
+
   propagateAttributes(
     { userId: "u_1", sessionId: "conv_9", metadata: { plan: "pro", flags: { beta: true } } },
     () => {
@@ -42,6 +45,7 @@ test("stamps user.id, gen_ai.conversation.id, and td.metadata.* on every span in
   await flush();
   const exported = spans.getFinishedSpans();
   expect(exported).toHaveLength(3);
+
   for (const span of exported) {
     expect(span.attributes["user.id"]).toBe("u_1");
     expect(span.attributes["gen_ai.conversation.id"]).toBe("conv_9");
@@ -155,6 +159,7 @@ test("root spans of one session share the deterministic session trace", async ()
   await flush();
   const exported = spans.getFinishedSpans();
   expect(exported).toHaveLength(3);
+
   for (const span of exported) {
     expect(span.spanContext().traceId).toBe(session.traceId);
     expect(span.parentSpanContext?.spanId).toBe(session.spanId);
@@ -201,12 +206,15 @@ test("session roots obey configured root sampling and retain deterministic trace
     const sampler = new ParentBasedSampler({ root });
     const { spans } = setup({ sampler });
     const expected: string[] = [];
+
     for (let i = 0; i < 20; i++) {
       const sessionId = `session-${i}`;
       const traceId = sessionSpanContext("td_live_test", sessionId).traceId;
+
       const sampled =
         sampler.shouldSample(ROOT_CONTEXT, traceId, "turn", SpanKind.INTERNAL, {}, []).decision ===
         SamplingDecision.RECORD_AND_SAMPLED;
+
       propagateAttributes({ sessionId }, () => {
         startActiveSpan("turn", (span) => {
           expect(span.isRecording).toBe(sampled);
@@ -217,8 +225,10 @@ test("session roots obey configured root sampling and retain deterministic trace
           child.end();
         });
       });
+
       if (sampled) expected.push(traceId, traceId);
     }
+
     await flush();
     expect(spans.getFinishedSpans().map((span) => span.spanContext().traceId)).toEqual(expected);
     await shutdown();
@@ -227,12 +237,14 @@ test("session roots obey configured root sampling and retain deterministic trace
 
 test("an unsampled explicit parent stays active for children inside a session", async () => {
   const { spans } = setup({ sampler: new ParentBasedSampler({ root: new AlwaysOnSampler() }) });
+
   const parent = {
     traceId: "12345678901234567890123456789012",
     spanId: "1234567890123456",
     traceFlags: TraceFlags.NONE,
     isRemote: true,
   };
+
   propagateAttributes({ sessionId: "s1" }, () => {
     startActiveSpan("turn", { parent }, (span) => {
       expect(span.isRecording).toBe(false);
@@ -254,6 +266,7 @@ test.each([
   "root sampling sees safe initial attributes ($sessionId, capture $captureInput)",
   async ({ sessionId, captureInput }) => {
     let masked = 0;
+
     const { spans } = setup({
       captureInput: false,
       captureOutput: false,
@@ -270,6 +283,7 @@ test.each([
               attributes["gen_ai.conversation.id"] === sessionId &&
               attributes["gen_ai.input.messages"] === (captureInput ? "masked-1" : undefined) &&
               attributes["gen_ai.output.messages"] === undefined;
+
             return {
               decision: accepted
                 ? SamplingDecision.RECORD_AND_SAMPLED
@@ -280,6 +294,7 @@ test.each([
         },
       }),
     });
+
     propagateAttributes(
       { userId: "inherited-user", sessionId, metadata: { plan: "inherited-plan" } },
       () => {

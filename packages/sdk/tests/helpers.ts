@@ -18,6 +18,7 @@ export interface Setup {
 export function setup(options?: TelemetryOptions, overrides?: ClientOverrides): Setup {
   const spans = new InMemorySpanExporter();
   const logs = new InMemoryLogRecordExporter();
+
   const client = init(
     {
       apiKey: "td_live_test",
@@ -30,11 +31,13 @@ export function setup(options?: TelemetryOptions, overrides?: ClientOverrides): 
     },
     { spanExporter: spans, logRecordExporter: logs, ...overrides },
   );
+
   return { client, spans, logs };
 }
 
 export function makeMetricCapture() {
   const batches: ResourceMetrics[] = [];
+
   const exporter: PushMetricExporter = {
     export: (resourceMetrics, resultCallback) => {
       batches.push(resourceMetrics);
@@ -44,5 +47,6 @@ export function makeMetricCapture() {
     forceFlush: () => Promise.resolve(),
     shutdown: () => Promise.resolve(),
   };
+
   return { batches, exporter };
 }

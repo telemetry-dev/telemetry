@@ -11,16 +11,22 @@ import type { AsyncLocalStorage } from "node:async_hooks";
 import { startSpan, type SpanFields, type SpanHandle } from "@telemetry-dev/sdk";
 
 type AttributeValue = NonNullable<SpanFields["attributes"]>[string];
+
 type AlsConstructor = new <T>() => AsyncLocalStorage<T>;
+
 type AsyncHooksModule = { AsyncLocalStorage?: AlsConstructor };
 
 function loadAls(): AlsConstructor | undefined {
   const globals = globalThis as { AsyncLocalStorage?: AlsConstructor };
+
   if (globals.AsyncLocalStorage) return globals.AsyncLocalStorage;
   const proc = globalThis.process as { getBuiltinModule?: (id: string) => unknown } | undefined;
+
   if (typeof proc?.getBuiltinModule !== "function") return undefined;
+
   try {
     const mod = proc.getBuiltinModule("node:async_hooks") as AsyncHooksModule | undefined;
+
     return mod?.AsyncLocalStorage;
   } catch {
     return undefined;
@@ -32,16 +38,20 @@ const ORIGINAL = Symbol("telemetry.dev.google-genai.original");
 const wrappedClients = new WeakSet<object>();
 const usageCollectorModels = new WeakSet<object>();
 const AlsCtor = loadAls();
+
 const afcUsageStore = AlsCtor
   ? new AlsCtor<{ usage?: SpanFields["usage"]; toolUsePromptTokens?: number }>()
   : undefined;
-
-type UnknownRecord = Record<string, unknown>;
 
 type WrappedFunction = ((...args: unknown[]) => unknown) & {
   [WRAPPED]?: true;
   [ORIGINAL]?: (...args: unknown[]) => unknown;
 };
+
+interface UnknownRecord {
+  // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- Google returns versioned external payloads; every consumed field is narrowed after this boundary.
+  [key: string]: unknown;
+}
 
 interface RequestMapping {
   name: string;
@@ -85,11 +95,13 @@ function readNumber(value: unknown): number | undefined {
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {
   if (value === null || typeof value !== "object" || !("then" in value)) return false;
+
   return typeof value.then === "function";
 }
 
 function compactUsage(usage: SpanFields["usage"]): SpanFields["usage"] {
   if (!usage) return undefined;
+
   return Object.values(usage).some((value) => value !== undefined) ? usage : undefined;
 }
 
@@ -107,19 +119,23 @@ function setJsonAttribute(
   value: unknown,
 ): void {
   const serialized = jsonStringify(value);
+
   if (serialized !== undefined) attributes[key] = serialized;
 }
 
 function stopSequences(value: unknown): string[] | undefined {
   const arr = asArray(value);
+
   if (!arr) return undefined;
   const strings = arr.filter((item): item is string => typeof item === "string");
+
   return strings.length > 0 ? strings : undefined;
 }
 
 function outputTypeFromConfig(config: UnknownRecord | undefined): string | undefined {
   if (!config) return undefined;
   const mime = readString(config.responseMimeType);
+
   if (
     mime === "application/json" ||
     config.responseSchema !== undefined ||
@@ -127,60 +143,84 @@ function outputTypeFromConfig(config: UnknownRecord | undefined): string | undef
   ) {
     return "json";
   }
+
   if (mime === "text/plain") return "text";
+
   return undefined;
 }
 
 function mapToolDefinitions(tools: unknown): unknown[] | undefined {
   const toolArray = asArray(tools);
+
   if (!toolArray) return undefined;
   const definitions: unknown[] = [];
+
   for (const tool of toolArray) {
     const record = asRecord(tool);
+
     if (!record) continue;
+
     if (typeof record.callTool === "function") {
       const name = readString(record.name);
+
       if (name) definitions.push({ type: "function", name });
       continue;
     }
+
     for (const declaration of asArray(record.functionDeclarations) ?? []) {
       const fn = asRecord(declaration);
+
       if (!fn) continue;
       const definition = { type: "function", name: fn.name };
+
       if (fn.description !== undefined) Object.assign(definition, { description: fn.description });
+
       if (fn.parameters !== undefined) Object.assign(definition, { parameters: fn.parameters });
       definitions.push(definition);
     }
+
     for (const key of BUILTIN_TOOL_KEYS) {
       if (record[key] !== undefined) definitions.push({ type: key });
     }
   }
+
   return definitions.length > 0 ? definitions : undefined;
 }
 
 function requestAttributesFromConfig(config: UnknownRecord | undefined) {
   const attributes: Record<string, AttributeValue> = {};
+
   if (!config) return attributes;
   const toolDefs = mapToolDefinitions(config.tools);
+
   if (toolDefs) {
     const serialized = jsonStringify(toolDefs);
+
     if (serialized !== undefined) attributes["gen_ai.tool.definitions"] = serialized;
   }
+
   const candidateCount = readNumber(config.candidateCount);
+
   if (candidateCount !== undefined) attributes["gen_ai.request.choice.count"] = candidateCount;
+
   if (config.toolConfig !== undefined)
     setJsonAttribute(attributes, "google_genai.request.tool_config", config.toolConfig);
+
   if (config.safetySettings !== undefined) {
     setJsonAttribute(attributes, "google_genai.request.safety_settings", config.safetySettings);
   }
+
   if (config.thinkingConfig !== undefined) {
     setJsonAttribute(attributes, "google_genai.request.thinking_config", config.thinkingConfig);
   }
+
   if (config.labels !== undefined)
     setJsonAttribute(attributes, "google_genai.request.labels", config.labels);
   const cachedContent = readString(config.cachedContent);
+
   if (cachedContent !== undefined)
     attributes["google_genai.request.cached_content"] = cachedContent;
+
   if (config.responseModalities !== undefined) {
     setJsonAttribute(
       attributes,
@@ -188,12 +228,15 @@ function requestAttributesFromConfig(config: UnknownRecord | undefined) {
       config.responseModalities,
     );
   }
+
   return attributes;
 }
 
 function usageFromMetadata(usage: unknown): SpanFields["usage"] {
   const metadata = asRecord(usage);
+
   if (!metadata) return undefined;
+
   return compactUsage({
     inputTokens: readNumber(metadata.promptTokenCount),
     outputTokens: readNumber(metadata.candidatesTokenCount),
@@ -205,18 +248,23 @@ function usageFromMetadata(usage: unknown): SpanFields["usage"] {
 
 function candidateOutput(response: UnknownRecord): unknown[] | undefined {
   const candidates = asArray(response.candidates);
+
   if (!candidates || candidates.length === 0) return undefined;
+
   const output = candidates
     .map((candidate) => {
       const record = asRecord(candidate);
       const content = asRecord(record?.content);
+
       if (!content) return undefined;
+
       return {
         role: readString(content.role) ?? "model",
         parts: asArray(content.parts) ?? [],
       };
     })
     .filter((entry) => entry !== undefined);
+
   return output.length > 0 ? output : undefined;
 }
 
@@ -225,11 +273,14 @@ function responseAttributes(response: UnknownRecord) {
   const candidates = asArray(response.candidates) ?? [];
   const promptFeedback = asRecord(response.promptFeedback);
   const blockReason = readString(promptFeedback?.blockReason);
+
   if (blockReason) attributes["google_genai.response.block_reason"] = blockReason;
   const blockReasonMessage = readString(promptFeedback?.blockReasonMessage);
+
   if (blockReasonMessage)
     attributes["google_genai.response.block_reason_message"] = blockReasonMessage;
   const promptSafetyRatings = asArray(promptFeedback?.safetyRatings);
+
   if (promptSafetyRatings && promptSafetyRatings.length > 0) {
     setJsonAttribute(
       attributes,
@@ -241,10 +292,12 @@ function responseAttributes(response: UnknownRecord) {
   const finishReasons = candidates
     .map((candidate) => readString(asRecord(candidate)?.finishReason))
     .filter((reason): reason is string => reason !== undefined);
+
   if (finishReasons.length > 1) attributes["gen_ai.response.finish_reasons"] = finishReasons;
 
   const usageMetadata = asRecord(response.usageMetadata);
   const toolUsePromptTokens = readNumber(usageMetadata?.toolUsePromptTokenCount);
+
   if (toolUsePromptTokens !== undefined) {
     attributes["google_genai.usage.tool_use_prompt_tokens"] = toolUsePromptTokens;
   }
@@ -253,15 +306,19 @@ function responseAttributes(response: UnknownRecord) {
     .map((candidate, index) => {
       const record = asRecord(candidate);
       const ratings = asArray(record?.safetyRatings);
+
       if (!ratings || ratings.length === 0) return undefined;
+
       return { candidateIndex: readNumber(record?.index) ?? index, ratings };
     })
     .filter((entry) => entry !== undefined);
+
   if (safetyEntries.length > 0) {
     setJsonAttribute(attributes, "google_genai.response.safety_ratings", safetyEntries);
   }
 
   const firstCandidate = asRecord(candidates[0]);
+
   if (firstCandidate?.groundingMetadata !== undefined) {
     setJsonAttribute(
       attributes,
@@ -269,6 +326,7 @@ function responseAttributes(response: UnknownRecord) {
       firstCandidate.groundingMetadata,
     );
   }
+
   if (firstCandidate?.urlContextMetadata !== undefined) {
     setJsonAttribute(
       attributes,
@@ -278,6 +336,7 @@ function responseAttributes(response: UnknownRecord) {
   }
 
   const afcHistory = asArray(response.automaticFunctionCallingHistory);
+
   if (afcHistory && afcHistory.length > 0)
     attributes["google_genai.automatic_function_calling"] = true;
 
@@ -288,6 +347,7 @@ function generateRequestFields(params: UnknownRecord): RequestMapping {
   const model = readString(params.model);
   const config = asRecord(params.config);
   const attributes = requestAttributesFromConfig(config);
+
   const fields: RequestMapping["fields"] = {
     type: "generation",
     model,
@@ -303,18 +363,23 @@ function generateRequestFields(params: UnknownRecord): RequestMapping {
     presencePenalty: readNumber(config?.presencePenalty),
     outputType: outputTypeFromConfig(config),
   };
+
   if (Object.keys(attributes).length > 0) fields.attributes = attributes;
+
   return { name: `chat ${model ?? "unknown"}`, fields };
 }
 
 function generateResponseFields(response: unknown): SpanFields {
   const record = asRecord(response) ?? {};
   const candidates = asArray(record.candidates) ?? [];
+
   const finishReasons = candidates
     .map((candidate) => readString(asRecord(candidate)?.finishReason))
     .filter((reason): reason is string => reason !== undefined);
+
   const attributes = responseAttributes(record);
   const afcHistory = asArray(record.automaticFunctionCallingHistory);
+
   const fields: SpanFields = {
     responseModel: readString(record.modelVersion),
     responseId: readString(record.responseId),
@@ -322,12 +387,16 @@ function generateResponseFields(response: unknown): SpanFields {
     output: candidateOutput(record),
     usage: usageFromMetadata(record.usageMetadata),
   };
+
   if (Object.keys(attributes).length > 0) fields.attributes = attributes;
+
   if (afcHistory && afcHistory.length > 0) fields.input = afcHistory;
+
   if (readString(asRecord(record.promptFeedback)?.blockReason)) {
     delete fields.output;
     delete fields.finishReason;
   }
+
   return fields;
 }
 
@@ -336,13 +405,18 @@ function embedRequestFields(params: UnknownRecord): RequestMapping {
   const config = asRecord(params.config);
   const attributes: Record<string, AttributeValue> = {};
   const taskType = readString(config?.taskType);
+
   if (taskType) attributes["google_genai.request.task_type"] = taskType;
   const outputDimensionality = readNumber(config?.outputDimensionality);
+
   if (outputDimensionality !== undefined) {
     attributes["google_genai.request.output_dimensionality"] = outputDimensionality;
   }
+
   const fields: RequestMapping["fields"] = { type: "embedding", model, input: params.contents };
+
   if (Object.keys(attributes).length > 0) fields.attributes = attributes;
+
   return { name: `embeddings ${model ?? "unknown"}`, fields };
 }
 
@@ -350,30 +424,39 @@ function embedResponseFields(response: unknown): SpanFields {
   const record = asRecord(response) ?? {};
   const embeddings = asArray(record.embeddings) ?? [];
   const attributes: Record<string, AttributeValue> = {};
+
   if (embeddings.length > 0)
     attributes["google_genai.response.embedding_count"] = embeddings.length;
   const firstValues = asArray(asRecord(embeddings[0])?.values);
+
   if (firstValues) attributes["google_genai.response.embedding_dimensions"] = firstValues.length;
   let inputTokens = 0;
   let sawTokens = false;
+
   for (const embedding of embeddings) {
     const tokenCount = readNumber(asRecord(asRecord(embedding)?.statistics)?.tokenCount);
+
     if (tokenCount !== undefined) {
       sawTokens = true;
       inputTokens += tokenCount;
     }
   }
+
   const metadata = asRecord(record.metadata);
   const billableCharacters = readNumber(metadata?.billableCharacterCount);
+
   if (billableCharacters !== undefined) {
     attributes["google_genai.usage.billable_characters"] = billableCharacters;
   }
+
   const fields: SpanFields = { usage: sawTokens ? compactUsage({ inputTokens }) : undefined };
+
   if (Object.keys(attributes).length > 0) fields.attributes = attributes;
+
   return fields;
 }
 
-function isWrapped(fn: unknown): fn is WrappedFunction {
+function isWrapped<T>(fn: T): fn is T & WrappedFunction {
   return typeof fn === "function" && (fn as WrappedFunction)[WRAPPED] === true;
 }
 
@@ -383,11 +466,13 @@ function markWrapped<T extends WrappedFunction>(
 ): T {
   Object.defineProperty(fn, WRAPPED, { value: true });
   Object.defineProperty(fn, ORIGINAL, { value: original });
+
   return fn;
 }
 
 function endOnce(span: SpanHandle): (fields?: SpanFields) => void {
   let ended = false;
+
   return (fields?: SpanFields) => {
     if (ended) return;
     ended = true;
@@ -409,11 +494,13 @@ function safeRequestMapping(
     return mapRequest(params);
   } catch {
     let model: string | undefined;
+
     try {
       model = readString(params.model);
     } catch {
       model = undefined;
     }
+
     return {
       name: `${fallback.namePrefix} ${model ?? "unknown"}`,
       fields: { type: fallback.type, model },
@@ -436,8 +523,10 @@ function shouldAggregateAfcUsage(params: UnknownRecord): boolean {
   try {
     const config = asRecord(params.config);
     const tools = asArray(config?.tools) ?? [];
+
     if (!tools.some((tool) => typeof asRecord(tool)?.callTool === "function")) return false;
     const automaticFunctionCalling = asRecord(config?.automaticFunctionCalling);
+
     return (
       automaticFunctionCalling?.disable !== true &&
       readNumber(automaticFunctionCalling?.maximumRemoteCalls) !== 0
@@ -450,16 +539,20 @@ function shouldAggregateAfcUsage(params: UnknownRecord): boolean {
 function installInternalUsageCollector(models: UnknownRecord | undefined): void {
   if (!models || usageCollectorModels.has(models)) return;
   const original = models.generateContentInternal;
+
   if (typeof original !== "function") return;
   models.generateContentInternal = function (this: unknown, ...args: unknown[]) {
     const result = original.apply(this, args);
+
     const recordUsage = (response: unknown) => {
       try {
         const store = afcUsageStore?.getStore();
         const usageMetadata = asRecord(response)?.usageMetadata;
+
         if (store) {
           store.usage = sumUsage(store.usage, usageFromMetadata(asRecord(usageMetadata)));
           const toolUsePromptTokens = readNumber(asRecord(usageMetadata)?.toolUsePromptTokenCount);
+
           if (toolUsePromptTokens !== undefined) {
             store.toolUsePromptTokens =
               (readNumber(store.toolUsePromptTokens) ?? 0) + toolUsePromptTokens;
@@ -468,10 +561,13 @@ function installInternalUsageCollector(models: UnknownRecord | undefined): void 
       } catch {
         // Telemetry-only AFC usage collection must fail open.
       }
+
       return response;
     };
+
     return isThenable(result) ? result.then(recordUsage) : recordUsage(result);
   };
+
   usageCollectorModels.add(models);
 }
 
@@ -484,33 +580,43 @@ function wrapUnary(
   models?: UnknownRecord,
 ): WrappedFunction {
   if (isWrapped(original)) return original;
+
   const wrapped = function (this: unknown, ...args: unknown[]) {
     const params = asRecord(args[0]) ?? {};
     const request = safeRequestMapping(params, mapRequest, fallback);
     const span = startSpan(request.name, { ...request.fields, provider });
     const end = endOnce(span);
     const usageStore = afcUsageStore;
+
     const internalUsage: { usage?: SpanFields["usage"]; toolUsePromptTokens?: number } | undefined =
       usageStore && shouldAggregateAfcUsage(params) ? {} : undefined;
+
     if (internalUsage) installInternalUsageCollector(models);
+
     const finishResponse = (response: unknown) => {
       const fields = safeResponseFields(mapResponse, response);
+
       if (internalUsage?.usage) fields.usage = internalUsage.usage;
       const toolUsePromptTokens = readNumber(internalUsage?.toolUsePromptTokens);
+
       if (toolUsePromptTokens !== undefined) {
         fields.attributes = {
           ...fields.attributes,
           "google_genai.usage.tool_use_prompt_tokens": toolUsePromptTokens,
         };
       }
+
       end(fields);
+
       return response;
     };
+
     try {
       const result =
         usageStore && internalUsage
           ? usageStore.run(internalUsage, () => original.call(this, ...args))
           : original.call(this, ...args);
+
       if (isThenable(result)) {
         return result.then(
           (response) => finishResponse(response),
@@ -520,12 +626,14 @@ function wrapUnary(
           },
         );
       }
+
       return finishResponse(result);
     } catch (error) {
       end({ error });
       throw error;
     }
   };
+
   return markWrapped(wrapped as WrappedFunction, original);
 }
 
@@ -537,6 +645,7 @@ interface CandidateAggregate {
 
 function appendPart(parts: UnknownRecord[], incoming: UnknownRecord): void {
   const last = parts[parts.length - 1];
+
   if (
     last &&
     typeof last.text === "string" &&
@@ -544,8 +653,10 @@ function appendPart(parts: UnknownRecord[], incoming: UnknownRecord): void {
     last.thought === incoming.thought
   ) {
     last.text += incoming.text;
+
     return;
   }
+
   parts.push({ ...incoming });
 }
 
@@ -554,9 +665,12 @@ function sumUsage(
   right: SpanFields["usage"] | undefined,
 ): SpanFields["usage"] {
   if (!left) return right;
+
   if (!right) return left;
+
   const add = (a: number | undefined, b: number | undefined) =>
     a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0);
+
   return compactUsage({
     inputTokens: add(left.inputTokens, right.inputTokens),
     outputTokens: add(left.outputTokens, right.outputTokens),
@@ -571,6 +685,7 @@ function copyContent(content: UnknownRecord) {
     role: readString(content.role) ?? "model",
     parts: (asArray(content.parts) ?? []).flatMap((part) => {
       const record = asRecord(part);
+
       return record ? [{ ...record }] : [];
     }),
   };
@@ -578,32 +693,40 @@ function copyContent(content: UnknownRecord) {
 
 function normalizeContentInput(input: unknown): unknown[] {
   if (input === undefined) return [];
+
   if (typeof input === "string") return [{ role: "user", parts: [{ text: input }] }];
   const items = asArray(input);
+
   if (items) {
     if (items.some((item) => readString(asRecord(item)?.role) || asArray(asRecord(item)?.parts))) {
       return [...items];
     }
+
     return [
       {
         role: "user",
         parts: items.flatMap((item) => {
           if (typeof item === "string") return [{ text: item }];
           const record = asRecord(item);
+
           return record ? [{ ...record }] : [];
         }),
       },
     ];
   }
+
   const record = asRecord(input);
+
   if (record && !readString(record.role) && !asArray(record.parts)) {
     return [{ role: "user", parts: [{ ...record }] }];
   }
+
   return [input];
 }
 
 function hasFunctionResponse(content: UnknownRecord | undefined): boolean {
   if (readString(content?.role) !== "user") return false;
+
   return (asArray(content?.parts) ?? []).some(
     (part) => asRecord(part)?.functionResponse !== undefined,
   );
@@ -638,15 +761,18 @@ class StreamAggregator {
     if (!this.afcHistory) {
       this.afcHistory = normalizeContentInput(this.requestInput);
     }
+
     return this.afcHistory;
   }
 
   private foldTurn(toAfcHistory: boolean): void {
     const output = this.currentOutput();
+
     if (output.length > 0) {
       if (toAfcHistory) this.ensureAfcHistory().push(...output);
       else this.priorOutput.push(...output);
     }
+
     this.committedUsage = sumUsage(this.committedUsage, this.usage);
     this.candidates.clear();
     this.usage = undefined;
@@ -655,41 +781,56 @@ class StreamAggregator {
   recordChunk(chunk: unknown): void {
     const record = asRecord(chunk) ?? {};
     const nextResponseId = readString(record.responseId);
+
     if (nextResponseId && this.responseId && nextResponseId !== this.responseId) {
       this.foldTurn(false);
     }
+
     if (nextResponseId) this.responseId = nextResponseId;
     const nextResponseModel = readString(record.modelVersion);
+
     if (nextResponseModel) this.responseModel = nextResponseModel;
 
     for (const candidate of asArray(record.candidates) ?? []) {
       const candidateRecord = asRecord(candidate) ?? {};
       const content = asRecord(candidateRecord.content);
+
       if (content && hasFunctionResponse(content)) {
         this.foldTurn(true);
         this.ensureAfcHistory().push(copyContent(content));
         continue;
       }
+
       const index = readNumber(candidateRecord.index) ?? 0;
       let state = this.candidates.get(index);
+
       if (!state) {
         state = { role: "model", parts: [] };
         this.candidates.set(index, state);
       }
+
       if (content) {
         const role = readString(content.role);
+
         if (role) state.role = role;
+
         for (const part of asArray(content.parts) ?? []) {
           const partRecord = asRecord(part);
+
           if (partRecord) appendPart(state.parts, partRecord);
         }
       }
+
       const finishReason = readString(candidateRecord.finishReason);
+
       if (finishReason) state.finishReason = finishReason;
     }
+
     const chunkUsage = usageFromMetadata(record.usageMetadata);
+
     if (chunkUsage) this.usage = chunkUsage;
     const afcHistory = asArray(record.automaticFunctionCallingHistory);
+
     if (afcHistory && afcHistory.length > 0) this.afcHistory = [...afcHistory];
     const chunkAttributes = responseAttributes(record);
     Object.assign(this.attributes, chunkAttributes);
@@ -700,7 +841,9 @@ class StreamAggregator {
       this.afcHistory && this.afcHistory.length > 0
         ? this.currentOutput()
         : [...this.priorOutput, ...this.currentOutput()];
+
     const finishReasons = this.finishReasons();
+
     const fields: SpanFields = {
       responseId: this.responseId,
       responseModel: this.responseModel,
@@ -708,17 +851,23 @@ class StreamAggregator {
       usage: sumUsage(this.committedUsage, this.usage),
       finishReason: finishReasons[0],
     };
+
     const attributes = { ...this.attributes };
+
     if (this.afcHistory && this.afcHistory.length > 0) {
       fields.input = this.afcHistory;
       attributes["google_genai.automatic_function_calling"] = true;
     }
+
     if (finishReasons.length > 1) attributes["gen_ai.response.finish_reasons"] = finishReasons;
+
     if (Object.keys(attributes).length > 0) fields.attributes = attributes;
+
     if (attributes["google_genai.response.block_reason"]) {
       delete fields.output;
       delete fields.finishReason;
     }
+
     return fields;
   }
 }
@@ -735,7 +884,9 @@ function createObservedStream(
   let sawFirst = false;
   let ended = false;
 
-  const recordChunk = (chunk: unknown): void => {
+  const recordChunk = (chunk: unknown, receivedAt: number): void => {
+    if (chunkHasOutput(chunk)) span.recordOutputChunk?.(receivedAt);
+
     if (!sawFirst) {
       sawFirst = true;
       const record = asRecord(chunk) ?? {};
@@ -745,6 +896,7 @@ function createObservedStream(
         responseModel: readString(record.modelVersion),
       });
     }
+
     try {
       aggregator.recordChunk(chunk);
     } catch {
@@ -756,11 +908,13 @@ function createObservedStream(
     if (ended) return;
     ended = true;
     let finalFields: SpanFields = {};
+
     try {
       finalFields = aggregator.finish();
     } catch {
       finalFields = {};
     }
+
     if (error !== undefined) finalFields.error = error;
     end(finalFields);
   };
@@ -772,8 +926,11 @@ function createObservedStream(
     async next(value?: unknown) {
       try {
         const step = await iterator.next(value);
+        const receivedAt = performance.now();
+
         if (step.done) finish();
-        else recordChunk(step.value);
+        else recordChunk(step.value, receivedAt);
+
         return step;
       } catch (error) {
         finish(error);
@@ -784,11 +941,16 @@ function createObservedStream(
       try {
         if (iterator.return) {
           const step = await iterator.return(value);
-          if (!step.done) recordChunk(step.value);
+          const receivedAt = performance.now();
+
+          if (!step.done) recordChunk(step.value, receivedAt);
           else finish();
+
           return step;
         }
+
         finish();
+
         return { done: true, value };
       } catch (error) {
         finish(error);
@@ -800,10 +962,14 @@ function createObservedStream(
         finish(error);
         throw error;
       }
+
       try {
         const step = await iterator.throw(error);
+        const receivedAt = performance.now();
+
         if (step.done) finish();
-        else recordChunk(step.value);
+        else recordChunk(step.value, receivedAt);
+
         return step;
       } catch (thrown) {
         finish(thrown);
@@ -816,6 +982,41 @@ function createObservedStream(
   };
 }
 
+function chunkHasOutput(chunk: unknown): boolean {
+  return (asArray(asRecord(chunk)?.candidates) ?? []).some((candidate) =>
+    (asArray(asRecord(asRecord(candidate)?.content)?.parts) ?? []).some((part) => {
+      const value = asRecord(part);
+      const inlineData = asRecord(value?.inlineData ?? value?.inline_data);
+      const functionCall = asRecord(value?.functionCall ?? value?.function_call);
+      const args = asRecord(functionCall?.args);
+      const partialArgs = asArray(functionCall?.partialArgs ?? functionCall?.partial_args) ?? [];
+
+      return (
+        (typeof value?.text === "string" && value.text.length > 0) ||
+        (args !== undefined && Object.keys(args).length > 0) ||
+        partialArgs.some((partialArg) => {
+          const partial = asRecord(partialArg);
+          const stringValue = partial?.stringValue ?? partial?.string_value;
+
+          return (
+            typeof partial?.boolValue === "boolean" ||
+            typeof partial?.bool_value === "boolean" ||
+            typeof partial?.numberValue === "number" ||
+            typeof partial?.number_value === "number" ||
+            (typeof stringValue === "string" && stringValue.length > 0) ||
+            partial?.nullValue === "NULL_VALUE" ||
+            partial?.null_value === "NULL_VALUE"
+          );
+        }) ||
+        (typeof inlineData?.mimeType === "string" &&
+          inlineData.mimeType.startsWith("audio/") &&
+          typeof inlineData.data === "string" &&
+          inlineData.data.length > 0)
+      );
+    }),
+  );
+}
+
 function wrapStream(
   original: (...args: unknown[]) => unknown,
   mapRequest: (params: UnknownRecord) => RequestMapping,
@@ -823,14 +1024,17 @@ function wrapStream(
   fallback: RequestFallback,
 ): WrappedFunction {
   if (isWrapped(original)) return original;
+
   const wrapped = function (this: unknown, ...args: unknown[]) {
     const params = asRecord(args[0]) ?? {};
     const request = safeRequestMapping(params, mapRequest, fallback);
     const span = startSpan(request.name, { ...request.fields, provider });
     const end = endOnce(span);
     const startedAt = Date.now();
+
     try {
       const result = original.call(this, ...args);
+
       return Promise.resolve(result).then(
         (generator) =>
           createObservedStream(
@@ -850,6 +1054,7 @@ function wrapStream(
       throw error;
     }
   };
+
   return markWrapped(wrapped as WrappedFunction, original);
 }
 
@@ -863,8 +1068,10 @@ function patchModelsMethod(
   streaming = false,
 ): void {
   const current = models[key];
+
   if (isWrapped(current) && Object.prototype.hasOwnProperty.call(models, key)) return;
   const original = isWrapped(current) ? current[ORIGINAL] : current;
+
   if (typeof original !== "function") return;
   const bound = original.bind(models) as (...args: unknown[]) => unknown;
   models[key] = streaming
@@ -905,5 +1112,6 @@ export function wrapGoogleGenAI<T extends GoogleGenAIClientLike>(client: T): T {
     type: "embedding",
   });
   wrappedClients.add(client);
+
   return client;
 }

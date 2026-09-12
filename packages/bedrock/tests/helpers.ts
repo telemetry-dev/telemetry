@@ -16,6 +16,7 @@ export function setup(): InMemorySpanExporter {
     },
     { spanExporter: spans, logRecordExporter: new InMemoryLogRecordExporter() },
   );
+
   return spans;
 }
 
@@ -25,7 +26,9 @@ export async function teardown(): Promise<void> {
 
 export function jsonAttr(span: ReadableSpan, key: string): any {
   const value = span.attributes[key];
+
   if (String(value) !== value) throw new Error(`${key} is not a string attribute`);
+
   return JSON.parse(value);
 }
 
@@ -36,19 +39,25 @@ export class FakeClient {
   async send(command: any, ..._rest: any[]): Promise<any> {
     const input =
       command && Object(command) === command && "input" in command ? command.input : undefined;
+
     this.calls.push(structuredClone(input));
     const response = this.responses.shift();
+
     if (response instanceof Error) throw response;
+
     return response;
   }
 }
 
 export async function collect<T>(iterable: AsyncIterable<T>, limit?: number): Promise<T[]> {
   const out: T[] = [];
+
   for await (const item of iterable) {
     out.push(item);
+
     if (limit !== undefined && out.length >= limit) break;
   }
+
   return out;
 }
 
@@ -65,6 +74,7 @@ export async function* streamOf(
     if (throwAt === i) throw error;
     yield events[i];
   }
+
   if (throwAt === events.length) {
     throw error;
   }

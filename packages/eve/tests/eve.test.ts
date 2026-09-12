@@ -46,6 +46,7 @@ interface Exporters extends ClientOverrides {
 function makeExporters(): Exporters {
   const spans = new InMemorySpanExporter();
   const logs = new InMemoryLogRecordExporter();
+
   return { logRecordExporter: logs, logs, spanExporter: spans, spans };
 }
 
@@ -65,6 +66,7 @@ function setupInstrumentation(
 ): InstrumentationDefinition {
   const definition = telemetryDevInstrumentation(telemetryOptions(options), overrides);
   definition.setup?.({ agentName: "agent-from-setup" });
+
   return definition;
 }
 
@@ -74,6 +76,7 @@ async function exportedServiceName(
   agentName: string,
 ): Promise<ExportedServiceName> {
   await resetForTesting();
+
   if (envServiceName === undefined) {
     delete process.env.OTEL_SERVICE_NAME;
   } else {
@@ -81,11 +84,13 @@ async function exportedServiceName(
   }
 
   const exporters = makeExporters();
+
   try {
     const definition = telemetryDevInstrumentation(telemetryOptions(options), exporters);
     definition.setup?.({ agentName });
     trace.getTracer("eve").startSpan(`service-${agentName}`).end();
     await flush();
+
     return exporters.spans.getFinishedSpans()[0]?.resource.attributes["service.name"];
   } finally {
     await resetForTesting();
@@ -97,6 +102,7 @@ function stepInput(auth?: {
   initiator?: string;
 }): InstrumentationStepStartedEventInput {
   const channel = { kind: "unit" } as never;
+
   return {
     channel,
     modelInput: { instructions: undefined, messages: [] },
@@ -158,11 +164,14 @@ function event<TType extends MessageStreamEvent["type"]>(
   ...args: EventPayload<TType> extends never ? [] : [data: EventPayload<TType>]
 ): Extract<MessageStreamEvent, { type: TType }> {
   const [data] = args;
+
   const result = {
     meta: { at: "2026-01-02T03:04:05.000Z", id: `evt_${type}` },
     type,
   };
+
   if (data !== undefined) Object.assign(result, { data });
+
   return result as Extract<MessageStreamEvent, { type: TType }>;
 }
 
@@ -189,14 +198,17 @@ function textResponse(body: string, status: number): Response {
 
 function ndjsonResponse(events: readonly MessageStreamEvent[]): Response {
   const encoder = new TextEncoder();
+
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
       for (const item of events) {
         controller.enqueue(encoder.encode(`${JSON.stringify(item)}\n`));
       }
+
       controller.close();
     },
   });
+
   return new Response(body, {
     headers: {
       "content-type": "application/x-ndjson; charset=utf-8",
@@ -208,19 +220,26 @@ function ndjsonResponse(events: readonly MessageStreamEvent[]): Response {
 
 function stubFetchSequence(responses: Response[]) {
   const requests: Array<Parameters<typeof fetch>> = [];
+
   const fetchMock = vi.fn(async (...args: Parameters<typeof fetch>) => {
     requests.push(args);
     const response = responses.shift();
+
     if (!response) throw new Error("unexpected fetch");
+
     return response;
   });
+
   vi.stubGlobal("fetch", fetchMock);
+
   return { requests };
 }
 
 function requestUrl(input: Parameters<typeof fetch>[0]): string {
   if (input instanceof URL) return input.href;
+
   if (input instanceof Request) return input.url;
+
   return String(input);
 }
 
@@ -278,23 +297,27 @@ function successfulTurnEvents(): MessageStreamEvent[] {
 function onlySpan(exporters: Exporters): ReadableSpan {
   const spans = exporters.spans.getFinishedSpans();
   expect(spans).toHaveLength(1);
+
   return spans[0]!;
 }
 
 function onlyLog(exporters: Exporters) {
   const records = exporters.logs.getFinishedLogRecords();
   expect(records).toHaveLength(1);
+
   return records[0]!;
 }
 
 afterEach(async () => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+
   if (originalOtelServiceName === undefined) {
     delete process.env.OTEL_SERVICE_NAME;
   } else {
     process.env.OTEL_SERVICE_NAME = originalOtelServiceName;
   }
+
   await resetForTesting();
 });
 
@@ -351,15 +374,18 @@ test("instrumentation puts every ai.eve.turn of a session in the session trace",
   for (const turnId of ["turn_0", "turn_1"]) {
     // eve runs each turn inside a workflow-engine span that starts its own trace.
     const engine = trace.getTracer("workflow").startSpan("workflow.execute");
+
     const turn = eve.startSpan(
       "ai.eve.turn",
       { attributes: { "eve.session.id": "session-1", "eve.turn.id": turnId } },
       trace.setSpan(apiContext.active(), engine),
     );
+
     genAi.startSpan("ai.streamText", {}, trace.setSpan(apiContext.active(), turn)).end();
     turn.end();
     engine.end();
   }
+
   await flush();
 
   // sha256("td_live_test\0session-1"): trace id = digest[0:16], session parent = digest[16:24]
@@ -370,9 +396,11 @@ test("instrumentation puts every ai.eve.turn of a session in the session trace",
     "ai.streamText",
     "ai.eve.turn",
   ]);
+
   for (const span of spans) {
     expect(span.spanContext().traceId).toBe("1382eccf84291f6161a535bdd642e06c");
   }
+
   for (const span of spans.filter((span) => span.name === "ai.eve.turn")) {
     expect(span.parentSpanContext?.spanId).toBe("da259c4698ed3d9f");
   }
@@ -419,6 +447,7 @@ test.each([
   "provider integration applies the $name filter to actual exports",
   async ({ options, httpExports, totalExports }) => {
     const requests: string[] = [];
+
     const integration = telemetryDevOtelIntegration({
       apiKey: "td_live_test",
       baseUrl: "https://ingest.test",
@@ -426,15 +455,18 @@ test.each([
       metrics: false,
       fetch: async (input) => {
         requests.push(requestUrl(input));
+
         return new Response(null, { status: 200 });
       },
       ...options,
     });
+
     const provider = new BasicTracerProvider({
       spanProcessors: integration.spanProcessors.filter(
         (processor) => typeof processor !== "string",
       ),
     });
+
     try {
       provider.getTracer("unrelated-http").startSpan("GET /health").end();
       await provider.forceFlush();
@@ -487,6 +519,7 @@ test("step.started returns undefined when no context is available", () => {
 test("step.started swallows user callback errors and reports them", () => {
   const onError = vi.fn();
   const thrown = new Error("callback failed");
+
   const definition = telemetryDevInstrumentation(
     telemetryOptions({
       onError,
@@ -798,10 +831,13 @@ test("hook ignores message.appended and malformed event data does not throw", as
 test("hook swallows event processing errors even when onError throws", async () => {
   const exporters = makeExporters();
   const thrown = new Error("event data failed");
+
   const onError = vi.fn(() => {
     throw new Error("onError failed");
   });
+
   const hook = telemetryDevHook(telemetryOptions({ onError }), exporters);
+
   const brokenEvent = {
     get data() {
       throw thrown;
@@ -838,6 +874,7 @@ test("wrapped eve client streams a successful turn and records usage on the turn
 
   const { response } = await client.sessions.create({ message: "hello" });
   const seen: string[] = [];
+
   for await (const item of response) seen.push(item.type);
   await flush();
 
@@ -934,6 +971,7 @@ test("wrapped eve client puts every turn of one session in the session trace", a
   const spans = exporters.spans.getFinishedSpans();
   expect(spans.map((s) => s.name)).toEqual(["invoke_agent", "invoke_agent"]);
   const ms = ([sec, nano]: [number, number]) => sec * 1000 + nano / 1e6;
+
   for (const span of spans) {
     expect(span.spanContext().traceId).toBe(expected.traceId);
     expect(span.parentSpanContext?.spanId).toBe(expected.spanId);
@@ -966,6 +1004,7 @@ test("wrapped eve client marks streams without terminal events as errored spans"
       streamReconnectPolicy: { reconnect: false },
     })
   ).response.result();
+
   await flush();
 
   expect(result.status).toBe("completed");
@@ -977,12 +1016,14 @@ test("wrapped eve client marks streams without terminal events as errored spans"
 
 test("wrapped eve client result() aggregates output, message, input requests, and status", async () => {
   const exporters = makeExporters();
+
   const inputRequest = {
     action: { callId: "call-approval", input: {}, kind: "tool-call" as const, toolName: "approve" },
     kind: "tool-approval" as const,
     prompt: "Approve?",
     requestId: "approval-1",
   };
+
   stubFetchSequence([
     jsonResponse({ sessionId: "session-2" }),
     ndjsonResponse([
@@ -1013,6 +1054,7 @@ test("wrapped eve client result() aggregates output, message, input requests, an
   const result = await (
     await client.sessions.create({ message: "approve this" })
   ).response.result();
+
   await flush();
 
   expect(result).toMatchObject({
@@ -1092,9 +1134,11 @@ test("wrapped eve client marks aborted streams as cancelled spans", async () => 
     "fetch",
     vi.fn(async (...args: Parameters<typeof fetch>) => {
       requests.push(args);
+
       if (requests.length === 1) return jsonResponse({ sessionId: "session-4" });
       controller.abort();
       const abortError = new DOMException("The operation was aborted.", "AbortError");
+
       return new Response(
         new ReadableStream<Uint8Array>({
           start(streamController) {
@@ -1110,6 +1154,7 @@ test("wrapped eve client marks aborted streams as cancelled spans", async () => 
   const result = await (
     await client.sessions.create({ message: "cancel", signal: controller.signal })
   ).response.result();
+
   expect(result.events).toEqual([]);
   await flush();
 
@@ -1124,12 +1169,14 @@ test.each(["create", "send", "respond"] as const)(
   async (method) => {
     const exporters = makeExporters();
     const controller = new AbortController();
+
     const inputRequest = {
       action: { callId: "call-1", input: {}, kind: "tool-call" as const, toolName: "approve" },
       kind: "tool-approval" as const,
       prompt: "Approve?",
       requestId: "approval-1",
     };
+
     stubFetchSequence([
       ...(method === "create" ? [] : [jsonResponse({ sessionId: "session-abort" })]),
       jsonResponse({ sessionId: "session-abort" }),
@@ -1140,12 +1187,14 @@ test.each(["create", "send", "respond"] as const)(
       await client.sessions.create({ message: "hello", signal: controller.signal });
     } else {
       const session = client.sessions.attach("session-abort");
+
       if (method === "send") {
         await session.send("hello", { signal: controller.signal });
       } else {
         await session.respond([inputRequest], { signal: controller.signal });
       }
     }
+
     controller.abort();
     await flush();
 
@@ -1179,8 +1228,10 @@ test("wrapped eve client keeps completed streams successful when abort races aft
     "fetch",
     vi.fn(async (...args: Parameters<typeof fetch>) => {
       requests.push(args);
+
       if (requests.length === 1) return jsonResponse({ sessionId: "session-4b" });
       controller.abort();
+
       return ndjsonResponse([event("session.completed")]);
     }),
   );
@@ -1189,6 +1240,7 @@ test("wrapped eve client keeps completed streams successful when abort races aft
   const result = await (
     await client.sessions.create({ message: "complete despite abort", signal: controller.signal })
   ).response.result();
+
   await flush();
 
   expect(result.status).toBe("completed");
@@ -1241,9 +1293,11 @@ test("wrapped eve client rethrows POST 500 errors and records the failed send", 
 
 test("wrapped eve client binds private-field methods for health and session state", async () => {
   const exporters = makeExporters();
+
   const { requests } = stubFetchSequence([
     jsonResponse({ ok: true, status: "ready", workflowId: "wf-1" }),
   ]);
+
   const client = wrapClient(exporters);
 
   await expect(client.health()).resolves.toEqual({ ok: true, status: "ready", workflowId: "wf-1" });

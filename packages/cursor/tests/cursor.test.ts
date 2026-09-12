@@ -27,6 +27,7 @@ import { createCursorTelemetry, type CursorTelemetry } from "../src/telemetry.ts
 import { createTitleLookup } from "../src/titles.ts";
 
 type JsonValue = string | number | boolean | null | undefined | JsonValue[] | JsonRecord;
+
 interface JsonRecord {
   [key: string]: JsonValue;
 }
@@ -45,6 +46,7 @@ function makeHarness(options: TelemetryDevCursorOptions = {}): Harness {
   const spans = new InMemorySpanExporter();
   const logs = new InMemoryLogRecordExporter();
   const overrides: ClientOverrides = { spanExporter: spans, logRecordExporter: logs };
+
   const telemetry = createCursorTelemetry(
     {
       apiKey,
@@ -57,6 +59,7 @@ function makeHarness(options: TelemetryDevCursorOptions = {}): Harness {
     },
     overrides,
   );
+
   return { spans, logs, telemetry };
 }
 
@@ -71,9 +74,11 @@ function setHome(home: string): () => void {
     USERPROFILE: process.env.USERPROFILE,
     XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
   };
+
   process.env.HOME = home;
   process.env.USERPROFILE = home;
   process.env.XDG_RUNTIME_DIR = home;
+
   return () => {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key];
@@ -308,6 +313,7 @@ describe("subagents", () => {
     // Task call can fan out parallel workers with the same tool_use_id.
     const { spans, telemetry } = makeHarness();
     telemetry.handle(event("beforeSubmitPrompt", { prompt: "explore" }));
+
     for (let i = 0; i < 2; i++) {
       telemetry.handle(
         event("preToolUse", {
@@ -317,6 +323,7 @@ describe("subagents", () => {
         }),
       );
     }
+
     for (const sub of ["sub-a", "sub-b"]) {
       telemetry.handle(
         event("preToolUse", {
@@ -337,6 +344,7 @@ describe("subagents", () => {
         }),
       );
     }
+
     telemetry.handle(
       event("postToolUse", {
         tool_name: "Task",
@@ -350,6 +358,7 @@ describe("subagents", () => {
     const parent = agentSpans(spans, "cursor")[0]!;
     const subs = agentSpans(spans, "code-explorer");
     expect(subs).toHaveLength(2);
+
     for (const sub of subs) {
       expect(sub.parentSpanContext?.spanId).toBe(parent.spanContext().spanId);
       expect(sub.attributes["gen_ai.response.finish_reasons"]).toEqual(["completed"]);
@@ -502,6 +511,7 @@ describe("subagents", () => {
         span.attributes["gen_ai.conversation.id"] === "conv-2" &&
         span.attributes["gen_ai.operation.name"] === "invoke_agent",
     );
+
     expect(other!.attributes["gen_ai.agent.name"]).toBe("cursor");
     const session = sessionSpanContext(apiKey, "conv-2");
     expect(other!.spanContext().traceId).toBe(session.traceId);
@@ -558,6 +568,7 @@ describe("subagents", () => {
         span.attributes["gen_ai.conversation.id"] === "headless-2" &&
         span.attributes["gen_ai.operation.name"] === "invoke_agent",
     );
+
     expect(headless!.attributes["gen_ai.agent.name"]).toBe("cursor");
     const session = sessionSpanContext(apiKey, "headless-2");
     expect(headless!.spanContext().traceId).toBe(session.traceId);
@@ -611,10 +622,12 @@ describe("subagents", () => {
     const parent = agentSpans(spans, "cursor")[0]!;
     const subA = agentSpans(spans, "explore")[0]!;
     const subB = agentSpans(spans, "shell")[0]!;
+
     for (const sub of [subA, subB]) {
       expect(sub.spanContext().traceId).toBe(parent.spanContext().traceId);
       expect(sub.parentSpanContext?.spanId).toBe(parent.spanContext().spanId);
     }
+
     expect(subA.attributes["gen_ai.output.messages"]).toContain("done a");
     expect(subB.attributes["gen_ai.output.messages"]).toContain("done b");
   });
@@ -731,6 +744,7 @@ describe("subagents", () => {
   test("subagent transcript paths match complete path segments", async () => {
     const { spans, telemetry } = makeHarness();
     telemetry.handle(event("beforeSubmitPrompt", { prompt: "explore" }));
+
     for (const subagentId of ["sub-1", "sub-10"]) {
       telemetry.handle(
         event("subagentStart", {
@@ -744,6 +758,7 @@ describe("subagents", () => {
         event("afterAgentResponse", { conversation_id: subagentId, text: `${subagentId} done` }),
       );
     }
+
     telemetry.handle(
       event("subagentStop", {
         conversation_id: "conv-1",
@@ -761,11 +776,13 @@ describe("subagents", () => {
         span.attributes["gen_ai.conversation.id"] === "sub-1" &&
         span.attributes["gen_ai.operation.name"] === "invoke_agent",
     );
+
     const sub10 = finished(spans).find(
       (span) =>
         span.attributes["gen_ai.conversation.id"] === "sub-10" &&
         span.attributes["gen_ai.operation.name"] === "invoke_agent",
     );
+
     expect(sub1!.attributes["gen_ai.response.finish_reasons"]).toEqual(["incomplete"]);
     expect(sub10!.attributes["gen_ai.response.finish_reasons"]).toEqual(["completed"]);
   });
@@ -785,6 +802,7 @@ describe("titles", () => {
       JSON.stringify({ schemaVersion: 1, title: "Subagent title from metadata" }),
     );
     const { spans, telemetry } = makeHarness({ chatsDir: chats });
+
     try {
       telemetry.handle(event("beforeSubmitPrompt", { prompt: "fix login" }));
       telemetry.handle(
@@ -818,6 +836,7 @@ describe("titles", () => {
   test("a missing title falls back to the prompt as the span name", async () => {
     const chats = mkdtempSync(join(tmpdir(), "cursor-chats-"));
     const { spans, telemetry } = makeHarness({ chatsDir: chats });
+
     try {
       telemetry.handle(event("beforeSubmitPrompt", { prompt: "x" }));
       telemetry.handle(event("stop", { status: "completed" }));
@@ -835,12 +854,14 @@ describe("titles", () => {
       { conversationId: "../outside", metaDir: ["outside"] },
       { conversationId: "bad\\id", metaDir: ["hash1", "bad\\id"] },
     ];
+
     for (const { conversationId, metaDir } of cases) {
       const chats = mkdtempSync(join(tmpdir(), "cursor-chats-"));
       mkdirSync(join(chats, "hash1"), { recursive: true });
       const titleDir = join(chats, ...metaDir);
       mkdirSync(titleDir, { recursive: true });
       writeFileSync(join(titleDir, "meta.json"), JSON.stringify({ title: "Outside title" }));
+
       try {
         expect(createTitleLookup(chats)(conversationId)).toBeUndefined();
       } finally {
@@ -864,10 +885,12 @@ describe("lifecycle logs", () => {
     const records = logs.getFinishedLogRecords();
     const names = records.map((r) => r.eventName);
     expect(names).toEqual(["sessionStart", "afterFileEdit", "preCompact", "sessionEnd"]);
+
     for (const record of records) {
       expect(record.attributes["gen_ai.conversation.id"]).toBe("conv-1");
       expect(record.attributes["gen_ai.agent.name"]).toBe("cursor");
     }
+
     const edit = records.find((r) => r.eventName === "afterFileEdit");
     expect(edit!.attributes["cursor.file_path"]).toBe("/tmp/project/a.ts");
     expect(edit!.attributes["cursor.edit_count"]).toBe(2);
@@ -910,10 +933,12 @@ describe("settle", () => {
 
   test("malformed events never throw", () => {
     const { telemetry } = makeHarness();
+
     const eventRecord = {
       hook_event_name: "unknownEvent",
       nested: { arbitrary: new Date() },
     };
+
     expectTypeOf<CursorTelemetry["handle"]>().parameter(0).toEqualTypeOf<Record<string, unknown>>();
     telemetry.handle({});
     telemetry.handle({ hook_event_name: "postToolUse" });
@@ -929,6 +954,7 @@ describe("fileConfig", () => {
     mkdirSync(join(home, ".cursor"));
     writeFileSync(join(home, ".cursor", "telemetry-dev.json"), "{not json");
     const restoreHome = setHome(home);
+
     try {
       expect(fileConfig()).toEqual({});
     } finally {
@@ -961,6 +987,7 @@ describe("stale state across turns", () => {
     const { spans, telemetry } = makeHarness();
     telemetry.handle(event("beforeSubmitPrompt", { prompt: "first", generation_id: "gen-1" }));
     telemetry.handle(event("beforeSubmitPrompt", { prompt: "second", generation_id: "gen-2" }));
+
     for (let index = 0; index < 100; index++) {
       const id = `other-${index}`;
       telemetry.handle(
@@ -981,6 +1008,7 @@ describe("stale state across turns", () => {
         span.attributes["gen_ai.conversation.id"] === "conv-1" &&
         span.attributes["gen_ai.operation.name"] === "invoke_agent",
     );
+
     expect(agents).toHaveLength(2);
     expect(agents[0]!.attributes["gen_ai.response.finish_reasons"]).toEqual(["incomplete"]);
     expect(agents[1]!.attributes["gen_ai.response.finish_reasons"]).toEqual(["completed"]);
@@ -1014,6 +1042,7 @@ describe("stale state across turns", () => {
         s.attributes["gen_ai.conversation.id"] === "conv-9" &&
         s.attributes["gen_ai.operation.name"] === "invoke_agent",
     );
+
     expect(later).toBeDefined();
     expect(later!.attributes["gen_ai.agent.name"]).toBe("cursor");
     const session = sessionSpanContext(apiKey, "conv-9");
@@ -1109,6 +1138,7 @@ describe.skipIf(process.platform === "win32")("daemon socket protocol", () => {
       socket.setEncoding("utf8");
       socket.on("data", (chunk: string) => {
         seen += chunk.split("\n").filter((l) => l.length > 0).length;
+
         if (seen >= acks) {
           socket.end();
           resolve();
@@ -1126,7 +1156,9 @@ describe.skipIf(process.platform === "win32")("daemon socket protocol", () => {
     const dir = mkdtempSync(join(tmpdir(), "tdc-sock-"));
     const path = join(dir, "d.sock");
     const server = await listen(path, telemetry);
+
     if (!server) throw new Error("failed to start test daemon");
+
     try {
       const post = {
         ...event("postToolUse", {
@@ -1137,6 +1169,7 @@ describe.skipIf(process.platform === "win32")("daemon socket protocol", () => {
         }),
         hook_delivery_id: "d-1",
       };
+
       const lines = [
         { ...event("beforeSubmitPrompt", { prompt: "x" }), hook_delivery_id: "d-0" },
         post,
@@ -1145,6 +1178,7 @@ describe.skipIf(process.platform === "win32")("daemon socket protocol", () => {
       ]
         .map((l) => `${JSON.stringify(l)}\n`)
         .join("");
+
       // Split mid-line to exercise framing across chunk boundaries.
       await sendChunks(path, [lines.slice(0, 25), lines.slice(25)], 4);
       await flush();
@@ -1168,9 +1202,11 @@ describe.skipIf(process.platform === "win32")("daemon socket protocol", () => {
     mkdirSync(lock);
     writeFileSync(held, "");
     utimesSync(held, 0, 0);
+
     const servers = (await Promise.all([listen(path, telemetry), listen(path, telemetry)])).filter(
       (server) => server !== undefined,
     );
+
     try {
       expect(servers).toHaveLength(1);
     } finally {
@@ -1188,6 +1224,7 @@ describe("install and uninstall", () => {
     const home = mkdtempSync(join(tmpdir(), "cursor-home-"));
     const restoreHome = setHome(home);
     const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+
     try {
       const hooksPath = join(home, ".cursor", "hooks.json");
       mkdirSync(join(home, ".cursor"), { recursive: true });
@@ -1203,6 +1240,7 @@ describe("install and uninstall", () => {
       const hooks = JSON.parse(readFileSync(hooksPath, "utf8")) as {
         hooks: Record<string, { command: string; telemetryDev?: boolean }[]>;
       };
+
       const stopHooks = hooks.hooks.stop!;
       expect(stopHooks.filter((h) => h.command === "my-other-hook")).toHaveLength(1);
       const oursEntries = stopHooks.filter((h) => h.telemetryDev === true);
@@ -1212,6 +1250,7 @@ describe("install and uninstall", () => {
       const config = JSON.parse(
         readFileSync(join(home, ".cursor", "telemetry-dev.json"), "utf8"),
       ) as { apiKey: string };
+
       expect(config.apiKey).toBe("td_live_test");
       expect(lstatSync(join(home, ".cursor", "telemetry-dev.json")).mode & 0o777).toBe(0o600);
     } finally {
@@ -1225,6 +1264,7 @@ describe("install and uninstall", () => {
     const home = mkdtempSync(join(tmpdir(), "cursor-home-"));
     const restoreHome = setHome(home);
     const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+
     try {
       const hooksPath = join(home, ".cursor", "hooks.json");
       mkdirSync(join(home, ".cursor"), { recursive: true });
@@ -1247,6 +1287,7 @@ describe("install and uninstall", () => {
       const hooks = JSON.parse(readFileSync(hooksPath, "utf8")) as {
         hooks: Record<string, { command: string }[]>;
       };
+
       expect(hooks.hooks.stop).toEqual([
         { command: "my-other-hook" },
         { command: "my-telemetry-dev-cursor-backup" },
@@ -1265,6 +1306,7 @@ describe("install and uninstall", () => {
       const home = mkdtempSync(join(tmpdir(), "cursor-home-"));
       const restoreHome = setHome(home);
       const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+
       try {
         const cliDir = join(home, "cli '$HOME' `tick`");
         const cliPath = join(cliDir, "hook.mjs");
@@ -1275,6 +1317,7 @@ describe("install and uninstall", () => {
         const hooks = JSON.parse(readFileSync(join(home, ".cursor", "hooks.json"), "utf8")) as {
           hooks: Record<string, { command: string }[]>;
         };
+
         const command = hooks.hooks.stop![0]!.command;
         const output = execFileSync("/bin/sh", ["-c", command], { encoding: "utf8" });
         expect(JSON.parse(output)).toEqual(["hook"]);
@@ -1291,6 +1334,7 @@ describe("install and uninstall", () => {
     async () => {
       const home = mkdtempSync(join(tmpdir(), "cursor-home-"));
       const restoreHome = setHome(home);
+
       try {
         const cursorDir = join(home, ".cursor");
         const target = join(home, "target.json");
@@ -1313,10 +1357,13 @@ describe("install and uninstall", () => {
   test("an option flag without a value aborts instead of consuming the next flag", async () => {
     const home = mkdtempSync(join(tmpdir(), "cursor-home-"));
     const restoreHome = setHome(home);
+
     const exit = vi.spyOn(process, "exit").mockImplementation((() => {
       throw new Error("exit(1)");
     }) as never);
+
     const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+
     try {
       await expect(
         runInstall("/opt/telemetry/cli.js", ["--api-key", "--base-url", "https://example.test"]),

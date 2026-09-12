@@ -77,7 +77,8 @@ The SDK installs the [session sampling wrapper](../otel/README.md#correlation-at
 - `observe(fn, options?)` — wrap a sync/async function: args → input, return → output, errors
   captured and rethrown; activates context for nesting.
 - `startSpan(name, options?)` — manual handle; does **not** activate context. `handle.update()`,
-  `handle.end()`, `handle.traceparent`, `handle.span` (raw OTel span).
+  `handle.end()`, `handle.recordOutputChunk(timestampMs?)`, `handle.traceparent`, `handle.span`
+  (raw OTel span).
 - `startActiveSpan(name, options?, fn)` — callback-scoped; activates context, auto-ends.
 - `updateActiveSpan(fields)` — update the innermost active span.
 - `propagateAttributes({ userId, sessionId, metadata }, fn)` — stamps `user.id`,
@@ -98,6 +99,18 @@ GenAI semantic conventions; cost is computed server-side from usage unless `cost
 
 Duration and token-usage histograms (`gen_ai.client.operation.duration`,
 `gen_ai.client.token.usage`) are recorded automatically for generation/agent/embedding/tool spans.
+
+Generation spans also emit `gen_ai.client.operation.time_to_first_chunk` when a valid
+`timeToFirstChunkMs` is supplied. `handle.recordOutputChunk()` records each nonempty output chunk's
+arrival; after the first chunk, intervals contribute to
+`gen_ai.client.operation.time_per_output_chunk`. Both histograms use seconds and are emitted only
+after the ended span passes `spanFilter`, including interrupted streams. Chunk timing uses bounded
+histogram state and does not retain individual intervals. Pull-based timing includes consumer delay
+between reads. An explicit timestamp uses the same monotonic millisecond clock for every chunk.
+
+Provider integrations feature-detect chunk recording. With an older core SDK that lacks
+`recordOutputChunk`, streams and existing tracing continue normally, but chunk-interval metrics are
+unavailable. Upgrade the core SDK with provider integrations to enable the new metric.
 
 ## Serverless
 

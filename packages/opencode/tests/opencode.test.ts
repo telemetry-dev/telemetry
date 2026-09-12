@@ -22,6 +22,7 @@ interface Harness {
 function makeExporters(): Exporters {
   const spans = new InMemorySpanExporter();
   const logs = new InMemoryLogRecordExporter();
+
   return { logRecordExporter: logs, logs, spanExporter: spans, spans };
 }
 
@@ -51,6 +52,7 @@ async function makeHarness(options?: TelemetryDevPluginOptions): Promise<Harness
   const exporters = makeExporters();
   const plugin = telemetryDevPlugin(telemetryOptions(options), exporters);
   const hooks = await plugin(pluginInput);
+
   return { exporters, hooks };
 }
 
@@ -67,6 +69,7 @@ async function event(hooks: Hooks, type: string, properties: JsonValue): Promise
 }
 
 type JsonObject = { [key: string]: JsonValue };
+
 type JsonValue = string | number | boolean | null | JsonValue[] | JsonObject;
 
 function assistantMessage(overrides?: JsonObject) {
@@ -99,6 +102,7 @@ function spansByName(exporters: Exporters, name: string): ReadableSpan[] {
 function spanByName(exporters: Exporters, name: string): ReadableSpan {
   const spans = spansByName(exporters, name);
   expect(spans, `expected one span named ${name}`).toHaveLength(1);
+
   return spans[0]!;
 }
 
@@ -279,6 +283,7 @@ test("dispose ends every dangling agent span as incomplete and flushes", async (
 
   const spans = spansByName(harness.exporters, "invoke_agent");
   expect(spans).toHaveLength(2);
+
   for (const span of spans) {
     expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["incomplete"]);
   }
@@ -350,11 +355,13 @@ describe("synthetic Task correlation", () => {
 test("poisoned events report through onError without throwing", async () => {
   const errors: unknown[] = [];
   const harness = await makeHarness({ onError: (error) => errors.push(error) });
+
   const poisoned = {
     get type(): never {
       throw "poisoned event";
     },
   };
+
   await expect(harness.hooks.event?.({ event: poisoned as never })).resolves.toBeUndefined();
   expect(errors).toHaveLength(1);
   expect(errors[0]).toEqual(new Error("poisoned event"));

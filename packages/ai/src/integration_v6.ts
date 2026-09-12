@@ -26,6 +26,7 @@ import {
   SEVERITY_WARN,
   type TelemetryDevEvent,
   type JsonValue,
+  unknownErrorMessage,
 } from "./shared.ts";
 
 // Structural shapes of the ai@6 telemetry events the hooks read. Declared locally because the
@@ -131,6 +132,7 @@ export function telemetryDev(
     { ...config, sdkName: "@telemetry-dev/ai-sdk" },
     overrides,
   );
+
   const v6 = createV6Hooks(config, emitter);
 
   // The public parameters are loose supertypes; the ai@6 dispatcher guarantees these shapes.
@@ -163,13 +165,16 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
   let sessionId: string | null = null;
   let restMetadata: Record<string, JsonValue> | undefined;
   let samplingAttributes: Attributes = {};
+
   const steps = new Map<
     number,
     { span?: Span; ctx: Context; startedAt: Date; messages?: JsonValue }
   >();
+
   const toolStarts = new Map<string, Date>();
   let childSpans: Span[] = [];
   let hasToolSpan = false;
+
   // Per-step metric inputs, collected at onStepFinish and emitted at onFinish. Model/provider are
   // captured per step so fallback or mixed-model runs attribute tokens and duration to the model
   // that actually ran the step, not the root request's model.
@@ -181,6 +186,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
     requestModel: string;
     responseModel: string | null;
   }> = [];
+
   const toolMetrics: Array<{ durationSec: number }> = [];
 
   const conversationAttributes = (): Attributes =>
@@ -203,27 +209,34 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
         model = e.model.modelId;
 
         const input: Record<string, JsonValue> = {};
+
         if (e.system !== undefined) {
           input.system = e.system;
         }
+
         if (e.prompt !== undefined) {
           input.prompt = e.prompt;
         }
+
         if (e.messages !== undefined) {
           input.messages = e.messages;
         }
+
         rootInput = Object.keys(input).length > 0 ? input : undefined;
 
         const metadata = e.metadata;
         userId = readId(metadata?.userId);
         sessionId = readId(metadata?.sessionId);
+
         if (metadata) {
           const rest: Record<string, JsonValue> = {};
+
           for (const [key, value] of Object.entries(metadata)) {
             if (key !== "userId" && key !== "sessionId") {
               rest[key] = value;
             }
           }
+
           restMetadata = Object.keys(rest).length > 0 ? rest : undefined;
         } else {
           restMetadata = undefined;
@@ -258,11 +271,13 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
         // Open the step (model `chat`) span now so tool calls that finish within this step parent
         // to it. Attributes/finish state land at onStepFinish; the span ends there too.
         const startedAt = new Date();
+
         const span = emitter.tracer.startSpan(
           "chat",
           { startTime: startedAt, kind: SpanKind.CLIENT, attributes: conversationAttributes() },
           rootCtx,
         );
+
         steps.set(e.stepNumber, {
           span,
           ctx: trace.setSpan(rootCtx, span),
@@ -278,6 +293,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
       try {
         const endedAt = new Date();
         let step = steps.get(e.stepNumber);
+
         if (!step) {
           // No matching onStepStart: open the span anchored to the trace start so startTime never
           // exceeds endTime.
@@ -290,20 +306,28 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
             },
             rootCtx,
           );
+
           step = { span, ctx: trace.setSpan(rootCtx, span), startedAt: rootStartedAt };
           steps.set(e.stepNumber, step);
         }
+
         const span = step.span!;
+
         const startedAt =
           step.startedAt.getTime() <= endedAt.getTime() ? step.startedAt : rootStartedAt;
+
         const usage = e.usage;
         const inputTokens = usage.inputTokens ?? null;
         const outputTokens = usage.outputTokens ?? null;
+
         const cacheReadTokens =
           usage.inputTokenDetails?.cacheReadTokens ?? usage.cachedInputTokens ?? null;
+
         const cacheCreationTokens = usage.inputTokenDetails?.cacheWriteTokens ?? null;
+
         const reasoningTokens =
           usage.outputTokenDetails?.reasoningTokens ?? usage.reasoningTokens ?? null;
+
         const stepProvider = providerLabel(e.model.provider);
         responseModel = e.response?.modelId ?? responseModel;
 
@@ -331,6 +355,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
         }
 
         const stepWarnings = e.warnings ?? [];
+
         for (const warning of stepWarnings) {
           const detail =
             warning.message?.constructor === String
@@ -338,6 +363,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
               : warning.type?.constructor === String
                 ? String(warning.type)
                 : "warning";
+
           span.addEvent(
             "model.warning",
             omitUndefined({
@@ -375,9 +401,12 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
     onToolCallFinish(e: V6ToolCallFinishEvent) {
       try {
         const endedAt = new Date();
+
         const started =
           toolStarts.get(e.toolCall.toolCallId) ?? new Date(endedAt.getTime() - e.durationMs);
+
         const startedAt = started.getTime() <= endedAt.getTime() ? started : rootStartedAt;
+
         const parentCtx =
           (e.stepNumber != null ? steps.get(e.stepNumber)?.ctx : undefined) ?? rootCtx;
 
@@ -399,7 +428,8 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
         );
 
         if (!e.success) {
-          const message = e.error instanceof Error ? e.error.message : String(e.error);
+          const message = e.error instanceof Error ? e.error.message : unknownErrorMessage(e.error);
+
           const errorType = e.error instanceof Error ? e.error.name : "tool_error";
           span.setStatus({ code: SpanStatusCode.ERROR });
           span.setAttribute("error.type", errorType);
@@ -434,7 +464,9 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
         const inputTokens = stepMetrics.reduce((sum, s) => sum + (s.inputTokens ?? 0), 0);
         const outputTokens = stepMetrics.reduce((sum, s) => sum + (s.outputTokens ?? 0), 0);
         const tokenParts: string[] = [];
+
         if (inputPresent) tokenParts.push(`${inputTokens} in`);
+
         if (outputPresent) tokenParts.push(`${outputTokens} out`);
         const tokenText = tokenParts.length > 0 ? `: ${tokenParts.join(" / ")} tokens` : "";
         const hasError = e.finishReason === "error";
@@ -453,9 +485,11 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
             ...samplingAttributes,
           }),
         );
+
         if (restMetadata) {
           for (const [key, value] of Object.entries(restMetadata)) {
             const attr = value?.constructor === String ? String(value) : jsonAttr(value);
+
             if (attr !== undefined) {
               rootSpan.setAttribute(`td.metadata.${key}`, attr);
             }
@@ -491,6 +525,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
           "gen_ai.request.model": model ?? undefined,
           "gen_ai.response.model": responseModel ?? undefined,
         });
+
         for (const s of stepMetrics) {
           const stepAttrs: Attributes = omitUndefined({
             "gen_ai.provider.name": s.provider,
@@ -498,10 +533,14 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
             "gen_ai.response.model": s.responseModel ?? undefined,
             "gen_ai.operation.name": "chat",
           });
+
           emitter.recordDuration(s.durationSec, stepAttrs);
+
           if (s.inputTokens !== null) emitter.recordTokens("input", s.inputTokens, stepAttrs);
+
           if (s.outputTokens !== null) emitter.recordTokens("output", s.outputTokens, stepAttrs);
         }
+
         for (const t of toolMetrics) {
           emitter.recordDuration(t.durationSec, {
             ...metricBase,

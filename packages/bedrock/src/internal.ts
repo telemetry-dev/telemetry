@@ -20,6 +20,7 @@ export type JsonValue =
   | JsonValue[]
   | JsonRecord
   | ((...args: JsonValue[]) => JsonValue);
+
 export interface JsonRecord {
   [key: string]: JsonValue;
 }
@@ -53,6 +54,7 @@ export function createInstrumentedSend(
     const rawRest = rest.map(asJsonValue);
     const name = isRecord(rawCommand) ? rawCommand.constructor?.name : undefined;
     const handler = String(name) === name ? handlers[name] : undefined;
+
     if (!handler) {
       return originalSend.apply(this, [rawCommand, ...rawRest]);
     }
@@ -64,25 +66,32 @@ export function createInstrumentedSend(
     const fields = safe(() => handler.requestFields(input, options)) ?? {};
     const span = startSpan(spanName, { type: spanType, ...fields });
     const callbackIndex = rawRest.findIndex((arg) => arg instanceof Function);
+
     if (callbackIndex !== -1) {
       const callback = rawRest[callbackIndex] as (cause: JsonValue, data?: JsonValue) => void;
       const wrappedRest = [...rawRest];
       wrappedRest[callbackIndex] = <TError, TData>(error: TError, data?: TData) => {
         const rawError: unknown = error;
         const rawData: unknown = data;
+
         if (rawError != null) {
           endSpan(span, { ...awsMetadataFields(metadataOf(rawError)), error: asError(rawError) });
           callback(asJsonValue(rawError), asJsonValue(rawData));
+
           return;
         }
+
         let nextData: JsonValue | object = asJsonValue(rawData);
+
         try {
           nextData = handler.onResult(asJsonValue(rawData), span, t0, input, options);
         } catch {
           endSpan(span, awsMetadataFields(metadataOf(rawData)));
         }
+
         callback(asJsonValue(rawError), asJsonValue(nextData));
       };
+
       try {
         return originalSend.apply(this, [rawCommand, ...wrappedRest]);
       } catch (error) {
@@ -92,6 +101,7 @@ export function createInstrumentedSend(
     }
 
     let result: JsonValue | object | Promise<JsonValue | object>;
+
     try {
       result = originalSend.apply(this, [rawCommand, ...rawRest]);
     } catch (error) {
@@ -105,6 +115,7 @@ export function createInstrumentedSend(
           return handler.onResult(asJsonValue(resolved), span, t0, input, options);
         } catch {
           endSpan(span, awsMetadataFields(metadataOf(resolved)));
+
           return resolved;
         }
       },
@@ -118,6 +129,7 @@ export function createInstrumentedSend(
 
 export function commandInput<T>(command: T): JsonRecord {
   if (!isRecord(command)) return {};
+
   return isRecord(command.input) ? command.input : {};
 }
 
@@ -151,6 +163,7 @@ export function updateSpan(span: SpanHandle, fields: SpanFields): void {
 
 export function metadataOf<T>(value: T): JsonValue {
   if (!isRecord(value)) return undefined;
+
   return value.$metadata;
 }
 
@@ -172,31 +185,42 @@ export function modeledStreamError(
     throttlingException: "ThrottlingException",
     validationException: "ValidationException",
   } as const;
+
   for (const [key, name] of Object.entries(keys)) {
     const exception = isRecord(event[key]) ? event[key] : undefined;
+
     if (!exception) continue;
+
     const error = new Error(
       stringValue(exception.message) ?? stringValue(exception.originalMessage) ?? name,
     );
+
     error.name = stringValue(exception.name) ?? name;
+
     return { error, fields: awsMetadataFields(exception.$metadata) };
   }
+
   return undefined;
 }
 
 export function awsMetadataFields<T>(metadata: T): SpanFields {
   const raw: unknown = metadata;
+
   if (!isRecord(raw)) return {};
   const requestId = stringValue(raw.requestId);
   const attempts = numberValue(raw.attempts);
   const httpStatusCode = numberValue(raw.httpStatusCode);
   const totalRetryDelay = numberValue(raw.totalRetryDelay);
   const attributes: SpanFields["attributes"] = {};
+
   if (httpStatusCode !== undefined) attributes["aws.http.status_code"] = httpStatusCode;
+
   if (attempts !== undefined && attempts > 1) attributes["aws.request.attempts"] = attempts;
+
   if (totalRetryDelay !== undefined) {
     attributes["aws.request.total_retry_delay_ms"] = totalRetryDelay;
   }
+
   return omitUndefined({
     responseId: requestId,
     attributes: Object.keys(attributes).length > 0 ? attributes : undefined,
@@ -205,14 +229,19 @@ export function awsMetadataFields<T>(metadata: T): SpanFields {
 
 export function mergeFields(...fields: Array<SpanFields | undefined>): SpanFields {
   const merged: SpanFields = {};
+
   for (const field of fields) {
     if (!field) continue;
     const { metadata, attributes, usage, ...rest } = field;
     Object.assign(merged, omitUndefined(rest));
+
     if (usage) merged.usage = { ...merged.usage, ...usage };
+
     if (metadata) merged.metadata = { ...merged.metadata, ...metadata };
+
     if (attributes) merged.attributes = { ...merged.attributes, ...attributes };
   }
+
   return merged;
 }
 
@@ -222,11 +251,13 @@ export function omitUndefined<T extends object>(value: T): T {
 
 export function stringValue<T>(value: T): string | undefined {
   const raw: unknown = value;
+
   return String(raw) === raw && raw.length > 0 ? raw : undefined;
 }
 
 export function numberValue<T>(value: T): number | undefined {
   const raw: unknown = value;
+
   return Number(raw) === raw && Number.isFinite(raw) ? raw : undefined;
 }
 
@@ -236,8 +267,11 @@ export function arrayValue<T, TValue = unknown>(value: TValue): T[] | undefined 
 
 export function bytesToString<T>(value: T): string | undefined {
   const raw: unknown = value;
+
   if (String(raw) === raw) return raw;
+
   if (raw instanceof Uint8Array) return new TextDecoder().decode(raw);
+
   if (ArrayBuffer.isView(raw)) {
     return new TextDecoder().decode(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength));
   }
@@ -245,7 +279,9 @@ export function bytesToString<T>(value: T): string | undefined {
 
 export function parseJson<T>(value: T): JsonValue {
   const text = bytesToString(value);
+
   if (text === undefined) return undefined;
+
   try {
     return asJsonValue(JSON.parse(text));
   } catch {
@@ -254,7 +290,7 @@ export function parseJson<T>(value: T): JsonValue {
 }
 
 export interface StreamState {
-  feed<T>(event: T): void;
+  feed<T>(event: T): boolean | void;
   finish(partial: boolean): SpanFields;
 }
 
@@ -264,15 +300,18 @@ export function wrapAsyncIterable<T>(
   span: SpanHandle,
   t0: number,
   baseFields: SpanFields,
+  trackOutputChunks = true,
 ): T {
   if (!iterable || !isAsyncIterable(iterable)) {
     endSpan(span, baseFields);
+
     return iterable;
   }
 
   let ended = false;
   let first = false;
   const unregisterToken = {};
+
   const endOnce = (fields?: SpanFields) => {
     if (ended) return;
     ended = true;
@@ -282,15 +321,25 @@ export function wrapAsyncIterable<T>(
 
   const generator = async function* () {
     let completed = false;
+
     try {
       for await (const event of iterable) {
+        const receivedAt = performance.now();
+
         if (!first) {
           first = true;
-          updateSpan(span, { timeToFirstChunkMs: performance.now() - t0 });
+          updateSpan(span, { timeToFirstChunkMs: receivedAt - t0 });
         }
-        safe(() => state.feed(event));
+
+        const stateHasOutput = safe(() => state.feed(event));
+
+        if (trackOutputChunks && (stateHasOutput ?? bedrockEventHasOutput(event))) {
+          safe(() => span.recordOutputChunk?.(receivedAt));
+        }
+
         yield event;
       }
+
       completed = true;
     } catch (error) {
       endOnce(
@@ -305,19 +354,88 @@ export function wrapAsyncIterable<T>(
   };
 
   const wrapped: { [key: PropertyKey]: JsonValue | (() => AsyncGenerator<unknown>) } = {};
+
   if (isRecord(iterable)) {
     for (const key of Reflect.ownKeys(iterable)) {
       wrapped[key] = (iterable as { [key: PropertyKey]: JsonValue })[key];
     }
   }
+
   const finishAbandoned = () => endOnce(safe(() => state.finish(true)));
   wrapped[Symbol.asyncIterator] = () => {
     const iterator = generator();
     STREAM_FINALIZER?.register(iterator, finishAbandoned, unregisterToken);
+
     return iterator;
   };
+
   STREAM_FINALIZER?.register(wrapped, finishAbandoned, unregisterToken);
+
   return wrapped as T;
+}
+
+function bedrockEventHasOutput(event: unknown): boolean {
+  const record = isRecord(event) ? event : undefined;
+
+  if (!record) return false;
+  const output = isRecord(record.output) ? record.output : undefined;
+
+  if (typeof output?.text === "string" && output.text.length > 0) return true;
+  const block = isRecord(record.contentBlockDelta) ? record.contentBlockDelta : undefined;
+  const delta = isRecord(block?.delta) ? block.delta : undefined;
+  const reasoning = isRecord(delta?.reasoningContent) ? delta.reasoningContent : undefined;
+  const toolUse = isRecord(delta?.toolUse) ? delta.toolUse : undefined;
+
+  if (
+    (typeof delta?.text === "string" && delta.text.length > 0) ||
+    (typeof reasoning?.text === "string" && reasoning.text.length > 0) ||
+    (typeof toolUse?.input === "string" && toolUse.input.length > 0)
+  )
+    return true;
+  const chunk = isRecord(record.chunk) ? record.chunk : undefined;
+  const raw = chunk?.bytes;
+
+  if (raw === undefined) return false;
+
+  const text =
+    typeof raw === "string"
+      ? raw
+      : raw instanceof Uint8Array
+        ? new TextDecoder().decode(raw)
+        : undefined;
+
+  if (!text) return false;
+  const parsed = parseJson(text);
+
+  if (parsed === undefined) return text.length > 0;
+
+  if (!isRecord(parsed)) return false;
+  const parsedDelta = isRecord(parsed.delta) ? parsed.delta : undefined;
+
+  const contentDelta = isRecord(parsed.contentBlockDelta ?? parsed.content_block_delta)
+    ? (parsed.contentBlockDelta ?? parsed.content_block_delta)
+    : undefined;
+
+  const nested =
+    isRecord(contentDelta) && isRecord(contentDelta.delta) ? contentDelta.delta : undefined;
+
+  const generations = Array.isArray(parsed.generations) ? parsed.generations : [];
+  const generation = isRecord(generations[0]) ? generations[0] : undefined;
+  const outputs = Array.isArray(parsed.outputs) ? parsed.outputs : [];
+  const firstOutput = isRecord(outputs[0]) ? outputs[0] : undefined;
+
+  return [
+    parsed.outputText,
+    parsed.generation,
+    parsed.completion,
+    parsed.text,
+    parsedDelta?.text,
+    parsedDelta?.thinking,
+    parsedDelta?.partial_json,
+    nested?.text,
+    firstOutput?.text,
+    generation?.text,
+  ].some((value) => typeof value === "string" && value.length > 0);
 }
 
 function isAsyncIterable<T>(value: T): value is T & AsyncIterable<unknown> {
@@ -334,6 +452,8 @@ function asError<T>(value: T): Error {
 
 export function basenameArn<T>(value: T): string | undefined {
   const text = stringValue(value);
+
   if (!text) return undefined;
+
   return text.split(/[/:]/).filter(Boolean).at(-1) ?? text;
 }

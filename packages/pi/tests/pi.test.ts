@@ -31,6 +31,7 @@ interface Exporters extends ClientOverrides {
 function makeExporters(): Exporters {
   const spans = new InMemorySpanExporter();
   const logs = new InMemoryLogRecordExporter();
+
   return { logRecordExporter: logs, logs, spanExporter: spans, spans };
 }
 
@@ -45,8 +46,11 @@ function telemetryOptions(options?: TelemetryDevExtensionOptions): TelemetryDevE
 }
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
 type JsonRecord = { [key: string]: JsonValue };
+
 type Event = { type: string; [key: string]: JsonValue };
+
 type EmitFn = (event: Event, ctx?: ExtensionContext) => Promise<void>;
 
 interface Harness {
@@ -66,13 +70,17 @@ function makeContext(sessionId = "session-1"): ExtensionContext {
       getSessionFile: () => undefined,
     },
   };
+
   return context as ExtensionContext;
 }
 
 function makeHarness(options?: TelemetryDevExtensionOptions): Harness {
   const exporters = makeExporters();
+
   type Handler = (event: Event, ctx: ExtensionContext) => void | Promise<void>;
+
   const handlers = new Map<string, Handler[]>();
+
   const api = {
     on(type: string, handler: Handler) {
       const list = handlers.get(type) ?? [];
@@ -85,11 +93,13 @@ function makeHarness(options?: TelemetryDevExtensionOptions): Harness {
   factory(api);
 
   const defaultCtx = makeContext();
+
   const emit: EmitFn = async (event, ctx = defaultCtx) => {
     for (const handler of handlers.get(event.type) ?? []) {
       await handler(event, ctx);
     }
   };
+
   return { emit, exporters };
 }
 
@@ -121,6 +131,7 @@ function assistantMessage(overrides?: JsonRecord) {
     timestamp: 1_700_000_000_000,
     ...overrides,
   };
+
   return message;
 }
 
@@ -141,6 +152,7 @@ async function runAgentLoop(
 function spanByName(exporters: Exporters, name: string): ReadableSpan {
   const span = exporters.spans.getFinishedSpans().find((candidate) => candidate.name === name);
   expect(span, `expected span ${name}`).toBeDefined();
+
   return span as ReadableSpan;
 }
 
@@ -185,6 +197,7 @@ test("automatic retries keep one invoke_agent span until the run settles", async
   const agents = harness.exporters.spans
     .getFinishedSpans()
     .filter((span) => span.name === "invoke_agent");
+
   expect(agents).toHaveLength(1);
   const agent = agents[0] as ReadableSpan;
   expect(agent.status.code).not.toBe(SpanStatusCode.ERROR);
@@ -204,6 +217,7 @@ test("all prompts of a pi session share one trace under a session root span", as
   const networkFetch = vi
     .spyOn(globalThis, "fetch")
     .mockRejectedValue(new Error("unexpected network"));
+
   const harness = makeHarness({ apiKey: "td_test_key" });
   await harness.emit({ type: "session_start", reason: "startup" });
   await runAgentLoop(harness);
@@ -239,6 +253,7 @@ test("a session switch closes the trace and the next prompt starts a new one", a
   const roots = harness.exporters.spans
     .getFinishedSpans()
     .filter((span) => span.name === "session");
+
   expect(roots).toHaveLength(2);
   expect(roots[0]?.spanContext().traceId).not.toBe(roots[1]?.spanContext().traceId);
 });
@@ -247,6 +262,7 @@ test("assistant lifecycle produces a timed chat span with model, usage, and cost
   const networkFetch = vi
     .spyOn(globalThis, "fetch")
     .mockRejectedValue(new Error("unexpected network"));
+
   let now = 1_700_000_000_000;
   vi.spyOn(Date, "now").mockImplementation(() => now);
   const harness = makeHarness();
@@ -286,11 +302,13 @@ test("assistant lifecycle produces a timed chat span with model, usage, and cost
 test("chat spans carry the system prompt, the model context, and every reply block", async () => {
   const harness = makeHarness();
   const context: JsonValue[] = [{ role: "user", content: [{ type: "text", text: "fix the bug" }] }];
+
   const content: JsonValue[] = [
     { type: "thinking", thinking: "Look first." },
     { type: "text", text: "Reading." },
     { type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } },
   ];
+
   const message = assistantMessage({ stopReason: "toolUse", content });
   await harness.emit({
     type: "before_agent_start",
@@ -324,9 +342,11 @@ test("chat spans carry the system prompt, the model context, and every reply blo
 
 test("request capture follows host conversion and later context and system-prompt replacements", async () => {
   const directory = await mkdtemp(join(tmpdir(), "telemetry-pi-capture-"));
+
   try {
     const exporters = makeExporters();
     const runtime = createExtensionRuntime();
+
     function extension(path: string): Extension {
       return {
         path,
@@ -340,6 +360,7 @@ test("request capture follows host conversion and later context and system-promp
         shortcuts: new Map(),
       };
     }
+
     const telemetry = extension("telemetry");
     telemetryDevExtension(
       telemetryOptions(),
@@ -351,6 +372,7 @@ test("request capture follows host conversion and later context and system-promp
         telemetry.handlers.set(type, handlers);
       },
     });
+
     const original: Parameters<typeof convertToLlm>[0] = [
       { role: "user", content: "obsolete context", timestamp: 1 },
       {
@@ -381,6 +403,7 @@ test("request capture follows host conversion and later context and system-promp
         timestamp: 5,
       },
     ];
+
     const later = extension("later");
     later.handlers.set("context", [
       async () => ({
@@ -400,6 +423,7 @@ test("request capture follows host conversion and later context and system-promp
     later.handlers.set("before_agent_start", [
       async () => ({ systemPrompt: "Effective system instructions." }),
     ]);
+
     const runner = new ExtensionRunner(
       [telemetry, later],
       runtime,
@@ -409,6 +433,7 @@ test("request capture follows host conversion and later context and system-promp
         await ModelRuntime.create({ authPath: join(directory, "auth.json"), modelsPath: null }),
       ),
     );
+
     let systemPrompt = "Base system instructions.";
     runner.bindCore(runtime, {
       getModel: () => undefined,
@@ -422,19 +447,23 @@ test("request capture follows host conversion and later context and system-promp
       compact: () => {},
       getSystemPrompt: () => systemPrompt,
     });
+
     const beforeStart = await runner.emitBeforeAgentStart("fix the bug", undefined, systemPrompt, {
       cwd: directory,
     });
+
     systemPrompt = beforeStart?.systemPrompt ?? systemPrompt;
     await runner.emit({ type: "agent_start" });
     const messages = convertToLlm(await runner.emitContext(original));
     await runner.emitBeforeProviderRequest({ messages });
+
     const message = {
       ...assistantMessage(),
       role: "assistant" as const,
       content: [{ type: "text" as const, text: "All done." }],
       stopReason: "stop" as const,
     };
+
     await runner.emit({ type: "message_start", message });
     await runner.emitMessageEnd({ type: "message_end", message });
     await runner.emit({ type: "agent_end", messages: [message] });
@@ -468,9 +497,11 @@ test("request capture follows host conversion and later context and system-promp
       }),
     );
     expect(chat.attributes["gen_ai.system_instructions"]).toBe("Effective system instructions.");
+
     const captured = JSON.stringify(
       exporters.spans.getFinishedSpans().map((span) => span.attributes),
     );
+
     expect(captured).not.toContain("PRIVATE_TOKEN");
     expect(captured).not.toContain("private-shell-output");
     expect(captured).not.toContain("private-custom-details");
@@ -515,6 +546,7 @@ test("provider request and effective system instructions pass through SDK maskin
     mask: (_value, { key }) =>
       key === "gen_ai.system_instructions" ? "[masked instructions]" : "[masked content]",
   });
+
   await harness.emit({ type: "agent_start" });
   await harness.emit({
     type: "before_provider_request",
@@ -584,6 +616,7 @@ test("tool executions produce successful and failed execute_tool spans", async (
   const spans = harness.exporters.spans
     .getFinishedSpans()
     .filter((span) => span.name === "execute_tool bash");
+
   expect(spans).toHaveLength(2);
   expect(spans[0]?.attributes).toMatchObject({
     "gen_ai.conversation.id": "session-1",
@@ -662,12 +695,14 @@ test("model_select logs the previous and selected model", async () => {
 test("malformed events never throw and report through onError", async () => {
   const errors: unknown[] = [];
   const harness = makeHarness({ onError: (error) => errors.push(error) });
+
   const poisoned = {
     type: "message_end",
     get message(): never {
       throw new Error("poisoned event");
     },
   };
+
   await expect(harness.emit(poisoned)).resolves.toBeUndefined();
   expect(errors).toHaveLength(1);
 
@@ -689,10 +724,12 @@ test("each event reads the current session id", async () => {
 test("tool spans nest under the chat span that issued the tool call", async () => {
   const harness = makeHarness();
   await harness.emit({ type: "agent_start" });
+
   const message = assistantMessage({
     stopReason: "toolUse",
     content: [{ type: "toolCall", id: "call-9", name: "bash", arguments: { command: "ls" } }],
   });
+
   await harness.emit({ type: "message_start", message });
   await harness.emit({ type: "message_end", message });
   await harness.emit({

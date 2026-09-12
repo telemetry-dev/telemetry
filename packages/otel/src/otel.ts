@@ -64,10 +64,12 @@ export class TelemetrySpanProcessor implements SpanProcessor {
   constructor(options: TelemetrySpanProcessorOptions = {}) {
     const env = resolveEnv();
     const apiKey = options.apiKey ?? env.TELEMETRY_DEV_API_KEY;
+
     const baseUrl = (options.baseUrl ?? env.TELEMETRY_DEV_BASE_URL ?? DEFAULT_BASE_URL).replace(
       /\/+$/,
       "",
     );
+
     const transport: Transport = {
       fetchImpl: options.fetch ?? globalThis.fetch,
       onError: options.onError,
@@ -82,20 +84,24 @@ export class TelemetrySpanProcessor implements SpanProcessor {
             transport,
           )
         : undefined);
+
     if (!exporter) {
       diag.debug(
         "no api key (apiKey option or TELEMETRY_DEV_API_KEY); TelemetrySpanProcessor is a no-op",
       );
+
       return;
     }
 
     const exportMode = options.exportMode ?? "batched";
+
     if (options.metrics !== false && apiKey) {
       const resource = resourceFromAttributes({
         "service.name": options.serviceName ?? env.OTEL_SERVICE_NAME ?? "unknown_service",
         "deployment.environment.name":
           options.environment ?? env.TELEMETRY_DEV_ENVIRONMENT ?? "production",
       });
+
       this.metrics = createMetricsPipeline({
         resource,
         exporter: createMetricExporter(
@@ -149,18 +155,22 @@ export function createTelemetrySpanExporter(
 ): SpanExporter {
   const env = resolveEnv();
   const apiKey = options.apiKey ?? env.TELEMETRY_DEV_API_KEY;
+
   const baseUrl = (options.baseUrl ?? env.TELEMETRY_DEV_BASE_URL ?? DEFAULT_BASE_URL).replace(
     /\/+$/,
     "",
   );
+
   if (!apiKey) {
     diag.debug("no api key (apiKey option or TELEMETRY_DEV_API_KEY); exporter is a no-op");
+
     return {
       export: (_spans, resultCallback) => resultCallback({ code: ExportResultCode.SUCCESS }),
       forceFlush: () => Promise.resolve(),
       shutdown: () => Promise.resolve(),
     };
   }
+
   return createTraceExporter(
     { url: `${baseUrl}/v1/traces`, headers: otlpHeaders(apiKey) },
     {

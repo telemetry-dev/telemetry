@@ -8,6 +8,7 @@ from typing import Any, cast
 import anthropic
 import httpx
 import pytest
+import telemetry_dev
 from anthropic import Anthropic, AsyncAnthropic
 from anthropic.resources.messages import AsyncMessages, Messages
 from anthropic.types import MessageParam, TextBlock
@@ -446,7 +447,21 @@ def test_tool_use_response_output_is_preserved(memory: SimpleNamespace) -> None:
     assert json.loads(str(a["gen_ai.input.messages"])) == {"messages": MESSAGES, "tools": [tool]}
 
 
-def test_create_streaming_preserves_events_and_records_aggregate(memory: SimpleNamespace) -> None:
+def test_create_streaming_preserves_events_and_records_aggregate(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timestamps: list[float] = []
+    original = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        assert timestamp_ms is not None
+        timestamps.append(timestamp_ms)
+        return original(handle, timestamp_ms)
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
+
     def handler(request: httpx.Request) -> httpx.Response:
         assert request_json(request)["stream"] is True
         return named_sse_response(stream_events())
@@ -468,6 +483,7 @@ def test_create_streaming_preserves_events_and_records_aggregate(memory: SimpleN
     assert a["gen_ai.response.model"] == "claude-sonnet-4-6"
     assert list(cast(Any, a["gen_ai.response.finish_reasons"])) == ["end_turn"]
     assert isinstance(a["gen_ai.response.time_to_first_chunk"], float)
+    assert len(timestamps) == 2
 
 
 def test_stream_mapping_error_reports_and_still_yields_provider_event(make: Any) -> None:
@@ -524,7 +540,21 @@ def test_streaming_response_helper_preserves_api_response(memory: SimpleNamespac
     assert memory.span_exporter.get_finished_spans() == ()
 
 
-async def test_async_create_streaming_matches_sync(memory: SimpleNamespace) -> None:
+async def test_async_create_streaming_matches_sync(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timestamps: list[float] = []
+    original = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        assert timestamp_ms is not None
+        timestamps.append(timestamp_ms)
+        return original(handle, timestamp_ms)
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
+
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request_json(request)["stream"] is True
         return named_sse_response(stream_events())
@@ -537,6 +567,7 @@ async def test_async_create_streaming_matches_sync(memory: SimpleNamespace) -> N
     await client.close()
 
     assert [event.type for event in events] == [event["type"] for event in stream_events()]
+    assert len(timestamps) == 2
     a = attrs(only_span(memory))
     assert json.loads(str(a["gen_ai.output.messages"])) == [
         {"role": "assistant", "content": [{"type": "text", "text": "Hello world"}]}

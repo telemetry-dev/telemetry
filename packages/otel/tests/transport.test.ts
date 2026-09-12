@@ -40,6 +40,7 @@ interface Call {
 
 function makeFetch(statuses: number[], headers?: Record<string, string>) {
   const calls: Call[] = [];
+
   const fetchImpl: typeof fetch = (input, init) => {
     if (!init) throw new Error("expected request init");
     calls.push({
@@ -48,23 +49,30 @@ function makeFetch(statuses: number[], headers?: Record<string, string>) {
       body: init.body as Uint8Array,
     });
     const status = statuses[Math.min(calls.length - 1, statuses.length - 1)]!;
+
     return Promise.resolve(new Response(null, { status, headers }));
   };
+
   return { calls, fetchImpl };
 }
 
 function makeSpans(count: number, attrBytes = 0): ReadableSpan[] {
   const exporter = new InMemorySpanExporter();
+
   const provider = new BasicTracerProvider({
     spanProcessors: [new SimpleSpanProcessor(exporter)],
     spanLimits: { attributeValueLengthLimit: 10_000_000 },
   });
+
   const tracer = provider.getTracer("test");
+
   for (let i = 0; i < count; i += 1) {
     const span = tracer.startSpan(`span-${i}`);
+
     if (attrBytes > 0) span.setAttribute("payload", "p".repeat(attrBytes));
     span.end();
   }
+
   return exporter.getFinishedSpans();
 }
 
@@ -115,10 +123,12 @@ const exportMetrics = (
 
 test("retries on 429/503 then succeeds", async () => {
   const { calls, fetchImpl } = makeFetch([429, 503, 200]);
+
   const exporter = createTraceExporter(
     { url: "https://ingest.example/v1/traces", headers: otlpHeaders("td_live_x") },
     { fetchImpl },
   );
+
   const code = await exportSpans(exporter, makeSpans(1));
   expect(code).toBe(ExportResultCode.SUCCESS);
   expect(calls).toHaveLength(3);
@@ -130,10 +140,12 @@ test("retries on 429/503 then succeeds", async () => {
 test("does not retry non-retryable statuses and reports the failure", async () => {
   const errors: unknown[] = [];
   const { calls, fetchImpl } = makeFetch([400]);
+
   const exporter = createTraceExporter(
     { url: "https://ingest.example/v1/traces", headers: otlpHeaders("td_live_x") },
     { fetchImpl, onError: (e) => errors.push(e) },
   );
+
   const code = await exportSpans(exporter, makeSpans(1));
   expect(code).toBe(ExportResultCode.FAILED);
   expect(calls).toHaveLength(1);
@@ -142,12 +154,14 @@ test("does not retry non-retryable statuses and reports the failure", async () =
 
 test("gives up after exhausting retries", async () => {
   const { calls, fetchImpl } = makeFetch([503, 503, 503]);
+
   const res = await postOtlp({
     fetchImpl,
     url: "https://ingest.example/v1/traces",
     headers: {},
     body: new Uint8Array([1]),
   });
+
   expect(res.status).toBe(503);
   expect(calls).toHaveLength(3);
 });
@@ -155,10 +169,12 @@ test("gives up after exhausting retries", async () => {
 test("exhausted retries surface as a failed export with onError", async () => {
   const errors: unknown[] = [];
   const { calls, fetchImpl } = makeFetch([503, 503, 503]);
+
   const exporter = createTraceExporter(
     { url: "https://ingest.example/v1/traces", headers: otlpHeaders("td_live_x") },
     { fetchImpl, onError: (e) => errors.push(e) },
   );
+
   const code = await exportSpans(exporter, makeSpans(1));
   expect(code).toBe(ExportResultCode.FAILED);
   expect(calls).toHaveLength(3);
@@ -168,10 +184,12 @@ test("exhausted retries surface as a failed export with onError", async () => {
 test("reports retry-after values beyond the local cap", async () => {
   const errors: unknown[] = [];
   const { calls, fetchImpl } = makeFetch([429, 200], { "retry-after": "60" });
+
   const exporter = createTraceExporter(
     { url: "https://ingest.example/v1/traces", headers: otlpHeaders("td_live_x") },
     { fetchImpl, onError: (error) => errors.push(error) },
   );
+
   const code = await exportSpans(exporter, makeSpans(1));
   expect(code).toBe(ExportResultCode.FAILED);
   expect(calls).toHaveLength(1);
@@ -188,12 +206,14 @@ describe("retry-after", () => {
 
   const startPost = (statuses: number[], headers: Record<string, string>) => {
     const { calls, fetchImpl } = makeFetch(statuses, headers);
+
     const pending = postOtlp({
       fetchImpl,
       url: "https://ingest.example/v1/traces",
       headers: {},
       body: new Uint8Array([1]),
     });
+
     return { calls, pending };
   };
 
@@ -223,9 +243,11 @@ describe("retry-after", () => {
 
   test("an HTTP date sets the delay relative to now", async () => {
     vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+
     const { calls, pending } = startPost([503, 200], {
       "retry-after": new Date(Date.now() + 1000).toUTCString(),
     });
+
     await vi.advanceTimersByTimeAsync(999);
     expect(calls).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(1);
@@ -277,6 +299,7 @@ describe("retry-after", () => {
 
 test("a missing CompressionStream ships large bodies uncompressed", async () => {
   vi.stubGlobal("CompressionStream", undefined);
+
   try {
     const original = new TextEncoder().encode("a".repeat(5000));
     const { body, contentEncoding } = await maybeGzip(original);
@@ -292,6 +315,7 @@ test("bodies above the threshold are gzipped and round-trip", async () => {
   const { body, contentEncoding } = await maybeGzip(original);
   expect(contentEncoding).toBe("gzip");
   expect(body.byteLength).toBeLessThan(original.byteLength);
+
   const decompressed = new Uint8Array(
     await new Response(
       new Blob([body as Uint8Array<ArrayBuffer>])
@@ -299,6 +323,7 @@ test("bodies above the threshold are gzipped and round-trip", async () => {
         .pipeThrough(new DecompressionStream("gzip")),
     ).arrayBuffer(),
   );
+
   expect(decompressed).toEqual(original);
 });
 
@@ -311,20 +336,24 @@ test("small bodies are not compressed", async () => {
 
 test("exported batches send a content-encoding gzip header for large payloads", async () => {
   const { calls, fetchImpl } = makeFetch([200]);
+
   const exporter = createTraceExporter(
     { url: "https://ingest.example/v1/traces", headers: otlpHeaders("td_live_x") },
     { fetchImpl },
   );
+
   await exportSpans(exporter, makeSpans(1, 10_000));
   expect(calls[0]!.headers["content-encoding"]).toBe("gzip");
 });
 
 test("oversized batches split into multiple POSTs", async () => {
   const { calls, fetchImpl } = makeFetch([200]);
+
   const exporter = createTraceExporter(
     { url: "https://ingest.example/v1/traces", headers: otlpHeaders("td_live_x") },
     { fetchImpl },
   );
+
   // Two ~2 MB spans: combined serialization exceeds the 3.5 MB guard, each half fits.
   const code = await exportSpans(exporter, makeSpans(2, 2_000_000));
   expect(code).toBe(ExportResultCode.SUCCESS);
@@ -334,10 +363,12 @@ test("oversized batches split into multiple POSTs", async () => {
 test("a single span beyond the limit is dropped with onError, not wedged", async () => {
   const errors: unknown[] = [];
   const { calls, fetchImpl } = makeFetch([200]);
+
   const exporter = createTraceExporter(
     { url: "https://ingest.example/v1/traces", headers: otlpHeaders("td_live_x") },
     { fetchImpl, onError: (e) => errors.push(e) },
   );
+
   const code = await exportSpans(exporter, makeSpans(1, 4_000_000));
   expect(code).toBe(ExportResultCode.SUCCESS);
   expect(calls).toHaveLength(0);
@@ -346,10 +377,12 @@ test("a single span beyond the limit is dropped with onError, not wedged", async
 
 test("metric exporter skips POSTs when every data point set is empty", async () => {
   const { calls, fetchImpl } = makeFetch([200]);
+
   const exporter = createMetricExporter(
     { url: "https://ingest.example/v1/metrics", headers: otlpHeaders("td_live_x") },
     { fetchImpl },
   );
+
   const code = await exportMetrics(exporter, makeGaugeMetrics([]));
   expect(code).toBe(ExportResultCode.SUCCESS);
   expect(calls).toHaveLength(0);
@@ -357,10 +390,12 @@ test("metric exporter skips POSTs when every data point set is empty", async () 
 
 test.each([429, 503])("metric exporter retries status %s", async (status) => {
   const { calls, fetchImpl } = makeFetch([status, 200]);
+
   const exporter = createMetricExporter(
     { url: "https://ingest.example/v1/metrics", headers: otlpHeaders("td_live_x") },
     { fetchImpl },
   );
+
   const code = await exportMetrics(exporter, makeGaugeMetrics([GAUGE_POINT]));
   expect(code).toBe(ExportResultCode.SUCCESS);
   expect(calls).toHaveLength(2);
@@ -370,14 +405,18 @@ test.each([429, 503])("metric exporter retries status %s", async (status) => {
 test("metric exporter exhausts retries for a network failure", async () => {
   const errors: unknown[] = [];
   let calls = 0;
+
   const fetchImpl: typeof fetch = () => {
     calls += 1;
+
     return Promise.reject(new Error("connection reset"));
   };
+
   const exporter = createMetricExporter(
     { url: "https://ingest.example/v1/metrics", headers: otlpHeaders("td_live_x") },
     { fetchImpl, onError: (e) => errors.push(e) },
   );
+
   const code = await exportMetrics(exporter, makeGaugeMetrics([GAUGE_POINT]));
   expect(code).toBe(ExportResultCode.FAILED);
   expect(calls).toBe(3);
@@ -410,17 +449,21 @@ const lifecycleCases = [
 describe.each(lifecycleCases)("$name exporter lifecycle", ({ create, start }) => {
   test("shutdown waits for active sends and rejects later exports", async () => {
     let resolveFetch: ((response: Response) => void) | undefined;
+
     const fetchImpl: typeof fetch = () =>
       new Promise((resolve) => {
         resolveFetch = resolve;
       });
+
     const exporter = create(fetchImpl);
     const events: string[] = [];
     start(exporter as never, (code) => events.push(`active:${code}`));
     await vi.waitFor(() => expect(resolveFetch).toBeDefined());
+
     const shutdown = exporter.shutdown().then(() => {
       events.push("shutdown");
     });
+
     await Promise.resolve();
     expect(events).toEqual([]);
     start(exporter as never, (code) => events.push(`late:${code}`));
@@ -436,18 +479,22 @@ describe.each(lifecycleCases)("$name exporter lifecycle", ({ create, start }) =>
 
   test("forceFlush resolves after every send active when it begins", async () => {
     const resolvers: Array<(response: Response) => void> = [];
+
     const fetchImpl: typeof fetch = () =>
       new Promise((resolve) => {
         resolvers.push(resolve);
       });
+
     const exporter = create(fetchImpl);
     const events: string[] = [];
     start(exporter as never, (code) => events.push(`first:${code}`));
     start(exporter as never, (code) => events.push(`second:${code}`));
     await vi.waitFor(() => expect(resolvers).toHaveLength(2));
+
     const flush = exporter.forceFlush!().then(() => {
       events.push("flush");
     });
+
     resolvers[0]!(new Response(null, { status: 200 }));
     await vi.waitFor(() => expect(events).toEqual([`first:${ExportResultCode.SUCCESS}`]));
     resolvers[1]!(new Response(null, { status: 200 }));
@@ -462,14 +509,17 @@ describe.each(lifecycleCases)("$name exporter lifecycle", ({ create, start }) =>
 
 test("forceFlush waits through a retry delay", async () => {
   vi.useFakeTimers();
+
   try {
     const { calls, fetchImpl } = makeFetch([503, 200]);
     const exporter = createTraceExporter(target, { fetchImpl });
     exporter.export(makeSpans(1), () => undefined);
     let flushed = false;
+
     const flush = exporter.forceFlush!().then(() => {
       flushed = true;
     });
+
     await vi.advanceTimersByTimeAsync(99);
     expect(calls).toHaveLength(1);
     expect(flushed).toBe(false);
@@ -508,6 +558,7 @@ test("callback and onError throws do not strand lifecycle state", async () => {
       throw new Error("onError failed");
     },
   });
+
   exporter.export(makeSpans(1), () => {
     throw new Error("callback failed");
   });
@@ -518,13 +569,17 @@ test("callback and onError throws do not strand lifecycle state", async () => {
 test("never-settling sends time out once and release lifecycle state", async () => {
   const spans = makeSpans(1);
   vi.useFakeTimers();
+
   try {
     const signals: AbortSignal[] = [];
     const results: ExportResultCode[][] = [[], []];
+
     const fetchImpl: typeof fetch = (_input, init) => {
       signals.push(init!.signal!);
+
       return new Promise(() => undefined);
     };
+
     const exporter = createTraceExporter(target, {
       fetchImpl,
       exportTimeoutMillis: 100,
@@ -532,6 +587,7 @@ test("never-settling sends time out once and release lifecycle state", async () 
         throw new Error("onError failed");
       },
     });
+
     exporter.export(spans, (result) => {
       results[0]!.push(result.code);
       throw new Error("callback failed");
@@ -564,16 +620,20 @@ test.each([-1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648])(
   "invalid export timeout %s uses the default",
   async (exportTimeoutMillis) => {
     vi.useFakeTimers();
+
     try {
       const signals: AbortSignal[] = [];
       const results: ExportResultCode[] = [];
+
       const exporter = createTraceExporter(target, {
         fetchImpl: (_input, init) => {
           signals.push(init!.signal!);
+
           return new Promise(() => undefined);
         },
         exportTimeoutMillis,
       });
+
       exporter.export(makeSpans(1), (result) => results.push(result.code));
       await Promise.resolve();
       await Promise.resolve();

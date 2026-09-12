@@ -3,7 +3,8 @@ import { flush, log, startSpan, type LogLevel, type SpanHandle } from "@telemetr
 import { ensureInit, type ClientOverrides, type TelemetryDevCursorOptions } from "./config.ts";
 import { createTitleLookup } from "./titles.ts";
 
-type JsonValue = string | number | boolean | null | undefined | JsonValue[] | JsonRecord;
+type JsonValue = string | number | boolean | null | undefined | Date | JsonValue[] | JsonRecord;
+
 interface JsonRecord {
   [key: string]: JsonValue;
 }
@@ -91,6 +92,7 @@ function asRecord<T>(value: T): JsonRecord | undefined {
 
 function readString<T>(value: T): string | undefined {
   const raw: unknown = value;
+
   return String(raw) === raw ? raw : undefined;
 }
 
@@ -101,6 +103,7 @@ function str(record: JsonRecord, key: string): string | undefined {
 function num(record: JsonRecord, key: string): number | undefined {
   const raw = record[key];
   const value = Number(raw);
+
   return value === raw && Number.isFinite(value) ? value : undefined;
 }
 
@@ -112,19 +115,23 @@ function asError<T>(cause: T): Error {
 function failureError(name: string, message: string | undefined): Error {
   const error = new Error(message ?? name);
   error.name = name;
+
   return error;
 }
 
 /** First line of the prompt or task, shortened to a span-name-sized label. */
 function shortName(text: string | undefined): string | undefined {
   const line = text?.trim().split("\n", 1)[0];
+
   if (!line) return undefined;
+
   return line.length > 60 ? `${line.slice(0, 59)}\u2026` : line;
 }
 
 /** `tool_output` arrives JSON-stringified; keep the string when it is not JSON. */
 function parseMaybeJson(value: string | undefined): JsonValue {
   if (value === undefined) return undefined;
+
   try {
     return JSON.parse(value) as JsonValue;
   } catch {
@@ -145,6 +152,7 @@ export function createCursorTelemetry(
   overrides?: ClientOverrides,
 ): CursorTelemetry {
   const onError = options.onError;
+
   try {
     ensureInit(options, overrides);
   } catch (error) {
@@ -161,14 +169,19 @@ export function createCursorTelemetry(
   function baseAttributes(event: JsonRecord) {
     const attributes: Record<string, string> = {};
     const conversationId = str(event, "conversation_id");
+
     if (conversationId) attributes["gen_ai.conversation.id"] = conversationId;
     const generationId = str(event, "generation_id");
+
     if (generationId) attributes["cursor.generation_id"] = generationId;
     const email = str(event, "user_email");
+
     if (email) attributes["cursor.user_email"] = email;
     const roots = event.workspace_roots;
     const workspace = Array.isArray(roots) ? readString(roots[0]) : undefined;
+
     if (workspace !== undefined) attributes["cursor.workspace"] = workspace;
+
     return attributes;
   }
 
@@ -187,18 +200,24 @@ export function createCursorTelemetry(
 
   function endTurn(conversationId: string, fields: Parameters<SpanHandle["end"]>[0]): void {
     const turn = turns.get(conversationId);
+
     if (!turn) return;
     turns.delete(conversationId);
+
     // Purge per-turn state so a later event or conversation cannot pick up
     // stale tool timings or claim a Task wait from this ended turn.
     for (const key of pendingTools.keys()) {
       if (key.startsWith(`${conversationId}:`)) pendingTools.delete(key);
     }
+
     for (let i = taskWaits.length - 1; i >= 0; i--) {
       if (taskWaits[i]!.parent === conversationId) taskWaits.splice(i, 1);
     }
+
     const link = subagents.get(conversationId);
+
     if (link) link.closed = true;
+
     // A parent that ends leaves no close signal for its open subagent turns;
     // end them at their own last activity.
     for (const [childId, childLink] of subagents) {
@@ -206,6 +225,7 @@ export function createCursorTelemetry(
       const child = turns.get(childId);
       endTurn(childId, { finishReason: "incomplete", endTime: child?.lastEvent });
     }
+
     turn.span.end({ name: titleFor(conversationId) ?? turn.fallbackName, ...fields });
   }
 
@@ -229,10 +249,13 @@ export function createCursorTelemetry(
     priorGenerations?: Set<string>,
   ): Turn | undefined {
     const conversationId = str(event, "conversation_id");
+
     if (!conversationId) return undefined;
     const existing = turns.get(conversationId);
+
     if (existing) return existing;
     let link = subagents.get(conversationId);
+
     if (
       !link &&
       !userPrompt &&
@@ -240,14 +263,17 @@ export function createCursorTelemetry(
       str(event, "generation_id") === conversationId
     ) {
       const wait = taskWaits.find((w) => !w.claimedBy && w.parent !== conversationId);
+
       if (wait) {
         wait.claimedBy = conversationId;
         link = { parent: wait.parent, type: wait.type, task: wait.task, closed: false };
         subagents.set(conversationId, link);
       }
     }
+
     const agentName = link ? (link.type ?? "subagent") : "cursor";
     const promptOrTask = readString(input) ?? link?.task;
+
     const turn: Turn = {
       span: startSpan(`invoke_agent ${agentName}`, {
         type: "agent",
@@ -264,7 +290,9 @@ export function createCursorTelemetry(
       generations: new Set(str(event, "generation_id") ? [str(event, "generation_id")!] : []),
       priorGenerations,
     };
+
     turns.set(conversationId, turn);
+
     return turn;
   }
 
@@ -274,14 +302,19 @@ export function createCursorTelemetry(
     // checked first: a nested child's stop can be delivered in its subagent
     // parent's context, where conversation_id names the parent, not the child.
     const transcript = str(event, "agent_transcript_path");
+
     if (transcript) {
       const parts = transcript.split(/[\\/]+/);
+
       for (const id of subagents.keys()) {
         if (parts.includes(id)) return id;
       }
     }
+
     const conversationId = str(event, "conversation_id");
+
     if (conversationId && subagents.has(conversationId)) return conversationId;
+
     return undefined;
   }
 
@@ -290,27 +323,34 @@ export function createCursorTelemetry(
     // A terminal event without a conversation_id still closes the sole open
     // turn, so a harness that omits the field cannot leak an open span.
     const soleTurn = turns.size === 1 ? [...turns.keys()][0] : undefined;
+
     const conversationId =
       str(event, "conversation_id") ??
       (name === "stop" || name === "sessionEnd" ? soleTurn : undefined);
+
     const now = Date.now();
     const generationId = str(event, "generation_id");
     // A stop can arrive late, after beforeSubmitPrompt already closed its turn
     // and opened the next one; matching it to the closed turn's generations
     // keeps it from prematurely closing the fresh turn.
     let staleStop = false;
+
     if (conversationId) {
       const active = turns.get(conversationId);
+
       if (active) {
         staleStop =
           name === "stop" &&
           generationId !== undefined &&
           !active.generations.has(generationId) &&
           active.priorGenerations?.has(generationId) === true;
+
         if (!staleStop) {
           active.lastEvent = now;
+
           if (generationId) active.generations.add(generationId);
           const sessionId = str(event, "session_id");
+
           if (sessionId) active.sessionId = sessionId;
         }
       }
@@ -319,11 +359,13 @@ export function createCursorTelemetry(
     switch (name) {
       case "sessionStart": {
         const sessionId = str(event, "session_id");
+
         if (sessionId) sessions.add(sessionId);
         emit(event, "info", "Session started", {
           "cursor.composer_mode": str(event, "composer_mode"),
           "cursor.is_background_agent": event.is_background_agent === true,
         });
+
         return;
       }
 
@@ -334,15 +376,20 @@ export function createCursorTelemetry(
           "cursor.error.message": str(event, "error_message"),
         });
         const sessionId = str(event, "session_id");
+
         if (sessionId) sessions.delete(sessionId);
+
         if (conversationId) sessions.delete(conversationId);
         const targets = new Set<string>();
+
         if (conversationId) targets.add(conversationId);
+
         if (sessionId) {
           for (const [id, turn] of turns) {
             if (turn.sessionId === sessionId) targets.add(id);
           }
         }
+
         for (const id of targets) {
           endTurn(id, {
             error:
@@ -352,35 +399,45 @@ export function createCursorTelemetry(
             finishReason: reason === "error" ? undefined : (reason ?? "incomplete"),
           });
         }
+
         void flush().catch((error) => onError?.(asError(error)));
+
         return;
       }
 
       case "beforeSubmitPrompt": {
         let priorGenerations: Set<string> | undefined;
+
         if (conversationId) {
           const prior = turns.get(conversationId);
+
           if (prior) {
             priorGenerations = new Set(prior.priorGenerations);
+
             for (const generation of prior.generations) {
               priorGenerations.add(generation);
             }
           }
+
           endTurn(conversationId, { finishReason: "incomplete" });
         }
+
         ensureTurn(event, str(event, "prompt"), true, priorGenerations);
+
         return;
       }
 
       case "preToolUse": {
         ensureTurn(event);
         const callId = str(event, "tool_use_id");
+
         if (callId && conversationId) {
           pendingTools.set(`${conversationId}:${callId}`, {
             startedAt: now,
             input: event.tool_input,
           });
         }
+
         // A Task call spawns a subagent conversation; the next unknown
         // conversation claims this wait (see ensureTurn).
         if (conversationId && str(event, "tool_name") === "Task") {
@@ -392,6 +449,7 @@ export function createCursorTelemetry(
             task: str(record, "prompt") ?? str(record, "description"),
           });
         }
+
         return;
       }
 
@@ -401,8 +459,10 @@ export function createCursorTelemetry(
         const tool = str(event, "tool_name") ?? "unknown";
         const callId = str(event, "tool_use_id");
         const pending = callId ? pendingTools.get(`${conversationId}:${callId}`) : undefined;
+
         if (callId) pendingTools.delete(`${conversationId}:${callId}`);
         const duration = num(event, "duration");
+
         const span = startSpan(`execute_tool ${tool}`, {
           type: "tool",
           parent: turn?.span,
@@ -414,6 +474,7 @@ export function createCursorTelemetry(
           output: parseMaybeJson(str(event, "tool_output")),
           attributes: baseAttributes(event),
         });
+
         span.end({
           error:
             name === "postToolUseFailure"
@@ -423,6 +484,7 @@ export function createCursorTelemetry(
                 )
               : undefined,
         });
+
         // The Task tool result closes the subagent conversations it spawned.
         // Parallel workers share one tool_use_id, so one result can close
         // several claimed waits.
@@ -430,10 +492,13 @@ export function createCursorTelemetry(
           const matches = taskWaits.filter(
             (w) => w.parent === conversationId && (callId ? w.callId === callId : true),
           );
+
           for (const wait of matches) {
             const index = taskWaits.indexOf(wait);
+
             if (index >= 0) taskWaits.splice(index, 1);
             const child = wait.claimedBy;
+
             if (!child || !turns.has(child)) continue;
             const failed = name === "postToolUseFailure";
             const childTurn = turns.get(child);
@@ -450,12 +515,14 @@ export function createCursorTelemetry(
             });
           }
         }
+
         return;
       }
 
       case "subagentStart": {
         const parent = str(event, "parent_conversation_id") ?? conversationId;
         const subagentId = str(event, "subagent_id");
+
         if (parent) {
           const link: SubagentLink = {
             parent,
@@ -464,38 +531,48 @@ export function createCursorTelemetry(
             task: str(event, "task"),
             closed: false,
           };
+
           if (subagentId) subagents.set(subagentId, link);
           // When the Task preToolUse already registered a wait, enrich it so a
           // conversation claiming it inherits the subagent type and model.
           const toolCallId = str(event, "tool_call_id");
+
           const wait = taskWaits.find(
             (w) => w.parent === parent && (toolCallId ? w.callId === toolCallId : !w.claimedBy),
           );
+
           if (wait) {
             wait.type ??= link.type;
             wait.task ??= link.task;
           }
+
           // Some payloads deliver the subagent's own conversation_id here.
           if (conversationId && conversationId !== parent) subagents.set(conversationId, link);
           // Open the parent turn so the subagent's spans have a trace to nest in.
           ensureTurn({ ...event, conversation_id: parent });
         }
+
         emit(event, "info", "Subagent started", {
           "cursor.subagent_id": subagentId,
           "cursor.subagent_type": str(event, "subagent_type"),
           "cursor.subagent_model": str(event, "subagent_model"),
         });
+
         return;
       }
 
       case "subagentStop": {
         const status = str(event, "status");
+
         const error =
           status === "error" ? failureError("SubagentError", str(event, "task")) : undefined;
+
         const subagentId = resolveSubagent(event);
         const link = subagentId ? subagents.get(subagentId) : undefined;
+
         if (subagentId && link) {
           const child = turns.get(subagentId);
+
           if (child) {
             child.span.update({
               output: str(event, "summary"),
@@ -503,16 +580,20 @@ export function createCursorTelemetry(
             });
             endTurn(subagentId, { error, finishReason: status === "error" ? undefined : status });
           }
+
           for (const [id, other] of subagents) {
             if (other === link) subagents.delete(id);
           }
+
           // The subagent's own events already produced its turn span; only a
           // link that never opened (and never closed) a turn needs the
           // synthetic span below.
           if (child || link.closed) return;
         }
+
         const turn = link ? turns.get(link.parent) : ensureTurn(event);
         const duration = num(event, "duration_ms") ?? 0;
+
         const span = startSpan(`invoke_agent ${str(event, "subagent_type") ?? "subagent"}`, {
           type: "agent",
           parent: turn?.span,
@@ -525,7 +606,9 @@ export function createCursorTelemetry(
             "cursor.subagent_status": status ?? "unknown",
           },
         });
+
         span.end({ error, finishReason: status === "error" ? undefined : status });
+
         return;
       }
 
@@ -536,6 +619,7 @@ export function createCursorTelemetry(
           "cursor.file_path": str(event, "file_path"),
           "cursor.edit_count": Array.isArray(edits) ? edits.length : 0,
         });
+
         return;
       }
 
@@ -549,12 +633,14 @@ export function createCursorTelemetry(
           output: str(event, "text"),
           attributes: baseAttributes(event),
         }).end();
+
         return;
       }
 
       case "afterAgentResponse": {
         const turn = ensureTurn(event);
         const model = str(event, "model_id") ?? str(event, "model");
+
         const span = startSpan(`chat ${model ?? "unknown"}`, {
           type: "generation",
           parent: turn?.span,
@@ -564,11 +650,14 @@ export function createCursorTelemetry(
           output: str(event, "text"),
           attributes: baseAttributes(event),
         });
+
         span.end();
+
         if (turn) {
           turn.lastBoundary = now;
           turn.span.update({ output: str(event, "text") });
         }
+
         return;
       }
 
@@ -579,19 +668,23 @@ export function createCursorTelemetry(
           "cursor.context_tokens": num(event, "context_tokens"),
           "cursor.messages_to_compact": num(event, "messages_to_compact"),
         });
+
         return;
       }
 
       case "stop": {
         if (staleStop) return;
         const status = str(event, "status");
+
         if (conversationId) {
           endTurn(conversationId, {
             error: status === "error" ? failureError("AgentError", "agent loop failed") : undefined,
             finishReason: status === "error" ? undefined : status,
           });
         }
+
         void flush().catch((error) => onError?.(asError(error)));
+
         return;
       }
     }
@@ -613,6 +706,7 @@ export function createCursorTelemetry(
         for (const [conversationId, turn] of turns) {
           endTurn(conversationId, { finishReason: "incomplete", endTime: turn.lastEvent });
         }
+
         pendingTools.clear();
         subagents.clear();
         taskWaits.length = 0;

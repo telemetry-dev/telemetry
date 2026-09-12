@@ -22,6 +22,7 @@ afterEach(async () => {
 
 test("InvokeAgent aggregates trace usage and return control", async () => {
   const spans = setup();
+
   const client = wrapBedrockAgents(
     new FakeClient([
       {
@@ -53,6 +54,7 @@ test("InvokeAgent aggregates trace usage and return control", async () => {
     ]),
     { captureAgentTrace: true },
   );
+
   const response = (await client.send(
     new InvokeAgentCommand({
       agentId: "agent-1",
@@ -62,6 +64,7 @@ test("InvokeAgent aggregates trace usage and return control", async () => {
       enableTrace: true,
     }),
   )) as { completion: AsyncIterable<unknown> };
+
   await collect(response.completion);
 
   const [span] = spans.getFinishedSpans();
@@ -86,6 +89,7 @@ test("InvokeAgent aggregates trace usage and return control", async () => {
 
 test("Retrieve and RetrieveAndGenerate capture outputs and citations", async () => {
   const spans = setup();
+
   const client = wrapBedrockAgents(
     new FakeClient([
       {
@@ -127,6 +131,7 @@ test("Retrieve and RetrieveAndGenerate capture outputs and citations", async () 
 
 test("RetrieveAndGenerateStream and InvokeFlow finish from streams", async () => {
   const spans = setup();
+
   const client = wrapBedrockAgents(
     new FakeClient([
       {
@@ -150,13 +155,17 @@ test("RetrieveAndGenerateStream and InvokeFlow finish from streams", async () =>
       },
     ]),
   );
+
   const rag = (await client.send(
     new RetrieveAndGenerateStreamCommand({ input: { text: "q" } }),
   )) as { stream: AsyncIterable<unknown> };
+
   await collect(rag.stream);
+
   const flow = (await client.send(
     new InvokeFlowCommand({ flowIdentifier: "flow-1", flowAliasIdentifier: "alias", inputs: [] }),
   )) as { responseStream: AsyncIterable<unknown> };
+
   await collect(flow.responseStream);
 
   const [ragSpan, flowSpan] = spans.getFinishedSpans();
@@ -171,8 +180,10 @@ test("RetrieveAndGenerateStream and InvokeFlow finish from streams", async () =>
   ]);
   expect(flowSpan.attributes["gen_ai.response.finish_reasons"]).toEqual(["SUCCESS"]);
 });
+
 test("modeled stream errors from Agent, RAG, and Flow mark spans as errors", async () => {
   const spans = setup();
+
   const client = wrapBedrockAgents(
     new FakeClient([
       {
@@ -213,17 +224,23 @@ test("modeled stream errors from Agent, RAG, and Flow mark spans as errors", asy
       },
     ]),
   );
+
   const agent = (await client.send(
     new InvokeAgentCommand({ agentId: "agent-1", agentAliasId: "alias", sessionId: "sess" }),
   )) as { completion: AsyncIterable<unknown> };
+
   await collect(agent.completion);
+
   const rag = (await client.send(
     new RetrieveAndGenerateStreamCommand({ input: { text: "q" } }),
   )) as { stream: AsyncIterable<unknown> };
+
   await collect(rag.stream);
+
   const flow = (await client.send(
     new InvokeFlowCommand({ flowIdentifier: "flow-1", flowAliasIdentifier: "alias", inputs: [] }),
   )) as { responseStream: AsyncIterable<unknown> };
+
   await collect(flow.responseStream);
 
   const [agentSpan, ragSpan, flowSpan] = spans.getFinishedSpans();
@@ -243,10 +260,12 @@ test("modeled stream errors from Agent, RAG, and Flow mark spans as errors", asy
 
 test("global agents instrumentation is idempotent", async () => {
   const spans = setup();
+
   const originalDescriptor = Object.getOwnPropertyDescriptor(
     BedrockAgentRuntimeClient.prototype,
     "send",
   );
+
   const fakeSend = async () => ({
     completion: streamOf([{ chunk: { bytes: bytes("global") } }]),
     $metadata: { requestId: "agent-global-1" },
@@ -261,13 +280,16 @@ test("global agents instrumentation is idempotent", async () => {
   try {
     instrumentBedrockAgents();
     instrumentBedrockAgents();
+
     const client = new BedrockAgentRuntimeClient({
       region: "us-east-1",
       credentials: { accessKeyId: "test", secretAccessKey: "test" },
     });
+
     const response = (await client.send(
       new InvokeAgentCommand({ agentId: "agent-1", agentAliasId: "alias", sessionId: "sess" }),
     )) as { completion: AsyncIterable<unknown> };
+
     await collect(response.completion);
     expect(spans.getFinishedSpans()).toHaveLength(1);
     expect(spans.getFinishedSpans()[0]!.attributes["gen_ai.response.id"]).toBe("agent-global-1");
@@ -277,6 +299,7 @@ test("global agents instrumentation is idempotent", async () => {
     ).toBe(fakeSend);
   } finally {
     uninstrumentBedrockAgents();
+
     if (originalDescriptor) {
       Object.defineProperty(BedrockAgentRuntimeClient.prototype, "send", originalDescriptor);
     }

@@ -79,6 +79,7 @@ test("the message passes through the mask hook", async () => {
   const { logs } = setup({
     mask: (value, ctx) => (ctx.key === "log.message" ? "[redacted]" : value),
   });
+
   log("user email is foo@bar.com");
   await flush();
   expect(logs.getFinishedLogRecords()[0]!.body).toBe("[redacted]");

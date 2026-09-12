@@ -10,9 +10,11 @@ afterEach(async () => {
 
 test("sync function: name, single-arg input, return output", async () => {
   const { spans } = setup();
+
   const double = observe(function double(n: number) {
     return n * 2;
   });
+
   expect(double(21)).toBe(42);
   await flush();
   const span = spans.getFinishedSpans()[0]!;
@@ -40,13 +42,16 @@ test("multiple args are captured as an array; zero args capture nothing", async 
 
 test("async function ends after resolution with output", async () => {
   const { spans } = setup();
+
   const fetchData = observe(
     async function fetchData() {
       await Promise.resolve();
+
       return { items: [1, 2] };
     },
     { type: "tool", toolName: "fetch-data" },
   );
+
   await fetchData();
   await flush();
   const span = spans.getFinishedSpans()[0]!;
@@ -56,9 +61,11 @@ test("async function ends after resolution with output", async () => {
 
 test("sync throw is recorded and rethrown", async () => {
   const { spans } = setup();
+
   const boom = observe(function boom(): never {
     throw new RangeError("sync fail");
   });
+
   expect(() => boom()).toThrow("sync fail");
   await flush();
   const span = spans.getFinishedSpans()[0]!;
@@ -68,10 +75,12 @@ test("sync throw is recorded and rethrown", async () => {
 
 test("async rejection is recorded and rethrown", async () => {
   const { spans } = setup();
+
   const boom = observe(async function asyncBoom() {
     await Promise.resolve();
     throw new Error("async fail");
   });
+
   await expect(boom()).rejects.toThrow("async fail");
   await flush();
   expect(spans.getFinishedSpans()[0]!.status.code).toBe(SpanStatusCode.ERROR);
@@ -79,14 +88,19 @@ test("async rejection is recorded and rethrown", async () => {
 
 test("nested observes parent correctly across await", async () => {
   const { spans } = setup();
+
   const inner = observe(async function inner() {
     await Promise.resolve();
+
     return "inner-done";
   });
+
   const outer = observe(async function outer() {
     await Promise.resolve();
+
     return inner();
   });
+
   await outer();
   await flush();
   const exported = spans.getFinishedSpans();
@@ -100,6 +114,7 @@ test("wrapping before init works; the client is resolved at call time", async ()
   const wrapped = observe(function early(x: string) {
     return x.toUpperCase();
   });
+
   expect(wrapped("pre-init")).toBe("PRE-INIT");
   const { spans } = setup();
   wrapped("post-init");

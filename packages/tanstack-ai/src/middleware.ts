@@ -41,9 +41,10 @@ type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-const isString = (value: unknown): value is string => typeof value === "string";
-const isNumber = (value: unknown): value is number => typeof value === "number";
-const isBigInt = (value: unknown): value is bigint => typeof value === "bigint";
+const isString = <T>(value: T): value is T & string => typeof value === "string";
+const isNumber = <T>(value: T): value is T & number => typeof value === "number";
+const isBigInt = <T>(value: T): value is T & bigint => typeof value === "bigint";
+
 const isObject = <T>(value: T): value is T & { [key: string]: JsonValue } =>
   value !== null && typeof value === "object";
 
@@ -51,9 +52,11 @@ function readId<T>(value: T): string | null {
   if (isString(value)) {
     return value.length > 0 ? value : null;
   }
+
   if (isNumber(value) || isBigInt(value)) {
     return value.toString();
   }
+
   return null;
 }
 
@@ -63,25 +66,33 @@ function firstNumber<T>(...candidates: T[]): number | undefined {
       return candidate;
     }
   }
+
   return undefined;
 }
 
 function errorTypeName<T>(err: T): string {
   if (err instanceof Error) return err.name || "Error";
+
   if (err && isObject(err) && "name" in err) {
     const n = (err as { name?: unknown }).name;
+
     if (isString(n) && n.length > 0) return n;
   }
+
   return "Error";
 }
 
 function errorMessage<T>(err: T): string {
   if (err instanceof Error) return err.message;
+
   if (isString(err)) return err;
+
   if (err && isObject(err) && "message" in err) {
     const m = (err as { message?: unknown }).message;
+
     if (isString(m)) return m;
   }
+
   return String(err);
 }
 
@@ -103,10 +114,12 @@ const MAX_TOKENS_KEYS = [
 // among the known spellings (including Ollama's nested `options`) for the gen_ai.request.* attrs.
 function samplingAttributes(modelOptions: Record<string, JsonValue> | undefined): Attributes {
   const sampling = modelOptions ?? {};
+
   const nested =
     sampling["options"] && isObject(sampling["options"])
       ? (sampling["options"] as Record<string, JsonValue>)
       : undefined;
+
   return omitUndefined({
     "gen_ai.request.temperature": firstNumber(sampling["temperature"], nested?.["temperature"]),
     "gen_ai.request.top_p": firstNumber(sampling["top_p"], sampling["topP"], nested?.["top_p"]),
@@ -175,6 +188,7 @@ export function telemetryDev(
   }
 
   const onError = config.onError;
+
   const emitter = createGenerationEmitter(
     {
       ...config,
@@ -185,10 +199,12 @@ export function telemetryDev(
     },
     overrides,
   );
+
   const states = new WeakMap<ChatMiddlewareContext, RunState>();
 
   const closeIteration = (state: RunState): void => {
     const iteration = state.iteration;
+
     if (!iteration) return;
     const endedAt = new Date();
     const usage = iteration.usage;
@@ -215,9 +231,11 @@ export function telemetryDev(
       inputTokens: usage?.promptTokens ?? null,
       outputTokens: usage?.completionTokens ?? null,
     });
+
     if (iteration.structured && iteration.outputText !== null) {
       state.structuredOutput = iteration.outputText;
     }
+
     state.iteration = null;
   };
 
@@ -237,9 +255,11 @@ export function telemetryDev(
         ...state.rootSampling,
       }),
     );
+
     if (state.restMetadata) {
       for (const [key, value] of Object.entries(state.restMetadata)) {
         const attr = isString(value) ? value : jsonAttr(value);
+
         if (attr !== undefined) {
           state.rootSpan.setAttribute(`td.metadata.${key}`, attr);
         }
@@ -269,12 +289,16 @@ export function telemetryDev(
       "gen_ai.request.model": state.requestModel,
       "gen_ai.response.model": state.responseModel ?? undefined,
     });
+
     for (const m of state.iterationMetrics) {
       const attrs: Attributes = { ...metricBase, "gen_ai.operation.name": "chat" };
       emitter.recordDuration(m.durationSec, attrs);
+
       if (m.inputTokens !== null) emitter.recordTokens("input", m.inputTokens, attrs);
+
       if (m.outputTokens !== null) emitter.recordTokens("output", m.outputTokens, attrs);
     }
+
     for (const t of state.toolMetrics) {
       emitter.recordDuration(t.durationSec, {
         ...metricBase,
@@ -292,7 +316,9 @@ export function telemetryDev(
       entry.span.end();
       state.childSpans.push(entry.span);
     }
+
     state.openTools.clear();
+
     if (state.iteration) {
       state.iteration.span.setStatus({ code: SpanStatusCode.ERROR, message });
       state.iteration.span.setAttribute("error.type", errType);
@@ -306,20 +332,25 @@ export function telemetryDev(
     onStart(ctx) {
       try {
         const rawMetadata = ctx.options?.["metadata"];
+
         const metadata =
           rawMetadata && isObject(rawMetadata)
             ? (rawMetadata as Record<string, JsonValue>)
             : undefined;
+
         const userId = readId(metadata?.["userId"]);
         const sessionId = readId(metadata?.["sessionId"]) ?? ctx.threadId;
         let restMetadata: Record<string, JsonValue> | undefined;
+
         if (metadata) {
           const rest: Record<string, JsonValue> = {};
+
           for (const [key, value] of Object.entries(metadata)) {
             if (key !== "userId" && key !== "sessionId") {
               rest[key] = value;
             }
           }
+
           restMetadata = Object.keys(rest).length > 0 ? rest : undefined;
         }
 
@@ -329,6 +360,7 @@ export function telemetryDev(
           { startTime: new Date(), kind: SpanKind.INTERNAL },
           withSessionParent(otelContext.active(), sessionId ?? undefined, config.apiKey),
         );
+
         states.set(ctx, {
           rootSpan,
           rootCtx: trace.setSpan(ROOT_CONTEXT, rootSpan),
@@ -360,8 +392,10 @@ export function telemetryDev(
       // `chat({ outputSchema })` on adapters without native combined support. The latter needs
       // its own span — otherwise its onUsage would overwrite the last iteration's usage.
       if (ctx.phase !== "beforeModel" && ctx.phase !== "structuredOutput") return undefined;
+
       try {
         const state = states.get(ctx);
+
         if (!state) return undefined;
 
         // The previous iteration's span stays open through tool execution and onUsage so tool
@@ -369,19 +403,24 @@ export function telemetryDev(
         closeIteration(state);
 
         const inputMessages: Array<{ role: string; content: unknown }> = [];
+
         for (const prompt of chatConfig.systemPrompts) {
           inputMessages.push({
             role: "system",
             content: isString(prompt) ? prompt : prompt.content,
           });
         }
+
         for (const message of chatConfig.messages) {
           inputMessages.push({ role: message.role, content: message.content });
         }
+
         const inputJson = jsonAttr(inputMessages);
+
         const sampling = samplingAttributes(
           (chatConfig.modelOptions ?? ctx.modelOptions) as Record<string, JsonValue> | undefined,
         );
+
         if (!state.rootCaptured) {
           state.rootCaptured = true;
           state.rootInput = inputJson;
@@ -389,6 +428,7 @@ export function telemetryDev(
         }
 
         const startedAt = new Date();
+
         const span = emitter.tracer.startSpan(
           "chat",
           {
@@ -405,6 +445,7 @@ export function telemetryDev(
           },
           state.rootCtx,
         );
+
         state.iteration = {
           span,
           otelCtx: trace.setSpan(state.rootCtx, span),
@@ -418,42 +459,54 @@ export function telemetryDev(
       } catch (err) {
         onError?.(err);
       }
+
       return undefined;
     },
 
     onChunk(ctx, chunk) {
       if (chunk.type !== "RUN_FINISHED" && chunk.type !== "CUSTOM") return undefined;
+
       try {
         const state = states.get(ctx);
         const iteration = state?.iteration;
+
         if (!state || !iteration) return undefined;
+
         if (chunk.type === "CUSTOM") {
           // The finalization stream reports its JSON via this event; `ctx.accumulatedContent`
           // still holds the agent loop's text, so this is the structured span's only output.
           if (iteration.structured && chunk.name === "structured-output.complete") {
             const raw = (chunk.value as { raw?: unknown } | null | undefined)?.raw;
+
             if (isString(raw)) iteration.outputText = raw;
           }
+
           return undefined;
         }
+
         iteration.finishReason = chunk.finishReason ?? null;
+
         if (chunk.model) {
           iteration.responseModel = chunk.model;
           state.responseModel = chunk.model;
         }
+
         if (chunk.usage) iteration.usage = chunk.usage;
+
         if (!iteration.structured) {
           iteration.outputText = ctx.accumulatedContent.length > 0 ? ctx.accumulatedContent : null;
         }
       } catch (err) {
         onError?.(err);
       }
+
       return undefined;
     },
 
     onUsage(ctx, usage: UsageInfo) {
       try {
         const state = states.get(ctx);
+
         if (state?.iteration) {
           state.iteration.usage = usage;
         }
@@ -465,8 +518,10 @@ export function telemetryDev(
     onBeforeToolCall(ctx, hookCtx: ToolCallHookContext) {
       try {
         const state = states.get(ctx);
+
         if (!state) return undefined;
         const startedAt = new Date();
+
         const span = emitter.tracer.startSpan(
           "execute_tool",
           {
@@ -482,11 +537,13 @@ export function telemetryDev(
           },
           state.iteration?.otelCtx ?? state.rootCtx,
         );
+
         state.openTools.set(hookCtx.toolCallId, { span, startedAt });
         state.hasToolSpan = true;
       } catch (err) {
         onError?.(err);
       }
+
       return undefined;
     },
 
@@ -494,12 +551,14 @@ export function telemetryDev(
       try {
         const state = states.get(ctx);
         const entry = state?.openTools.get(info.toolCallId);
+
         if (!state || !entry) return;
         state.openTools.delete(info.toolCallId);
         const { span } = entry;
 
         if (info.ok) {
           const result = jsonAttr(info.result ?? null);
+
           if (result !== undefined) {
             span.setAttribute("gen_ai.tool.call.result", result);
           }
@@ -526,8 +585,10 @@ export function telemetryDev(
     async onToolPhaseComplete(ctx, info: ToolPhaseCompleteInfo) {
       // Ordinary tool phases finalize through the terminal hooks; only the wait path needs us.
       if (info.needsApproval.length === 0 && info.needsClientExecution.length === 0) return;
+
       try {
         const state = states.get(ctx);
+
         if (!state) return;
         states.delete(ctx);
 
@@ -539,6 +600,7 @@ export function telemetryDev(
           entry.span.end();
           state.childSpans.push(entry.span);
         }
+
         state.openTools.clear();
         const finishReason = state.iteration?.finishReason ?? "tool_calls";
         closeIteration(state);
@@ -559,6 +621,7 @@ export function telemetryDev(
         const waitingTools = [...info.needsApproval, ...info.needsClientExecution]
           .map((t) => t.toolName)
           .join(", ");
+
         addSummaryEvent(state, false, `Generation paused awaiting tools (${waitingTools})`);
 
         state.rootSpan.end();
@@ -572,6 +635,7 @@ export function telemetryDev(
     async onFinish(ctx, info: FinishInfo) {
       try {
         const state = states.get(ctx);
+
         if (!state) return;
         states.delete(ctx);
 
@@ -581,6 +645,7 @@ export function telemetryDev(
           entry.span.end();
           state.childSpans.push(entry.span);
         }
+
         state.openTools.clear();
         closeIteration(state);
 
@@ -593,21 +658,27 @@ export function telemetryDev(
         );
 
         const finishReason = info.finishReason ?? "unknown";
+
         const inputTokens = state.iterationMetrics.reduce(
           (sum, m) => sum + (m.inputTokens ?? 0),
           0,
         );
+
         const outputTokens = state.iterationMetrics.reduce(
           (sum, m) => sum + (m.outputTokens ?? 0),
           0,
         );
+
         const tokenParts: string[] = [];
+
         if (state.iterationMetrics.some((m) => m.inputTokens !== null)) {
           tokenParts.push(`${inputTokens} in`);
         }
+
         if (state.iterationMetrics.some((m) => m.outputTokens !== null)) {
           tokenParts.push(`${outputTokens} out`);
         }
+
         const tokenText = tokenParts.length > 0 ? `: ${tokenParts.join(" / ")} tokens` : "";
         addSummaryEvent(state, false, `Generation completed (${finishReason})${tokenText}`);
 
@@ -622,6 +693,7 @@ export function telemetryDev(
     async onError(ctx, info: ErrorInfo) {
       try {
         const state = states.get(ctx);
+
         if (!state) return;
         states.delete(ctx);
 
@@ -650,6 +722,7 @@ export function telemetryDev(
     async onAbort(ctx, info: AbortInfo) {
       try {
         const state = states.get(ctx);
+
         if (!state) return;
         states.delete(ctx);
 

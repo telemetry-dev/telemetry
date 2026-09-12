@@ -24,10 +24,12 @@ test("primitives are safe no-ops before init", async () => {
 
 test("enabled:false yields a no-op client even with a key", () => {
   const spans = new InMemorySpanExporter();
+
   const client = init(
     { apiKey: "td_live_test", enabled: false, logLevel: "silent" },
     { spanExporter: spans },
   );
+
   expect(client.enabled).toBe(false);
   startSpan("nope").end();
   expect(spans.getFinishedSpans()).toHaveLength(0);
@@ -36,6 +38,7 @@ test("enabled:false yields a no-op client even with a key", () => {
 test("missing api key disables the client", () => {
   const previous = process.env.TELEMETRY_DEV_API_KEY;
   delete process.env.TELEMETRY_DEV_API_KEY;
+
   try {
     const client = init({ logLevel: "silent" });
     expect(client.enabled).toBe(false);
@@ -49,6 +52,7 @@ test("missing api key disables the client", () => {
 test("an exporter override enables the client without an api key", async () => {
   const previous = process.env.TELEMETRY_DEV_API_KEY;
   delete process.env.TELEMETRY_DEV_API_KEY;
+
   try {
     const spans = new InMemorySpanExporter();
     const client = init({ exportMode: "immediate", logLevel: "silent" }, { spanExporter: spans });
@@ -93,9 +97,11 @@ test("concurrent flush calls both resolve and export the span exactly once", asy
 test("waitUntil receives the flush promise instead of awaiting", async () => {
   let resultCallback: Parameters<SpanExporter["export"]>[1] | undefined;
   let resolveExportStarted!: () => void;
+
   const exportStarted = new Promise<void>((resolve) => {
     resolveExportStarted = resolve;
   });
+
   const exporter: SpanExporter = {
     export: (_spans, callback) => {
       resultCallback = callback;
@@ -103,6 +109,7 @@ test("waitUntil receives the flush promise instead of awaiting", async () => {
     },
     shutdown: () => Promise.resolve(),
   };
+
   let handoff: Promise<unknown> | undefined;
   setup(
     {
@@ -119,9 +126,11 @@ test("waitUntil receives the flush promise instead of awaiting", async () => {
 
   const exportPromise = handoff;
   const callback = resultCallback;
+
   try {
     expect(exportPromise).toBeDefined();
     expect(callback).toBeDefined();
+
     if (!exportPromise || !callback) {
       throw new Error("waitUntil did not receive an in-flight export");
     }
@@ -175,6 +184,7 @@ test("resource carries service name and environment", async () => {
   expect(span.resource.attributes["deployment.environment.name"]).toBe("test");
   expect(span.instrumentationScope.name).toBe("@telemetry-dev/sdk");
 });
+
 test("OTLP requests identify the calling SDK package", async () => {
   const requests: Request[] = [];
   init({
@@ -184,6 +194,7 @@ test("OTLP requests identify the calling SDK package", async () => {
     sdkName: "@telemetry-dev/cursor",
     fetch: async (input, init) => {
       requests.push(new Request(input, init));
+
       return new Response(null, { status: 200 });
     },
   });
