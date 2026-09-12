@@ -15,7 +15,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/telemetry-dev/sdks.git",
+    "url": "git+https://github.com/telemetry-dev/telemetry.git",
     "directory": "packages/tanstack-ai"
   },
   "files": [

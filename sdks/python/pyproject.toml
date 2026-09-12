@@ -26,7 +26,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://telemetry.dev"
-Repository = "https://github.com/telemetry-dev/sdks"
+Repository = "https://github.com/telemetry-dev/telemetry"
 
 [dependency-groups]
 dev = [

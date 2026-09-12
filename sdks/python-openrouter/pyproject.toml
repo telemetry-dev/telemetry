@@ -25,7 +25,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://telemetry.dev"
-Repository = "https://github.com/telemetry-dev/sdks"
+Repository = "https://github.com/telemetry-dev/telemetry"
 
 [tool.uv.sources]
 telemetry-dev = { path = "../python", editable = true }
