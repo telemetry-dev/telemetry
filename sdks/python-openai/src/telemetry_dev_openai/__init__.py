@@ -13,7 +13,7 @@ from openai.resources.chat.completions.completions import AsyncCompletions, Comp
 from openai.resources.embeddings import AsyncEmbeddings, Embeddings
 from openai.resources.responses.responses import AsyncResponses, Responses
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 ProviderResolver = Callable[[object | None], str]
 RequestMapper = Callable[[Mapping[str, Any]], tuple[str, dict[str, Any]]]

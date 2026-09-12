@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/tanstack-ai",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "TanStack AI telemetry integration for telemetry.dev: chat() middleware emitting OpenTelemetry GenAI spans.",
   "keywords": [
     "genai",
