@@ -1,6 +1,6 @@
 [project]
 name = "telemetry-dev"
-version = "0.2.3"
+version = "0.2.4"
 description = "telemetry.dev SDK for Python — OpenTelemetry-native GenAI tracing, logs, and metrics"
 readme = "README.md"
 license = "MIT"

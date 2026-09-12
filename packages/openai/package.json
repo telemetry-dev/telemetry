@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/openai",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "OpenAI SDK instrumentation for telemetry.dev: generation and embedding spans for the official openai Node SDK.",
   "keywords": [
     "genai",
