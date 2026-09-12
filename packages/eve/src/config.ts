@@ -47,6 +47,7 @@ export function ensureInit(
       spanFilter: options.spanFilter ?? ((span) => isAiScope(span.instrumentationScope.name)),
       sessionRootOf: (name, attributes) => {
         const sessionId = attributes["eve.session.id"];
+
         return name === "ai.eve.turn" && typeof sessionId === "string" ? sessionId : undefined;
       },
     },

@@ -28,6 +28,7 @@ export function wrapBedrockAgents<T extends WrappableBedrockAgentClient>(
     writable: true,
   });
   WRAPPED.add(client as object);
+
   return client;
 }
 
@@ -37,13 +38,16 @@ export function instrumentBedrockAgents(options: BedrockInstrumentationOptions =
   const hadOwn = Object.prototype.hasOwnProperty.call(proto, "send");
   const original = proto.send;
   const instrumentedSend = createInstrumentedSend(original, options, AGENT_HANDLERS);
+
   const wrapper = function telemetryDevBedrockAgentSend(
     this: WrappableBedrockAgentClient,
     ...args: unknown[]
   ) {
     if (WRAPPED.has(this as object)) return original.apply(this, args);
+
     return instrumentedSend.apply(this, args);
   };
+
   ORIGINAL = { proto, hadOwn, value: original, wrapper };
   Object.defineProperty(proto, "send", {
     configurable: true,
@@ -54,9 +58,12 @@ export function instrumentBedrockAgents(options: BedrockInstrumentationOptions =
 
 export function uninstrumentBedrockAgents(): void {
   const original = ORIGINAL;
+
   if (!original) return;
+
   if (Object.getOwnPropertyDescriptor(original.proto, "send")?.value !== original.wrapper) return;
   ORIGINAL = undefined;
+
   if (original.hadOwn) {
     Object.defineProperty(original.proto, "send", {
       configurable: true,

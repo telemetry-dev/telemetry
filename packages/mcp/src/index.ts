@@ -23,11 +23,18 @@ export interface InstrumentMcpTransportOptions {
 }
 
 type JsonRpcId = string | number;
-type JsonRecord = Record<string, unknown>;
+
+type JsonValue = string | number | boolean | null | JsonValue[] | JsonRecord;
+
+interface JsonRecord {
+  [key: string]: JsonValue | undefined;
+}
+
 type MessageHandler = (message: unknown, extra?: unknown) => void;
+
 type Send = (message: unknown, options?: unknown) => Promise<void>;
 
-interface SendOptions extends JsonRecord {
+interface SendOptions {
   requestSignal?: AbortSignal;
   onRequestStreamEnd?: () => void;
   resumptionToken?: string;
@@ -81,8 +88,10 @@ function asRecord(value: unknown): JsonRecord | undefined {
 
 function parseMessage(value: unknown): ParsedMessage | undefined {
   const message = asRecord(value);
+
   if (message === undefined) return undefined;
   const params = asRecord(message.params);
+
   return {
     message,
     method: requestMethod(message),
@@ -95,6 +104,7 @@ function parseMessage(value: unknown): ParsedMessage | undefined {
 function requestId(message: JsonRecord): JsonRpcId | undefined {
   if (!("id" in message)) return undefined;
   const id = message.id;
+
   return typeof id === "string" || typeof id === "number" ? id : undefined;
 }
 
@@ -114,6 +124,7 @@ function isRequest(
 
 function targetFor(method: string, params: JsonRecord | undefined): string | undefined {
   if (method !== "tools/call" && method !== "prompts/get") return undefined;
+
   return typeof params?.name === "string" ? params.name : undefined;
 }
 
@@ -126,11 +137,13 @@ function resourceUri(method: string, params: JsonRecord | undefined): string | u
   ) {
     return undefined;
   }
+
   return typeof params?.uri === "string" ? params.uri : undefined;
 }
 
 function metaProtocolVersion(meta: JsonRecord | undefined): string | undefined {
   const version = meta?.[PROTOCOL_VERSION_META_KEY];
+
   return typeof version === "string" ? version : undefined;
 }
 
@@ -139,11 +152,15 @@ function protocolVersion(
   message: ParsedMessage,
 ): string | undefined {
   const modern = metaProtocolVersion(message.meta);
+
   if (modern !== undefined) return modern;
+
   if (message.method === "initialize" && typeof message.params?.protocolVersion === "string") {
     PROTOCOL_VERSIONS.set(transport, message.params.protocolVersion);
+
     return message.params.protocolVersion;
   }
+
   return PROTOCOL_VERSIONS.get(transport) ?? transport.protocolVersion;
 }
 
@@ -153,12 +170,16 @@ function responseProtocolVersion(
   message: ParsedMessage,
 ): string | undefined {
   const modern = metaProtocolVersion(message.meta);
+
   if (modern !== undefined) return modern;
   const result = asRecord(message.message.result);
+
   if (method === "initialize" && typeof result?.protocolVersion === "string") {
     PROTOCOL_VERSIONS.set(transport, result.protocolVersion);
+
     return result.protocolVersion;
   }
+
   return PROTOCOL_VERSIONS.get(transport) ?? transport.protocolVersion;
 }
 
@@ -167,21 +188,29 @@ function requestAttributes(
   message: ParsedMessage,
 ): RequestSpanAttributes {
   const method = message.method!;
+
   const attributes: RequestSpanAttributes = {
     "gen_ai.operation.name": method === "tools/call" ? "execute_tool" : "mcp",
     "mcp.method.name": method,
   };
+
   if (message.id !== undefined) {
     attributes["jsonrpc.request.id"] = String(message.id);
   }
+
   if (typeof transport.sessionId === "string") attributes["mcp.session.id"] = transport.sessionId;
   const version = protocolVersion(transport, message);
+
   if (version !== undefined) attributes["mcp.protocol.version"] = version;
   const target = targetFor(method, message.params);
+
   if (method === "tools/call" && target !== undefined) attributes["gen_ai.tool.name"] = target;
+
   if (method === "prompts/get" && target !== undefined) attributes["gen_ai.prompt.name"] = target;
   const uri = resourceUri(method, message.params);
+
   if (uri !== undefined) attributes["mcp.resource.uri"] = uri;
+
   return attributes;
 }
 
@@ -193,21 +222,26 @@ function startRequest(
   propagateBaggage: boolean,
 ): PendingRequest | undefined {
   const method = message.method;
+
   if (method === undefined) return undefined;
   const target = targetFor(method, message.params);
   const ambient = activeContext();
+
   const extracted = receiver
     ? extractW3cContext(message.meta ?? {}, { includeBaggage: propagateBaggage })
     : undefined;
+
   const ambientSpan = trace.getSpanContext(ambient);
   const remoteSpan = extracted === undefined ? undefined : trace.getSpanContext(extracted);
   const remoteIsValid = remoteSpan !== undefined && trace.isSpanContextValid(remoteSpan);
   const remoteBaggage = extracted === undefined ? undefined : propagation.getBaggage(extracted);
+
   const parent = remoteIsValid
     ? extracted
     : remoteBaggage === undefined
       ? undefined
       : propagation.setBaggage(ambient, remoteBaggage);
+
   const links =
     ambientSpan !== undefined &&
     trace.isSpanContextValid(ambientSpan) &&
@@ -215,6 +249,7 @@ function startRequest(
     (ambientSpan.traceId !== remoteSpan.traceId || ambientSpan.spanId !== remoteSpan.spanId)
       ? [{ context: ambientSpan }]
       : undefined;
+
   const handle = startSpan(target === undefined ? method : `${method} ${target}`, {
     type: method === "tools/call" ? "tool" : "span",
     kind: receiver ? SpanKind.SERVER : SpanKind.CLIENT,
@@ -223,6 +258,7 @@ function startRequest(
     attributes: requestAttributes(transport, message),
     input: capturePayloads && method === "tools/call" ? message.params?.arguments : undefined,
   });
+
   return { handle, method, receiver, capturePayloads, completed: false };
 }
 
@@ -232,8 +268,10 @@ function updateObservableAttributes(
   message: ParsedMessage,
 ): void {
   const attributes: Record<string, string> = {};
+
   if (typeof transport.sessionId === "string") attributes["mcp.session.id"] = transport.sessionId;
   const version = responseProtocolVersion(transport, pending.method, message);
+
   if (version !== undefined) attributes["mcp.protocol.version"] = version;
   pending.handle.update({ attributes });
 }
@@ -250,18 +288,22 @@ function finishResponse(
 ): void {
   updateObservableAttributes(transport, pending, message);
   const error = asRecord(message.message.error);
+
   if (error !== undefined) {
     const code = typeof error.code === "number" ? error.code : undefined;
     const codeText = code === undefined ? "_OTHER" : String(code);
     pending.handle.span.setAttribute("rpc.response.status_code", codeText);
+
     if (!pending.receiver || code === undefined || !CALLER_ERROR_CODES.has(code)) {
       setFailure(pending, codeText, typeof error.message === "string" ? error.message : undefined);
     }
   } else {
     const result = asRecord(message.message.result);
+
     if (pending.method === "tools/call" && result?.isError === true) {
       setFailure(pending, "tool_error");
     }
+
     if (pending.capturePayloads && pending.method === "tools/call" && result?.isError !== true) {
       pending.handle.update({ output: message.message.result });
     }
@@ -276,11 +318,14 @@ function completePending(
 ): void {
   if (pending.completed) return;
   pending.completed = true;
+
   if (requests.get(key) === pending) requests.delete(key);
   pending.removeAbortListener?.();
+
   try {
     update?.();
   } catch {}
+
   try {
     pending.handle.end();
   } catch {}
@@ -292,6 +337,7 @@ function completeAs(
   type: "cancelled" | "connection_error",
 ): void {
   const pending = requests.get(id);
+
   if (pending !== undefined) {
     completePending(requests, id, pending, () => setFailure(pending, type));
   }
@@ -299,8 +345,10 @@ function completeAs(
 
 function cancellationId(message: ParsedMessage): JsonRpcId | undefined {
   if (message.method !== "notifications/cancelled") return undefined;
+
   if (message.params === undefined || !("requestId" in message.params)) return undefined;
   const id = message.params.requestId;
+
   return typeof id === "string" || typeof id === "number" ? id : undefined;
 }
 
@@ -308,6 +356,7 @@ function prepareInjectedRequest(message: ParsedMessage) {
   const params = { ...message.params };
   const meta = { ...message.meta };
   params._meta = meta;
+
   return { message: { ...message.message, params }, meta };
 }
 
@@ -328,17 +377,21 @@ export function instrumentMcpTransport<T extends McpTransport>(
   const capturePayloads = options.capturePayloads === true;
   const propagateBaggage = options.propagateBaggage === true;
   let onmessage = target.onmessage;
+
   const wrapClose = (handler: (() => void) | undefined) =>
     function () {
       for (const [key, pending] of outgoing) {
         completePending(outgoing, key, pending, () => setFailure(pending, "connection_error"));
       }
+
       for (const [key, pending] of incoming) {
         if (sendingResponses.has(pending)) continue;
         completePending(incoming, key, pending, () => setFailure(pending, "connection_error"));
       }
+
       handler?.call(target);
     };
+
   let onclose = wrapClose(target.onclose);
 
   target.send = async (value, sendOptions) => {
@@ -357,12 +410,15 @@ export function instrumentMcpTransport<T extends McpTransport>(
       );
       const rawOptions = asRecord(sendOptions) as SendOptions | undefined;
       const copiedOptions = rawOptions === undefined ? undefined : { ...rawOptions };
+
       const resumeOnly =
         typeof copiedOptions?.resumptionToken === "string" &&
         copiedOptions.resumptionToken.length > 0;
+
       requestSignal = copiedOptions?.requestSignal;
       const originalStreamEnd = copiedOptions?.onRequestStreamEnd;
       const requestCounts = new Map<JsonRpcId, number>();
+
       if (!resumeOnly) {
         for (const message of messages) {
           if (!isRequest(message)) continue;
@@ -372,6 +428,7 @@ export function instrumentMcpTransport<T extends McpTransport>(
       }
 
       const transformed = [...values];
+
       const prepared: Array<{
         index: number;
         key: JsonRpcId;
@@ -379,17 +436,23 @@ export function instrumentMcpTransport<T extends McpTransport>(
         message: InjectedRequest;
         meta: JsonRecord;
       }> = [];
+
       const cancelledKeys = new Set<JsonRpcId>();
+
       for (const [index, message] of messages.entries()) {
         const cancelled = cancellations[index];
+
         if (cancelled !== undefined) {
           cancelledKeys.add(cancelled);
         }
+
         if (!isRequest(message) || resumeOnly) continue;
         const key = message.id;
+
         if (requestCounts.get(key) !== 1 || (outgoing.has(key) && !cancelledKeys.has(key))) {
           continue;
         }
+
         const injected = prepareInjectedRequest(message);
         prepared.push({ index, key, parsed: message, ...injected });
       }
@@ -402,6 +465,7 @@ export function instrumentMcpTransport<T extends McpTransport>(
           capturePayloads,
           propagateBaggage,
         );
+
         if (pending !== undefined) {
           started.push({ index: request.index, key: request.key, pending });
           injectW3cContext(pending.handle.context, request.meta, {
@@ -412,6 +476,7 @@ export function instrumentMcpTransport<T extends McpTransport>(
       }
 
       if (started.length > 0) sent = Array.isArray(value) ? transformed : transformed[0];
+
       if (started.length > 0 && copiedOptions !== undefined) {
         forwardedOptions = {
           ...copiedOptions,
@@ -434,6 +499,7 @@ export function instrumentMcpTransport<T extends McpTransport>(
           pending.handle.end();
         } catch {}
       }
+
       messages = [];
       cancellations = [];
       started = [];
@@ -444,24 +510,31 @@ export function instrumentMcpTransport<T extends McpTransport>(
 
     const startedByIndex = new Map(started.map((request) => [request.index, request]));
     const signal = requestSignal;
+
     for (const [index, cancelled] of cancellations.entries()) {
       if (cancelled !== undefined) completeAs(outgoing, cancelled, "cancelled");
       const request = startedByIndex.get(index);
+
       if (request !== undefined) {
         const { key, pending } = request;
+
         if (outgoing.has(key)) {
           completePending(outgoing, key, pending, () =>
             setFailure(pending, "duplicate_request_id"),
           );
           continue;
         }
+
         outgoing.set(key, pending);
+
         if (signal !== undefined) {
           const onAbort = () =>
             completePending(outgoing, key, pending, () => setFailure(pending, "cancelled"));
+
           try {
             signal.addEventListener("abort", onAbort, { once: true });
             pending.removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+
             if (signal.aborted) onAbort();
           } catch {}
         }
@@ -470,11 +543,13 @@ export function instrumentMcpTransport<T extends McpTransport>(
 
     const responses: Array<{ key: JsonRpcId; pending: PendingRequest; message: ParsedMessage }> =
       [];
+
     for (const message of messages) {
       if (message === undefined || message.method !== undefined || message.id === undefined)
         continue;
       const key = message.id;
       const pending = incoming.get(key);
+
       if (pending === undefined || sendingResponses.has(pending)) continue;
       sendingResponses.add(pending);
       responses.push({ key, pending, message });
@@ -487,9 +562,11 @@ export function instrumentMcpTransport<T extends McpTransport>(
         for (const { key, pending } of started) {
           completePending(outgoing, key, pending, () => pending.handle.update({ error }));
         }
+
         for (const { key, pending } of responses) {
           completePending(incoming, key, pending, () => pending.handle.update({ error }));
         }
+
         throw error;
       }
 
@@ -520,23 +597,31 @@ export function instrumentMcpTransport<T extends McpTransport>(
           ? undefined
           : function (value, extra) {
               const object = value !== null && typeof value === "object" ? value : undefined;
+
               if (object !== undefined && dispatching.has(object)) {
                 handler.call(target, value, extra);
+
                 return;
               }
+
               if (object !== undefined) dispatching.add(object);
 
               let invoked = false;
+
               const invoke = () => {
                 invoked = true;
+
                 return handler.call(target, value, extra);
               };
+
               const received: Array<{ key: JsonRpcId; pending: PendingRequest }> = [];
+
               const completeFailure = (error: unknown) => {
                 for (const { key, pending } of received) {
                   completePending(incoming, key, pending, () => pending.handle.update({ error }));
                 }
               };
+
               const completeAsyncFailure = (result: unknown): unknown => {
                 if (
                   result === null ||
@@ -546,6 +631,7 @@ export function instrumentMcpTransport<T extends McpTransport>(
                 ) {
                   return result;
                 }
+
                 return Promise.resolve(result).catch((error: unknown) => {
                   completeFailure(error);
                   throw error;
@@ -557,6 +643,7 @@ export function instrumentMcpTransport<T extends McpTransport>(
                   const values = Array.isArray(value) ? value : [value];
                   const messages = values.map(parseMessage);
                   const requestCounts = new Map<JsonRpcId, number>();
+
                   for (const message of messages) {
                     if (!isRequest(message)) continue;
                     const key = message.id;
@@ -566,11 +653,14 @@ export function instrumentMcpTransport<T extends McpTransport>(
                   for (const message of messages) {
                     if (message === undefined) continue;
                     const cancelled = cancellationId(message);
+
                     if (cancelled !== undefined) completeAs(incoming, cancelled, "cancelled");
 
                     if (isRequest(message)) {
                       const key = message.id;
+
                       if (requestCounts.get(key) !== 1 || incoming.has(key)) continue;
+
                       const pending = startRequest(
                         target,
                         message,
@@ -578,6 +668,7 @@ export function instrumentMcpTransport<T extends McpTransport>(
                         capturePayloads,
                         propagateBaggage,
                       );
+
                       if (pending !== undefined) {
                         incoming.set(key, pending);
                         received.push({ key, pending });
@@ -585,6 +676,7 @@ export function instrumentMcpTransport<T extends McpTransport>(
                     } else if (message.method === undefined && message.id !== undefined) {
                       const key = message.id;
                       const pending = outgoing.get(key);
+
                       if (pending !== undefined) {
                         completePending(outgoing, key, pending, () =>
                           finishResponse(target, pending, message),
@@ -596,11 +688,13 @@ export function instrumentMcpTransport<T extends McpTransport>(
                   for (const { key, pending } of received) {
                     completePending(incoming, key, pending);
                   }
+
                   received.length = 0;
                 }
 
                 const requestContext =
                   received.length === 1 ? received[0]?.pending.handle.context : undefined;
+
                 try {
                   return completeAsyncFailure(
                     requestContext === undefined ? invoke() : withContext(requestContext, invoke),
@@ -614,6 +708,7 @@ export function instrumentMcpTransport<T extends McpTransport>(
                       throw handlerError;
                     }
                   }
+
                   completeFailure(error);
                   throw error;
                 }
@@ -634,5 +729,6 @@ export function instrumentMcpTransport<T extends McpTransport>(
   });
 
   if (onmessage !== undefined) target.onmessage = onmessage;
+
   return transport;
 }

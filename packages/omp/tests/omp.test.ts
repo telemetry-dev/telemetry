@@ -16,6 +16,7 @@ interface Exporters extends ClientOverrides {
 function makeExporters(): Exporters {
   const spans = new InMemorySpanExporter();
   const logs = new InMemoryLogRecordExporter();
+
   return { logRecordExporter: logs, logs, spanExporter: spans, spans };
 }
 
@@ -23,6 +24,7 @@ function telemetryOptions(options?: TelemetryDevExtensionOptions): TelemetryDevE
   const fetch = Object.assign(async () => new Response(null, { status: 200 }), {
     preconnect: () => undefined,
   });
+
   return {
     environment: "test",
     exportMode: "immediate" as const,
@@ -68,10 +70,12 @@ function makeContext(sessionId = "session-1"): ExtensionContext {
 
 function makeHarness(options?: TelemetryDevExtensionOptions): Harness {
   const exporters = makeExporters();
+
   const handlers = new Map<
     string,
     ((event: TestEvent, ctx: ExtensionContext) => void | Promise<void>)[]
   >();
+
   const api = {
     on(type: string, handler: (event: TestEvent, ctx: ExtensionContext) => void | Promise<void>) {
       const list = handlers.get(type) ?? [];
@@ -84,11 +88,13 @@ function makeHarness(options?: TelemetryDevExtensionOptions): Harness {
   factory(api as never);
 
   const defaultCtx = makeContext();
+
   const emit: EmitFn = async (event, ctx = defaultCtx) => {
     for (const handler of handlers.get(event.type) ?? []) {
       await handler(event, ctx);
     }
   };
+
   return { emit, exporters };
 }
 
@@ -127,6 +133,7 @@ async function runAgentLoop(harness: Harness, message = assistantMessage()): Pro
 function spanByName(exporters: Exporters, name: string): ReadableSpan {
   const span = exporters.spans.getFinishedSpans().find((candidate) => candidate.name === name);
   expect(span, `expected span ${name}`).toBeDefined();
+
   return span as ReadableSpan;
 }
 
@@ -151,6 +158,7 @@ test("willContinue agent_end keeps one invoke_agent span until the terminal agen
   const agents = harness.exporters.spans
     .getFinishedSpans()
     .filter((span) => span.name === "invoke_agent");
+
   expect(agents).toHaveLength(1);
   const agent = agents[0] as ReadableSpan;
   expect(agent.status.code).not.toBe(SpanStatusCode.ERROR);
@@ -179,6 +187,7 @@ test("continuation agent_start arriving before its willContinue agent_end keeps 
   const agents = harness.exporters.spans
     .getFinishedSpans()
     .filter((span) => span.name === "invoke_agent");
+
   expect(agents).toHaveLength(1);
   const agent = agents[0] as ReadableSpan;
   expect(agent.attributes["gen_ai.input.messages"]).toBe("fix the bug");
@@ -200,6 +209,7 @@ test("a fresh prompt after a missing agent_end closes the dangling span instead 
   const agents = harness.exporters.spans
     .getFinishedSpans()
     .filter((span) => span.name === "invoke_agent");
+
   expect(agents).toHaveLength(2);
   const [dangling, fresh] = agents as [ReadableSpan, ReadableSpan];
   expect(dangling.attributes["gen_ai.input.messages"]).toBe("first prompt");
@@ -210,10 +220,12 @@ test("a fresh prompt after a missing agent_end closes the dangling span instead 
 
 test("a delayed terminal agent_end does not close or clear the fresh prompt span", async () => {
   const harness = makeHarness();
+
   const oldMessage = assistantMessage({
     content: [{ type: "text", text: "Old output." }],
     responseId: "resp-old",
   });
+
   await harness.emit({ type: "before_agent_start", prompt: "first prompt" });
   await harness.emit({ type: "agent_start" });
   await harness.emit({ type: "message_end", message: oldMessage });
@@ -235,6 +247,7 @@ test("a delayed terminal agent_end does not close or clear the fresh prompt span
   const endedAgents = harness.exporters.spans
     .getFinishedSpans()
     .filter((span) => span.name === "invoke_agent");
+
   expect(endedAgents).toHaveLength(1);
   expect(endedAgents[0]?.attributes["gen_ai.input.messages"]).toBe("first prompt");
   expect(endedAgents[0]?.attributes["gen_ai.response.finish_reasons"]).toEqual(["incomplete"]);
@@ -246,10 +259,12 @@ test("a delayed terminal agent_end does not close or clear the fresh prompt span
     result: { content: [{ type: "text", text: "/tmp/project" }] },
     isError: false,
   });
+
   const freshMessage = assistantMessage({
     content: [{ type: "text", text: "Fresh output." }],
     responseId: "resp-fresh",
   });
+
   await harness.emit({ type: "message_end", message: freshMessage });
   await harness.emit({ type: "agent_end", messages: [freshMessage] });
   await flush();
@@ -257,6 +272,7 @@ test("a delayed terminal agent_end does not close or clear the fresh prompt span
   const agents = harness.exporters.spans
     .getFinishedSpans()
     .filter((span) => span.name === "invoke_agent");
+
   expect(agents).toHaveLength(2);
   const fresh = agents.find((span) => span.attributes["gen_ai.input.messages"] === "second prompt");
   expect(fresh?.attributes["gen_ai.output.messages"]).toBe("Fresh output.");
@@ -268,10 +284,12 @@ test("a delayed terminal agent_end does not close or clear the fresh prompt span
 test("agent_end closes the span when message_end receives a copied message", async () => {
   const harness = makeHarness();
   const original = assistantMessage();
+
   const displayed = {
     ...original,
     content: [{ type: "text", text: "All done." }],
   };
+
   await harness.emit({ type: "before_agent_start", prompt: "fix the bug" });
   await harness.emit({ type: "agent_start" });
   await harness.emit({ type: "message_end", message: displayed });
@@ -487,12 +505,14 @@ test("auto retry and compaction events are logged with severities", async () => 
 test("malformed events never throw and report through onError", async () => {
   const errors: unknown[] = [];
   const harness = makeHarness({ onError: (error) => errors.push(error) });
+
   const poisoned = {
     type: "message_end",
     get message(): never {
       throw new Error("poisoned event");
     },
   };
+
   await expect(harness.emit(poisoned as never)).resolves.toBeUndefined();
   expect(errors).toHaveLength(1);
 

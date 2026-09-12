@@ -39,6 +39,7 @@ export const RUNTIME_HANDLERS = {
     requestFields: converseRequestFields,
     onResult(result, span) {
       endSpan(span, converseResponseFields(result));
+
       return result;
     },
   },
@@ -48,10 +49,13 @@ export const RUNTIME_HANDLERS = {
     requestFields: converseRequestFields,
     onResult(result, span, t0) {
       const response = result as { stream?: unknown; $metadata?: unknown };
+
       if (!response.stream) {
         endSpan(span, awsMetadataFields(response.$metadata));
+
         return result;
       }
+
       return {
         ...response,
         stream: wrapAsyncIterable(
@@ -70,6 +74,7 @@ export const RUNTIME_HANDLERS = {
     requestFields: invokeModelRequestFields,
     onResult(result, span, _t0, input) {
       endSpan(span, invokeModelResponseFields(input, result));
+
       return result;
     },
   },
@@ -79,10 +84,13 @@ export const RUNTIME_HANDLERS = {
     requestFields: invokeModelRequestFields,
     onResult(result, span, t0) {
       const response = result as { body?: unknown; $metadata?: unknown };
+
       if (!response.body) {
         endSpan(span, awsMetadataFields(response.$metadata));
+
         return result;
       }
+
       return {
         ...response,
         body: wrapAsyncIterable(
@@ -119,6 +127,7 @@ export const RUNTIME_HANDLERS = {
           }),
         }),
       );
+
       return result;
     },
   },
@@ -143,6 +152,7 @@ export const AGENT_HANDLERS = {
     requestFields: retrieveRequestFields,
     onResult(result, span) {
       endSpan(span, retrieveResponseFields(result));
+
       return result;
     },
   },
@@ -152,6 +162,7 @@ export const AGENT_HANDLERS = {
     requestFields: ragRequestFields,
     onResult(result, span) {
       endSpan(span, ragResponseFields(result));
+
       return result;
     },
   },
@@ -161,13 +172,17 @@ export const AGENT_HANDLERS = {
     requestFields: ragRequestFields,
     onResult(result, span, t0) {
       const response = result as { stream?: unknown; $metadata?: unknown; sessionId?: string };
+
       const base = mergeFields(awsMetadataFields(response.$metadata), {
         metadata: omitUndefined({ bedrock_session_id: stringValue(response.sessionId) }),
       });
+
       if (!response.stream) {
         endSpan(span, base);
+
         return result;
       }
+
       return {
         ...response,
         stream: wrapAsyncIterable(response.stream, new RagStreamState(), span, t0, base, false),
@@ -180,10 +195,13 @@ export const AGENT_HANDLERS = {
     requestFields: flowRequestFields,
     onResult(result, span, t0) {
       const response = result as { responseStream?: unknown; $metadata?: unknown };
+
       if (!response.responseStream) {
         endSpan(span, awsMetadataFields(response.$metadata));
+
         return result;
       }
+
       return {
         ...response,
         responseStream: wrapAsyncIterable(
@@ -213,16 +231,20 @@ function streamAgentResult(key: "completion") {
       sessionId?: string;
       memoryId?: string;
     };
+
     const base = mergeFields(awsMetadataFields(response.$metadata), {
       metadata: omitUndefined({
         bedrock_session_id: stringValue(response.sessionId),
         bedrock_memory_id: stringValue(response.memoryId),
       }),
     });
+
     if (!response[key]) {
       endSpan(span, base);
+
       return result;
     }
+
     return {
       ...response,
       [key]: wrapAsyncIterable(response[key], new AgentStreamState(options), span, t0, base, false),

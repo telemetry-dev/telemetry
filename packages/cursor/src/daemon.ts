@@ -19,6 +19,7 @@ import { fileConfig } from "./config.ts";
 import { createCursorTelemetry, type CursorTelemetry } from "./telemetry.ts";
 
 type JsonValue = string | number | boolean | null | undefined | JsonValue[] | JsonRecord;
+
 interface JsonRecord {
   [key: string]: JsonValue;
 }
@@ -36,6 +37,7 @@ export function socketPath(): string {
   if (process.platform === "win32") {
     return `\\\\.\\pipe\\telemetry-dev-cursor-${userInfo().username}`;
   }
+
   return join(socketDir(), "d.sock");
 }
 
@@ -51,11 +53,14 @@ function socketDir(): string {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const stat = lstatSync(dir);
   const uid = process.getuid?.();
+
   if (!stat.isDirectory() || (uid !== undefined && stat.uid !== uid)) {
     throw new Error(`refusing unsafe socket directory ${dir}`);
   }
+
   // mkdirSync ignores mode for a pre-existing directory; tighten it ourselves.
   if ((stat.mode & 0o077) !== 0) chmodSync(dir, 0o700);
+
   return dir;
 }
 
@@ -66,16 +71,21 @@ function socketDir(): string {
 export async function runDaemon(): Promise<void> {
   const telemetry = createCursorTelemetry(fileConfig());
   let server: Server | undefined;
+
   const shutdown = (): void => {
     if (server) void stop(server, telemetry);
   };
+
   server = await listen(socketPath(), telemetry, shutdown);
+
   if (!server) {
     await telemetry.settle();
+
     return;
   }
 
   let idleTimer: NodeJS.Timeout | undefined;
+
   const touch = (): void => {
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
@@ -83,6 +93,7 @@ export async function runDaemon(): Promise<void> {
       else shutdown();
     }, IDLE_MS);
   };
+
   server.on("connection", touch);
   touch();
 
@@ -113,29 +124,39 @@ export async function listen(
       await bind(server, path);
     } catch (error) {
       const code = errorCode(error);
+
       if (code !== "EADDRINUSE") throw error;
+
       if (await alive(path)) return undefined;
       await bind(server, path);
     }
+
     return server;
   }
 
   const owner = lockRecovery(path);
+
   if (!owner) return undefined;
+
   try {
     try {
       await bind(server, path);
     } catch (error) {
       const code = errorCode(error);
+
       if (code !== "EADDRINUSE") throw error;
+
       if (await alive(path)) return undefined;
       const stale = lstatSync(path, { throwIfNoEntry: false });
+
       if (stale && !stale.isSocket()) {
         throw new Error(`refusing to replace non-socket ${path}`);
       }
+
       if (stale) unlinkSync(path);
       await bind(server, path);
     }
+
     return server;
   } finally {
     unlockRecovery(path, owner);
@@ -153,20 +174,27 @@ function lockRecovery(path: string): string | undefined {
   const pending = `${lock}.${owner}`;
   mkdirSync(pending, { mode: 0o700 });
   writeFileSync(join(pending, owner), "", { flag: "wx", mode: 0o600 });
+
   try {
     try {
       renameSync(pending, lock);
+
       return owner;
     } catch (error) {
       const code = errorCode(error);
+
       if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
     }
+
     if (!clearStaleLock(lock)) return undefined;
+
     try {
       renameSync(pending, lock);
+
       return owner;
     } catch (error) {
       const code = errorCode(error);
+
       if (code === "EEXIST" || code === "ENOTEMPTY") return undefined;
       throw error;
     }
@@ -177,31 +205,40 @@ function lockRecovery(path: string): string | undefined {
 
 function clearStaleLock(lock: string): boolean {
   let entries: string[];
+
   try {
     entries = readdirSync(lock);
   } catch (error) {
     return errorCode(error) === "ENOENT";
   }
+
   if (entries.length > 1) return false;
+
   if (entries.length === 1) {
     const entry = entries[0];
+
     if (!entry) return false;
     const held = join(lock, entry);
     let mtimeMs: number;
+
     try {
       mtimeMs = lstatSync(held).mtimeMs;
     } catch (error) {
       return errorCode(error) === "ENOENT";
     }
+
     if (Date.now() - mtimeMs <= LOCK_STALE_MS) return false;
+
     try {
       unlinkSync(held);
     } catch (error) {
       return errorCode(error) === "ENOENT";
     }
   }
+
   try {
     rmdirSync(lock);
+
     return true;
   } catch (error) {
     return errorCode(error) === "ENOENT";
@@ -210,20 +247,24 @@ function clearStaleLock(lock: string): boolean {
 
 function unlockRecovery(path: string, owner: string): void {
   const lock = `${path}.lock`;
+
   try {
     unlinkSync(join(lock, owner));
   } catch {
     return;
   }
+
   try {
     rmdirSync(lock);
   } catch {
     // The directory is already gone or belongs to a new owner.
   }
 }
+
 function errorCode<T>(error: T): string | undefined {
   if (error === null || error instanceof Function || Object(error) !== error) return undefined;
   const value = error as T & { code?: JsonValue };
+
   return "code" in value ? readString(value.code) : undefined;
 }
 
@@ -234,6 +275,7 @@ function bind(server: Server, path: string): Promise<void> {
     server.removeListener("error", reject);
     resolve();
   });
+
   return promise;
 }
 
@@ -245,6 +287,7 @@ function alive(path: string): Promise<boolean> {
     resolve(true);
   });
   probe.once("error", () => resolve(false));
+
   return promise;
 }
 
@@ -260,14 +303,18 @@ function serve(
   socket.on("data", (chunk: string) => {
     buffer += chunk;
     let index = buffer.indexOf("\n");
+
     while (index >= 0) {
       const line = buffer.slice(0, index);
       buffer = buffer.slice(index + 1);
       index = buffer.indexOf("\n");
+
       if (line.trim().length === 0) continue;
       let shutdown = false;
+
       try {
         const parsed = JSON.parse(line) as JsonRecord;
+
         if (parsed.telemetry_dev_control === "shutdown") {
           // Sent by install/uninstall so the next hook restarts the daemon
           // with the new configuration.
@@ -278,7 +325,9 @@ function serve(
       } catch {
         // Malformed line from a mismatched forwarder version; drop it.
       }
+
       socket.write("ok\n");
+
       if (shutdown) onShutdown();
     }
   });
@@ -293,16 +342,21 @@ function serve(
 function replayed(event: JsonRecord, seenIds: Set<string>): boolean {
   const id = readString(event.hook_delivery_id);
   delete event.hook_delivery_id;
+
   if (id === undefined) return false;
+
   if (seenIds.has(id)) return true;
   seenIds.add(id);
+
   if (seenIds.size > SEEN_IDS_MAX) {
     seenIds.delete(seenIds.values().next().value as string);
   }
+
   return false;
 }
 
 function readString<T>(value: T): string | undefined {
   const raw: unknown = value;
+
   return String(raw) === raw ? raw : undefined;
 }

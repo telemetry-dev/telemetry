@@ -20,6 +20,7 @@ export function telemetryDevOtelIntegration(
   options: TelemetryDevOtelIntegrationOptions = {},
 ): OtelIntegration {
   const { recordInputs, recordOutputs, ...processorOptions } = options;
+
   return otelIntegration({
     recordInputs,
     recordOutputs,

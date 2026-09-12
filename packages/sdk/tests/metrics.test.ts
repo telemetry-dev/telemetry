@@ -166,6 +166,7 @@ test("failed spans add error.type to the duration histogram only", async () => {
   expect(durations[0]!.attributes["error.type"]).toBe("TypeError");
   const tokens = histogramPoints(batches, "gen_ai.client.token.usage");
   expect(tokens).toHaveLength(2);
+
   for (const point of tokens) {
     expect(point.attributes["error.type"]).toBeUndefined();
   }
@@ -207,10 +208,12 @@ test("histograms use DELTA temporality and the GenAI bucket boundaries", async (
   setup({}, { metricExporter: exporter });
   startSpan("gen", { type: "generation", usage: { inputTokens: 10 } }).end();
   await flush();
+
   const metric = batches
     .flatMap((rm) => rm.scopeMetrics)
     .flatMap((sm) => sm.metrics)
     .find((m) => m.descriptor.name === "gen_ai.client.token.usage")!;
+
   expect(metric.aggregationTemporality).toBe(AggregationTemporality.DELTA);
   expect(metric.dataPointType).toBe(DataPointType.HISTOGRAM);
   const point = metric.dataPoints[0]!;
@@ -223,6 +226,7 @@ test("histograms use DELTA temporality and the GenAI bucket boundaries", async (
 
 test("filter-rejected spans record no metrics", async () => {
   const { batches, exporter } = makeMetricCapture();
+
   const { spans } = setup(
     { spanFilter: (span) => span.name !== "rejected" },
     { metricExporter: exporter },
@@ -246,9 +250,11 @@ test("quiet intervals collect zero data points", async () => {
   const { batches, exporter } = makeMetricCapture();
   setup({}, { metricExporter: exporter });
   await flush();
+
   const pointCount = batches
     .flatMap((rm) => rm.scopeMetrics)
     .flatMap((sm) => sm.metrics)
     .reduce((total, metric) => total + metric.dataPoints.length, 0);
+
   expect(pointCount).toBe(0);
 });

@@ -1,4 +1,5 @@
 export type { TelemetryDevOpencodeOptions } from "./config.ts";
+
 export {
   telemetryDevPlugin,
   type TelemetryDevHooks,

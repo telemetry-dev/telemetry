@@ -47,26 +47,32 @@ export interface TelemetryDevExtensionHost {
 export type TelemetryDevExtension = (pi: TelemetryDevExtensionHost) => void;
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
 type JsonRecord = { [key: string]: JsonValue };
+
 type Attrs = NonNullable<LogOptions["attributes"]>;
 
 function asRecord(cause: unknown): JsonRecord | undefined {
   if (cause === null || cause instanceof Function || Object(cause) !== cause) return undefined;
+
   return cause as JsonRecord;
 }
 
 function stringField(record: JsonRecord | undefined, key: string): string | undefined {
   const value = record?.[key];
+
   return value?.constructor === String && value.length > 0 ? value : undefined;
 }
 
 function numberField(record: JsonRecord | undefined, key: string): number | undefined {
   const value = record?.[key];
+
   return value?.constructor === Number && Number.isFinite(value) ? value : undefined;
 }
 
 function booleanField(record: JsonRecord | undefined, key: string): boolean | undefined {
   const value = record?.[key];
+
   return value?.constructor === Boolean ? value : undefined;
 }
 
@@ -80,6 +86,7 @@ function reportError(onError: Function | undefined, cause: unknown): void {
 
 function sessionId(ctx: TelemetryDevExtensionContext): string | undefined {
   const id = ctx.sessionManager.getSessionId();
+
   return id?.constructor === String && id.length > 0 ? id : undefined;
 }
 
@@ -87,16 +94,21 @@ function sessionId(ctx: TelemetryDevExtensionContext): string | undefined {
 function textContent(content: JsonValue | undefined): string | undefined {
   if (!Array.isArray(content)) return undefined;
   const parts: string[] = [];
+
   for (const block of content) {
     const record = asRecord(block);
+
     if (record?.type === "text" && record.text?.constructor === String) parts.push(record.text);
   }
+
   return parts.length > 0 ? parts.join("\n") : undefined;
 }
 
 function usageFields(message: JsonRecord): TokenUsage | undefined {
   const usage = asRecord(message.usage);
+
   if (!usage) return undefined;
+
   return {
     inputTokens: numberField(usage, "input"),
     outputTokens: numberField(usage, "output"),
@@ -111,6 +123,7 @@ function usageFields(message: JsonRecord): TokenUsage | undefined {
 function failureError(name: string, message: string | undefined): Error {
   const error = new Error(message ?? name);
   error.name = name;
+
   return error;
 }
 
@@ -179,6 +192,7 @@ export function telemetryDevExtension(
 
     function spanAttributes(ctx: TelemetryDevExtensionContext): Record<string, string> {
       const id = sessionId(ctx);
+
       return id ? { "gen_ai.conversation.id": id } : {};
     }
 
@@ -186,6 +200,7 @@ export function telemetryDevExtension(
       for (const span of toolSpans.values()) {
         span.end({ error: failureError("incomplete", "tool execution did not complete") });
       }
+
       toolSpans.clear();
       chatSpanByToolCall.clear();
     }
@@ -254,10 +269,13 @@ export function telemetryDevExtension(
     on("agent_end", (event: { messages: JsonValue[] }, _ctx) => {
       const messages = Array.isArray(event.messages) ? event.messages : [];
       let lastAssistant: JsonRecord | undefined;
+
       for (const message of messages) {
         const record = asRecord(message);
+
         if (record?.role === "assistant") lastAssistant = record;
       }
+
       const stopReason = stringField(lastAssistant, "stopReason");
       const errorMessage = stringField(lastAssistant, "errorMessage");
       // agent_end only closes one low-level run; pi may remove a retryable
@@ -279,11 +297,13 @@ export function telemetryDevExtension(
 
     on("message_start", (event: { message: JsonValue }, _ctx) => {
       const message = asRecord(event.message);
+
       if (message?.role === "assistant") assistantStartedAt = Date.now();
     });
 
     on("message_end", (event: { message: JsonValue }, ctx) => {
       const message = asRecord(event.message);
+
       if (message?.role !== "assistant") return;
       const startTime = assistantStartedAt;
       assistantStartedAt = undefined;
@@ -292,6 +312,7 @@ export function telemetryDevExtension(
       const responseModel = stringField(message, "responseModel") ?? model;
       const errorMessage = stringField(message, "errorMessage");
       const stopReason = stringField(message, "stopReason");
+
       const span = startSpan(model ? `chat ${model}` : "chat", {
         type: "generation",
         parent: agentSpan,
@@ -309,14 +330,18 @@ export function telemetryDevExtension(
         error: stopReason === "error" ? failureError(stopReason, errorMessage) : undefined,
         attributes: spanAttributes(ctx),
       });
+
       request = undefined;
       systemPrompt = undefined;
+
       for (const block of Array.isArray(message.content) ? message.content : []) {
         const record = asRecord(block);
+
         if (record?.type === "toolCall" && record.id?.constructor === String) {
           chatSpanByToolCall.set(record.id, span);
         }
       }
+
       span.end({ endTime });
     });
 
@@ -331,6 +356,7 @@ export function telemetryDevExtension(
           input: event.args,
           attributes: spanAttributes(ctx),
         });
+
         chatSpanByToolCall.delete(event.toolCallId);
         toolSpans.set(event.toolCallId, span);
       },
@@ -343,6 +369,7 @@ export function telemetryDevExtension(
         _ctx,
       ) => {
         const span = toolSpans.get(event.toolCallId);
+
         if (!span) return;
         toolSpans.delete(event.toolCallId);
         const resultText = textContent(asRecord(event.result)?.content);
@@ -399,6 +426,7 @@ export function telemetryDevExtension(
             endAgentSpan(lastRunResult ?? { finishReason: "incomplete" });
             lastRunResult = undefined;
           }
+
           endSessionSpan();
           emit("session_shutdown", ctx, "info", "Session shutdown", {
             "pi.session.reason": event.reason,

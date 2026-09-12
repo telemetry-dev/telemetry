@@ -126,32 +126,42 @@ export function fieldsToAttributes(
 
   if (fields.systemInstructions !== undefined && cfg.captureInput) {
     const value = prepareCaptureValue("gen_ai.system_instructions", fields.systemInstructions, cfg);
+
     if (value !== undefined) attrs["gen_ai.system_instructions"] = value;
   }
+
   if (fields.input !== undefined && cfg.captureInput) {
     const key = inputKeyFor(type);
     const value = prepareCaptureValue(key, fields.input, cfg);
+
     if (value !== undefined) attrs[key] = value;
   }
+
   if (fields.output !== undefined && cfg.captureOutput) {
     const key = outputKeyFor(type);
     const value = prepareCaptureValue(key, fields.output, cfg);
+
     if (value !== undefined) attrs[key] = value;
   }
+
   if (fields.metadata) {
     for (const [key, value] of Object.entries(fields.metadata)) {
       if (RESERVED_METADATA_KEYS.has(key)) {
         diag.debug(`metadata key "${key}" is reserved; pass it via propagateAttributes instead`);
         continue;
       }
+
       const attr = typeof value === "string" ? value : jsonAttr(value);
+
       if (attr !== undefined) {
         attrs[`td.metadata.${key}`] = truncate(attr, cfg.maxAttributeLength);
       }
     }
   }
+
   if (fields.attributes) {
     Object.assign(attrs, omitUndefined(fields.attributes));
   }
+
   return attrs;
 }

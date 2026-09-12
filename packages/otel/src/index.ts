@@ -1,4 +1,5 @@
 export { jsonAttr, omitUndefined, SCOPE_NAME, SCOPE_VERSION } from "./attrs.ts";
+
 export {
   type BatchOptions,
   DEFAULT_BASE_URL,
@@ -8,6 +9,7 @@ export {
   resolveEnv,
   type SdkLogLevel,
 } from "./config.ts";
+
 export {
   activeContext,
   als,
@@ -19,12 +21,15 @@ export {
   propagatedFromContext,
   withContext,
 } from "./context.ts";
+
 export { diag, reportError, setLogLevel } from "./debug.ts";
+
 export {
   createGenerationEmitter,
   type GenerationEmitter,
   type GenerationEmitterOverrides,
 } from "./generation.ts";
+
 export {
   BATCHED_METRIC_INTERVAL_MS,
   createMetricsPipeline,
@@ -35,12 +40,15 @@ export {
   type MetricsPipeline,
   TOKEN_BUCKETS,
 } from "./metrics.ts";
+
 export {
   createTelemetrySpanExporter,
   TelemetrySpanProcessor,
   type TelemetrySpanProcessorOptions,
 } from "./otel.ts";
+
 export { StampingSpanProcessor, type StampingProcessorOptions } from "./processor.ts";
+
 export {
   sessionIdOf,
   type SessionRootOf,
@@ -50,6 +58,7 @@ export {
   sha256,
   withSessionParent,
 } from "./session.ts";
+
 export {
   createLogExporter,
   createMetricExporter,

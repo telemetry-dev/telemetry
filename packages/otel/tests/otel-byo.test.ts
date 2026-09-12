@@ -36,15 +36,18 @@ afterEach(() => {
 
 function byoSetup(options?: ConstructorParameters<typeof TelemetrySpanProcessor>[0]) {
   const exporter = new InMemorySpanExporter();
+
   const processor = new TelemetrySpanProcessor({
     exportMode: "immediate",
     spanExporter: exporter,
     ...options,
   });
+
   const provider = new BasicTracerProvider({
     sampler: sessionSampler(),
     spanProcessors: [processor],
   });
+
   return { exporter, processor, provider, tracer: provider.getTracer("user-app") };
 }
 
@@ -88,6 +91,7 @@ test("spanFilter narrows what gets exported", async () => {
   const { exporter, processor, tracer } = byoSetup({
     spanFilter: (span) => span.name.startsWith("keep"),
   });
+
   tracer.startSpan("keep-me").end();
   tracer.startSpan("drop-me").end();
   await processor.forceFlush();
@@ -97,6 +101,7 @@ test("spanFilter narrows what gets exported", async () => {
 test("without an api key or exporter override the processor is a silent no-op", async () => {
   const previous = process.env.TELEMETRY_DEV_API_KEY;
   delete process.env.TELEMETRY_DEV_API_KEY;
+
   try {
     const processor = new TelemetrySpanProcessor();
     const provider = new BasicTracerProvider({ spanProcessors: [processor] });
@@ -117,30 +122,38 @@ test("forceFlush and shutdown resolve", async () => {
 test("createTelemetrySpanExporter is a no-op without a key and real otherwise", async () => {
   const previous = process.env.TELEMETRY_DEV_API_KEY;
   delete process.env.TELEMETRY_DEV_API_KEY;
+
   try {
     const noop = createTelemetrySpanExporter();
+
     const code = await new Promise<number>((resolve) =>
       noop.export([], (result) => resolve(result.code)),
     );
+
     expect(code).toBe(0);
     await noop.shutdown();
 
     const calls: Array<{ url: string; method?: string }> = [];
+
     const fetchImpl: typeof fetch = (input, init) => {
       calls.push({
         url: input instanceof URL ? input.href : input instanceof Request ? input.url : input,
         method: init?.method,
       });
+
       return Promise.resolve(new Response(null, { status: 200 }));
     };
+
     const exporter = createTelemetrySpanExporter({
       apiKey: "td_live_x",
       baseUrl: "https://ingest.example/",
       fetch: fetchImpl,
     });
+
     const provider = new BasicTracerProvider({
       spanProcessors: [new SimpleSpanProcessor(exporter)],
     });
+
     try {
       provider.getTracer("public-exporter").startSpan("exported").end();
       await provider.forceFlush();
@@ -155,22 +168,28 @@ test("createTelemetrySpanExporter is a no-op without a key and real otherwise", 
 
 test("createTelemetrySpanExporter honors a timeout beyond the default", async () => {
   vi.useFakeTimers();
+
   try {
     let signal: AbortSignal | undefined;
     const results: number[] = [];
     const source = new InMemorySpanExporter();
+
     const provider = new BasicTracerProvider({
       spanProcessors: [new SimpleSpanProcessor(source)],
     });
+
     provider.getTracer("timeout-source").startSpan("exported").end();
+
     const exporter = createTelemetrySpanExporter({
       apiKey: "td_live_x",
       exportTimeoutMillis: 35_000,
       fetch: (_input, init) => {
         signal = init!.signal!;
+
         return new Promise(() => undefined);
       },
     });
+
     exporter.export(source.getFinishedSpans(), (result) => results.push(result.code));
     await Promise.resolve();
     await Promise.resolve();
@@ -191,19 +210,26 @@ test("createTelemetrySpanExporter honors a timeout beyond the default", async ()
 test("metrics are skipped without an api key even when enabled", async () => {
   const previous = process.env.TELEMETRY_DEV_API_KEY;
   delete process.env.TELEMETRY_DEV_API_KEY;
+
   try {
     const calls: string[] = [];
+
     const fetchImpl: typeof fetch = (input) => {
       calls.push(input instanceof URL ? input.href : input instanceof Request ? input.url : input);
+
       return Promise.resolve(new Response(null, { status: 200 }));
     };
+
     const exporter = new InMemorySpanExporter();
+
     const processor = new TelemetrySpanProcessor({
       spanExporter: exporter,
       metrics: true,
       fetch: fetchImpl,
     });
+
     const provider = new BasicTracerProvider({ spanProcessors: [processor] });
+
     try {
       const span = provider.getTracer("x").startSpan("chat");
       span.setAttribute("gen_ai.operation.name", "chat");
@@ -222,6 +248,7 @@ test("metrics are skipped without an api key even when enabled", async () => {
 test("global tracer interop: registered provider receives raw OTel API spans", async () => {
   const { exporter, processor, provider } = byoSetup();
   trace.setGlobalTracerProvider(provider);
+
   try {
     trace.getTracer("third-party").startSpan("via-global").end();
     await processor.forceFlush();
@@ -235,6 +262,7 @@ test("sha256 matches the FIPS vector", () => {
   const hex = Array.from(sha256(new TextEncoder().encode("abc")), (b) =>
     b.toString(16).padStart(2, "0"),
   ).join("");
+
   expect(hex).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 });
 
@@ -265,6 +293,7 @@ test("sessionRootTracerProvider keeps roots for missing inputs and callback erro
   const errors: Error[] = [];
   const noKey = sessionRootTracerProvider(provider, undefined, () => "s1");
   const noSession = sessionRootTracerProvider(provider, "td_live_k", () => "");
+
   const broken = sessionRootTracerProvider(
     provider,
     "td_live_k",
@@ -287,6 +316,7 @@ test("sessionRootTracerProvider keeps roots for missing inputs and callback erro
     "broken",
     "active-broken",
   ]);
+
   for (const span of finished) expect(span.parentSpanContext).toBeUndefined();
   expect(errors.map((error) => error.message)).toEqual([
     "session root failed",
@@ -302,11 +332,14 @@ test("session roots use the BYO root sampler, not the synthetic parent flags", a
   ]) {
     const policy = new ParentBasedSampler({ root });
     const provider = new BasicTracerProvider({ sampler: sessionSampler(policy) });
+
     try {
       const tracer = provider.getTracer("byo");
+
       for (let i = 0; i < 20; i++) {
         const parent = withSessionParent(ROOT_CONTEXT, `session-${i}`, "td_live_k");
         const id = trace.getSpanContext(parent)!.traceId;
+
         const expected = policy.shouldSample(
           ROOT_CONTEXT,
           id,
@@ -315,6 +348,7 @@ test("session roots use the BYO root sampler, not the synthetic parent flags", a
           {},
           [],
         ).decision;
+
         const span = tracer.startSpan("turn", {}, parent);
         expect(span.isRecording()).toBe(expected !== SamplingDecision.NOT_RECORD);
         expect(span.spanContext().traceFlags & TraceFlags.SAMPLED).toBe(
@@ -331,14 +365,18 @@ test("session roots use the BYO root sampler, not the synthetic parent flags", a
 
 test("session roots and children keep real parent sampling, tracestate, and baggage", async () => {
   context.setGlobalContextManager(new AlsContextManager(als!));
+
   const provider = new BasicTracerProvider({
     sampler: sessionSampler(new ParentBasedSampler({ root: new AlwaysOffSampler() })),
   });
+
   const tracer = sessionRootTracerProvider(provider, "td_live_k", (name) =>
     name === "turn" ? "s1" : undefined,
   ).getTracer("framework");
+
   const baggage = propagation.createBaggage({ tenant: { value: "kept" } });
   const traceState = createTraceState("vendor=kept");
+
   try {
     for (const isRemote of [false, true]) {
       for (const traceFlags of [TraceFlags.NONE, TraceFlags.SAMPLED]) {
@@ -349,6 +387,7 @@ test("session roots and children keep real parent sampling, tracestate, and bagg
           isRemote,
           traceState,
         };
+
         const ctx = propagation.setBaggage(trace.setSpanContext(ROOT_CONTEXT, parent), baggage);
         expect(withSessionParent(ctx, "s1", "td_live_k")).toBe(ctx);
         context.with(ctx, () =>
@@ -387,6 +426,7 @@ test("session roots and children keep real parent sampling, tracestate, and bagg
 
 test("session sampling keeps baggage changed after attaching the session parent", async () => {
   const exporter = new InMemorySpanExporter();
+
   const provider = new BasicTracerProvider({
     sampler: sessionSampler(
       new ParentBasedSampler({
@@ -405,21 +445,26 @@ test("session sampling keeps baggage changed after attaching the session parent"
     ),
     spanProcessors: [new SimpleSpanProcessor(exporter)],
   });
+
   try {
     const tracer = provider.getTracer("byo");
+
     const before = propagation.setBaggage(
       ROOT_CONTEXT,
       propagation.createBaggage({
         tenant: { value: "denied" },
       }),
     );
+
     const parent = withSessionParent(before, "s1", "td_live_k");
+
     const allowed = propagation.setBaggage(
       parent,
       propagation.createBaggage({
         tenant: { value: "allowed" },
       }),
     );
+
     tracer.startSpan("allowed", {}, allowed).end();
     tracer.startSpan("denied", {}, parent).end();
     tracer.startSpan("removed", {}, propagation.deleteBaggage(allowed)).end();
@@ -451,10 +496,12 @@ test("session samplers keep record-only results, attributes, and tracestate", as
       },
     ],
   });
+
   try {
     const span = provider
       .getTracer("byo")
       .startSpan("turn", {}, withSessionParent(ROOT_CONTEXT, "s1", "td_live_k"));
+
     expect(span.isRecording()).toBe(true);
     expect(span.spanContext().traceFlags & TraceFlags.SAMPLED).toBe(TraceFlags.NONE);
     expect(span.spanContext().traceState?.serialize()).toBe("vendor=record");
@@ -477,6 +524,7 @@ test.each([
   vi.stubEnv("OTEL_TRACES_SAMPLER", mode);
   vi.stubEnv("OTEL_TRACES_SAMPLER_ARG", arg);
   const provider = new BasicTracerProvider({ sampler: sessionSampler() });
+
   try {
     const tracer = provider.getTracer("byo");
     const ordinary = tracer.startSpan("ordinary", {}, ROOT_CONTEXT);
@@ -486,6 +534,7 @@ test.each([
     expect(span.isRecording()).toBe(root);
     expect(span.spanContext().traceId).toBe("9e21d32713f05502cf537dba02d3d6fe");
     span.end();
+
     for (const [traceFlags, expected] of [
       [TraceFlags.NONE, unsampled],
       [TraceFlags.SAMPLED, sampled],
@@ -496,6 +545,7 @@ test.each([
         traceFlags,
         isRemote: true,
       });
+
       const child = tracer.startSpan("child", {}, withSessionParent(ctx, "s1", "td_live_k"));
       expect(child.isRecording()).toBe(expected);
       child.end();
@@ -511,10 +561,12 @@ test.each([undefined, "", "NaN", "Infinity", "-0.1", "1.1"])(
     vi.stubEnv("OTEL_TRACES_SAMPLER", "parentbased_traceidratio");
     vi.stubEnv("OTEL_TRACES_SAMPLER_ARG", arg);
     const provider = new BasicTracerProvider({ sampler: sessionSampler() });
+
     try {
       const span = provider
         .getTracer("byo")
         .startSpan("turn", {}, withSessionParent(ROOT_CONTEXT, "s1", "td_live_k"));
+
       expect(span.isRecording()).toBe(true);
       span.end();
     } finally {

@@ -34,10 +34,12 @@ const DEFAULT_BASE_URL = "https://ingest.telemetry.dev";
 
 export function resolveConfig(options: TelemetryDevOptions = {}): ResolvedConfig {
   const env = globalThis.process?.env ?? {};
+
   const baseUrl = (options.baseUrl ?? env.TELEMETRY_DEV_BASE_URL ?? DEFAULT_BASE_URL).replace(
     /\/+$/,
     "",
   );
+
   return {
     apiKey: options.apiKey ?? env.TELEMETRY_DEV_API_KEY,
     baseUrl,

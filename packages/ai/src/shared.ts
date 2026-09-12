@@ -15,9 +15,11 @@ export function readId(value: JsonValue): string | null {
   if (typeof value === "string") {
     return value.length > 0 ? value : null;
   }
+
   if (typeof value === "number" || typeof value === "bigint") {
     return String(value);
   }
+
   return null;
 }
 
@@ -26,6 +28,11 @@ export function readId(value: JsonValue): string | null {
 // Applied at both provider read sites so the chain root and its model steps never disagree.
 export function providerLabel(provider: string): string {
   return provider === "gateway" ? "Vercel AI Gateway" : provider;
+}
+
+export function unknownErrorMessage(value: unknown): string {
+  // oxlint-disable-next-line typescript/no-base-to-string -- error payloads must not be JSON-emitted.
+  return String(value);
 }
 
 export const SEVERITY_INFO = 9;

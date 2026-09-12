@@ -95,6 +95,7 @@ export const DEFAULT_MAX_ATTRIBUTE_LENGTH = 65536;
 
 export function resolveConfig(options: TelemetryOptions = {}): ResolvedConfig {
   const env = resolveEnv();
+
   if (
     options.sessionMode !== undefined &&
     options.sessionMode !== "explicit" &&
@@ -102,10 +103,12 @@ export function resolveConfig(options: TelemetryOptions = {}): ResolvedConfig {
   ) {
     throw new TypeError(`Invalid sessionMode: ${String(options.sessionMode)}`);
   }
+
   const baseUrl = (options.baseUrl ?? env.TELEMETRY_DEV_BASE_URL ?? DEFAULT_BASE_URL).replace(
     /\/+$/,
     "",
   );
+
   return {
     apiKey: options.apiKey ?? env.TELEMETRY_DEV_API_KEY,
     baseUrl,

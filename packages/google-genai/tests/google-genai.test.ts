@@ -45,6 +45,7 @@ function jsonErrorResponse(status: number, message: string): Response {
 
 function sseResponse(chunks: JsonValue[]): Response {
   const body = chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("");
+
   return new Response(body, {
     status: 200,
     headers: { "content-type": "text/event-stream" },
@@ -62,13 +63,16 @@ function erroringSseResponse(chunks: JsonValue | JsonValue[], error: Error): Res
 
         if (chunk !== undefined) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+
           return;
         }
+
         controller.error(error);
       },
     },
     { highWaterMark: 0 },
   );
+
   return new Response(body, {
     status: 200,
     headers: { "content-type": "text/event-stream" },
@@ -77,21 +81,24 @@ function erroringSseResponse(chunks: JsonValue | JsonValue[], error: Error): Res
 
 function createFakeFetch(...responses: Response[]) {
   const requests: CapturedRequest[] = [];
+
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = input instanceof Request ? input.url : String(input);
-    const bodyText =
-      Object.prototype.toString.call(init?.body) === "[object String]"
-        ? String(init?.body)
-        : undefined;
+
+    const bodyText = typeof init?.body === "string" ? init.body : undefined;
+
     requests.push({
       method: init?.method,
       path: new URL(url).pathname + new URL(url).search,
       body: bodyText ? JSON.parse(bodyText) : undefined,
     });
     const response = responses.shift();
+
     if (!response) throw new Error(`unexpected request to ${url}`);
+
     return response;
   };
+
   return { fetch: fetchImpl, requests };
 }
 
@@ -108,6 +115,7 @@ function setupSpans(): InMemorySpanExporter {
     },
     { spanExporter },
   );
+
   return spanExporter;
 }
 
@@ -169,22 +177,28 @@ async function finishedSpans(
   for (let attempt = 0; attempt < 20; attempt += 1) {
     await flush();
     const spans = exporter.getFinishedSpans();
+
     if (spans.length === expectedCount) return spans;
+
     if (spans.length > expectedCount) expect(spans).toHaveLength(expectedCount);
     await Promise.resolve();
   }
+
   expect(exporter.getFinishedSpans()).toHaveLength(expectedCount);
+
   return exporter.getFinishedSpans();
 }
 
 async function exportedSpan(exporter: InMemorySpanExporter): Promise<ReadableSpan> {
   const spans = await finishedSpans(exporter, 1);
+
   return spans[0]!;
 }
 
 function jsonAttr<T>(span: ReadableSpan, key: string): T {
   const value = span.attributes[key];
   expect(Object.prototype.toString.call(value)).toBe("[object String]");
+
   return JSON.parse(String(value)) as T;
 }
 
@@ -200,6 +214,7 @@ afterEach(async () => {
 
 test("generateContent maps request, response, usage, finish reason, provider, and sampling attributes", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     jsonResponse({
       candidates: [
@@ -220,8 +235,10 @@ test("generateContent maps request, response, usage, finish reason, provider, an
       },
     }),
   );
+
   vi.stubGlobal("fetch", fake.fetch);
   const client = clientWith();
+
   const response = await client.models.generateContent({
     model: "gemini-2.5-flash",
     contents: [{ role: "user", parts: [{ text: "Say hello" }] }],
@@ -235,6 +252,7 @@ test("generateContent maps request, response, usage, finish reason, provider, an
       seed: 42,
     },
   });
+
   expect(response.text).toBe("Hello there");
   const span = await exportedSpan(spans);
   expect(span.name).toBe("chat gemini-2.5-flash");
@@ -267,13 +285,16 @@ test("generateContent maps request, response, usage, finish reason, provider, an
 
 test("generateContent normalizes part-array input before recording", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     jsonResponse({
       candidates: [{ content: { role: "model", parts: [{ text: "An image." }] } }],
     }),
   );
+
   vi.stubGlobal("fetch", fake.fetch);
   const client = clientWith();
+
   const contents = [
     { text: "Describe this image" },
     { inlineData: { mimeType: "image/png", data: "abc123" } },
@@ -287,6 +308,7 @@ test("generateContent normalizes part-array input before recording", async () =>
 
 test("structured output records json output type", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     jsonResponse({
       candidates: [
@@ -297,6 +319,7 @@ test("structured output records json output type", async () => {
       ],
     }),
   );
+
   vi.stubGlobal("fetch", fake.fetch);
   const client = clientWith();
   await client.models.generateContent({
@@ -316,6 +339,7 @@ test("structured output records json output type", async () => {
 
 test("function tools map definitions, toolConfig, and functionCall output", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     jsonResponse({
       candidates: [
@@ -329,6 +353,7 @@ test("function tools map definitions, toolConfig, and functionCall output", asyn
       ],
     }),
   );
+
   vi.stubGlobal("fetch", fake.fetch);
   const client = clientWith();
   await client.models.generateContent({
@@ -370,6 +395,7 @@ test("function tools map definitions, toolConfig, and functionCall output", asyn
 
 test("generateContent automatic function calls sum usage from internal generateContent calls", async () => {
   const spans = setupSpans();
+
   const callableTool = {
     name: "get_weather",
     async tool(): Promise<Tool> {
@@ -394,6 +420,7 @@ test("generateContent automatic function calls sum usage from internal generateC
       ];
     },
   };
+
   const functionCallResponse = {
     responseId: "afc_1",
     candidates: [
@@ -412,6 +439,7 @@ test("generateContent automatic function calls sum usage from internal generateC
       toolUsePromptTokenCount: 2,
     },
   };
+
   const finalResponse = {
     responseId: "afc_2",
     candidates: [
@@ -427,6 +455,7 @@ test("generateContent automatic function calls sum usage from internal generateC
       toolUsePromptTokenCount: 3,
     },
   };
+
   const fake = createFakeFetch(jsonResponse(functionCallResponse), jsonResponse(finalResponse));
   vi.stubGlobal("fetch", fake.fetch);
   const client = clientWith();
@@ -466,6 +495,7 @@ test("generateContent automatic function calls sum usage from internal generateC
 
 test("built-in tools map every SDK marker to tool definitions", async () => {
   const spans = setupSpans();
+
   const client = wrapGoogleGenAI({
     models: {
       generateContent(_params: any) {
@@ -473,6 +503,7 @@ test("built-in tools map every SDK marker to tool definitions", async () => {
       },
     },
   });
+
   client.models.generateContent({
     model: "gemini-2.5-flash",
     contents: "Use tools",
@@ -512,6 +543,7 @@ test("built-in tools map every SDK marker to tool definitions", async () => {
 
 test("multi-candidate responses capture choice count and finish reasons", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     jsonResponse({
       candidates: [
@@ -528,6 +560,7 @@ test("multi-candidate responses capture choice count and finish reasons", async 
       ],
     }),
   );
+
   vi.stubGlobal("fetch", fake.fetch);
   const client = clientWith();
   await client.models.generateContent({
@@ -543,14 +576,17 @@ test("multi-candidate responses capture choice count and finish reasons", async 
 
 test("streaming aggregates chunks, preserves passthrough, and records time to first chunk", async () => {
   const spans = setupSpans();
+
   const chunk1 = {
     candidates: [{ content: { role: "model", parts: [{ text: "Hel" }] } }],
     responseId: "stream_1",
     modelVersion: "gemini-2.5-flash-stream",
   };
+
   const chunk2 = {
     candidates: [{ content: { role: "model", parts: [{ text: "lo" }] } }],
   };
+
   const chunk3 = {
     candidates: [{ content: { role: "model", parts: [{ text: "!" }] }, finishReason: "STOP" }],
     usageMetadata: {
@@ -559,19 +595,25 @@ test("streaming aggregates chunks, preserves passthrough, and records time to fi
       totalTokenCount: 5,
     },
   };
+
   const fake = createFakeFetch(sseResponse([chunk1, chunk2, chunk3]));
   vi.stubGlobal("fetch", fake.fetch);
   const client = clientWith();
+
   const stream = await client.models.generateContentStream({
     model: "gemini-2.5-flash",
     contents: "Stream",
   });
+
   const stripTransport = (value: any) => {
     const copy = JSON.parse(JSON.stringify(value)) as { [key: string]: JsonValue };
     delete copy.sdkHttpResponse;
+
     return copy;
   };
+
   const seen: object[] = [];
+
   for await (const chunk of stream) seen.push(stripTransport(chunk));
   expect(seen).toEqual([chunk1, chunk2, chunk3]);
   const span = await exportedSpan(spans);
@@ -586,6 +628,7 @@ test("streaming aggregates chunks, preserves passthrough, and records time to fi
 test("streaming automatic function calls keep tool turns out of final output", async () => {
   const spans = setupSpans();
   const requestContents = [{ role: "user", parts: [{ text: "Weather?" }] }];
+
   const expectedInput = [
     { role: "user", parts: [{ text: "Weather?" }] },
     {
@@ -597,6 +640,7 @@ test("streaming automatic function calls keep tool turns out of final output", a
       parts: [{ functionResponse: { name: "get_weather", response: { temperature: 21 } } }],
     },
   ];
+
   const functionCallChunk = {
     responseId: "afc_1",
     candidates: [
@@ -609,6 +653,7 @@ test("streaming automatic function calls keep tool turns out of final output", a
     ],
     usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 2, totalTokenCount: 12 },
   };
+
   const functionResponseChunk = {
     candidates: [
       {
@@ -619,6 +664,7 @@ test("streaming automatic function calls keep tool turns out of final output", a
       },
     ],
   };
+
   const finalChunk = {
     responseId: "afc_2",
     candidates: [
@@ -629,15 +675,19 @@ test("streaming automatic function calls keep tool turns out of final output", a
     ],
     usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 3, totalTokenCount: 7 },
   };
+
   const fake = createFakeFetch(sseResponse([functionCallChunk, functionResponseChunk, finalChunk]));
   vi.stubGlobal("fetch", fake.fetch);
   const client = clientWith();
+
   const stream = await client.models.generateContentStream({
     model: "gemini-2.5-flash",
     contents: requestContents,
   });
+
   for await (const _chunk of stream) {
   }
+
   const span = await exportedSpan(spans);
   expect(requestContents).toEqual([{ role: "user", parts: [{ text: "Weather?" }] }]);
   expect(messagesAttr(span, "gen_ai.input.messages")).toEqual(expectedInput);
@@ -653,6 +703,7 @@ test("streaming automatic function calls keep tool turns out of final output", a
 
 test("streaming automatic function history excludes prior synthetic output", async () => {
   const spans = setupSpans();
+
   const functionCallChunk = {
     responseId: "afc_1",
     candidates: [
@@ -664,6 +715,7 @@ test("streaming automatic function history excludes prior synthetic output", asy
       },
     ],
   };
+
   const finalChunk = {
     responseId: "afc_2",
     candidates: [
@@ -684,6 +736,7 @@ test("streaming automatic function history excludes prior synthetic output", asy
       },
     ],
   };
+
   const client = wrapGoogleGenAI({
     models: {
       async *generateContentStream(_params: any) {
@@ -692,6 +745,7 @@ test("streaming automatic function history excludes prior synthetic output", asy
       },
     },
   });
+
   const stream = await (client.models.generateContentStream({
     model: "gemini-2.5-flash",
     contents: [{ role: "user", parts: [{ text: "Weather?" }] }],
@@ -711,25 +765,32 @@ test("streaming automatic function history excludes prior synthetic output", asy
 
 test("streaming keeps thought parts separate from plain text parts", async () => {
   const spans = setupSpans();
+
   const chunk1 = {
     candidates: [{ content: { role: "model", parts: [{ text: "thinking", thought: true }] } }],
   };
+
   const chunk2 = {
     candidates: [{ content: { role: "model", parts: [{ text: "answer" }] } }],
   };
+
   const chunk3 = {
     candidates: [{ finishReason: "STOP" }],
     usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
   };
+
   const fake = createFakeFetch(sseResponse([chunk1, chunk2, chunk3]));
   vi.stubGlobal("fetch", fake.fetch);
   const client = clientWith();
+
   const stream = await client.models.generateContentStream({
     model: "gemini-2.5-flash",
     contents: "Think",
   });
+
   for await (const _chunk of stream) {
   }
+
   const span = await exportedSpan(spans);
   expect(messagesAttr(span, "gen_ai.output.messages")[0]).toEqual({
     role: "model",
@@ -739,16 +800,20 @@ test("streaming keeps thought parts separate from plain text parts", async () =>
 
 test("streaming mid-stream error records error status with partial output", async () => {
   const spans = setupSpans();
+
   const chunk = {
     candidates: [{ content: { role: "model", parts: [{ text: "partial" }] } }],
   };
+
   const fake = createFakeFetch(erroringSseResponse(chunk, new Error("stream failed")));
   vi.stubGlobal("fetch", fake.fetch);
   const client = clientWith();
+
   const stream = await client.models.generateContentStream({
     model: "gemini-2.5-flash",
     contents: "Stream",
   });
+
   await expect(async () => {
     for await (const _chunk of stream) {
     }
@@ -985,19 +1050,24 @@ test.each(["next", "return", "throw"] as const)(
 
 test("streaming early break ends span with partial aggregate", async () => {
   const spans = setupSpans();
+
   const chunk1 = {
     candidates: [{ content: { role: "model", parts: [{ text: "first" }] } }],
   };
+
   const chunk2 = {
     candidates: [{ content: { role: "model", parts: [{ text: "second" }] } }],
   };
+
   const fake = createFakeFetch(sseResponse([chunk1, chunk2]));
   vi.stubGlobal("fetch", fake.fetch);
   const client = clientWith();
+
   const stream = await client.models.generateContentStream({
     model: "gemini-2.5-flash",
     contents: "Stream",
   });
+
   for await (const _chunk of stream) break;
   const span = await exportedSpan(spans);
   expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
@@ -1008,6 +1078,7 @@ test("streaming early break ends span with partial aggregate", async () => {
 test("streaming return before first chunk ends span", async () => {
   const spans = setupSpans();
   let returned = false;
+
   const source = {
     [Symbol.asyncIterator]() {
       return {
@@ -1019,11 +1090,13 @@ test("streaming return before first chunk ends span", async () => {
         },
         async return() {
           returned = true;
+
           return { done: true as const, value: undefined };
         },
       };
     },
   };
+
   const client = wrapGoogleGenAI({
     models: {
       generateContentStream(_params: any) {
@@ -1031,10 +1104,12 @@ test("streaming return before first chunk ends span", async () => {
       },
     },
   });
+
   const stream = await (client.models.generateContentStream({
     model: "gemini-2.5-flash",
     contents: "Stream",
   }) as any);
+
   await stream.return(undefined);
   expect(returned).toBe(true);
   const span = await exportedSpan(spans);
@@ -1044,6 +1119,7 @@ test("streaming return before first chunk ends span", async () => {
 
 test("streaming return forwards the source iterator result", async () => {
   const spans = setupSpans();
+
   const returnChunk = {
     candidates: [
       {
@@ -1053,13 +1129,16 @@ test("streaming return forwards the source iterator result", async () => {
     ],
     usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 2, totalTokenCount: 3 },
   };
+
   const source = {
     [Symbol.asyncIterator]() {
       let done = false;
+
       return {
         async next() {
           if (done) return { done: true as const, value: undefined };
           done = true;
+
           return {
             done: false as const,
             value: {
@@ -1074,6 +1153,7 @@ test("streaming return forwards the source iterator result", async () => {
       };
     },
   };
+
   const client = wrapGoogleGenAI({
     models: {
       generateContentStream(_params: any) {
@@ -1081,6 +1161,7 @@ test("streaming return forwards the source iterator result", async () => {
       },
     },
   });
+
   const stream = await (client.models.generateContentStream({
     model: "gemini-2.5-flash",
     contents: "Stream",
@@ -1102,11 +1183,13 @@ test("streaming return forwards the source iterator result", async () => {
 test("streaming next forwards values to the source iterator", async () => {
   const spans = setupSpans();
   const seen: object[] = [];
+
   const source = {
     [Symbol.asyncIterator]() {
       return {
         async next(value?: any) {
           seen.push(value);
+
           return {
             done: false as const,
             value: {
@@ -1120,6 +1203,7 @@ test("streaming next forwards values to the source iterator", async () => {
       };
     },
   };
+
   const client = wrapGoogleGenAI({
     models: {
       generateContentStream(_params: any) {
@@ -1127,6 +1211,7 @@ test("streaming next forwards values to the source iterator", async () => {
       },
     },
   });
+
   const stream = await (client.models.generateContentStream({
     model: "gemini-2.5-flash",
     contents: "Stream",
@@ -1144,6 +1229,7 @@ test("streaming next forwards values to the source iterator", async () => {
 test("streaming return failure records a non-Error rejection", async () => {
   const spans = setupSpans();
   const cleanupFailure = "cleanup failed";
+
   const source = {
     [Symbol.asyncIterator]() {
       return {
@@ -1156,6 +1242,7 @@ test("streaming return failure records a non-Error rejection", async () => {
       };
     },
   };
+
   const client = wrapGoogleGenAI({
     models: {
       generateContentStream<T>(_params: T) {
@@ -1163,11 +1250,14 @@ test("streaming return failure records a non-Error rejection", async () => {
       },
     },
   });
+
   const stream = await client.models.generateContentStream({
     model: "gemini-2.5-flash",
     contents: "Stream",
   });
+
   const iterator = stream[Symbol.asyncIterator]();
+
   if (!iterator.return) throw new Error("stream iterator does not support return");
 
   await expect(iterator.return()).rejects.toBe(cleanupFailure);
@@ -1194,6 +1284,7 @@ test("API error 400 rethrows ApiError and records error span", async () => {
 test("non-Error unary failures end spans and preserve the thrown values", async () => {
   const spans = setupSpans();
   const rejected = "unary rejected";
+
   const rejecting = wrapGoogleGenAI({
     models: {
       generateContent<T>(_params: T) {
@@ -1201,11 +1292,13 @@ test("non-Error unary failures end spans and preserve the thrown values", async 
       },
     },
   });
+
   await expect(
     rejecting.models.generateContent({ model: "gemini-2.5-flash", contents: "fail" }),
   ).rejects.toBe(rejected);
 
   const thrown = { message: "unary threw" };
+
   const throwing = wrapGoogleGenAI({
     models: {
       generateContent<T>(_params: T) {
@@ -1213,13 +1306,16 @@ test("non-Error unary failures end spans and preserve the thrown values", async 
       },
     },
   });
+
   let caught = false;
+
   try {
     throwing.models.generateContent({ model: "gemini-2.5-flash", contents: "fail" });
   } catch (error) {
     caught = true;
     expect(error).toBe(thrown);
   }
+
   expect(caught).toBe(true);
 
   const finished = await finishedSpans(spans, 2);
@@ -1235,6 +1331,7 @@ test("non-Error unary failures end spans and preserve the thrown values", async 
 test("non-Error stream setup failures end spans and preserve the thrown values", async () => {
   const spans = setupSpans();
   const rejected = "stream setup rejected";
+
   const rejecting = wrapGoogleGenAI({
     models: {
       generateContentStream<T>(_params: T) {
@@ -1242,11 +1339,13 @@ test("non-Error stream setup failures end spans and preserve the thrown values",
       },
     },
   });
+
   await expect(
     rejecting.models.generateContentStream({ model: "gemini-2.5-flash", contents: "fail" }),
   ).rejects.toBe(rejected);
 
   const thrown = { message: "stream setup threw" };
+
   const throwing = wrapGoogleGenAI({
     models: {
       generateContentStream<T>(_params: T) {
@@ -1254,13 +1353,16 @@ test("non-Error stream setup failures end spans and preserve the thrown values",
       },
     },
   });
+
   let caught = false;
+
   try {
     throwing.models.generateContentStream({ model: "gemini-2.5-flash", contents: "fail" });
   } catch (error) {
     caught = true;
     expect(error).toBe(thrown);
   }
+
   expect(caught).toBe(true);
 
   const finished = await finishedSpans(spans, 2);
@@ -1275,6 +1377,7 @@ test("non-Error stream setup failures end spans and preserve the thrown values",
 
 test("blocked prompt records block attrs without output", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     jsonResponse({
       promptFeedback: {
@@ -1284,6 +1387,7 @@ test("blocked prompt records block attrs without output", async () => {
       },
     }),
   );
+
   vi.stubGlobal("fetch", fake.fetch);
   const client = clientWith();
   await client.models.generateContent({ model: "gemini-2.5-flash", contents: "blocked" });
@@ -1299,6 +1403,7 @@ test("blocked prompt records block attrs without output", async () => {
 
 test("embedContent maps embedding span fields without output", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     jsonResponse({
       embeddings: [
@@ -1308,6 +1413,7 @@ test("embedContent maps embedding span fields without output", async () => {
       metadata: { billableCharacterCount: 42 },
     }),
   );
+
   vi.stubGlobal("fetch", fake.fetch);
   const client = clientWith();
   await client.models.embedContent({
@@ -1336,15 +1442,18 @@ test("chats sendMessage emits span input with history for wrap-before-create and
       },
     ],
   };
+
   const history = [{ role: "user", parts: [{ text: "Hi" }] }];
   const spans = setupSpans();
   const fakeBefore = createFakeFetch(jsonResponse(responseBody), jsonResponse(responseBody));
   vi.stubGlobal("fetch", fakeBefore.fetch);
   const wrappedFirst = clientWith();
+
   const chatBefore = wrappedFirst.chats.create({
     model: "gemini-2.5-flash",
     history,
   });
+
   await chatBefore.sendMessage({ message: "Again" });
   const spanBefore = (await finishedSpans(spans, 1))[0]!;
   expect(messagesAttr(spanBefore, "gen_ai.input.messages")).toEqual([
@@ -1369,11 +1478,13 @@ test("chats sendMessage emits span input with history for wrap-before-create and
 
 test("vertex clients report gcp.vertex_ai provider", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     jsonResponse({
       candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }],
     }),
   );
+
   vi.stubGlobal("fetch", fake.fetch);
   const client = wrapGoogleGenAI(new GoogleGenAI({ vertexai: true, apiKey: "test" }));
   await client.models.generateContent({ model: "gemini-2.5-flash", contents: "hi" });
@@ -1383,6 +1494,7 @@ test("vertex clients report gcp.vertex_ai provider", async () => {
 
 test("double wrapGoogleGenAI emits one span per call", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     jsonResponse({
       candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }],
@@ -1391,6 +1503,7 @@ test("double wrapGoogleGenAI emits one span per call", async () => {
       candidates: [{ content: { role: "model", parts: [{ text: "ok2" }] }, finishReason: "STOP" }],
     }),
   );
+
   vi.stubGlobal("fetch", fake.fetch);
   const once = wrapGoogleGenAI(new GoogleGenAI({ apiKey: "test" }));
   const twice = wrapGoogleGenAI(once);
@@ -1401,12 +1514,14 @@ test("double wrapGoogleGenAI emits one span per call", async () => {
 
 test("wrapped calls fail open when telemetry mapping throws", async () => {
   const spans = setupSpans();
+
   const response = {
     text: "ok",
     get candidates() {
       throw new Error("response mapper failed");
     },
   };
+
   const client = wrapGoogleGenAI({
     models: {
       generateContent(_params: any) {
@@ -1414,6 +1529,7 @@ test("wrapped calls fail open when telemetry mapping throws", async () => {
       },
     },
   });
+
   const params = {
     model: "gemini-2.5-flash",
     contents: "hi",
@@ -1421,6 +1537,7 @@ test("wrapped calls fail open when telemetry mapping throws", async () => {
       throw new Error("request mapper failed");
     },
   };
+
   const result = client.models.generateContent(params);
   expect(result).toBe(response);
   const span = await exportedSpan(spans);
@@ -1434,11 +1551,14 @@ test("wrapped calls fail open when telemetry is not initialized", async () => {
       candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }],
     }),
   );
+
   vi.stubGlobal("fetch", fake.fetch);
   const client = wrapGoogleGenAI(new GoogleGenAI({ apiKey: "test" }));
+
   const response = await client.models.generateContent({
     model: "gemini-2.5-flash",
     contents: "hi",
   });
+
   expect(response.text).toBe("ok");
 });

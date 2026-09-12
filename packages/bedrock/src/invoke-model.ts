@@ -18,6 +18,7 @@ import {
 
 export function isEmbeddingModel<T>(modelId: T): boolean {
   const model = stringValue(modelId)?.toLowerCase() ?? "";
+
   return (
     model.includes("titan-embed") || model.includes("cohere.embed") || model.includes("-embedding")
   );
@@ -25,12 +26,14 @@ export function isEmbeddingModel<T>(modelId: T): boolean {
 
 export function invokeModelSpanName(input: JsonRecord): string {
   const model = stringValue(input.modelId) ?? "unknown";
+
   return `${isEmbeddingModel(model) ? "embeddings" : "chat"} ${model}`;
 }
 
 export function invokeModelRequestFields(input: JsonRecord): SpanFields {
   const model = stringValue(input.modelId);
   const body = parseBody(input.body, input.contentType);
+
   return omitUndefined({
     provider: PROVIDER,
     model,
@@ -44,20 +47,25 @@ export function invokeModelResponseFields(input: JsonRecord, output: JsonValue):
   const model = stringValue(input.modelId);
   const body = isRecord(output) ? parseBody(output.body, output.contentType) : undefined;
   const metadata = isRecord(output) ? output.$metadata : undefined;
+
   return mergeFields(awsMetadataFields(metadata), nativeResponseFields(model, body, metadata));
 }
 
 export function parseBody<TBody, TContentType>(body: TBody, contentType: TContentType): JsonValue {
   const type = stringValue(contentType) ?? "application/json";
+
   if (!type.includes("json")) return undefined;
+
   return parseJson(body);
 }
 
 function nativeSamplingFields<T>(model: string | undefined, body: T): SpanFields {
   if (!isRecord(body)) return {};
   const lower = model?.toLowerCase() ?? "";
+
   if (lower.includes("amazon.titan")) {
     const cfg = isRecord(body.textGenerationConfig) ? body.textGenerationConfig : {};
+
     return omitUndefined({
       temperature: numberValue(cfg.temperature),
       topP: numberValue(cfg.topP),
@@ -65,8 +73,10 @@ function nativeSamplingFields<T>(model: string | undefined, body: T): SpanFields
       stopSequences: arrayValue<string>(cfg.stopSequences),
     });
   }
+
   if (lower.includes("amazon.nova")) {
     const cfg = isRecord(body.inferenceConfig) ? body.inferenceConfig : {};
+
     return omitUndefined({
       temperature: numberValue(cfg.temperature),
       topP: numberValue(cfg.topP) ?? numberValue(cfg.top_p),
@@ -75,6 +85,7 @@ function nativeSamplingFields<T>(model: string | undefined, body: T): SpanFields
       stopSequences: arrayValue<string>(cfg.stopSequences),
     });
   }
+
   if (lower.includes("anthropic.claude")) {
     return omitUndefined({
       temperature: numberValue(body.temperature),
@@ -84,6 +95,7 @@ function nativeSamplingFields<T>(model: string | undefined, body: T): SpanFields
       stopSequences: arrayValue<string>(body.stop_sequences),
     });
   }
+
   if (lower.includes("meta.llama")) {
     return omitUndefined({
       temperature: numberValue(body.temperature),
@@ -91,6 +103,7 @@ function nativeSamplingFields<T>(model: string | undefined, body: T): SpanFields
       maxTokens: numberValue(body.max_gen_len),
     });
   }
+
   return omitUndefined({
     temperature: numberValue(body.temperature),
     topP: numberValue(body.top_p) ?? numberValue(body.topP),
@@ -105,6 +118,7 @@ function nativeResponseFields(
 ): SpanFields {
   if (!isRecord(body)) return headerUsageFields(metadata);
   const lower = model?.toLowerCase() ?? "";
+
   if (isEmbeddingModel(model)) {
     return withHeaderUsage(
       {
@@ -115,8 +129,10 @@ function nativeResponseFields(
       metadata,
     );
   }
+
   if (lower.includes("amazon.titan")) {
     const first = Array.isArray(body.results) && isRecord(body.results[0]) ? body.results[0] : {};
+
     return omitUndefined({
       output: body,
       finishReason: stringValue(first.completionReason),
@@ -126,8 +142,10 @@ function nativeResponseFields(
       }),
     });
   }
+
   if (lower.includes("amazon.nova")) {
     const usage = isRecord(body.usage) ? body.usage : {};
+
     return omitUndefined({
       output: body,
       finishReason: stringValue(body.stopReason),
@@ -138,8 +156,10 @@ function nativeResponseFields(
       }),
     });
   }
+
   if (lower.includes("anthropic.claude")) {
     const usage = isRecord(body.usage) ? body.usage : {};
+
     return withHeaderUsage(
       {
         output: body,
@@ -154,6 +174,7 @@ function nativeResponseFields(
       metadata,
     );
   }
+
   if (lower.includes("meta.llama")) {
     return omitUndefined({
       output: body,
@@ -164,32 +185,39 @@ function nativeResponseFields(
       }),
     });
   }
+
   if (lower.includes("mistral")) {
     const first = Array.isArray(body.outputs) && isRecord(body.outputs[0]) ? body.outputs[0] : {};
+
     return withHeaderUsage(
       { output: body, finishReason: stringValue(first.stop_reason) },
       metadata,
     );
   }
+
   if (lower.includes("cohere.command-r")) {
     return withHeaderUsage(
       { output: body, finishReason: stringValue(body.finish_reason) },
       metadata,
     );
   }
+
   if (lower.includes("cohere.command")) {
     const first =
       Array.isArray(body.generations) && isRecord(body.generations[0]) ? body.generations[0] : {};
+
     return withHeaderUsage(
       { output: body, finishReason: stringValue(first.finish_reason) },
       metadata,
     );
   }
+
   return withHeaderUsage({ output: body }, metadata);
 }
 
 function withHeaderUsage<T>(fields: SpanFields, metadata: T): SpanFields {
   if (fields.usage && Object.keys(fields.usage).length > 0) return fields;
+
   return mergeFields(fields, headerUsageFields(metadata));
 }
 
@@ -201,19 +229,24 @@ function headerUsageFields<T>(metadata: T): SpanFields {
         ? metadata.HTTPHeaders
         : undefined
     : undefined;
+
   const usage = omitUndefined({
     inputTokens: headerNumber(headers?.["x-amzn-bedrock-input-token-count"]),
     outputTokens: headerNumber(headers?.["x-amzn-bedrock-output-token-count"]),
   });
+
   return { usage: Object.keys(usage).length > 0 ? usage : undefined };
 }
 
 function headerNumber<T>(value: T): number | undefined {
   const text = stringValue(value);
+
   if (text !== undefined) {
     const parsed = Number.parseInt(text, 10);
+
     return Number.isFinite(parsed) ? parsed : undefined;
   }
+
   return numberValue(value);
 }
 
@@ -227,12 +260,14 @@ export class InvokeModelStreamState implements StreamState {
   feed<T>(event: T): boolean {
     if (!isRecord(event)) return false;
     const streamError = modeledStreamError(event);
+
     if (streamError) {
       this.error = streamError.error;
       this.errorFields = streamError.fields;
 
       return false;
     }
+
     const chunk = isRecord(event.chunk) ? event.chunk : undefined;
     const parsed = parseJson(chunk?.bytes);
 
@@ -244,22 +279,27 @@ export class InvokeModelStreamState implements StreamState {
 
     this.chunks.push(parsed);
     this.text += textFromProviderChunk(parsed);
+
     if (isRecord(parsed)) {
       const delta = isRecord(parsed.delta) ? parsed.delta : undefined;
       const message = isRecord(parsed.message) ? parsed.message : undefined;
       const messageUsage = isRecord(message?.usage) ? message?.usage : undefined;
       const usage = isRecord(parsed.usage) ? parsed.usage : undefined;
+
       const metrics = isRecord(parsed["amazon-bedrock-invocationMetrics"])
         ? parsed["amazon-bedrock-invocationMetrics"]
         : undefined;
+
       const outputs =
         Array.isArray(parsed.outputs) && isRecord(parsed.outputs[0])
           ? parsed.outputs[0]
           : undefined;
+
       const generation =
         Array.isArray(parsed.generations) && isRecord(parsed.generations[0])
           ? parsed.generations[0]
           : undefined;
+
       this.finishReason =
         stringValue(delta?.stop_reason) ??
         stringValue(parsed.stop_reason) ??
@@ -314,16 +354,20 @@ export class InvokeModelStreamState implements StreamState {
 function textFromProviderChunk<T>(value: T): string {
   if (!isRecord(value)) return "";
   const delta = isRecord(value.delta) ? value.delta : undefined;
+
   const contentBlockDelta = isRecord(value.contentBlockDelta)
     ? value.contentBlockDelta
     : isRecord(value.content_block_delta)
       ? value.content_block_delta
       : undefined;
+
   const nestedDelta = isRecord(contentBlockDelta?.delta) ? contentBlockDelta?.delta : undefined;
+
   const generation =
     Array.isArray(value.generations) && isRecord(value.generations[0])
       ? value.generations[0]
       : undefined;
+
   return (
     stringValue(value.outputText) ??
     stringValue(value.generation) ??

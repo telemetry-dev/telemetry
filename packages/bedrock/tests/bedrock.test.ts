@@ -19,6 +19,7 @@ afterEach(async () => {
 
 test("Converse captures normalized messages, usage, metadata, request id, and sampling", async () => {
   const spans = setup();
+
   const request: ConverseCommandInput = {
     modelId: "anthropic.claude-3-5-haiku-20241022-v1:0",
     messages: [
@@ -33,7 +34,9 @@ test("Converse captures normalized messages, usage, metadata, request id, and sa
     system: [{ text: "be terse" }],
     inferenceConfig: { temperature: 0.2, topP: 0.8, maxTokens: 64, stopSequences: ["stop"] },
   };
+
   const requestSnapshot = structuredClone(request);
+
   const client = wrapBedrock(
     new FakeClient([
       {
@@ -87,6 +90,7 @@ test("Converse captures normalized messages, usage, metadata, request id, and sa
 
 test("Converse normalizes tool calls, tool results, and reasoning", async () => {
   const spans = setup();
+
   const client = wrapBedrock(
     new FakeClient([
       {
@@ -141,12 +145,15 @@ test("Converse normalizes tool calls, tool results, and reasoning", async () => 
     { type: "reasoning", content: "Need weather." },
   ]);
 });
+
 test("Converse normalizes citationsContent as cited text", async () => {
   const spans = setup();
+
   const citation = {
     title: "source",
     location: { s3Location: { uri: "s3://bucket/doc.txt" } },
   };
+
   const client = wrapBedrock(
     new FakeClient([
       {
@@ -179,6 +186,7 @@ test("Converse normalizes citationsContent as cited text", async () => {
 
 test("ConverseStream accumulates output and ends partial on early break", async () => {
   const spans = setup();
+
   const client = wrapBedrock(
     new FakeClient([
       {
@@ -193,9 +201,11 @@ test("ConverseStream accumulates output and ends partial on early break", async 
       },
     ]),
   );
+
   const response = (await client.send(
     new ConverseStreamCommand({ modelId: "anthropic.claude", messages: [] }),
   )) as { stream: AsyncIterable<unknown> };
+
   await collect(response.stream, 3);
 
   const [span] = spans.getFinishedSpans();
@@ -209,6 +219,7 @@ test("ConverseStream accumulates output and ends partial on early break", async 
 
 test("ConverseStream records modeled errors and non-text blocks", async () => {
   const spans = setup();
+
   const client = wrapBedrock(
     new FakeClient([
       {
@@ -243,9 +254,11 @@ test("ConverseStream records modeled errors and non-text blocks", async () => {
       },
     ]),
   );
+
   const response = (await client.send(
     new ConverseStreamCommand({ modelId: "anthropic.claude", messages: [] }),
   )) as { stream: AsyncIterable<unknown> };
+
   await collect(response.stream);
 
   const [span] = spans.getFinishedSpans();
@@ -261,6 +274,7 @@ test("ConverseStream records modeled errors and non-text blocks", async () => {
 
 test("ConverseStream records stream errors with partial output", async () => {
   const spans = setup();
+
   const client = wrapBedrock(
     new FakeClient([
       {
@@ -278,9 +292,11 @@ test("ConverseStream records stream errors with partial output", async () => {
       },
     ]),
   );
+
   const response = (await client.send(
     new ConverseStreamCommand({ modelId: "anthropic.claude", messages: [] }),
   )) as { stream: AsyncIterable<unknown> };
+
   await expect(collect(response.stream)).rejects.toThrow("stream boom");
 
   const [span] = spans.getFinishedSpans();
@@ -293,6 +309,7 @@ test("ConverseStream records stream errors with partial output", async () => {
 
 test("InvokeModel captures provider-native bodies and embedding spans", async () => {
   const spans = setup();
+
   const client = wrapBedrock(
     new FakeClient([
       {
@@ -366,6 +383,7 @@ test("InvokeModel captures Nova native sampling fields", async () => {
 
 test("InvokeModelWithResponseStream preserves optional invocation metrics", async () => {
   const spans = setup();
+
   const client = wrapBedrock(
     new FakeClient([
       {
@@ -383,6 +401,7 @@ test("InvokeModelWithResponseStream preserves optional invocation metrics", asyn
       },
     ]),
   );
+
   const response = (await client.send(
     new InvokeModelWithResponseStreamCommand({
       modelId: "anthropic.claude",
@@ -390,6 +409,7 @@ test("InvokeModelWithResponseStream preserves optional invocation metrics", asyn
       body: bytes({ messages: [], max_tokens: 10 }),
     }),
   )) as { body: AsyncIterable<unknown> };
+
   await collect(response.body);
 
   const [span] = spans.getFinishedSpans();
@@ -437,6 +457,7 @@ test("InvokeModelWithResponseStream parses each payload once and delivers malfor
 
 test("InvokeModelWithResponseStream captures Titan token counts and Cohere generations", async () => {
   const spans = setup();
+
   const client = wrapBedrock(
     new FakeClient([
       {
@@ -465,6 +486,7 @@ test("InvokeModelWithResponseStream captures Titan token counts and Cohere gener
       },
     ]),
   );
+
   const titan = (await client.send(
     new InvokeModelWithResponseStreamCommand({
       modelId: "amazon.titan-text-express-v1",
@@ -472,7 +494,9 @@ test("InvokeModelWithResponseStream captures Titan token counts and Cohere gener
       body: bytes({ inputText: "hello" }),
     }),
   )) as { body: AsyncIterable<unknown> };
+
   await collect(titan.body);
+
   const cohere = (await client.send(
     new InvokeModelWithResponseStreamCommand({
       modelId: "cohere.command-text-v14",
@@ -480,6 +504,7 @@ test("InvokeModelWithResponseStream captures Titan token counts and Cohere gener
       body: bytes({ prompt: "hello" }),
     }),
   )) as { body: AsyncIterable<unknown> };
+
   await collect(cohere.body);
 
   const [titanSpan, cohereSpan] = spans.getFinishedSpans();
@@ -493,6 +518,7 @@ test("InvokeModelWithResponseStream captures Titan token counts and Cohere gener
 
 test("InvokeModelWithResponseStream normalizes Nova contentBlockDelta chunks", async () => {
   const spans = setup();
+
   const client = wrapBedrock(
     new FakeClient([
       {
@@ -503,6 +529,7 @@ test("InvokeModelWithResponseStream normalizes Nova contentBlockDelta chunks", a
       },
     ]),
   );
+
   const response = (await client.send(
     new InvokeModelWithResponseStreamCommand({
       modelId: "amazon.nova-pro-v1:0",
@@ -510,6 +537,7 @@ test("InvokeModelWithResponseStream normalizes Nova contentBlockDelta chunks", a
       body: bytes({ messages: [] }),
     }),
   )) as { body: AsyncIterable<unknown> };
+
   await collect(response.body);
 
   const [span] = spans.getFinishedSpans();
@@ -518,6 +546,7 @@ test("InvokeModelWithResponseStream normalizes Nova contentBlockDelta chunks", a
 
 test("InvokeModelWithResponseStream records modeled stream errors with partial output", async () => {
   const spans = setup();
+
   const client = wrapBedrock(
     new FakeClient([
       {
@@ -534,6 +563,7 @@ test("InvokeModelWithResponseStream records modeled stream errors with partial o
       },
     ]),
   );
+
   const response = (await client.send(
     new InvokeModelWithResponseStreamCommand({
       modelId: "anthropic.claude",
@@ -541,6 +571,7 @@ test("InvokeModelWithResponseStream records modeled stream errors with partial o
       body: bytes({ messages: [], max_tokens: 10 }),
     }),
   )) as { body: AsyncIterable<unknown> };
+
   await collect(response.body);
 
   const [span] = spans.getFinishedSpans();
@@ -552,6 +583,7 @@ test("InvokeModelWithResponseStream records modeled stream errors with partial o
 
 test("ApplyGuardrail captures action metadata", async () => {
   const spans = setup();
+
   const client = wrapBedrock(
     new FakeClient([
       {
@@ -581,10 +613,12 @@ test("ApplyGuardrail captures action metadata", async () => {
 
 test("errors, fail-open, idempotency, and prototype restore behave", async () => {
   const spans = setup();
+
   const error = Object.assign(new Error("throttled"), {
     name: "ThrottlingException",
     $metadata: { requestId: "err-1", attempts: 2, httpStatusCode: 429, totalRetryDelay: 25 },
   });
+
   const client = wrapBedrock(wrapBedrock(new FakeClient([error])));
 
   await expect(client.send(new ConverseCommand({ modelId: "m", messages: [] }))).rejects.toThrow(
@@ -608,18 +642,22 @@ test("errors, fail-open, idempotency, and prototype restore behave", async () =>
 test("callback-style send creates a span while returning undefined", () => {
   const spans = setup();
   let callbackData: unknown;
+
   const client = wrapBedrock({
     calls: 0,
     send<TCommand>(_command: TCommand, ...rest: unknown[]): undefined {
       this.calls += 1;
+
       const callback = rest.find(
         (arg): arg is (cause: unknown, data?: { output: object; $metadata: object }) => void =>
           arg instanceof Function,
       );
+
       callback?.(undefined, {
         output: { message: { role: "assistant", content: [{ text: "ok" }] } },
         $metadata: { requestId: "callback-1" },
       });
+
       return undefined;
     },
   });
@@ -645,10 +683,12 @@ test("callback-style send creates a span while returning undefined", () => {
 
 test("global instrumentation is idempotent", async () => {
   const spans = setup();
+
   const originalDescriptor = Object.getOwnPropertyDescriptor(
     BedrockRuntimeClient.prototype,
     "send",
   );
+
   const fakeSend = async () => ({
     output: { message: { content: [] } },
     $metadata: { requestId: "global-1" },
@@ -663,17 +703,21 @@ test("global instrumentation is idempotent", async () => {
   try {
     instrumentBedrock();
     instrumentBedrock();
+
     const client = new BedrockRuntimeClient({
       region: "us-east-1",
       credentials: { accessKeyId: "test", secretAccessKey: "test" },
     });
+
     await client.send(new ConverseCommand({ modelId: "m", messages: [] }));
     expect(spans.getFinishedSpans()).toHaveLength(1);
     expect(spans.getFinishedSpans()[0]!.attributes["gen_ai.response.id"]).toBe("global-1");
+
     const telemetryWrapper = Object.getOwnPropertyDescriptor(
       BedrockRuntimeClient.prototype,
       "send",
     )?.value;
+
     const laterWrapper = async () => ({ output: { message: { content: [] } } });
     Object.defineProperty(BedrockRuntimeClient.prototype, "send", {
       configurable: true,
@@ -695,6 +739,7 @@ test("global instrumentation is idempotent", async () => {
     );
   } finally {
     uninstrumentBedrock();
+
     if (originalDescriptor) {
       Object.defineProperty(BedrockRuntimeClient.prototype, "send", originalDescriptor);
     }

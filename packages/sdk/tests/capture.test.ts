@@ -10,13 +10,17 @@ afterEach(async () => {
 
 test("mask receives the structured value and the attribute key before stringification", async () => {
   const calls: Array<{ key: string; value: unknown }> = [];
+
   const { spans } = setup({
     mask: (value, ctx) => {
       calls.push({ key: ctx.key, value });
+
       if (ctx.key === "gen_ai.input.messages") return { redacted: true };
+
       return value;
     },
   });
+
   startSpan("masked", {
     type: "generation",
     input: { prompt: "secret", ssn: "123-45-6789" },
@@ -45,6 +49,7 @@ test("a throwing mask drops content but never the span", async () => {
     },
     onError: () => {},
   });
+
   startSpan("survives", { input: "content" }).end();
   await flush();
   const span = spans.getFinishedSpans()[0]!;

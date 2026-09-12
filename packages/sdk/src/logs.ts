@@ -34,26 +34,33 @@ export interface LogOptions {
  */
 export function log(message: string, options?: LogOptions): void {
   const core = currentClient().core;
+
   if (!core) return;
+
   try {
     const logger = core.ensureLogger();
+
     if (!logger) return;
     const cfg = core.config;
+
     const captureCfg = {
       mask: cfg.mask,
       maxAttributeLength: cfg.maxAttributeLength,
       onError: cfg.onError,
     };
+
     const severity = SEVERITIES[options?.level ?? "info"];
     const active = activeContext();
     const explicitSession = options?.attributes?.["gen_ai.conversation.id"];
     const propagatedSession = propagatedFromContext(active)?.["gen_ai.conversation.id"];
+
     const sessionId =
       explicitSession !== undefined
         ? undefined
         : typeof propagatedSession === "string"
           ? propagatedSession
           : cfg.processSessionId;
+
     const ctx =
       sessionId === undefined
         ? active
@@ -63,16 +70,22 @@ export function log(message: string, options?: LogOptions): void {
           });
 
     const attributes: Record<string, AttributeValue> = {};
+
     for (const [key, value] of Object.entries(options?.attributes ?? {})) {
       if (value === undefined) continue;
+
       if (typeof value === "number" || typeof value === "boolean") {
         attributes[key] = value;
         continue;
       }
+
       const prepared = prepareCaptureValue(key, value, captureCfg);
+
       if (prepared !== undefined) attributes[key] = prepared;
     }
+
     const propagated = propagatedFromContext(ctx);
+
     if (propagated) {
       for (const [key, value] of Object.entries(propagated)) {
         if (value !== undefined) {

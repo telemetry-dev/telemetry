@@ -109,25 +109,35 @@ function isSpanHandle(value: Exclude<ParentRef, string>): value is SpanHandle {
 function withAmbientPropagated(ctx: Context): Context {
   if (propagatedFromContext(ctx)) return ctx;
   const ambient = propagatedFromContext(activeContext());
+
   return ambient ? ctx.setValue(PROPAGATED_KEY, ambient) : ctx;
 }
 
 function resolveParent(parent: ParentRef | undefined): Context {
   const base = activeContext();
+
   if (parent === undefined) return base;
+
   if (typeof parent === "string") {
     const parsed = parseTraceParent(parent);
+
     if (!parsed) return base;
+
     return trace.setSpanContext(base, { ...parsed, isRemote: true });
   }
+
   const ref = parent as Exclude<ParentRef, string>;
+
   if (isSpanHandle(ref)) return withAmbientPropagated(ref.context);
+
   if (isContext(ref)) return withAmbientPropagated(ref);
+
   return trace.setSpanContext(base, ref);
 }
 
 function applyError(span: Span, error: unknown): void {
   const err = error instanceof Error ? error : undefined;
+
   // Prefer the specific subclass name (Python parity: type(error).__name__) — many SDK
   // error classes (e.g. openai's BadRequestError) never override the inherited "Error" name.
   const errorType =
@@ -136,6 +146,7 @@ function applyError(span: Span, error: unknown): void {
       : err.name !== "Error" && err.name.length > 0
         ? err.name
         : (err.constructor?.name ?? "Error") || "Error";
+
   const message = err?.message ?? String(error);
   span.setStatus({ code: SpanStatusCode.ERROR });
   span.setAttribute("error.type", errorType);
@@ -153,12 +164,15 @@ function applyError(span: Span, error: unknown): void {
 function applyFields(span: Span, meta: SpanMeta, fields: SpanFields): void {
   if (fields.name) span.updateName(fields.name);
   const attrs = fieldsToAttributes(fields, meta.type, meta.capture);
+
   if (Object.keys(attrs).length > 0) span.setAttributes(attrs);
+
   if (fields.error !== undefined) applyError(span, fields.error);
 }
 
 function metaFor(core: ClientCore, options?: StartSpanOptions): SpanMeta {
   const cfg = core.config;
+
   return {
     type: options?.type ?? "span",
     capture: {
@@ -180,6 +194,7 @@ export function createSpanHandle(
   const meta = metaFor(core, options);
   const resolved = resolveParent(options.parent);
   const sessionId = sessionIdOf(resolved, options.attributes) ?? core.config.processSessionId;
+
   const sessionContext =
     sessionId === undefined
       ? resolved
@@ -187,8 +202,10 @@ export function createSpanHandle(
           ...propagatedFromContext(resolved),
           "gen_ai.conversation.id": sessionId,
         });
+
   const parentCtx = withSessionParent(sessionContext, sessionId, core.config.apiKey);
   const attrs = fieldsToAttributes(options, meta.type, meta.capture);
+
   const span = core.tracer.startSpan(
     name,
     {
@@ -203,15 +220,20 @@ export function createSpanHandle(
     },
     parentCtx,
   );
+
   SPAN_META.set(span, meta);
+
   // The processor stamps propagation on start; explicit fields still win.
   if (Object.keys(attrs).length > 0) span.setAttributes(attrs);
+
   if (options.name) span.updateName(options.name);
+
   if (options.error !== undefined) applyError(span, options.error);
 
   const spanContext = span.spanContext();
   let previousOutputChunkTime: number | undefined;
   const flags = (spanContext.traceFlags & 0xff).toString(16).padStart(2, "0");
+
   const handle: SpanHandle = {
     span,
     context: trace.setSpan(parentCtx, span),
@@ -227,6 +249,7 @@ export function createSpanHandle(
       } catch (error) {
         reportError(meta.onError, error instanceof Error ? error : new Error(String(error)));
       }
+
       return handle;
     },
     recordOutputChunk(timestampMs) {
@@ -270,20 +293,25 @@ export function createSpanHandle(
       } catch (error) {
         reportError(meta.onError, error instanceof Error ? error : new Error(String(error)));
       }
+
       span.end(fields?.endTime);
     },
   };
+
   return handle;
 }
 
 /** Start a span WITHOUT activating context; the caller must call .end(). */
 export function startSpan(name: string, options?: StartSpanOptions): SpanHandle {
   const core = currentClient().core;
+
   if (!core) return NOOP_SPAN_HANDLE;
+
   try {
     return createSpanHandle(core, name, options);
   } catch (error) {
     reportError(core.config.onError, error instanceof Error ? error : new Error(String(error)));
+
     return NOOP_SPAN_HANDLE;
   }
 }
@@ -291,10 +319,12 @@ export function startSpan(name: string, options?: StartSpanOptions): SpanHandle 
 export function runWithHandle<T>(handle: SpanHandle, fn: (span: SpanHandle) => T): T {
   try {
     const result = withContext(handle.context, () => fn(handle));
+
     if (isThenable(result)) {
       return result.then(
         (value) => {
           handle.end();
+
           return value;
         },
         (error: unknown) => {
@@ -303,7 +333,9 @@ export function runWithHandle<T>(handle: SpanHandle, fn: (span: SpanHandle) => T
         },
       ) as T;
     }
+
     handle.end();
+
     return result;
   } catch (error) {
     handle.end({ error });
@@ -326,16 +358,21 @@ export function startActiveSpan<T>(
   const fn = isFn ? optionsOrFn : maybeFn!;
   const options = isFn ? undefined : optionsOrFn;
   const handle = startSpan(name, options);
+
   if (handle === NOOP_SPAN_HANDLE) return fn(handle);
+
   return runWithHandle(handle, fn);
 }
 
 /** Update the innermost active span; no-op when none is recording. */
 export function updateActiveSpan(fields: SpanFields): void {
   const core = currentClient().core;
+
   if (!core) return;
+
   try {
     const span = trace.getSpan(activeContext());
+
     if (!span?.isRecording()) return;
     const meta = SPAN_META.get(span) ?? metaFor(core);
     applyFields(span, meta, fields);
@@ -345,6 +382,7 @@ export function updateActiveSpan(fields: SpanFields): void {
 }
 
 const TRACE_CONTEXT_PROPAGATOR = new W3CTraceContextPropagator();
+
 const W3C_PROPAGATOR = new CompositePropagator({
   propagators: [TRACE_CONTEXT_PROPAGATOR, new W3CBaggagePropagator()],
 });
@@ -357,6 +395,7 @@ export function extractW3cContext(
   options: { includeBaggage?: boolean } = {},
 ): Context {
   const propagator = options.includeBaggage === true ? W3C_PROPAGATOR : TRACE_CONTEXT_PROPAGATOR;
+
   return propagator.extract(ROOT_CONTEXT, carrier, defaultTextMapGetter);
 }
 
@@ -367,12 +406,17 @@ export function injectW3cContext(
   options: { includeBaggage?: boolean } = {},
 ): void {
   const propagator = options.includeBaggage === true ? W3C_PROPAGATOR : TRACE_CONTEXT_PROPAGATOR;
+
   for (const key of Object.keys(carrier)) {
     const normalized = key.toLowerCase();
+
     if (normalized === "traceparent" || normalized === "tracestate" || normalized === "baggage") {
-      delete carrier[key];
+      if (!Reflect.deleteProperty(carrier, key)) {
+        throw new TypeError(`Cannot delete stale W3C carrier property: ${key}`);
+      }
     }
   }
+
   propagator.inject(context, carrier, defaultTextMapSetter);
 }
 
@@ -380,5 +424,6 @@ export function injectW3cContext(
 export function getTraceparent(): string | null {
   const carrier = { traceparent: undefined };
   TRACE_CONTEXT_PROPAGATOR.inject(activeContext(), carrier, defaultTextMapSetter);
+
   return carrier.traceparent ?? null;
 }

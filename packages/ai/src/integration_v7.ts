@@ -26,6 +26,7 @@ import {
   SEVERITY_WARN,
   type TelemetryDevEvent,
   type JsonValue,
+  unknownErrorMessage,
 } from "./shared.ts";
 
 type TelemetryDevHook = (event: TelemetryDevEvent) => void | PromiseLike<void>;
@@ -326,6 +327,7 @@ export function createV7Hooks(
 
   const stateOf = (event: TelemetryDevEvent): CallState | undefined => {
     const callId = callIdOf(event);
+
     return callId === undefined ? undefined : calls.get(callId);
   };
 
@@ -333,15 +335,19 @@ export function createV7Hooks(
     const userId = readId(runtimeContext?.userId);
     const sessionId = readId(runtimeContext?.sessionId);
     let restMetadata: Record<string, JsonValue> | undefined;
+
     if (runtimeContext) {
       const rest: Record<string, JsonValue> = {};
+
       for (const [key, value] of Object.entries(runtimeContext)) {
         if (key !== "userId" && key !== "sessionId") {
           rest[key] = value;
         }
       }
+
       restMetadata = Object.keys(rest).length > 0 ? rest : undefined;
     }
+
     return { userId, sessionId, restMetadata };
   };
 
@@ -368,14 +374,17 @@ export function createV7Hooks(
       "user.id": state.userId ?? undefined,
       ...state.samplingAttributes,
     });
+
     if (state.restMetadata) {
       for (const [key, value] of Object.entries(state.restMetadata)) {
         const attr = value?.constructor === String ? String(value) : jsonAttr(value);
+
         if (attr !== undefined) {
           attributes[`td.metadata.${key}`] = attr;
         }
       }
     }
+
     return attributes;
   };
 
@@ -387,15 +396,20 @@ export function createV7Hooks(
         "gen_ai.response.model": s.responseModel ?? undefined,
         "gen_ai.operation.name": s.operation,
       });
+
       emitter.recordDuration(s.durationSec, stepAttrs);
+
       if (s.inputTokens !== null) emitter.recordTokens("input", s.inputTokens, stepAttrs);
+
       if (s.outputTokens !== null) emitter.recordTokens("output", s.outputTokens, stepAttrs);
     }
+
     const metricBase: Attributes = omitUndefined({
       "gen_ai.provider.name": state.provider,
       "gen_ai.request.model": state.model,
       "gen_ai.response.model": state.responseModel ?? undefined,
     });
+
     for (const t of state.toolMetrics) {
       emitter.recordDuration(t.durationSec, {
         ...metricBase,
@@ -428,30 +442,38 @@ export function createV7Hooks(
       } else {
         span.end(endedAt);
       }
+
       state.childSpans.push(span);
     };
+
     for (const step of state.steps.values()) {
       if (step.open) {
         close(step.span);
         step.open = false;
       }
     }
+
     if (state.objectStep) {
       close(state.objectStep.span);
       state.objectStep = undefined;
     }
+
     for (const embed of state.embedSpans.values()) {
       close(embed.span);
     }
+
     state.embedSpans.clear();
+
     if (state.rerankSpan) {
       close(state.rerankSpan.span);
       state.rerankSpan = undefined;
     }
+
     for (const tool of state.toolSpans.values()) {
       close(tool.span);
       state.hasToolSpan = true;
     }
+
     state.toolSpans.clear();
   };
 
@@ -473,15 +495,21 @@ export function createV7Hooks(
         const startedAt = new Date();
 
         let rootInput: JsonValue;
+
         if (opKind === "text") {
           const input: Record<string, JsonValue> = {};
+
           if (e.instructions !== undefined) input.instructions = e.instructions;
+
           if (e.messages !== undefined) input.messages = e.messages;
           rootInput = Object.keys(input).length > 0 ? input : undefined;
         } else if (opKind === "object") {
           const input: Record<string, JsonValue> = {};
+
           if (e.system !== undefined) input.system = e.system;
+
           if (e.prompt !== undefined) input.prompt = e.prompt;
+
           if (e.messages !== undefined) input.messages = e.messages;
           rootInput = Object.keys(input).length > 0 ? input : undefined;
         } else if (opKind === "embed") {
@@ -548,12 +576,14 @@ export function createV7Hooks(
     onStepStart(event) {
       try {
         const state = stateOf(event);
+
         if (!state) return;
         const e = event as V7StepStartEvent;
         applyRuntimeContext(state, e.runtimeContext);
         // Open the step (model `chat`) span now so tool calls that finish within this step parent
         // to it. Attributes/finish state land at onStepEnd; the span ends there too.
         const startedAt = new Date();
+
         const span = emitter.tracer.startSpan(
           "chat",
           {
@@ -568,6 +598,7 @@ export function createV7Hooks(
           },
           state.rootCtx,
         );
+
         state.steps.set(e.stepNumber, {
           span,
           ctx: trace.setSpan(state.rootCtx, span),
@@ -584,11 +615,13 @@ export function createV7Hooks(
     onStepEnd(event) {
       try {
         const state = stateOf(event);
+
         if (!state) return;
         const e = event as V7StepEndEvent;
         applyRuntimeContext(state, e.runtimeContext);
         const endedAt = new Date();
         let step = state.steps.get(e.stepNumber);
+
         if (!step) {
           // No matching onStepStart: open the span anchored to the trace start so startTime never
           // exceeds endTime.
@@ -601,6 +634,7 @@ export function createV7Hooks(
             },
             state.rootCtx,
           );
+
           step = {
             span,
             ctx: trace.setSpan(state.rootCtx, span),
@@ -609,8 +643,10 @@ export function createV7Hooks(
           };
           state.steps.set(e.stepNumber, step);
         }
+
         const startedAt =
           step.startedAt.getTime() <= endedAt.getTime() ? step.startedAt : state.rootStartedAt;
+
         const usage = e.usage;
         const inputTokens = usage.inputTokens ?? null;
         const outputTokens = usage.outputTokens ?? null;
@@ -655,6 +691,7 @@ export function createV7Hooks(
               : warning.type?.constructor === String
                 ? String(warning.type)
                 : "warning";
+
           step.span.addEvent(
             "model.warning",
             omitUndefined({
@@ -694,17 +731,21 @@ export function createV7Hooks(
     // OTel context.
     executeLanguageModelCall({ callId, execute }) {
       const state = calls.get(callId);
+
       if (!state) return execute();
+
       const ctx =
         (state.currentStepNumber != null
           ? state.steps.get(state.currentStepNumber)?.ctx
           : undefined) ?? state.rootCtx;
+
       return otelContext.with(ctx, execute);
     },
 
     onToolExecutionStart(event) {
       try {
         const state = stateOf(event);
+
         if (!state) return;
         const e = event as V7ToolExecutionStartEvent;
         state.toolStarts.set(e.toolCall.toolCallId, new Date());
@@ -720,34 +761,41 @@ export function createV7Hooks(
     executeTool({ callId, toolCallId, execute }) {
       let ctx: Context | undefined;
       const state = calls.get(callId);
+
       if (state) {
         try {
           const startedAt = state.toolStarts.get(toolCallId) ?? new Date();
+
           const parentCtx =
             (state.currentStepNumber != null
               ? state.steps.get(state.currentStepNumber)?.ctx
               : undefined) ?? state.rootCtx;
+
           const span = emitter.tracer.startSpan(
             "execute_tool",
             { startTime: startedAt, kind: SpanKind.INTERNAL },
             parentCtx,
           );
+
           state.toolSpans.set(toolCallId, { span, startedAt });
           ctx = trace.setSpan(parentCtx, span);
         } catch (err) {
           onError?.(err instanceof Error ? err : String(err));
         }
       }
+
       return ctx ? otelContext.with(ctx, execute) : execute();
     },
 
     onToolExecutionEnd(event) {
       try {
         const state = stateOf(event);
+
         if (!state) return;
         const e = event as V7ToolExecutionEndEvent;
         const endedAt = new Date();
         const success = e.toolOutput.type === "tool-result";
+
         const attributes = omitUndefined({
           "gen_ai.operation.name": "execute_tool",
           "gen_ai.tool.name": e.toolCall.toolName,
@@ -764,29 +812,36 @@ export function createV7Hooks(
         // invoked by this ai version), create the span after the fact.
         let span = state.toolSpans.get(e.toolCall.toolCallId)?.span;
         state.toolSpans.delete(e.toolCall.toolCallId);
+
         if (span) {
           span.setAttributes(attributes);
         } else {
           const started =
             state.toolStarts.get(e.toolCall.toolCallId) ??
             new Date(endedAt.getTime() - e.toolExecutionMs);
+
           const startedAt = started.getTime() <= endedAt.getTime() ? started : state.rootStartedAt;
+
           // The event carries no stepNumber: the tool belongs to the currently open step.
           const parentCtx =
             (state.currentStepNumber != null
               ? state.steps.get(state.currentStepNumber)?.ctx
               : undefined) ?? state.rootCtx;
+
           span = emitter.tracer.startSpan(
             "execute_tool",
             { startTime: startedAt, kind: SpanKind.INTERNAL, attributes },
             parentCtx,
           );
         }
+
         state.toolStarts.delete(e.toolCall.toolCallId);
 
         if (e.toolOutput.type === "tool-error") {
           const error = e.toolOutput.error;
-          const message = error instanceof Error ? error.message : String(error);
+
+          const message = error instanceof Error ? error.message : unknownErrorMessage(error);
+
           const errorType = error instanceof Error ? error.name : "tool_error";
           span.setStatus({ code: SpanStatusCode.ERROR });
           span.setAttribute("error.type", errorType);
@@ -811,9 +866,11 @@ export function createV7Hooks(
     onObjectStepStart(event) {
       try {
         const state = stateOf(event);
+
         if (!state) return;
         const e = event as V7ObjectStepStartEvent;
         const startedAt = new Date();
+
         const span = emitter.tracer.startSpan(
           "chat",
           {
@@ -830,6 +887,7 @@ export function createV7Hooks(
           },
           state.rootCtx,
         );
+
         state.objectStep = { span, startedAt };
       } catch (err) {
         onError?.(err instanceof Error ? err : String(err));
@@ -839,6 +897,7 @@ export function createV7Hooks(
     onObjectStepEnd(event) {
       try {
         const state = stateOf(event);
+
         if (!state?.objectStep) return;
         const e = event as V7ObjectStepEndEvent;
         const endedAt = new Date();
@@ -895,9 +954,11 @@ export function createV7Hooks(
     onEmbedStart(event) {
       try {
         const state = stateOf(event);
+
         if (!state) return;
         const e = event as V7EmbedCallStartEvent;
         const startedAt = new Date();
+
         const span = emitter.tracer.startSpan(
           "embeddings",
           {
@@ -912,6 +973,7 @@ export function createV7Hooks(
           },
           state.rootCtx,
         );
+
         state.embedSpans.set(e.embedCallId, { span, startedAt });
       } catch (err) {
         onError?.(err instanceof Error ? err : String(err));
@@ -921,9 +983,11 @@ export function createV7Hooks(
     onEmbedEnd(event) {
       try {
         const state = stateOf(event);
+
         if (!state) return;
         const e = event as V7EmbedCallEndEvent;
         const entry = state.embedSpans.get(e.embedCallId);
+
         if (!entry) return;
         const endedAt = new Date();
         const inputTokens = e.usage?.tokens ?? null;
@@ -956,9 +1020,11 @@ export function createV7Hooks(
     onRerankStart(event) {
       try {
         const state = stateOf(event);
+
         if (!state) return;
         const startedAt = new Date();
         const e = event as { provider?: string; modelId?: string };
+
         const span = emitter.tracer.startSpan(
           "rerank",
           {
@@ -973,6 +1039,7 @@ export function createV7Hooks(
           },
           state.rootCtx,
         );
+
         state.rerankSpan = { span, startedAt };
       } catch (err) {
         onError?.(err instanceof Error ? err : String(err));
@@ -982,6 +1049,7 @@ export function createV7Hooks(
     onRerankEnd(event) {
       try {
         const state = stateOf(event);
+
         if (!state?.rerankSpan) return;
         const endedAt = new Date();
         const { span, startedAt } = state.rerankSpan;
@@ -1013,6 +1081,7 @@ export function createV7Hooks(
       try {
         const callId = callIdOf(event);
         const state = callId === undefined ? undefined : calls.get(callId);
+
         if (!state || callId === undefined) return;
         const e = event as V7EndEvent;
         applyRuntimeContext(state, e.runtimeContext);
@@ -1026,7 +1095,9 @@ export function createV7Hooks(
           const inputTokens = e.usage?.inputTokens;
           const outputTokens = e.usage?.outputTokens;
           const tokenParts: string[] = [];
+
           if (inputTokens != null) tokenParts.push(`${inputTokens} in`);
+
           if (outputTokens != null) tokenParts.push(`${outputTokens} out`);
           const tokenText = tokenParts.length > 0 ? `: ${tokenParts.join(" / ")} tokens` : "";
 
@@ -1070,16 +1141,19 @@ export function createV7Hooks(
               "gen_ai.response.finish_reasons": e.finishReason ? [e.finishReason] : undefined,
             }),
           );
+
           // streamObject reports parse/schema-validation failures via `error` on the end event
           // (finishReason may still be "stop"); generateObject throws into onError instead.
           if (e.error !== undefined || e.finishReason === "error") {
             const errorType = e.error instanceof Error ? e.error.name || "error" : "error";
+
             const message =
               e.error !== undefined
                 ? e.error instanceof Error
                   ? e.error.message
                   : (jsonAttr(e.error) ?? "unknown error")
                 : `Generation failed (${e.finishReason})`;
+
             root.setStatus({ code: SpanStatusCode.ERROR });
             root.setAttribute("error.type", errorType);
             root.addEvent("exception", {
@@ -1121,6 +1195,7 @@ export function createV7Hooks(
         const errorEvent = event as { callId?: string; error?: unknown };
         const callId = callIdOf(errorEvent);
         const state = callId === undefined ? undefined : calls.get(callId);
+
         if (!state || callId === undefined) return;
         const error = errorEvent.error;
         const endedAt = new Date();
@@ -1150,6 +1225,7 @@ export function createV7Hooks(
       try {
         const callId = callIdOf(event);
         const state = callId === undefined ? undefined : calls.get(callId);
+
         if (!state || callId === undefined) return;
         const endedAt = new Date();
 

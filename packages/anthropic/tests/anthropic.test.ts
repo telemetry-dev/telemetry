@@ -9,6 +9,7 @@ const SPAN_STATUS_UNSET = 0;
 const SPAN_STATUS_ERROR = 2;
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
 interface JsonRecord {
   [key: string]: JsonValue;
 }
@@ -21,6 +22,7 @@ interface CapturedRequest {
 
 function asRecord<T>(value: T): (T & JsonRecord) | undefined {
   if (value === null || value === undefined || Array.isArray(value)) return undefined;
+
   return Object(value) === value ? (value as T & JsonRecord) : undefined;
 }
 
@@ -47,8 +49,12 @@ function jsonErrorResponse(status: number, message: string): Response {
 
 function namedSseResponse(events: JsonRecord[]): Response {
   const body = events
-    .map((event) => `event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`)
+    .map(
+      (event) =>
+        `event: ${typeof event.type === "string" ? event.type : ""}\ndata: ${JSON.stringify(event)}\n\n`,
+    )
     .join("");
+
   return new Response(body, {
     status: 200,
     headers: { "content-type": "text/event-stream", "request-id": "req_stream" },
@@ -63,19 +69,26 @@ interface CountedResponse {
 
 function countedSseResponse(events: JsonRecord[]): CountedResponse {
   const encoder = new TextEncoder();
+
   const parts = events.map(
-    (event) => `event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`,
+    (event) =>
+      `event: ${typeof event.type === "string" ? event.type : ""}\ndata: ${JSON.stringify(event)}\n\n`,
   );
+
   let index = 0;
   let pulled = 0;
+
   const body = new ReadableStream<Uint8Array>(
     {
       pull(controller) {
         const part = parts[index];
+
         if (part === undefined) {
           controller.close();
+
           return;
         }
+
         index += 1;
         pulled += 1;
         controller.enqueue(encoder.encode(part));
@@ -83,6 +96,7 @@ function countedSseResponse(events: JsonRecord[]): CountedResponse {
     },
     { highWaterMark: 0 },
   );
+
   return {
     response: new Response(body, {
       status: 200,
@@ -98,11 +112,15 @@ async function parseRequestBody(
   init: RequestInit | undefined,
 ): Promise<JsonValue | undefined> {
   const initBody = init?.body;
-  if (String(initBody) === initBody) return JSON.parse(initBody);
+
+  if (typeof initBody === "string") return JSON.parse(initBody);
+
   if (input instanceof Request) {
     const text = await input.clone().text();
+
     return text ? JSON.parse(text) : undefined;
   }
+
   return undefined;
 }
 
@@ -113,6 +131,7 @@ interface FakeFetch {
 
 function createFakeFetch(...responses: Response[]): FakeFetch {
   const requests: CapturedRequest[] = [];
+
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = input instanceof Request ? input.url : String(input);
     requests.push({
@@ -121,9 +140,12 @@ function createFakeFetch(...responses: Response[]): FakeFetch {
       body: await parseRequestBody(input, init),
     });
     const response = responses.shift();
+
     if (!response) throw new Error(`unexpected request to ${url}`);
+
     return response;
   };
+
   return { fetch: fetchImpl, requests };
 }
 
@@ -140,6 +162,7 @@ function setupSpans(): InMemorySpanExporter {
     },
     { spanExporter },
   );
+
   return spanExporter;
 }
 
@@ -154,28 +177,36 @@ async function finishedSpans(
   for (let attempt = 0; attempt < 20; attempt += 1) {
     await flush();
     const spans = exporter.getFinishedSpans();
+
     if (spans.length === expectedCount) return spans;
+
     if (spans.length > expectedCount) expect(spans).toHaveLength(expectedCount);
     await Promise.resolve();
   }
+
   expect(exporter.getFinishedSpans()).toHaveLength(expectedCount);
+
   return exporter.getFinishedSpans();
 }
 
 async function exportedSpan(exporter: InMemorySpanExporter): Promise<ReadableSpan> {
   const spans = await finishedSpans(exporter, 1);
+
   return spans[0]!;
 }
 
 function jsonAttr<T>(span: ReadableSpan, key: string): T {
   const value = span.attributes[key];
   expect(String(value) === value).toBe(true);
+
   return JSON.parse(String(value)) as T;
 }
 
 async function collectStream(stream: AsyncIterable<unknown>): Promise<unknown[]> {
   const chunks: unknown[] = [];
+
   for await (const chunk of stream) chunks.push(chunk);
+
   return chunks;
 }
 
@@ -319,17 +350,20 @@ test("messages.create records one error span when the Anthropic API returns 4xx"
 
 test("messages.create preserves request tools and tool-use blocks in output", async () => {
   const spans = setupSpans();
+
   const toolUse = {
     type: "tool_use",
     id: "toolu_1",
     name: "get_weather",
     input: { location: "Paris" },
   };
+
   const tool = {
     name: "get_weather",
     description: "Get weather",
     input_schema: { type: "object", properties: { location: { type: "string" } } },
   } as const;
+
   const fake = createFakeFetch(
     jsonResponse(
       messagePayload({
@@ -369,6 +403,7 @@ test("messages.create streaming preserves events and records aggregated text usa
     messages: [{ role: "user", content: "Say hello" }],
     stream: true,
   });
+
   const visibleEvents = await collectStream(stream);
 
   expect(fake.requests[0]?.body).toMatchObject({ stream: true });
@@ -392,6 +427,7 @@ test("messages.create streaming preserves events and records aggregated text usa
 
 test("messages.create streaming observes duck-typed stream responses", async () => {
   const spans = setupSpans();
+
   class AlternateStream implements AsyncIterable<unknown> {
     private abortController = new AbortController();
     controller = {
@@ -403,6 +439,7 @@ test("messages.create streaming observes duck-typed stream responses", async () 
       for (const event of streamEvents()) yield event;
     }
   }
+
   const client = wrapAnthropic({
     messages: {
       create: (_params: JsonValue) => Promise.resolve(new AlternateStream()),
@@ -415,6 +452,7 @@ test("messages.create streaming observes duck-typed stream responses", async () 
     messages: [{ role: "user", content: "Say hello" }],
     stream: true,
   });
+
   await collectStream(stream);
 
   const span = await exportedSpan(spans);
@@ -475,6 +513,7 @@ test("message timestamps precede telemetry mapping", async () => {
 
 test("messages.create streaming preserves citation deltas", async () => {
   const spans = setupSpans();
+
   const citation = {
     type: "char_location",
     cited_text: "quoted text",
@@ -483,6 +522,7 @@ test("messages.create streaming preserves citation deltas", async () => {
     start_char_index: 0,
     end_char_index: 11,
   };
+
   const fake = createFakeFetch(
     namedSseResponse([
       { type: "message_start", message: messagePayload({ id: "msg_cited", content: [] }) },
@@ -501,6 +541,7 @@ test("messages.create streaming preserves citation deltas", async () => {
     messages: [{ role: "user", content: "Cite this" }],
     stream: true,
   });
+
   await collectStream(stream);
 
   const span = await exportedSpan(spans);
@@ -511,6 +552,7 @@ test("messages.create streaming preserves citation deltas", async () => {
 
 test("messages.create streaming aggregates tool-use input JSON fragments", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     namedSseResponse([
       { type: "message_start", message: messagePayload({ id: "msg_tool_stream", content: [] }) },
@@ -553,6 +595,7 @@ test("messages.create streaming aggregates tool-use input JSON fragments", async
     messages: [{ role: "user", content: "Weather in Paris?" }],
     stream: true,
   });
+
   await collectStream(stream);
 
   const span = await exportedSpan(spans);
@@ -576,6 +619,7 @@ test("messages.create streaming aggregates tool-use input JSON fragments", async
 
 test("messages.create streaming aggregates thinking and signature deltas", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetch(
     namedSseResponse([
       { type: "message_start", message: messagePayload({ id: "msg_thinking", content: [] }) },
@@ -602,6 +646,7 @@ test("messages.create streaming aggregates thinking and signature deltas", async
     messages: [{ role: "user", content: "Think" }],
     stream: true,
   });
+
   await collectStream(stream);
 
   const span = await exportedSpan(spans);
@@ -652,6 +697,7 @@ test("messages.create streaming ends with error when aborted before iteration st
     messages: [{ role: "user", content: "Say hello" }],
     stream: true,
   });
+
   stream.controller.abort();
 
   const span = await exportedSpan(spans);
@@ -670,6 +716,7 @@ test("messages.stream helper routes through create and records one span", async 
     max_tokens: 64,
     messages: [{ role: "user", content: "Say hello" }],
   });
+
   const events = await collectStream(stream);
   const finalMessage = await stream.finalMessage();
 
@@ -745,10 +792,12 @@ test("wrapAnthropic keeps a client instrumented after global instrumentation is 
 test("instrumentAnthropic and wrapAnthropic together record one span per call", async () => {
   const spans = setupSpans();
   instrumentAnthropic();
+
   const fake = createFakeFetch(
     jsonResponse(messagePayload({ id: "msg_global_wrapped" })),
     jsonResponse(messagePayload({ id: "msg_instance_wrapped_after_global" })),
   );
+
   const client = wrapAnthropic(new Anthropic({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 }));
 
   await client.messages.create({
@@ -775,6 +824,7 @@ test("instrumentAnthropic and wrapAnthropic together record one span per call", 
 
 test("wrapAnthropic records Bedrock provider names from client constructor names", async () => {
   const spans = setupSpans();
+
   class AnthropicBedrock {
     messages = {
       create: async (_params: JsonValue) => messagePayload({ id: "msg_bedrock" }),

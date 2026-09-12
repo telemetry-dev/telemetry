@@ -1,5 +1,7 @@
 export type LogLevel = "debug" | "info" | "warn" | "error";
+
 export type SdkLogLevel = LogLevel | "silent";
+
 export type ExportMode = "batched" | "immediate";
 
 export interface BatchOptions {
@@ -24,5 +26,6 @@ export const DEFAULT_BATCH: Required<BatchOptions> = {
 
 export function resolveEnv(): Record<string, string | undefined> {
   if (globalThis.process !== undefined && process.env) return process.env;
+
   return {};
 }

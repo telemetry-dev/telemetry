@@ -1,4 +1,5 @@
 export type JsonObject = { [key: string]: JsonValue | undefined };
+
 export type JsonValue = string | number | boolean | null | undefined | JsonValue[] | JsonObject;
 
 export function isJsonObject<T>(value: T): value is T & JsonObject {

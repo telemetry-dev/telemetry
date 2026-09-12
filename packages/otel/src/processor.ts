@@ -40,10 +40,12 @@ export class StampingSpanProcessor implements SpanProcessor {
       const propagated =
         (parentContext.getValue(PROPAGATED_KEY) as Attributes | undefined) ??
         propagatedFromContext(activeContext());
+
       if (propagated) span.setAttributes(propagated);
     } catch (error) {
       reportError(this.options.onError, error);
     }
+
     this.inner.onStart(span, parentContext);
   }
 
@@ -54,11 +56,13 @@ export class StampingSpanProcessor implements SpanProcessor {
       // A throwing filter must not drop spans; fall through and export.
       reportError(this.options.onError, error);
     }
+
     try {
       this.options.recordMetrics?.(span);
     } catch (error) {
       reportError(this.options.onError, error);
     }
+
     this.inner.onEnd(span);
   }
 

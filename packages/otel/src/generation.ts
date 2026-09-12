@@ -61,6 +61,7 @@ export function createGenerationEmitter(
   const core = coreFor(config);
   const transport: Transport = { fetchImpl: config.fetchImpl, onError: config.onError };
   const onError = config.onError;
+
   const sendSpans =
     overrides?.sendSpans ?? ((spans: ReadableSpan[]) => core.sendSpans(spans, transport));
 
@@ -72,6 +73,7 @@ export function createGenerationEmitter(
     overrides?.recordDuration ??
     ((seconds: number, attributes: Attributes) =>
       ensureMetrics().durationHistogram.record(seconds, attributes));
+
   const recordTokens =
     overrides?.recordTokens ??
     ((tokenType: "input" | "output", count: number, attributes: Attributes) =>
@@ -84,24 +86,30 @@ export function createGenerationEmitter(
     // Detach before the first await so overlapping flushes cannot share metrics.
     const pipeline = metrics;
     metrics = undefined;
+
     const p = (async () => {
       try {
         const sampled = spans.filter(isReadableSpan);
+
         if (sampled.length) await sendSpans(sampled);
       } catch (e) {
         onError?.(e instanceof Error ? e : String(e));
       }
+
       try {
         if (pipeline) await pipeline.shutdown();
       } catch (e) {
         onError?.(e instanceof Error ? e : String(e));
       }
     })();
+
     // Await export unless the serverless runtime receives the promise through waitUntil.
     if (config.waitUntil) {
       config.waitUntil(p);
+
       return Promise.resolve();
     }
+
     return p;
   };
 
@@ -130,18 +138,22 @@ function coreFor(config: GenerationEmitterConfig): EmitterCore {
   if (config.sampler) return buildCore(config);
   const key = `${config.sdkName}|${config.apiKey}|${config.baseUrl}|${config.environment}|${config.serviceName}`;
   const cached = cache.get(key);
+
   if (cached) return cached;
   const core = buildCore(config);
   cache.set(key, core);
+
   return core;
 }
 
 function buildCore(config: GenerationEmitterConfig): EmitterCore {
   const { apiKey, baseUrl, environment, serviceName, sdkName } = config;
+
   const resource = resourceFromAttributes({
     "service.name": serviceName,
     "deployment.environment.name": environment,
   });
+
   const headers = otlpHeaders(apiKey ?? "", sdkName);
 
   const provider = new BasicTracerProvider({ resource, sampler: sessionSampler(config.sampler) });
@@ -164,6 +176,7 @@ function buildCore(config: GenerationEmitterConfig): EmitterCore {
       exporter: createMetricExporter({ url: `${baseUrl}/v1/metrics`, headers }, transport),
       exportIntervalMillis: DORMANT_INTERVAL_MS,
     });
+
     const meterProvider = new MeterProvider({ resource, readers: [reader] });
     const meter = meterProvider.getMeter(sdkName, SCOPE_VERSION);
 
@@ -171,6 +184,7 @@ function buildCore(config: GenerationEmitterConfig): EmitterCore {
       unit: "s",
       advice: { explicitBucketBoundaries: DURATION_BUCKETS },
     });
+
     const tokenHistogram = meter.createHistogram("gen_ai.client.token.usage", {
       unit: "{token}",
       advice: { explicitBucketBoundaries: TOKEN_BUCKETS },

@@ -59,9 +59,11 @@ test("explicit sessions win and remain consistent on nested spans and logs", asy
     },
   );
   await flush();
+
   for (const span of spans.getFinishedSpans()) {
     expect(span.attributes["gen_ai.conversation.id"]).toBe(span.name.split("-")[0]);
   }
+
   for (const record of logs.getFinishedLogRecords()) {
     expect(typeof record.body).toBe("string");
     expect(record.attributes["gen_ai.conversation.id"]).toBe((record.body as string).split("-")[0]);
@@ -70,12 +72,14 @@ test("explicit sessions win and remain consistent on nested spans and logs", asy
 
 test("process mode honors an existing remote parent", async () => {
   const { spans } = setup({ sessionMode: "process" });
+
   const parent = {
     traceId: "0123456789abcdef0123456789abcdef",
     spanId: "0123456789abcdef",
     traceFlags: TraceFlags.SAMPLED,
     isRemote: true,
   };
+
   startSpan("joined", { parent }).end();
   await flush();
   const span = spans.getFinishedSpans()[0]!;
@@ -99,12 +103,14 @@ test("reinitializing process mode generates a new session", async () => {
 
 test("invalid mode fails open through onError", () => {
   const errors: Error[] = [];
+
   const client = init({
     apiKey: "td_live_test",
     sessionMode: "invalid" as "process",
     onError: (error) => errors.push(error),
     logLevel: "silent",
   });
+
   expect(client.enabled).toBe(false);
   expect(errors[0]).toBeInstanceOf(TypeError);
 });

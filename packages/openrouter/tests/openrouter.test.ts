@@ -13,9 +13,11 @@ const SPAN_STATUS_UNSET = 0;
 const SPAN_STATUS_ERROR = 2;
 
 type JsonValue = string | number | boolean | null | undefined | JsonValue[] | JsonRecord;
+
 interface JsonRecord {
   [key: string]: JsonValue;
 }
+
 interface CapturedRequest {
   method: string;
   path: string;
@@ -31,6 +33,7 @@ function jsonResponse<T>(body: T): Response {
 
 function sseResponse(events: unknown[]): Response {
   const body = `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`;
+
   return new Response(body, {
     status: 200,
     headers: { "content-type": "text/event-stream" },
@@ -39,6 +42,7 @@ function sseResponse(events: unknown[]): Response {
 
 function openSseResponse(events: unknown[]): Response {
   const encoder = new TextEncoder();
+
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
       for (const event of events) {
@@ -46,6 +50,7 @@ function openSseResponse(events: unknown[]): Response {
       }
     },
   });
+
   return new Response(body, {
     status: 200,
     headers: { "content-type": "text/event-stream" },
@@ -54,6 +59,7 @@ function openSseResponse(events: unknown[]): Response {
 
 function createFakeFetcher(...responses: Response[]) {
   const requests: CapturedRequest[] = [];
+
   const fetcher: Fetcher = async (input, init) => {
     const request = input instanceof Request ? input : new Request(input, init);
     const text = await request.clone().text();
@@ -63,9 +69,12 @@ function createFakeFetcher(...responses: Response[]) {
       body: text.length > 0 ? JSON.parse(text) : undefined,
     });
     const response = responses.shift();
+
     if (!response) throw new Error(`unexpected request to ${request.url}`);
+
     return response;
   };
+
   return { fetcher, requests };
 }
 
@@ -83,6 +92,7 @@ function setupSpans(mask?: MaskFn): InMemorySpanExporter {
     },
     { spanExporter },
   );
+
   return spanExporter;
 }
 
@@ -92,6 +102,7 @@ function clientWith(fetcher: Fetcher, wrapped = true): OpenRouter {
     httpClient: new HTTPClient({ fetcher }),
     retryConfig: { strategy: "none" },
   });
+
   return wrapped ? wrapOpenRouter(client) : client;
 }
 
@@ -102,22 +113,28 @@ async function finishedSpans(
   for (let attempt = 0; attempt < 20; attempt += 1) {
     await flush();
     const spans = exporter.getFinishedSpans();
+
     if (spans.length === expectedCount) return spans;
+
     if (spans.length > expectedCount) expect(spans).toHaveLength(expectedCount);
     await Promise.resolve();
   }
+
   expect(exporter.getFinishedSpans()).toHaveLength(expectedCount);
+
   return exporter.getFinishedSpans();
 }
 
 async function exportedSpan(exporter: InMemorySpanExporter): Promise<ReadableSpan> {
   const spans = await finishedSpans(exporter, 1);
+
   return spans[0]!;
 }
 
 function jsonAttr<T>(span: ReadableSpan, key: string): T {
   const value = span.attributes[key];
   expect(String(value)).toBe(value);
+
   return JSON.parse(String(value)) as T;
 }
 
@@ -137,7 +154,9 @@ function chatBody(
     prompt_tokens_details: { cached_tokens: 3, cache_write_tokens: 6 },
     completion_tokens_details: { reasoning_tokens: 2 },
   };
+
   if (options.cost !== undefined) Object.assign(usage, { cost: options.cost });
+
   if (options.upstreamCost !== undefined) {
     Object.assign(usage, {
       cost_details: {
@@ -147,6 +166,7 @@ function chatBody(
       },
     });
   }
+
   return {
     id,
     object: "chat.completion",
@@ -187,8 +207,11 @@ function chatChunk(
       },
     ],
   };
+
   if (options.usage !== undefined) Object.assign(chunk, { usage: options.usage });
+
   if (options.error !== undefined) Object.assign(chunk, { error: options.error });
+
   return chunk;
 }
 
@@ -197,6 +220,7 @@ function responsesBody(
   status: "completed" | "failed" | "incomplete" | "in_progress" = "completed",
 ) {
   const output = Array<JsonValue>();
+
   return {
     completed_at: status === "completed" ? 2 : null,
     created_at: 1,
@@ -253,12 +277,15 @@ function embeddingsBody(id: string) {
 
 async function collectStream(stream: AsyncIterable<unknown>): Promise<unknown[]> {
   const chunks: unknown[] = [];
+
   for await (const chunk of stream) chunks.push(chunk);
+
   return chunks;
 }
 
 function prototypeMethod<T extends object>(target: T, key: string) {
   const value: unknown = Object.getOwnPropertyDescriptor(target, key)?.value;
+
   return value instanceof Function ? value : undefined;
 }
 
@@ -270,6 +297,7 @@ afterEach(async () => {
 
 test("chat maps request, response, usage, primary cost, provider, and sampling fields", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetcher(
     jsonResponse(
       chatBody("chat_1", {
@@ -278,7 +306,9 @@ test("chat maps request, response, usage, primary cost, provider, and sampling f
       }),
     ),
   );
+
   const client = clientWith(fake.fetcher);
+
   const messages = [
     { role: "system" as const, content: "Be terse" },
     { role: "user" as const, content: "Say hello" },
@@ -350,6 +380,7 @@ test("chat maps request, response, usage, primary cost, provider, and sampling f
 
 test("cost falls back to upstream inference cost when usage cost is absent", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetcher(
     jsonResponse(chatBody("chat_cost_fallback", { upstreamCost: 0.009 })),
   );
@@ -550,6 +581,7 @@ test.each(["chat", "responses"])("%s timestamps precede telemetry mapping", asyn
 
 test("consumed chat streams remain readable, reconstruct tool calls, and use final usage without request mutation", async () => {
   const spans = setupSpans();
+
   const finalUsage = {
     prompt_tokens: 11,
     completion_tokens: 6,
@@ -563,6 +595,7 @@ test("consumed chat streams remain readable, reconstruct tool calls, and use fin
       upstream_inference_prompt_cost: 0.006,
     },
   };
+
   const fake = createFakeFetcher(
     sseResponse([
       chatChunk("stream_1", { role: "assistant", content: "" }),
@@ -585,7 +618,9 @@ test("consumed chat streams remain readable, reconstruct tool calls, and use fin
       ),
     ]),
   );
+
   const client = clientWith(fake.fetcher);
+
   const request = {
     chatRequest: {
       model: "openai/gpt-4o",
@@ -597,6 +632,7 @@ test("consumed chat streams remain readable, reconstruct tool calls, and use fin
   const stream = await client.chat.send(request);
   expect(stream).toBeInstanceOf(ReadableStream);
   expect(stream).toBeInstanceOf(EventStream);
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   const chunks = await collectStream(stream);
 
@@ -645,9 +681,11 @@ test("consumed chat streams remain readable, reconstruct tool calls, and use fin
 test("chat stream capture is bounded without dropping chunks or terminal metadata", async () => {
   const spans = setupSpans();
   const content = "x".repeat(1024);
+
   const deltas = Array.from({ length: 70 }, (_, index) =>
     chatChunk("stream_bounded", index === 0 ? { role: "assistant", content } : { content }),
   );
+
   const usage = { prompt_tokens: 3, completion_tokens: 70, total_tokens: 73, cost: 0.04 };
   const events = [...deltas, chatChunk("stream_bounded", {}, { finishReason: "stop", usage })];
   const fake = createFakeFetcher(sseResponse(events));
@@ -659,6 +697,7 @@ test("chat stream capture is bounded without dropping chunks or terminal metadat
       stream: true,
     },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   const chunks = await collectStream(stream);
 
@@ -675,6 +714,7 @@ test("chat stream capture is bounded without dropping chunks or terminal metadat
 
 test("chat stream chunk errors end one error span with partial output", async () => {
   const spans = setupSpans();
+
   const errorChunk = {
     id: "stream_error",
     object: "chat.completion.chunk",
@@ -683,6 +723,7 @@ test("chat stream chunk errors end one error span with partial output", async ()
     choices: [],
     error: { code: 502, message: "upstream disconnected" },
   };
+
   const fake = createFakeFetcher(
     openSseResponse([
       chatChunk("stream_error", { role: "assistant", content: "Partial" }),
@@ -697,6 +738,7 @@ test("chat stream chunk errors end one error span with partial output", async ()
       stream: true,
     },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   const reader = stream.getReader();
   expect((await reader.read()).done).toBe(false);
@@ -716,6 +758,7 @@ test("chat stream chunk errors end one error span with partial output", async ()
 
 test("early chat stream cancellation captures partial output and ends once", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetcher(
     sseResponse([
       chatChunk("stream_cancel", { role: "assistant", content: "First" }),
@@ -730,6 +773,7 @@ test("early chat stream cancellation captures partial output and ends once", asy
       stream: true,
     },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   const reader = stream.getReader();
   const first = await reader.read();
@@ -746,6 +790,7 @@ test("early chat stream cancellation captures partial output and ends once", asy
 
 test("early Responses stream cancellation captures final text, reasoning, summary, and refusal", async () => {
   const spans = setupSpans();
+
   const events = [
     {
       type: "response.output_text.delta",
@@ -814,13 +859,16 @@ test("early Responses stream cancellation captures final text, reasoning, summar
       text: "Final summary",
     },
   ];
+
   const fake = createFakeFetcher(sseResponse(events));
 
   const stream = await clientWith(fake.fetcher).responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Cancel", stream: true },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   const reader = stream.getReader();
+
   for (const _event of events) expect((await reader.read()).done).toBe(false);
   await reader.cancel("caller stopped");
 
@@ -850,6 +898,7 @@ test("early Responses stream cancellation captures final text, reasoning, summar
 
 test("early Responses stream cancellation retains partial text, reasoning, summary, and refusal", async () => {
   const spans = setupSpans();
+
   const events = [
     {
       type: "response.output_text.delta",
@@ -885,13 +934,16 @@ test("early Responses stream cancellation retains partial text, reasoning, summa
       delta: "Summary",
     },
   ];
+
   const fake = createFakeFetcher(sseResponse(events));
 
   const stream = await clientWith(fake.fetcher).responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Cancel", stream: true },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   const reader = stream.getReader();
+
   for (const _event of events) expect((await reader.read()).done).toBe(false);
   await reader.cancel("caller stopped");
 
@@ -930,6 +982,7 @@ test.each(["response.created", "response.in_progress"])(
         content: [{ type: "output_text", text: "Retained output", annotations: [] }],
       },
     ];
+
     const events = [
       { type, sequence_number: 1, response },
       {
@@ -941,13 +994,16 @@ test.each(["response.created", "response.in_progress"])(
         },
       },
     ];
+
     const fake = createFakeFetcher(sseResponse(events));
 
     const stream = await clientWith(fake.fetcher).responses.send({
       responsesRequest: { model: "openai/gpt-4o", input: "Cancel", stream: true },
     });
+
     if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
     const reader = stream.getReader();
+
     for (const _event of events) expect((await reader.read()).done).toBe(false);
     await reader.cancel("caller stopped");
 
@@ -980,21 +1036,25 @@ test("terminal Responses output retains previously consumed provider events", as
       content: [{ type: "output_text", text: "Terminal output", annotations: [] }],
     },
   ];
+
   const providerEvent = {
     type: "response.image_generation_call.completed",
     sequence_number: 1,
     item_id: "image_terminal",
     output_index: 1,
   };
+
   const events = [
     providerEvent,
     { type: "response.completed", sequence_number: 2, response: terminal },
   ];
+
   const fake = createFakeFetcher(sseResponse(events));
 
   const stream = await clientWith(fake.fetcher).responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Complete", stream: true },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   await collectStream(stream);
 
@@ -1022,6 +1082,7 @@ test("terminal Responses output preserves provider event truncation", async () =
       content: [{ type: "output_text", text: "Terminal output", annotations: [] }],
     },
   ];
+
   const events = [
     {
       type: "response.image_generation_call.partial_image",
@@ -1033,11 +1094,13 @@ test("terminal Responses output preserves provider event truncation", async () =
     },
     { type: "response.completed", sequence_number: 2, response: terminal },
   ];
+
   const fake = createFakeFetcher(sseResponse(events));
 
   const stream = await clientWith(fake.fetcher).responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Complete", stream: true },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   await collectStream(stream);
 
@@ -1048,6 +1111,7 @@ test("terminal Responses output preserves provider event truncation", async () =
 
 test("early Responses stream cancellation retains hydrated items, content, annotations, and tool arguments", async () => {
   const spans = setupSpans();
+
   const events = [
     {
       type: "response.output_item.added",
@@ -1133,13 +1197,16 @@ test("early Responses stream cancellation retains hydrated items, content, annot
       },
     },
   ];
+
   const fake = createFakeFetcher(sseResponse(events));
 
   const stream = await clientWith(fake.fetcher).responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Weather", stream: true },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   const reader = stream.getReader();
+
   for (const _event of events) expect((await reader.read()).done).toBe(false);
   await reader.cancel("caller stopped");
 
@@ -1179,6 +1246,7 @@ test("early Responses stream cancellation retains hydrated items, content, annot
 
 test("Responses stream capture rejects sparse annotation indexes", async () => {
   const spans = setupSpans();
+
   const events = [
     {
       type: "response.content_part.added",
@@ -1204,13 +1272,16 @@ test("Responses stream capture rejects sparse annotation indexes", async () => {
       },
     },
   ];
+
   const fake = createFakeFetcher(sseResponse(events));
 
   const stream = await clientWith(fake.fetcher).responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Annotate", stream: true },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   const reader = stream.getReader();
+
   for (const _event of events) expect((await reader.read()).done).toBe(false);
   await reader.cancel("caller stopped");
 
@@ -1229,6 +1300,7 @@ test("Responses stream capture rejects sparse annotation indexes", async () => {
 
 test("Responses stream cancellation retains custom tools and bounded provider event payloads", async () => {
   const spans = setupSpans();
+
   const events = [
     {
       type: "response.output_item.added",
@@ -1411,13 +1483,16 @@ test("Responses stream cancellation retains custom tools and bounded provider ev
       },
     },
   ];
+
   const fake = createFakeFetcher(sseResponse(events));
 
   const stream = await clientWith(fake.fetcher).responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Tools", stream: true },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   const reader = stream.getReader();
+
   for (const _event of events) expect((await reader.read()).done).toBe(false);
   await reader.cancel("caller stopped");
 
@@ -1469,10 +1544,12 @@ test("Responses streams map completed and failed terminal events", async () => {
   const spans = setupSpans();
   const completed = responsesBody("resp_completed", "completed");
   const failed = responsesBody("resp_failed", "failed");
+
   const fake = createFakeFetcher(
     sseResponse([{ type: "response.completed", sequence_number: 1, response: completed }]),
     sseResponse([{ type: "response.failed", sequence_number: 1, response: failed }]),
   );
+
   const client = clientWith(fake.fetcher);
 
   const completedStream = await client.responses.send({
@@ -1486,6 +1563,7 @@ test("Responses streams map completed and failed terminal events", async () => {
       stream: true,
     },
   });
+
   if (!(completedStream instanceof ReadableStream)) throw new Error("expected a readable stream");
   await collectStream(completedStream);
 
@@ -1496,16 +1574,20 @@ test("Responses streams map completed and failed terminal events", async () => {
       stream: true,
     },
   });
+
   if (!(failedStream instanceof ReadableStream)) throw new Error("expected a readable stream");
   await collectStream(failedStream);
 
   const finished = await finishedSpans(spans, 2);
+
   const completedSpan = finished.find(
     (span) => span.attributes["gen_ai.response.id"] === "resp_completed",
   );
+
   const failedSpan = finished.find(
     (span) => span.attributes["gen_ai.response.id"] === "resp_failed",
   );
+
   expect(completedSpan?.name).toBe("chat openai/gpt-4o");
   expect(completedSpan?.status.code).toBe(SPAN_STATUS_UNSET);
   expect(completedSpan?.attributes["gen_ai.provider.name"]).toBe("openrouter");
@@ -1527,12 +1609,14 @@ test("Responses streams map completed and failed terminal events", async () => {
 
 test("Responses streams capture SDK unknown-event wrappers", async () => {
   const spans = setupSpans();
+
   const usage = {
     input_tokens: 3,
     output_tokens: 2,
     total_tokens: 5,
     cost_details: { upstream_inference_cost: 0.004 },
   };
+
   const fake = createFakeFetcher(
     sseResponse([
       {
@@ -1567,17 +1651,20 @@ test("Responses streams capture SDK unknown-event wrappers", async () => {
       },
     ]),
   );
+
   const client = clientWith(fake.fetcher);
 
   const completedStream = await client.responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Complete", stream: true },
   });
+
   if (!(completedStream instanceof ReadableStream)) throw new Error("expected a readable stream");
   const completedEvents = await collectStream(completedStream);
 
   const failedStream = await client.responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Fail", stream: true },
   });
+
   if (!(failedStream instanceof ReadableStream)) throw new Error("expected a readable stream");
   await collectStream(failedStream);
 
@@ -1586,12 +1673,15 @@ test("Responses streams capture SDK unknown-event wrappers", async () => {
     expect.objectContaining({ type: "UNKNOWN", isUnknown: true }),
   ]);
   const finished = await finishedSpans(spans, 2);
+
   const completedSpan = finished.find(
     (span) => span.attributes["gen_ai.response.id"] === "resp_raw_completed",
   );
+
   const failedSpan = finished.find(
     (span) => span.attributes["gen_ai.response.id"] === "resp_raw_failed",
   );
+
   expect(jsonAttr(completedSpan!, "gen_ai.output.messages")).toEqual([
     {
       id: "msg_raw",
@@ -1609,9 +1699,11 @@ test("Responses streams capture SDK unknown-event wrappers", async () => {
 
 test("stream spans are parented by the invocation context, not the consumer context", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetcher(
     sseResponse([chatChunk("stream_parented", { role: "assistant", content: "Parented" })]),
   );
+
   const client = clientWith(fake.fetcher);
 
   const invocation = await startActiveSpan("invocation", async (parent) => {
@@ -1622,9 +1714,12 @@ test("stream spans are parented by the invocation context, not the consumer cont
         stream: true,
       },
     });
+
     return { stream, parentSpanId: parent.spanId };
   });
+
   const invocationStream = invocation.stream;
+
   if (!(invocationStream instanceof ReadableStream)) throw new Error("expected a readable stream");
   await startActiveSpan("consumer", async () => collectStream(invocationStream));
 
@@ -1636,10 +1731,13 @@ test("stream spans are parented by the invocation context, not the consumer cont
 
 test("unconsumed streams export no span until the caller cancels", async () => {
   let captureCount = 0;
+
   const spans = setupSpans((value) => {
     captureCount += 1;
+
     return value;
   });
+
   const fake = createFakeFetcher(
     sseResponse([chatChunk("stream_unconsumed", { content: "Not consumed" })]),
   );
@@ -1651,6 +1749,7 @@ test("unconsumed streams export no span until the caller cancels", async () => {
       stream: true,
     },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   await flush();
   expect(spans.getFinishedSpans()).toHaveLength(0);
@@ -1669,12 +1768,14 @@ test.each([
 ])("chat stream capture accounts for JSON escape overhead from %s", async (_, character) => {
   const spans = setupSpans();
   const escaped = character.repeat(1024);
+
   const events = Array.from({ length: 70 }, (_, index) =>
     chatChunk(
       "stream_escaped",
       index === 0 ? { role: "assistant", content: escaped } : { content: escaped },
     ),
   );
+
   const fake = createFakeFetcher(sseResponse(events));
 
   const stream = await clientWith(fake.fetcher).chat.send({
@@ -1684,6 +1785,7 @@ test.each([
       stream: true,
     },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   expect(await collectStream(stream)).toHaveLength(events.length);
 
@@ -1699,11 +1801,13 @@ test.each([
 
 test("chat streams bound choice-state creation without dropping chunks", async () => {
   const spans = setupSpans();
+
   const choices = Array.from({ length: 1200 }, (_, index) => ({
     index,
     delta: index === 0 ? { role: "assistant", content: "Hi" } : {},
     finish_reason: null,
   }));
+
   const fake = createFakeFetcher(
     sseResponse([
       {
@@ -1723,14 +1827,17 @@ test("chat streams bound choice-state creation without dropping chunks", async (
       stream: true,
     },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   expect(await collectStream(stream)).toHaveLength(1);
 
   const span = await exportedSpan(spans);
+
   const output = jsonAttr<Array<{ role: string; content?: string }>>(
     span,
     "gen_ai.output.messages",
   );
+
   expect(output).toHaveLength(1024);
   expect(output[0]).toEqual({ role: "assistant", content: "Hi" });
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
@@ -1738,6 +1845,7 @@ test("chat streams bound choice-state creation without dropping chunks", async (
 
 test("multi-choice chat streams reconstruct every choice", async () => {
   const spans = setupSpans();
+
   const chunk = (deltas: Array<{ index: number; delta: JsonRecord; finish?: string }>) => ({
     id: "stream_multi",
     object: "chat.completion.chunk",
@@ -1749,6 +1857,7 @@ test("multi-choice chat streams reconstruct every choice", async () => {
       finish_reason: finish ?? null,
     })),
   });
+
   const fake = createFakeFetcher(
     sseResponse([
       chunk([
@@ -1769,6 +1878,7 @@ test("multi-choice chat streams reconstruct every choice", async () => {
       stream: true,
     },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   await collectStream(stream);
 
@@ -1782,6 +1892,7 @@ test("multi-choice chat streams reconstruct every choice", async () => {
 
 test("non-2xx chat responses end one error span and propagate the failure", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetcher(
     new Response(JSON.stringify({ error: { code: 500, message: "provider exploded" } }), {
       status: 500,
@@ -1826,6 +1937,7 @@ test("mid-stream body failures end one error span with partial output", async ()
   const spans = setupSpans();
   const encoder = new TextEncoder();
   let delivered = false;
+
   const body = new ReadableStream<Uint8Array>({
     pull(controller) {
       if (delivered) throw new Error("connection reset");
@@ -1837,6 +1949,7 @@ test("mid-stream body failures end one error span with partial output", async ()
       );
     },
   });
+
   const fake = createFakeFetcher(
     new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } }),
   );
@@ -1848,6 +1961,7 @@ test("mid-stream body failures end one error span with partial output", async ()
       stream: true,
     },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   await expect(collectStream(stream)).rejects.toThrow("connection reset");
 
@@ -1861,6 +1975,7 @@ test("mid-stream body failures end one error span with partial output", async ()
 
 test("Responses stream error events record numeric codes and end once", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetcher(
     openSseResponse([
       {
@@ -1878,6 +1993,7 @@ test("Responses stream error events record numeric codes and end once", async ()
   const stream = await clientWith(fake.fetcher).responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Fail mid-stream", stream: true },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   const reader = stream.getReader();
   expect((await reader.read()).done).toBe(false);
@@ -1895,6 +2011,7 @@ test("Responses stream error events record numeric codes and end once", async ()
 test("final Responses text replaces delta-truncated output using a fresh budget", async () => {
   const spans = setupSpans();
   const delta = "y".repeat(1024);
+
   const deltas = Array.from({ length: 70 }, (_, sequenceNumber) => ({
     type: "response.output_text.delta",
     sequence_number: sequenceNumber,
@@ -1904,6 +2021,7 @@ test("final Responses text replaces delta-truncated output using a fresh budget"
     delta,
     logprobs: [],
   }));
+
   const events = [
     ...deltas,
     {
@@ -1916,11 +2034,13 @@ test("final Responses text replaces delta-truncated output using a fresh budget"
       logprobs: [],
     },
   ];
+
   const fake = createFakeFetcher(sseResponse(events));
 
   const stream = await clientWith(fake.fetcher).responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Long answer", stream: true },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   await collectStream(stream);
 
@@ -1939,6 +2059,7 @@ test("final Responses text replaces delta-truncated output using a fresh budget"
 
 test("final Responses text preserves provider event truncation", async () => {
   const spans = setupSpans();
+
   const events = [
     {
       type: "response.image_generation_call.partial_image",
@@ -1958,11 +2079,13 @@ test("final Responses text preserves provider event truncation", async () => {
       logprobs: [],
     },
   ];
+
   const fake = createFakeFetcher(sseResponse(events));
 
   const stream = await clientWith(fake.fetcher).responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Long answer", stream: true },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   await collectStream(stream);
 
@@ -1982,6 +2105,7 @@ test("final Responses text preserves provider event truncation", async () => {
 test("oversized final Responses text preserves bounded partial output", async () => {
   const spans = setupSpans();
   const delta = "y".repeat(1024);
+
   const deltas = Array.from({ length: 20 }, (_, sequenceNumber) => ({
     type: "response.output_text.delta",
     sequence_number: sequenceNumber,
@@ -1991,6 +2115,7 @@ test("oversized final Responses text preserves bounded partial output", async ()
     delta,
     logprobs: [],
   }));
+
   const events = [
     ...deltas,
     {
@@ -2003,19 +2128,23 @@ test("oversized final Responses text preserves bounded partial output", async ()
       logprobs: [],
     },
   ];
+
   const fake = createFakeFetcher(sseResponse(events));
 
   const stream = await clientWith(fake.fetcher).responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Long answer", stream: true },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   await collectStream(stream);
 
   const span = await exportedSpan(spans);
+
   const output = jsonAttr<Array<{ content: Array<{ text: string }> }>>(
     span,
     "gen_ai.output.messages",
   );
+
   expect(output[0]?.content[0]?.text).toBe(delta.repeat(deltas.length));
   expect(output[0]?.content[0]?.text).not.toContain("z");
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
@@ -2024,6 +2153,7 @@ test("oversized final Responses text preserves bounded partial output", async ()
 test("small terminal Responses output replaces delta-truncated output", async () => {
   const spans = setupSpans();
   const delta = "y".repeat(1024);
+
   const deltas = Array.from({ length: 70 }, (_, sequenceNumber) => ({
     type: "response.output_text.delta",
     sequence_number: sequenceNumber,
@@ -2033,6 +2163,7 @@ test("small terminal Responses output replaces delta-truncated output", async ()
     delta,
     logprobs: [],
   }));
+
   const events = [
     ...deltas,
     {
@@ -2041,11 +2172,13 @@ test("small terminal Responses output replaces delta-truncated output", async ()
       response: responsesBody("resp_bounded"),
     },
   ];
+
   const fake = createFakeFetcher(sseResponse(events));
 
   const stream = await clientWith(fake.fetcher).responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Long answer", stream: true },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   const received = await collectStream(stream);
 
@@ -2062,6 +2195,7 @@ test("small terminal Responses output replaces delta-truncated output", async ()
 test("oversized terminal Responses output preserves bounded partial output", async () => {
   const spans = setupSpans();
   const delta = "y".repeat(1024);
+
   const deltas = Array.from({ length: 20 }, (_, sequenceNumber) => ({
     type: "response.output_text.delta",
     sequence_number: sequenceNumber,
@@ -2071,6 +2205,7 @@ test("oversized terminal Responses output preserves bounded partial output", asy
     delta,
     logprobs: [],
   }));
+
   const terminal = responsesBody("resp_oversized");
   terminal.output = [
     {
@@ -2081,6 +2216,7 @@ test("oversized terminal Responses output preserves bounded partial output", asy
       content: [{ type: "output_text", text: "z".repeat(70 * 1024), annotations: [] }],
     },
   ];
+
   const events = [
     ...deltas,
     {
@@ -2089,19 +2225,23 @@ test("oversized terminal Responses output preserves bounded partial output", asy
       response: terminal,
     },
   ];
+
   const fake = createFakeFetcher(sseResponse(events));
 
   const stream = await clientWith(fake.fetcher).responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Long answer", stream: true },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   await collectStream(stream);
 
   const span = await exportedSpan(spans);
+
   const output = jsonAttr<Array<{ content: Array<{ text: string }> }>>(
     span,
     "gen_ai.output.messages",
   );
+
   expect(output[0]?.content[0]?.text).toBe(delta.repeat(deltas.length));
   expect(output[0]?.content[0]?.text).not.toContain("z");
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
@@ -2126,6 +2266,7 @@ test("non-streaming failed Responses record a useful error", async () => {
 
 test("failed Responses stream events keep numeric provider error codes", async () => {
   const spans = setupSpans();
+
   const fake = createFakeFetcher(
     sseResponse([
       {
@@ -2144,6 +2285,7 @@ test("failed Responses stream events keep numeric provider error codes", async (
   const stream = await clientWith(fake.fetcher).responses.send({
     responsesRequest: { model: "openai/gpt-4o", input: "Fail", stream: true },
   });
+
   if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
   await collectStream(stream);
 
@@ -2194,6 +2336,7 @@ test("wrap and global instrumentation have parity, are idempotent, and restore p
     jsonResponse(responsesBody("global_response")),
     jsonResponse(embeddingsBody("global_embedding")),
   );
+
   const globalClient = clientWith(globalFake.fetcher, false);
   await globalClient.chat.send({
     chatRequest: {
@@ -2214,6 +2357,7 @@ test("wrap and global instrumentation have parity, are idempotent, and restore p
     jsonResponse(embeddingsBody("wrapped_embedding")),
     jsonResponse(chatBody("wrapped_after_restore", { cost: 0.012 })),
   );
+
   const wrappedClient = wrapOpenRouter(wrapOpenRouter(clientWith(wrappedFake.fetcher, false)));
   await wrappedClient.chat.send({
     chatRequest: {
@@ -2229,6 +2373,7 @@ test("wrap and global instrumentation have parity, are idempotent, and restore p
   });
 
   const initial = await finishedSpans(spans, 6);
+
   for (const id of [
     "global_chat",
     "global_response",
@@ -2267,6 +2412,7 @@ test("wrap and global instrumentation have parity, are idempotent, and restore p
 
 test("global uninstrumentation preserves later prototype patches", () => {
   const originalDescriptor = Object.getOwnPropertyDescriptor(Chat.prototype, "send");
+
   if (!originalDescriptor) throw new Error("Chat.prototype.send is missing");
   instrumentOpenRouter();
   const laterPatch = () => undefined;
@@ -2285,6 +2431,7 @@ test("global uninstrumentation preserves later prototype patches", () => {
 
 test("wrapped clients fail open when telemetry is not initialized", async () => {
   await shutdown();
+
   const fake = createFakeFetcher(
     jsonResponse(chatBody("no_telemetry", { content: "Still works" })),
   );

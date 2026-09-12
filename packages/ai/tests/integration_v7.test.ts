@@ -12,6 +12,11 @@ import { sessionSpanContext } from "@telemetry-dev/otel";
 import { expect, test } from "vitest";
 
 import { telemetryDev } from "../src/index.ts";
+import { unknownErrorMessage } from "../src/shared.ts";
+
+test("unknown errors do not expose structured payloads", () => {
+  expect(unknownErrorMessage({ code: "tool_failed", secret: "private" })).toBe("[object Object]");
+});
 
 interface MetricRecord {
   metric: "duration" | "tokens";
@@ -23,6 +28,7 @@ interface MetricRecord {
 function makeCapture() {
   const spanBatches: ReadableSpan[][] = [];
   const metrics: MetricRecord[] = [];
+
   const overrides = {
     sendSpans: async (spans: ReadableSpan[]) => {
       spanBatches.push(spans);
@@ -34,6 +40,7 @@ function makeCapture() {
       metrics.push({ metric: "tokens", tokenType, value, attributes });
     },
   };
+
   return { spanBatches, metrics, overrides };
 }
 
@@ -42,8 +49,10 @@ const baseOptions = { apiKey: "td_live_test", environment: "test", serviceName: 
 
 const spanId = (s: ReadableSpan) => s.spanContext().spanId;
 const traceId = (s: ReadableSpan) => s.spanContext().traceId;
+
 const byOperation = (spans: ReadableSpan[], operation: string) =>
   spans.filter((s) => s.attributes["gen_ai.operation.name"] === operation);
+
 const event = (s: ReadableSpan, name: string) => s.events.find((ev) => ev.name === name);
 
 test("single-step generateText flushes root+child with aggregated onEnd usage and responseTime duration", async () => {
@@ -219,10 +228,12 @@ test("runtimeContext refreshes user metadata but keeps the starting session", as
   const session = sessionSpanContext("td_live_test", "session-start");
 
   expect(root.parentSpanContext?.spanId).toBe(session.spanId);
+
   for (const span of spans) {
     expect(traceId(span)).toBe(session.traceId);
     expect(span.attributes["gen_ai.conversation.id"]).toBe("session-start");
   }
+
   expect(root.attributes["user.id"]).toBe("user-step");
   expect(root.attributes["td.metadata.plan"]).toBe("pro");
 });
@@ -230,6 +241,7 @@ test("runtimeContext refreshes user metadata but keeps the starting session", as
 test("missing or empty runtimeContext emits no identity or metadata attributes", async () => {
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
+
   const cases = [
     { callId: "call-runtime-absent", runtimeContext: undefined },
     { callId: "call-runtime-empty", runtimeContext: {} },
@@ -237,6 +249,7 @@ test("missing or empty runtimeContext emits no identity or metadata attributes",
 
   for (const { callId, runtimeContext } of cases) {
     const toolCall = { toolCallId: `${callId}-tool`, toolName: "lookup", input: { q: callId } };
+
     const startEvent = {
       callId,
       operationId: "ai.generateText",
@@ -245,6 +258,7 @@ test("missing or empty runtimeContext emits no identity or metadata attributes",
       messages: [{ role: "user", content: callId }],
       runtimeContext,
     };
+
     integ.onStart?.(startEvent);
     integ.onStepStart?.({ callId, stepNumber: 0 });
     integ.onToolExecutionEnd?.({
@@ -271,8 +285,10 @@ test("missing or empty runtimeContext emits no identity or metadata attributes",
   }
 
   expect(spanBatches).toHaveLength(2);
+
   for (const spans of spanBatches) {
     expect(spans).toHaveLength(3);
+
     for (const span of spans) {
       expect(span.attributes["user.id"]).toBeUndefined();
       expect(span.attributes["gen_ai.conversation.id"]).toBeUndefined();
@@ -287,6 +303,7 @@ test("onStepFinish is not implemented, so ai@7's step-end fan-out cannot double 
   const { spanBatches, metrics, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-dedupe";
+
   const stepResult = {
     callId,
     stepNumber: 0,
@@ -339,7 +356,9 @@ test("two interleaved callIds on one integration produce disjoint traces per flu
       modelId: "gpt-4o",
       functionId: fn,
     });
+
   const stepStart = (callId: string) => integ.onStepStart?.({ callId, stepNumber: 0 });
+
   const stepEnd = (callId: string, text: string) =>
     integ.onStepEnd?.({
       callId,
@@ -350,6 +369,7 @@ test("two interleaved callIds on one integration produce disjoint traces per flu
       response: { id: `resp-${callId}`, modelId: "gpt-4o" },
       usage: { inputTokens: 1, outputTokens: 1 },
     });
+
   const end = (callId: string, text: string) =>
     integ.onEnd?.({
       callId,
@@ -371,7 +391,9 @@ test("two interleaved callIds on one integration produce disjoint traces per flu
 
   const batchFor = (fn: string) => {
     const batch = spanBatches.find((spans) => spans.some((s) => s.name === fn));
+
     if (!batch) throw new Error(`missing batch for ${fn}`);
+
     return batch;
   };
 
@@ -385,13 +407,16 @@ test("two interleaved callIds on one integration produce disjoint traces per flu
   const traceA = traceId(batchA[0]!);
   const traceB = traceId(batchB[0]!);
   expect(traceA).not.toBe(traceB);
+
   for (const s of batchA) expect(traceId(s)).toBe(traceA);
+
   for (const s of batchB) expect(traceId(s)).toBe(traceB);
 });
 
 test("calls that share a sessionId share one trace under the session parent", async () => {
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
+
   const run = async (callId: string, sessionId?: string) => {
     integ.onStart?.({
       callId,
@@ -418,17 +443,21 @@ test("calls that share a sessionId share one trace under the session parent", as
       usage: { inputTokens: 1, outputTokens: 1 },
     });
   };
+
   await run("turn-1", "s1");
   await run("turn-2", "s1");
   await run("solo");
 
   const session = sessionSpanContext(baseOptions.apiKey, "s1");
   const [batch1, batch2, batch3] = spanBatches;
+
   for (const s of [...batch1!, ...batch2!]) expect(traceId(s)).toBe(session.traceId);
+
   for (const batch of [batch1!, batch2!]) {
     const root = batch.find((s) => s.kind === SpanKind.INTERNAL)!;
     expect(root.parentSpanContext?.spanId).toBe(session.spanId);
   }
+
   expect(traceId(batch3![0]!)).not.toBe(session.traceId);
   expect(batch3!.find((s) => s.kind === SpanKind.INTERNAL)!.parentSpanContext).toBeUndefined();
 });
@@ -555,6 +584,7 @@ test("tool success and tool error spans parent to the open step with execute_too
   const toolDurations = metrics.filter(
     (m) => m.metric === "duration" && m.attributes["gen_ai.operation.name"] === "execute_tool",
   );
+
   expect(toolDurations.map((m) => m.value).sort((a, b) => a - b)).toEqual([0.4, 0.8]);
 });
 
@@ -712,11 +742,13 @@ test("embedMany flushes two embedding children and aggregated root usage on onEn
   expect(children).toHaveLength(2);
   expect(root.attributes["gen_ai.operation.name"]).toBe("embeddings");
   expect(root.attributes["gen_ai.usage.input_tokens"]).toBe(8);
+
   for (const child of children) {
     expect(child.name).toBe("embeddings");
     expect(child.attributes["gen_ai.operation.name"]).toBe("embeddings");
     expect(child.attributes["gen_ai.usage.input_tokens"]).toBeDefined();
   }
+
   expect(
     children.map((s) => Number(s.attributes["gen_ai.usage.input_tokens"])).sort((a, b) => a - b),
   ).toEqual([3, 5]);
@@ -727,6 +759,7 @@ test("embedMany flushes two embedding children and aggregated root usage on onEn
       m.tokenType === "input" &&
       m.attributes["gen_ai.operation.name"] === "embeddings",
   );
+
   expect(embedTokens).toHaveLength(2);
   expect(embedTokens.map((m) => m.value).sort((a, b) => a - b)).toEqual([3, 5]);
 });
@@ -771,6 +804,7 @@ test("rerank success flushes root and child spans with rerank duration metrics",
   const duration = metrics.find(
     (m) => m.metric === "duration" && m.attributes["gen_ai.operation.name"] === "rerank",
   )!;
+
   expect(duration.value).toBeGreaterThanOrEqual(0);
   expect(duration.attributes["gen_ai.provider.name"]).toBe("cohere");
   expect(duration.attributes["gen_ai.request.model"]).toBe("rerank-english-v3.0");
@@ -928,19 +962,24 @@ test("v7 exports session spans only when the configured sampler selects them", a
     new TraceIdRatioBasedSampler(0.5),
     { shouldSample: () => ({ decision: SamplingDecision.RECORD }), toString: () => "RecordOnly" },
   ];
+
   for (const root of roots) {
     const sampler = new ParentBasedSampler({ root });
     const { spanBatches, overrides } = makeCapture();
     const errors: unknown[] = [];
+
     const integ = telemetryDev(
       { ...baseOptions, sampler, onError: (error) => errors.push(error) },
       overrides,
     );
+
     const expected: string[] = [];
+
     for (let i = 0; i < 20; i++) {
       const callId = `sample-${i}`;
       const sessionId = `session-${i}`;
       const id = sessionSpanContext("td_live_test", sessionId).traceId;
+
       if (
         sampler.shouldSample(ROOT_CONTEXT, id, "chat", SpanKind.INTERNAL, {}, []).decision ===
         SamplingDecision.RECORD_AND_SAMPLED
@@ -965,6 +1004,7 @@ test("v7 exports session spans only when the configured sampler selects them", a
       });
       await integ.onEnd?.({ callId, text: "ok", finishReason: "stop" });
     }
+
     expect(spanBatches.flat().map(traceId)).toEqual(expected);
     expect(errors).toEqual([]);
   }

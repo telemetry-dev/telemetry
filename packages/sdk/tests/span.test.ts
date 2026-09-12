@@ -22,6 +22,7 @@ afterEach(async () => {
 
 test("each span type maps to its gen_ai.operation.name", async () => {
   const { spans } = setup();
+
   const expected = {
     span: "function",
     generation: "chat",
@@ -29,12 +30,15 @@ test("each span type maps to its gen_ai.operation.name", async () => {
     agent: "invoke_agent",
     embedding: "embeddings",
   } satisfies Record<SpanType, string>;
+
   for (const type of ["span", "generation", "tool", "agent", "embedding"] satisfies SpanType[]) {
     startSpan(type, { type }).end();
   }
+
   await flush();
   const exported = spans.getFinishedSpans();
   expect(exported).toHaveLength(5);
+
   for (const [type, operation] of Object.entries(expected)) {
     const span = exported.find((s) => s.name === type)!;
     expect(span.attributes["gen_ai.operation.name"]).toBe(operation);
@@ -64,11 +68,13 @@ test("kind can be overridden without changing defaults", async () => {
 
 test("passes span links through unchanged", async () => {
   const { spans } = setup();
+
   const linked = {
     traceId: "0af7651916cd43dd8448eb211c80319c",
     spanId: "b7ad6b7169203331",
     traceFlags: 1,
   };
+
   startSpan("linked", { links: [{ context: linked, attributes: { reason: "ambient" } }] }).end();
   await flush();
   expect(spans.getFinishedSpans()[0]?.links).toEqual([
@@ -220,12 +226,14 @@ test("handle.traceparent and getTraceparent round-trip", async () => {
 test("W3C propagation omits baggage unless enabled", () => {
   setup();
   let parentTraceId = "";
+
   const carrier = {
     traceparent: undefined as string | undefined,
     tracestate: undefined as string | undefined,
     baggage: "tenant=stale" as string | undefined,
     Baggage: "tenant=uppercase" as string | undefined,
   };
+
   const baggageCarrier = { ...carrier };
   startActiveSpan("parent", (parent) => {
     parentTraceId = parent.traceId;
@@ -256,8 +264,19 @@ test("W3C propagation omits baggage unless enabled", () => {
     TRACESTATE: "vendor=stale",
     Baggage: "tenant=stale",
   };
+
   injectW3cContext(extractW3cContext({}), staleCarrier);
   expect(staleCarrier).toEqual({});
+
+  const sealedCarrier = {};
+  Object.defineProperty(sealedCarrier, "TraceParent", {
+    configurable: false,
+    enumerable: true,
+    value: "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+  });
+  expect(() => injectW3cContext(extractW3cContext({}), sealedCarrier)).toThrow(
+    "Cannot delete stale W3C carrier property: TraceParent",
+  );
 });
 
 test("W3C extraction does not inherit ambient context", () => {

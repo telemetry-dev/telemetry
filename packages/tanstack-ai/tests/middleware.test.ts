@@ -35,6 +35,7 @@ interface MetricRecord {
 function makeCapture() {
   const spanBatches: ReadableSpan[][] = [];
   const metrics: MetricRecord[] = [];
+
   const overrides = {
     sendSpans: async (spans: ReadableSpan[]) => {
       spanBatches.push(spans);
@@ -46,6 +47,7 @@ function makeCapture() {
       metrics.push({ metric: "tokens", tokenType, value, attributes });
     },
   };
+
   return { spanBatches, metrics, overrides };
 }
 
@@ -91,8 +93,10 @@ const chatConfig = (over?: Record<string, TestValue>) =>
 
 const spanId = (s: ReadableSpan) => s.spanContext().spanId;
 const traceId = (s: ReadableSpan) => s.spanContext().traceId;
+
 const byOperation = (spans: ReadableSpan[], operation: string) =>
   spans.filter((s) => s.attributes["gen_ai.operation.name"] === operation);
+
 const event = (s: ReadableSpan, name: string) => s.events.find((ev) => ev.name === name);
 
 const middleware = (overrides: ReturnType<typeof makeCapture>["overrides"]) =>
@@ -217,9 +221,11 @@ test("bigint metadata IDs populate user and conversation attributes", async () =
   await mw.onFinish?.(ctx, { finishReason: "stop", duration: 5, content: "ok" } as never);
 
   const spans = spanBatches[0]!;
+
   for (const s of spans) {
     expect(s.attributes["gen_ai.conversation.id"]).toBe("9");
   }
+
   const root = spans.find((s) => s.kind === SpanKind.INTERNAL)!;
   expect(root.attributes["user.id"]).toBe("2");
   // Reserved keys never leak into td.metadata.*.
@@ -238,9 +244,11 @@ test("string metadata IDs override threadId and populate user attributes", async
   await mw.onFinish?.(ctx, { finishReason: "stop", duration: 5, content: "ok" } as never);
 
   const spans = spanBatches[0]!;
+
   for (const span of spans) {
     expect(span.attributes["gen_ai.conversation.id"]).toBe("sess_9");
   }
+
   const root = spans.find((span) => span.kind === SpanKind.INTERNAL)!;
   expect(root.attributes["user.id"]).toBe("u2");
 });
@@ -341,9 +349,11 @@ test("a failed tool call records ERROR status and an exception event", async () 
   const tools = byOperation(spans, "execute_tool");
   const iteration = spans.find((s) => s.kind === SpanKind.CLIENT)!;
   expect(tools).toHaveLength(2);
+
   for (const t of tools) {
     expect(t.parentSpanContext?.spanId).toBe(spanId(iteration));
   }
+
   const failed = tools.find((t) => t.attributes["gen_ai.tool.name"] === "t2")!;
   expect(failed.status.code).toBe(SpanStatusCode.ERROR);
   expect(failed.attributes["error.type"]).toBe("Error");
@@ -445,29 +455,35 @@ test("one middleware instance handles concurrent chats independently", async () 
 test("chats on one thread share one trace under the session parent", async () => {
   const { spanBatches, overrides } = makeCapture();
   const mw = middleware(overrides);
+
   const run = async (ctx: ChatMiddlewareContext) => {
     await mw.onStart?.(ctx);
     await mw.onConfig?.(ctx, chatConfig());
     await mw.onChunk?.(ctx, { type: "RUN_FINISHED", finishReason: "stop" } as never);
     await mw.onFinish?.(ctx, { finishReason: "stop", duration: 5, content: "ok" } as never);
   };
+
   await run(makeCtx({ runId: "run_1" }));
   await run(makeCtx({ runId: "run_2" }));
   await run(makeCtx({ threadId: "thread_other" }));
 
   const session = sessionSpanContext("td_live_test", "thread_1");
   const [batch1, batch2, batch3] = spanBatches;
+
   for (const s of [...batch1!, ...batch2!]) expect(s.spanContext().traceId).toBe(session.traceId);
+
   for (const batch of [batch1!, batch2!]) {
     const root = batch.find((s) => s.kind === SpanKind.INTERNAL)!;
     expect(root.parentSpanContext?.spanId).toBe(session.spanId);
   }
+
   expect(batch3![0]!.spanContext().traceId).not.toBe(session.traceId);
 });
 
 test("export failure reaches onError even on the waitUntil path", async () => {
   const errors: unknown[] = [];
   let handed: Promise<unknown> | undefined;
+
   const mw = telemetryDev(
     {
       apiKey: "td_live_test",
@@ -488,6 +504,7 @@ test("export failure reaches onError even on the waitUntil path", async () => {
       recordTokens: () => {},
     },
   );
+
   const ctx = makeCtx();
 
   await mw.onStart?.(ctx);
@@ -506,21 +523,27 @@ test("export failure reaches onError even on the waitUntil path", async () => {
 test("metric export retries a transient ingest failure", async () => {
   const errors: unknown[] = [];
   let metricCalls = 0;
+
   const mw = telemetryDev({
     apiKey: "td_live_metric_retry",
     environment: "test",
     serviceName: "metric-retry",
     fetch: async (url: string | Request | URL, _init?: RequestInit) => {
-      if (String(url).endsWith("/v1/metrics")) {
+      const href = url instanceof Request ? url.url : url.toString();
+
+      if (href.endsWith("/v1/metrics")) {
         metricCalls += 1;
+
         return new Response(null, { status: metricCalls === 1 ? 503 : 200 });
       }
+
       return new Response(null, { status: 200 });
     },
     onError: (e) => {
       errors.push(e);
     },
   });
+
   const ctx = makeCtx();
 
   await mw.onStart?.(ctx);
@@ -642,6 +665,7 @@ test("structured output finalization records a separate iteration span", async (
   const structuredIteration = iterations.find(
     (s) => s.attributes["gen_ai.output.type"] === "json",
   )!;
+
   expect(structuredIteration.attributes["gen_ai.usage.input_tokens"]).toBe(7);
   expect(structuredIteration.attributes["gen_ai.usage.output_tokens"]).toBe(3);
   expect(structuredIteration.attributes["gen_ai.output.messages"]).toBe('{"a":1}');
@@ -653,6 +677,7 @@ test("structured output finalization records a separate iteration span", async (
   const inputTokens = metrics
     .filter((m) => m.metric === "tokens" && m.tokenType === "input")
     .map((m) => m.value);
+
   expect(inputTokens).toEqual([10, 7]);
 });
 
@@ -870,10 +895,12 @@ test("session chats export spans only when the configured sampler selects them",
     new TraceIdRatioBasedSampler(0.5),
     { shouldSample: () => ({ decision: SamplingDecision.RECORD }), toString: () => "RecordOnly" },
   ];
+
   for (const root of roots) {
     const sampler = new ParentBasedSampler({ root });
     const { spanBatches, overrides } = makeCapture();
     const errors: unknown[] = [];
+
     const mw = telemetryDev(
       {
         apiKey: "td_live_test",
@@ -883,10 +910,13 @@ test("session chats export spans only when the configured sampler selects them",
       },
       overrides,
     );
+
     const expected: string[] = [];
+
     for (let i = 0; i < 20; i++) {
       const threadId = `session-${i}`;
       const id = sessionSpanContext("td_live_test", threadId).traceId;
+
       if (
         sampler.shouldSample(ROOT_CONTEXT, id, "chat", SpanKind.INTERNAL, {}, []).decision ===
         SamplingDecision.RECORD_AND_SAMPLED
@@ -898,6 +928,7 @@ test("session chats export spans only when the configured sampler selects them",
       await mw.onChunk?.(ctx, { type: "RUN_FINISHED", finishReason: "stop" } as never);
       await mw.onFinish?.(ctx, { finishReason: "stop", duration: 5, content: "ok" } as never);
     }
+
     expect(spanBatches.flat().map(traceId)).toEqual(expected);
     expect(errors).toEqual([]);
   }

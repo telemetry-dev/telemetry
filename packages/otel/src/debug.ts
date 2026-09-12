@@ -31,5 +31,6 @@ export function reportError(onError: ((error: Error) => void) | undefined, cause
   } catch {
     // onError itself must never propagate
   }
+
   diag.error(cause);
 }

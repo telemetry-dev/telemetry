@@ -29,6 +29,12 @@ interface TestTransport {
   setProtocolVersion?: (version: string) => void;
 }
 
+type JsonValue = string | number | boolean | null | JsonValue[] | JsonRecord;
+
+interface JsonRecord {
+  [key: string]: JsonValue | undefined;
+}
+
 function setup(): InMemorySpanExporter {
   const spans = new InMemorySpanExporter();
   init(
@@ -42,16 +48,20 @@ function setup(): InMemorySpanExporter {
     },
     { spanExporter: spans },
   );
+
   return spans;
 }
 
 async function exported(spans: InMemorySpanExporter, count: number): Promise<ReadableSpan[]> {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     await flush();
+
     if (spans.getFinishedSpans().length === count) return spans.getFinishedSpans();
     await Promise.resolve();
   }
+
   expect(spans.getFinishedSpans()).toHaveLength(count);
+
   return spans.getFinishedSpans();
 }
 
@@ -67,9 +77,9 @@ test("instruments both v2 transport directions with propagation and opt-in paylo
   expect(instrumentMcpTransport(client)).toBe(clientRaw);
 
   client.onmessage = () => undefined;
-  let receivedMeta: Record<string, unknown> | undefined;
+  let receivedMeta: JsonRecord | undefined;
   server.onmessage = (message) => {
-    receivedMeta = (message as { params?: { _meta?: Record<string, unknown> } }).params?._meta;
+    receivedMeta = (message as { params?: { _meta?: JsonRecord } }).params?._meta;
     startSpan("handler-work").end();
     void server.send({
       jsonrpc: "2.0",
@@ -78,6 +88,7 @@ test("instruments both v2 transport directions with propagation and opt-in paylo
     });
     void message;
   };
+
   await client.start();
   await server.start();
 
@@ -94,6 +105,7 @@ test("instruments both v2 transport directions with propagation and opt-in paylo
       },
     },
   } satisfies JSONRPCMessage;
+
   const baggage = propagation.createBaggage({ tenant: { value: "acme" } });
   await withContext(propagation.setBaggage(activeContext(), baggage), () => client.send(request));
 
@@ -125,6 +137,7 @@ test("instruments both v2 transport directions with propagation and opt-in paylo
 test("propagates baggage only when enabled", async () => {
   const spans = setup();
   let sent: unknown;
+
   const transport = instrumentMcpTransport<TestTransport>(
     {
       send: async (message: unknown) => {
@@ -133,6 +146,7 @@ test("propagates baggage only when enabled", async () => {
     },
     { propagateBaggage: true },
   );
+
   transport.onmessage = () => undefined;
 
   const baggage = propagation.createBaggage({ tenant: { value: "acme" } });
@@ -140,7 +154,7 @@ test("propagates baggage only when enabled", async () => {
     transport.send({ jsonrpc: "2.0", id: 2, method: "ping" } as never),
   );
 
-  const meta = (sent as { params?: { _meta?: Record<string, unknown> } }).params?._meta;
+  const meta = (sent as { params?: { _meta?: JsonRecord } }).params?._meta;
   expect(meta?.traceparent).toBeTypeOf("string");
   expect(meta?.baggage).toBe("tenant=acme");
   transport.onmessage?.({ jsonrpc: "2.0", id: 2, result: {} } as never);
@@ -155,8 +169,10 @@ test("works through the official v2 client and server connection lifecycle", asy
   let preexistingCalls = 0;
   serverRaw.onmessage = function (message) {
     expect(this).toBe(serverRaw);
+
     if ("method" in message && message.method === "tools/call") preexistingCalls += 1;
   };
+
   server.registerTool("weather", { description: "Get the weather" }, async () => ({
     content: [{ type: "text", text: "sunny" }],
   }));
@@ -169,6 +185,7 @@ test("works through the official v2 client and server connection lifecycle", asy
   const toolSpans = spans
     .getFinishedSpans()
     .filter((span) => span.attributes["mcp.method.name"] === "tools/call");
+
   expect(toolSpans).toHaveLength(2);
   expect(toolSpans.map((span) => span.kind)).toContain(SpanKind.CLIENT);
   expect(toolSpans.map((span) => span.kind)).toContain(SpanKind.SERVER);
@@ -183,6 +200,7 @@ test("works through the official v2 client and server connection lifecycle", asy
 
 test("completes responses before a per-request HTTP transport closes", async () => {
   const spans = setup();
+
   const handler = createMcpHandler(
     () => {
       const server = new McpServer({ name: "test-server", version: "1.0.0" });
@@ -191,10 +209,12 @@ test("completes responses before a per-request HTTP transport closes", async () 
       }));
       const connect = server.connect.bind(server);
       server.connect = (transport) => connect(instrumentMcpTransport(transport));
+
       return server;
     },
     { legacy: "reject" },
   );
+
   const response = await handler.fetch(
     new Request("https://mcp.example.test", {
       method: "POST",
@@ -233,9 +253,11 @@ test("completes responses before a per-request HTTP transport closes", async () 
 
 test("applies asymmetric JSON-RPC error status rules", async () => {
   const spans = setup();
+
   const [client, server] = InMemoryTransport.createLinkedPair().map((transport) =>
     instrumentMcpTransport(transport),
   );
+
   client.onmessage = () => undefined;
   server.onmessage = () => {
     void server.send({
@@ -244,6 +266,7 @@ test("applies asymmetric JSON-RPC error status rules", async () => {
       error: { code: -32602, message: "Invalid params" },
     });
   };
+
   await client.start();
   await server.start();
   await client.send({ jsonrpc: "2.0", id: 7, method: "prompts/get", params: { name: "review" } });
@@ -263,9 +286,11 @@ test.each([-32021, -32022])(
   "treats MCP v2 caller error %i as a client failure only",
   async (code) => {
     const spans = setup();
+
     const [client, server] = InMemoryTransport.createLinkedPair().map((transport) =>
       instrumentMcpTransport(transport),
     );
+
     client.onmessage = () => undefined;
     server.onmessage = () => {
       void server.send({
@@ -274,6 +299,7 @@ test.each([-32021, -32022])(
         error: { code, message: "Client compatibility error" },
       });
     };
+
     await client.start();
     await server.start();
     await client.send({ jsonrpc: "2.0", id: 8, method: "ping" });
@@ -290,9 +316,11 @@ test.each([-32021, -32022])(
 
 test("marks CallToolResult errors and closes pending requests", async () => {
   const spans = setup();
+
   const [client, server] = InMemoryTransport.createLinkedPair().map((transport) =>
     instrumentMcpTransport(transport),
   );
+
   client.onmessage = () => undefined;
   server.onmessage = () => {
     void server.send({
@@ -301,6 +329,7 @@ test("marks CallToolResult errors and closes pending requests", async () => {
       result: { content: [{ type: "text", text: "failed" }], isError: true },
     });
   };
+
   await client.start();
   await server.start();
   await client.send({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "broken" } });
@@ -311,11 +340,13 @@ test("marks CallToolResult errors and closes pending requests", async () => {
 
   await shutdown();
   const closeSpans = setup();
+
   const rawTransport: TestTransport = {
     send: async (_message: unknown) => undefined,
     onmessage: undefined,
     onclose: undefined,
   };
+
   const transport = instrumentMcpTransport(rawTransport);
   transport.onclose = () => undefined;
   await transport.send({ jsonrpc: "2.0", id: 10, method: "ping" } as never);
@@ -327,11 +358,13 @@ test("marks CallToolResult errors and closes pending requests", async () => {
 
 test("ends an outgoing request span when send fails", async () => {
   const spans = setup();
+
   const transport = instrumentMcpTransport({
     send: async (_message: unknown) => {
       throw new TypeError("disconnected");
     },
   });
+
   await expect(
     transport.send({ jsonrpc: "2.0", id: 11, method: "resources/list" } as never),
   ).rejects.toThrow("disconnected");
@@ -342,12 +375,14 @@ test("ends an outgoing request span when send fails", async () => {
 
 test("records response send failures that race with transport close", async () => {
   const spans = setup();
+
   const rawTransport: TestTransport = {
     send: async (_message: unknown) => {
       rawTransport.onclose?.();
       throw new TypeError("response disconnected");
     },
   };
+
   const transport = instrumentMcpTransport(rawTransport);
   transport.onmessage = () => undefined;
   transport.onmessage({ jsonrpc: "2.0", id: 14, method: "resources/list" } as never);
@@ -362,9 +397,11 @@ test("records response send failures that race with transport close", async () =
 
 test("ends an incoming request span when its handler throws", async () => {
   const spans = setup();
+
   const transport = instrumentMcpTransport<TestTransport>({
     send: async (_message: unknown) => undefined,
   });
+
   transport.onmessage = () => {
     throw new TypeError("handler failed");
   };
@@ -379,9 +416,11 @@ test("ends an incoming request span when its handler throws", async () => {
 
 test("ends an incoming request span when its async handler rejects", async () => {
   const spans = setup();
+
   const transport = instrumentMcpTransport<TestTransport>({
     send: async (_message: unknown) => undefined,
   });
+
   transport.onmessage = async () => {
     await Promise.resolve();
     throw new TypeError("async handler failed");
@@ -392,6 +431,7 @@ test("ends an incoming request span when its async handler rejects", async () =>
     id: 13,
     method: "resources/list",
   } as never) as unknown;
+
   await expect(result).rejects.toThrow("async handler failed");
   const [span] = await exported(spans, 1);
   expect(span?.attributes["error.type"]).toBe("TypeError");
@@ -401,10 +441,12 @@ test("ends an incoming request span when its async handler rejects", async () =>
 test("observes protocol versions without owning transport negotiation", async () => {
   const spans = setup();
   const setProtocolVersion = vi.fn();
+
   const rawTransport: TestTransport = {
     send: async (_message: unknown) => undefined,
     setProtocolVersion,
   };
+
   const transport = instrumentMcpTransport(rawTransport);
   transport.onmessage = () => undefined;
 
@@ -428,25 +470,38 @@ test("observes protocol versions without owning transport negotiation", async ()
   Object.defineProperty(transport, "protocolVersion", { value: "stale", configurable: true });
   await transport.send({ jsonrpc: "2.0", id: 21, method: "ping" } as never);
   transport.onmessage?.({ jsonrpc: "2.0", id: 21, result: {} } as never);
+
   const versions = (await exported(spans, 2)).map(
     (finished) => finished.attributes["mcp.protocol.version"],
   );
+
   expect(versions).toContain("2025-03-26");
   expect(setProtocolVersion).toHaveBeenCalledOnce();
 });
 
 test("completes pending spans exactly once on abort, cancellation, and stream end", async () => {
   const spans = setup();
-  const sentOptions = new Map<number, Record<string, unknown>>();
+
+  const sentOptions = new Map<
+    number,
+    { requestSignal?: AbortSignal; onRequestStreamEnd?: () => void }
+  >();
+
   const originalStreamEnd = vi.fn();
+
   const rawTransport: TestTransport = {
     send: async (message: unknown, options?: unknown) => {
       const id = (message as { id?: unknown }).id;
+
       if (typeof id === "number" && options !== undefined) {
-        sentOptions.set(id, options as Record<string, unknown>);
+        sentOptions.set(
+          id,
+          options as { requestSignal?: AbortSignal; onRequestStreamEnd?: () => void },
+        );
       }
     },
   };
+
   const transport = instrumentMcpTransport(rawTransport);
   transport.onmessage = () => undefined;
 
@@ -493,14 +548,17 @@ test("completes pending spans exactly once on abort, cancellation, and stream en
 test("stale stream callbacks cannot complete a newer request with a reused id", async () => {
   const spans = setup();
   let firstStreamEnd: (() => void) | undefined;
+
   const rawTransport: TestTransport = {
     send: async (message: unknown, options?: unknown) => {
       const id = (message as { id?: unknown }).id;
+
       if (id === 34 && firstStreamEnd === undefined) {
         firstStreamEnd = (options as { onRequestStreamEnd?: () => void }).onRequestStreamEnd;
       }
     },
   };
+
   const transport = instrumentMcpTransport(rawTransport);
   transport.onmessage = () => undefined;
 
@@ -518,6 +576,7 @@ test("stale stream callbacks cannot complete a newer request with a reused id", 
 test("instruments mixed batched requests without mutating untouched messages", async () => {
   const spans = setup();
   let sent: unknown;
+
   const transport = instrumentMcpTransport<TestTransport>(
     {
       send: async (message: unknown) => {
@@ -526,31 +585,36 @@ test("instruments mixed batched requests without mutating untouched messages", a
     },
     { capturePayloads: true },
   );
+
   transport.onmessage = () => undefined;
+
   const first = {
     jsonrpc: "2.0",
     id: 60,
     method: "tools/call",
     params: { name: "weather", arguments: { city: "Paris" }, _meta: { existing: "kept" } },
   };
+
   const notification = {
     jsonrpc: "2.0",
     method: "notifications/progress",
     params: { progressToken: "one", progress: 1 },
   };
+
   const second = {
     jsonrpc: "2.0",
     id: "61",
     method: "prompts/get",
     params: { name: "review" },
   };
+
   const batch = [first, notification, second];
 
   await transport.send(batch as never);
 
-  const sentBatch = sent as Array<Record<string, unknown>>;
-  const firstParams = sentBatch[0]?.params as { _meta?: Record<string, unknown> } | undefined;
-  const secondParams = sentBatch[2]?.params as { _meta?: Record<string, unknown> } | undefined;
+  const sentBatch = sent as JsonRecord[];
+  const firstParams = sentBatch[0]?.params as { _meta?: JsonRecord } | undefined;
+  const secondParams = sentBatch[2]?.params as { _meta?: JsonRecord } | undefined;
   const firstMeta = firstParams?._meta;
   const secondMeta = secondParams?._meta;
   expect(sentBatch).not.toBe(batch);
@@ -599,11 +663,14 @@ test("instruments both directions when a transport delivers batches intact", asy
   const client = instrumentMcpTransport(clientRaw);
   const server = instrumentMcpTransport(serverRaw);
   client.onmessage = () => undefined;
+
   const serverHandler = vi.fn((message: unknown) => {
     const requests = message as Array<{ id: string | number }>;
     void server.send(requests.map((request) => ({ jsonrpc: "2.0", id: request.id, result: {} })));
   });
+
   server.onmessage = serverHandler;
+
   const batch = [
     { jsonrpc: "2.0", id: 71, method: "ping" },
     { jsonrpc: "2.0", id: "72", method: "tools/list" },
@@ -614,6 +681,7 @@ test("instruments both directions when a transport delivers batches intact", asy
   const finished = await exported(spans, 4);
   expect(serverHandler).toHaveBeenCalledOnce();
   expect(serverHandler.mock.calls[0]?.[0]).toBeInstanceOf(Array);
+
   for (const id of ["71", "72"]) {
     const matching = finished.filter((span) => span.attributes["jsonrpc.request.id"] === id);
     const clientSpan = matching.find((span) => span.kind === SpanKind.CLIENT);
@@ -626,11 +694,13 @@ test("instruments both directions when a transport delivers batches intact", asy
 test("skips duplicate batch ids while distinguishing numeric and string ids", async () => {
   const spans = setup();
   let sent: unknown;
+
   const transport = instrumentMcpTransport<TestTransport>({
     send: async (message: unknown) => {
       sent = message;
     },
   });
+
   transport.onmessage = () => undefined;
   const first = { jsonrpc: "2.0", id: 62, method: "ping" };
   const duplicate = { jsonrpc: "2.0", id: 62, method: "tools/list" };
@@ -639,11 +709,11 @@ test("skips duplicate batch ids while distinguishing numeric and string ids", as
 
   await transport.send(batch as never);
 
-  const sentBatch = sent as Array<Record<string, unknown>>;
+  const sentBatch = sent as JsonRecord[];
   expect(sentBatch[0]).toBe(first);
   expect(sentBatch[1]).toBe(duplicate);
   expect(sentBatch[2]).not.toBe(distinct);
-  const distinctParams = sentBatch[2]?.params as { _meta?: Record<string, unknown> } | undefined;
+  const distinctParams = sentBatch[2]?.params as { _meta?: JsonRecord } | undefined;
   expect(distinctParams?._meta?.traceparent).toBeTypeOf("string");
   transport.onmessage?.({ jsonrpc: "2.0", id: 62, result: {} });
   expect(spans.getFinishedSpans()).toHaveLength(0);
@@ -656,23 +726,27 @@ test("skips duplicate batch ids while distinguishing numeric and string ids", as
 test("applies batched cancellations in message order", async () => {
   const spans = setup();
   let sent: unknown;
+
   const transport = instrumentMcpTransport<TestTransport>({
     send: async (message: unknown) => {
       sent = message;
     },
   });
+
   transport.onmessage = () => undefined;
   await transport.send({ jsonrpc: "2.0", id: 63, method: "ping" } as never);
+
   const cancellation = {
     jsonrpc: "2.0",
     method: "notifications/cancelled",
     params: { requestId: 63 },
   };
+
   const replacement = { jsonrpc: "2.0", id: 63, method: "tools/list" };
 
   await transport.send([cancellation, replacement] as never);
 
-  const sentBatch = sent as Array<Record<string, unknown>>;
+  const sentBatch = sent as JsonRecord[];
   expect(sentBatch[0]).toBe(cancellation);
   expect(sentBatch[1]).not.toBe(replacement);
   transport.onmessage?.({ jsonrpc: "2.0", id: 63, result: {} });
@@ -695,6 +769,7 @@ test.each([73, 74])("does not trace id-bearing cancellation controls with id %i"
   const transport = instrumentMcpTransport<TestTransport>({ send: originalSend });
   transport.onmessage = () => undefined;
   await transport.send({ jsonrpc: "2.0", id: 73, method: "ping" } as never);
+
   const cancellation = {
     jsonrpc: "2.0",
     id,
@@ -715,9 +790,11 @@ test.each([75, 76])(
   "does not trace received id-bearing cancellation controls with id %i",
   async (id) => {
     const spans = setup();
+
     const transport = instrumentMcpTransport<TestTransport>({
       send: async (_message: unknown) => undefined,
     });
+
     transport.onmessage = () => undefined;
     transport.onmessage?.({ jsonrpc: "2.0", id: 75, method: "ping" });
     transport.onmessage?.({
@@ -736,6 +813,7 @@ test.each([75, 76])(
 
 test("completes every batched request when send fails", async () => {
   const spans = setup();
+
   const transport = instrumentMcpTransport<TestTransport>({
     send: async (_message: unknown) => {
       throw new TypeError("batch disconnected");
@@ -788,6 +866,7 @@ test("completes incoming requests from a batched response send", async () => {
   transport.onmessage = () => undefined;
   transport.onmessage?.({ jsonrpc: "2.0", id: 69, method: "ping" });
   transport.onmessage?.({ jsonrpc: "2.0", id: 70, method: "tools/list" });
+
   const responses = [
     { jsonrpc: "2.0", id: 70, result: { tools: [] } },
     { jsonrpc: "2.0", id: 69, result: {} },
@@ -803,13 +882,16 @@ test("completes incoming requests from a batched response send", async () => {
 
 test("does not trace resume-only Streamable HTTP sends", async () => {
   const spans = setup();
+
   const fetch = vi.fn(
     async (_input: RequestInfo | URL, _init?: RequestInit) =>
       new Response(null, { status: 405, statusText: "Method Not Allowed" }),
   );
+
   const rawTransport = new StreamableHTTPClientTransport(new URL("https://mcp.example.test"), {
     fetch,
   });
+
   const transport = instrumentMcpTransport(rawTransport);
   transport.onerror = () => undefined;
   await transport.start();
@@ -836,6 +918,7 @@ test("parents inbound work to remote context and links a distinct ambient span",
       result: {},
     } as never);
   };
+
   const remoteTraceId = "0af7651916cd43dd8448eb211c80319c";
   const remoteSpanId = "b7ad6b7169203331";
 
@@ -859,9 +942,11 @@ test("parents inbound work to remote context and links a distinct ambient span",
 
 test("parents unpropagated inbound work to the ambient context", async () => {
   const spans = setup();
+
   const transport = instrumentMcpTransport<TestTransport>({
     send: async (_message: unknown) => undefined,
   });
+
   transport.onmessage = (message: unknown) => {
     void transport.send({
       jsonrpc: "2.0",
@@ -917,9 +1002,11 @@ test("does not instrument null ids outside the MCP v2 RequestId contract", async
 
 test("closes pending spans even when no onclose handler was assigned", async () => {
   const spans = setup();
+
   const transport = instrumentMcpTransport<TestTransport>({
     send: async (_message: unknown) => undefined,
   });
+
   await transport.send({ jsonrpc: "2.0", id: 51, method: "ping" } as never);
   transport.onclose?.();
 

@@ -21,6 +21,7 @@ export interface TelemetryDevInstrumentationOptions extends TelemetryDevEveOptio
 
 const envServiceName = (): string | undefined =>
   globalThis.process !== undefined ? process.env.OTEL_SERVICE_NAME : undefined;
+
 function reportError(onError: ((error: Error) => void) | undefined, error: Error): void {
   try {
     onError?.(error);
@@ -55,12 +56,15 @@ export function telemetryDevInstrumentation(
     events: {
       "step.started"(input) {
         const ctx = { ...runtimeContext } satisfies InstrumentationRuntimeContext;
+
         const userId =
           input.session.auth.initiator?.principalId ?? input.session.auth.current?.principalId;
+
         const runtimeContextWithUser = userId ? { ...ctx, "user.id": userId } : ctx;
 
         try {
           const userResult = stepStarted?.(input);
+
           if (userResult?.runtimeContext) {
             Object.assign(runtimeContextWithUser, userResult.runtimeContext);
           }
@@ -81,5 +85,6 @@ export function telemetryDevInstrumentation(
   if (functionId !== undefined) {
     return { ...definition, functionId };
   }
+
   return definition;
 }
