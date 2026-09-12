@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/anthropic",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Anthropic SDK instrumentation for telemetry.dev: wraps the Messages API and emits OpenTelemetry GenAI spans.",
   "keywords": [
     "anthropic",

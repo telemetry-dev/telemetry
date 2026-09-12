@@ -1,6 +1,6 @@
 [project]
 name = "telemetry-dev-google-genai"
-version = "0.1.1"
+version = "0.1.2"
 description = "Google GenAI (Gemini) integration for telemetry.dev Python SDK"
 readme = "README.md"
 license = "MIT"

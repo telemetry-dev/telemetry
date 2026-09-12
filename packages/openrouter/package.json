@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/openrouter",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "OpenRouter SDK instrumentation for telemetry.dev: generation and embedding spans for the official @openrouter/sdk package.",
   "keywords": [
     "genai",

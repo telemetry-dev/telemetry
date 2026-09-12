@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/sdk",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Pure TypeScript SDK for telemetry.dev: LLM traces, logs, and GenAI metrics on OpenTelemetry, for Node and edge runtimes.",
   "keywords": [
     "genai",

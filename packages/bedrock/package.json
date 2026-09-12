@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/bedrock",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "AWS Bedrock instrumentation for telemetry.dev: Converse, InvokeModel, and Bedrock Agents spans for AWS SDK v3 clients.",
   "keywords": [
     "aws",
