@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "openai": ["./node_modules/openai-v6"],
+      "openai/*": ["./node_modules/openai-v6/*"]
+    }
+  }
+}

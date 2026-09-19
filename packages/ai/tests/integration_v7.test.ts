@@ -526,6 +526,12 @@ test("tool success and tool error spans parent to the open step with execute_too
   const callId = "call-tools";
   const okTool = { toolCallId: "t-ok", toolName: "lookup", input: { q: "x" } };
   const badTool = { toolCallId: "t-bad", toolName: "lookup", input: { q: "y" } };
+  const privateTool = { toolCallId: "t-private", toolName: "lookup", input: { q: "z" } };
+  const arrayTool = { toolCallId: "t-array", toolName: "lookup", input: { q: "a" } };
+  const customTool = { toolCallId: "t-custom", toolName: "lookup", input: { q: "c" } };
+  const emptyErrorTool = { toolCallId: "t-empty", toolName: "lookup", input: { q: "e" } };
+  const primitiveErrorTool = { toolCallId: "t-primitive", toolName: "lookup", input: { q: "p" } };
+  let customToStringCalls = 0;
 
   integ.onStart?.({
     callId,
@@ -549,6 +555,52 @@ test("tool success and tool error spans parent to the open step with execute_too
     toolExecutionMs: 400,
     toolOutput: { type: "tool-error", error: new Error("tool blew up") },
   });
+  integ.onToolExecutionStart?.({ callId, toolCall: privateTool });
+  integ.onToolExecutionEnd?.({
+    callId,
+    toolCall: privateTool,
+    toolExecutionMs: 200,
+    toolOutput: { type: "tool-error", error: { code: "tool_failed", secret: "private" } },
+  });
+  integ.onToolExecutionStart?.({ callId, toolCall: arrayTool });
+  integ.onToolExecutionEnd?.({
+    callId,
+    toolCall: arrayTool,
+    toolExecutionMs: 150,
+    toolOutput: { type: "tool-error", error: ["private-array"] },
+  });
+  integ.onToolExecutionStart?.({ callId, toolCall: customTool });
+  integ.onToolExecutionEnd?.({
+    callId,
+    toolCall: customTool,
+    toolExecutionMs: 100,
+    toolOutput: {
+      type: "tool-error",
+      error: {
+        get message() {
+          throw new Error("poisoned getter");
+        },
+        toString() {
+          customToStringCalls += 1;
+          return "private-custom";
+        },
+      },
+    },
+  });
+  integ.onToolExecutionStart?.({ callId, toolCall: emptyErrorTool });
+  integ.onToolExecutionEnd?.({
+    callId,
+    toolCall: emptyErrorTool,
+    toolExecutionMs: 50,
+    toolOutput: { type: "tool-error", error: new Error() },
+  });
+  integ.onToolExecutionStart?.({ callId, toolCall: primitiveErrorTool });
+  integ.onToolExecutionEnd?.({
+    callId,
+    toolCall: primitiveErrorTool,
+    toolExecutionMs: 25,
+    toolOutput: { type: "tool-error", error: 404 },
+  });
   integ.onStepEnd?.({
     callId,
     stepNumber: 0,
@@ -568,10 +620,11 @@ test("tool success and tool error spans parent to the open step with execute_too
   const spans = spanBatches[0]!;
   const step = byOperation(spans, "chat").find((s) => s.kind === SpanKind.CLIENT)!;
   const tools = byOperation(spans, "execute_tool");
-  expect(tools).toHaveLength(2);
+  expect(tools).toHaveLength(7);
 
   const ok = tools.find((s) => s.attributes["gen_ai.tool.call.id"] === "t-ok")!;
   const bad = tools.find((s) => s.attributes["gen_ai.tool.call.id"] === "t-bad")!;
+  const privateFailure = tools.find((s) => s.attributes["gen_ai.tool.call.id"] === "t-private")!;
   expect(ok.parentSpanContext?.spanId).toBe(spanId(step));
   expect(bad.parentSpanContext?.spanId).toBe(spanId(step));
   expect(ok.attributes["gen_ai.tool.call.result"]).toBe(JSON.stringify({ ok: true }));
@@ -580,12 +633,2036 @@ test("tool success and tool error spans parent to the open step with execute_too
   expect(bad.status.code).toBe(SpanStatusCode.ERROR);
   expect(bad.attributes["error.type"]).toBe("Error");
   expect(event(bad, "exception")?.attributes?.["log.severity_number"]).toBe(17);
+  expect(privateFailure.attributes["error.type"]).toBe("tool_error");
+  expect(event(privateFailure, "exception")?.attributes?.["exception.message"]).toBe(
+    "Tool execution failed",
+  );
+  expect(
+    tools
+      .filter((tool) =>
+        ["t-array", "t-custom", "t-empty"].includes(String(tool.attributes["gen_ai.tool.call.id"])),
+      )
+      .map((tool) => event(tool, "exception")?.attributes?.["exception.message"]),
+  ).toEqual(["Tool execution failed", "Tool execution failed", "Tool execution failed"]);
+  expect(
+    event(
+      tools.find((tool) => tool.attributes["gen_ai.tool.call.id"] === "t-primitive")!,
+      "exception",
+    )?.attributes?.["exception.message"],
+  ).toBe("404");
+  expect(customToStringCalls).toBe(0);
 
   const toolDurations = metrics.filter(
     (m) => m.metric === "duration" && m.attributes["gen_ai.operation.name"] === "execute_tool",
   );
 
-  expect(toolDurations.map((m) => m.value).sort((a, b) => a - b)).toEqual([0.4, 0.8]);
+  expect(toolDurations.map((m) => m.value).sort((a, b) => a - b)).toEqual([
+    0.025, 0.05, 0.1, 0.15, 0.2, 0.4, 0.8,
+  ]);
+});
+
+test("provider-executed tools use the last normalized result for extension spans", async () => {
+  const { spanBatches, metrics, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-tools";
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+    messages: [{ role: "user", content: "search" }],
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({
+    callId,
+    content: [
+      {
+        type: "tool-call",
+        toolCallId: "provider-ok",
+        toolName: "web_search",
+        input: { query: "OpenTelemetry" },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-result",
+        toolCallId: "provider-ok",
+        toolName: "web_search",
+        input: { query: "OpenTelemetry" },
+        output: { result: "preview" },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-result",
+        toolCallId: "provider-ok",
+        toolName: "web_search",
+        input: { query: "OpenTelemetry" },
+        output: { result: "found" },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-call",
+        toolCallId: "provider-error",
+        toolName: "code_interpreter",
+        input: { code: "fail()" },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-result",
+        toolCallId: "provider-error",
+        toolName: "code_interpreter",
+        input: { code: "fail()" },
+        output: { status: "running" },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-error",
+        toolCallId: "provider-error",
+        toolName: "code_interpreter",
+        input: { code: "fail()" },
+        error: new RangeError("sandbox failed"),
+        providerExecuted: true,
+      },
+      {
+        type: "tool-call",
+        toolCallId: "client-tool",
+        toolName: "lookup",
+        input: { query: "local" },
+        providerExecuted: false,
+      },
+    ],
+  });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model,
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 3, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 3, outputTokens: 1 },
+  });
+
+  const spans = spanBatches[0]!;
+  const root = spans.find((s) => s.kind === SpanKind.INTERNAL && s.name !== "execute_tool")!;
+  const step = byOperation(spans, "chat").find((s) => s.kind === SpanKind.CLIENT)!;
+  const tools = byOperation(spans, "execute_tool");
+
+  expect(root.attributes["gen_ai.operation.name"]).toBe("invoke_agent");
+  expect(tools).toHaveLength(2);
+
+  const succeeded = tools.find((s) => s.attributes["gen_ai.tool.call.id"] === "provider-ok")!;
+  const failed = tools.find((s) => s.attributes["gen_ai.tool.call.id"] === "provider-error")!;
+
+  for (const tool of tools) {
+    expect(tool.parentSpanContext?.spanId).toBe(spanId(step));
+    expect(tool.attributes["gen_ai.tool.type"]).toBe("extension");
+    expect(tool.duration).toEqual([0, 0]);
+  }
+
+  expect(succeeded.attributes["gen_ai.tool.call.arguments"]).toBe(
+    JSON.stringify({ query: "OpenTelemetry" }),
+  );
+  expect(succeeded.attributes["gen_ai.tool.call.result"]).toBe(JSON.stringify({ result: "found" }));
+  expect(failed.status.code).toBe(SpanStatusCode.ERROR);
+  expect(failed.attributes["error.type"]).toBe("RangeError");
+  expect(event(failed, "exception")?.attributes?.["exception.message"]).toBe("sandbox failed");
+  expect(
+    metrics.filter(
+      (m) => m.metric === "duration" && m.attributes["gen_ai.operation.name"] === "execute_tool",
+    ),
+  ).toHaveLength(0);
+});
+
+test("provider tool observations snapshot callback payloads", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-snapshot";
+  const toolCall = {
+    type: "tool-call",
+    toolCallId: "snapshot-tool",
+    toolName: "web_search",
+    input: { query: "original" },
+    providerExecuted: true,
+  };
+  const toolResult = {
+    type: "tool-result",
+    toolCallId: "snapshot-tool",
+    toolName: "web_search",
+    output: { result: "original" },
+    providerExecuted: true,
+  };
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({ callId, content: [toolCall, toolResult] });
+
+  toolCall.toolCallId = "mutated-call";
+  toolCall.toolName = "mutated_tool";
+  toolCall.input.query = "mutated";
+  toolResult.toolCallId = "mutated-result";
+  toolResult.toolName = "mutated_tool";
+  toolResult.output.result = "mutated";
+
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model,
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const tool = byOperation(spanBatches[0]!, "execute_tool")[0]!;
+
+  expect(tool.attributes["gen_ai.tool.call.id"]).toBe("snapshot-tool");
+  expect(tool.attributes["gen_ai.tool.name"]).toBe("web_search");
+  expect(tool.attributes["gen_ai.tool.call.arguments"]).toBe(JSON.stringify({ query: "original" }));
+  expect(tool.attributes["gen_ai.tool.call.result"]).toBe(JSON.stringify({ result: "original" }));
+});
+
+test("provider-executed tools preserve structured errors and classify invalid MCP result errors", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-error-shapes";
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({
+    callId,
+    content: [
+      {
+        type: "tool-call",
+        toolCallId: "structured-error",
+        toolName: "code_interpreter",
+        input: { code: "run()" },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-error",
+        toolCallId: "structured-error",
+        toolName: "code_interpreter",
+        error: { code: "sandbox_failed", message: "quota exceeded" },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-call",
+        toolCallId: "mcp-error",
+        toolName: "mcp.delete_file",
+        input: undefined,
+        error: new Error("invalid arguments"),
+        invalid: true,
+        providerExecuted: true,
+        dynamic: true,
+      },
+      {
+        type: "tool-result",
+        toolCallId: "mcp-error",
+        toolName: "mcp.delete_file",
+        output: {
+          type: "call",
+          serverLabel: "files",
+          name: "delete_file",
+          arguments: '{"path":"/protected"}',
+          error: "permission denied",
+        },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-call",
+        toolCallId: "mcp-health",
+        toolName: "mcp.healthcheck",
+        input: undefined,
+        providerExecuted: true,
+        dynamic: true,
+      },
+      {
+        type: "tool-result",
+        toolCallId: "mcp-health",
+        toolName: "mcp.healthcheck",
+        output: {
+          type: "call",
+          serverLabel: "health",
+          name: "healthcheck",
+          arguments: "{}",
+          error: false,
+        },
+        providerExecuted: true,
+        dynamic: true,
+      },
+    ],
+  });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model,
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 3, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 3, outputTokens: 1 },
+  });
+
+  const tools = byOperation(spanBatches[0]!, "execute_tool");
+
+  const structured = tools.find(
+    (span) => span.attributes["gen_ai.tool.call.id"] === "structured-error",
+  )!;
+
+  const mcp = tools.find((span) => span.attributes["gen_ai.tool.call.id"] === "mcp-error")!;
+  const health = tools.find((span) => span.attributes["gen_ai.tool.call.id"] === "mcp-health")!;
+
+  expect(tools).toHaveLength(3);
+
+  for (const tool of [structured, mcp]) {
+    expect(tool.status.code).toBe(SpanStatusCode.ERROR);
+    expect(tool.attributes["error.type"]).toBe("tool_error");
+  }
+
+  expect(event(structured, "exception")?.attributes?.["exception.message"]).toBe("quota exceeded");
+  expect(event(mcp, "exception")?.attributes?.["exception.message"]).toBe("permission denied");
+  expect(mcp.attributes["gen_ai.tool.call.result"]).toBeUndefined();
+  expect(health.status.code).toBe(SpanStatusCode.UNSET);
+  expect(health.attributes["gen_ai.tool.call.result"]).toBe(
+    JSON.stringify({
+      type: "call",
+      serverLabel: "health",
+      name: "healthcheck",
+      arguments: "{}",
+      error: false,
+    }),
+  );
+});
+
+test("provider-executed tools correlate deferred final results across model calls", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-deferred";
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "anthropic",
+    modelId: "claude-sonnet",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({
+    callId,
+    content: [
+      {
+        type: "tool-call",
+        toolCallId: "deferred-tool",
+        toolName: "code_execution",
+        input: { code: "print(1)" },
+        providerExecuted: true,
+      },
+    ],
+  });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model: { provider: "anthropic", modelId: "claude-sonnet" },
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  integ.onStepStart?.({ callId, stepNumber: 1 });
+  integ.onLanguageModelCallEnd?.({
+    callId,
+    content: [
+      {
+        type: "tool-result",
+        toolCallId: "deferred-tool",
+        toolName: "code_execution",
+        input: undefined,
+        output: { stdout: "1" },
+        providerExecuted: true,
+        preliminary: true,
+      },
+    ],
+  });
+  integ.onLanguageModelCallEnd?.({
+    callId,
+    content: [
+      {
+        type: "tool-result",
+        toolCallId: "deferred-tool",
+        toolName: "code_execution",
+        input: undefined,
+        output: { stdout: "1\n" },
+        providerExecuted: true,
+      },
+    ],
+  });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 1,
+    model: { provider: "anthropic", modelId: "claude-sonnet" },
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 2, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 2, outputTokens: 1 },
+  });
+
+  const spans = spanBatches[0]!;
+  const steps = byOperation(spans, "chat").filter((span) => span.kind === SpanKind.CLIENT);
+  const tools = byOperation(spans, "execute_tool");
+
+  expect(steps).toHaveLength(2);
+  expect(tools).toHaveLength(1);
+  expect(tools[0]!.parentSpanContext?.spanId).toBe(spanId(steps[0]!));
+  expect(tools[0]!.parentSpanContext?.spanId).not.toBe(spanId(steps[1]!));
+  expect(tools[0]!.attributes["gen_ai.tool.call.arguments"]).toBe(
+    JSON.stringify({ code: "print(1)" }),
+  );
+  expect(tools[0]!.attributes["gen_ai.tool.call.result"]).toBe(JSON.stringify({ stdout: "1\n" }));
+  expect(tools[0]!.duration).toEqual([0, 0]);
+});
+
+test("provider results recover the latest matching input from a later generation history", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const firstCallId = "call-provider-history-source";
+  const secondCallId = "call-provider-history-result";
+  const providerCall = {
+    type: "tool-call",
+    toolCallId: "deferred-tool",
+    toolName: "web_search",
+    input: { query: "latest" },
+    providerExecuted: true,
+  };
+
+  integ.onStart?.({
+    callId: firstCallId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+  });
+  integ.onStepStart?.({ callId: firstCallId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({ callId: firstCallId, content: [providerCall] });
+  integ.onStepEnd?.({
+    callId: firstCallId,
+    stepNumber: 0,
+    model,
+    content: [providerCall],
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId: firstCallId,
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const messages = [
+    {
+      role: "assistant",
+      content: [
+        {
+          ...providerCall,
+          input: { query: "stale" },
+        },
+        providerCall,
+      ],
+    },
+  ];
+  const providerResult = {
+    type: "tool-result",
+    toolCallId: "deferred-tool",
+    toolName: "web_search",
+    output: { result: "latest result" },
+    providerExecuted: true,
+  };
+
+  integ.onStart?.({
+    callId: secondCallId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+    messages,
+  });
+  integ.onStepStart?.({ callId: secondCallId, stepNumber: 0, messages });
+  integ.onLanguageModelCallEnd?.({ callId: secondCallId, content: [providerResult] });
+  integ.onStepEnd?.({
+    callId: secondCallId,
+    stepNumber: 0,
+    model,
+    content: [providerResult],
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 2, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId: secondCallId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 2, outputTokens: 1 },
+  });
+
+  const resultTool = byOperation(spanBatches.flat(), "execute_tool").find(
+    (span) => span.attributes["gen_ai.tool.call.result"] !== undefined,
+  )!;
+
+  expect(resultTool.attributes["gen_ai.tool.call.arguments"]).toBe(
+    JSON.stringify({ query: "latest" }),
+  );
+  expect(resultTool.attributes["gen_ai.tool.call.result"]).toBe(
+    JSON.stringify({ result: "latest result" }),
+  );
+});
+
+test("provider results recover inputs from prepareStep message replacements", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-prepare-step-history";
+  const providerCall = {
+    type: "tool-call",
+    toolCallId: "deferred-tool",
+    toolName: "web_search",
+    input: { query: "initial" },
+    providerExecuted: true,
+  };
+  const messages = [{ role: "assistant", content: [providerCall] }];
+  const providerResult = {
+    type: "tool-result",
+    toolCallId: "deferred-tool",
+    toolName: "web_search",
+    output: { result: "prepared result" },
+    providerExecuted: true,
+  };
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+    messages,
+  });
+  providerCall.input = { query: "prepared" };
+  integ.onStepStart?.({ callId, stepNumber: 0, messages });
+  integ.onLanguageModelCallEnd?.({ callId, content: [providerResult] });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model,
+    content: [providerResult],
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const tools = byOperation(spanBatches[0]!, "execute_tool");
+
+  expect(tools).toHaveLength(1);
+  expect(tools[0]!.attributes["gen_ai.tool.call.arguments"]).toBe(
+    JSON.stringify({ query: "prepared" }),
+  );
+  expect(tools[0]!.attributes["gen_ai.tool.call.result"]).toBe(
+    JSON.stringify({ result: "prepared result" }),
+  );
+});
+
+test("provider result history is not inspected when input recording is disabled", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-history-redacted";
+  let inputReads = 0;
+  const providerCall = {
+    type: "tool-call",
+    toolCallId: "deferred-tool",
+    toolName: "web_search",
+    providerExecuted: true,
+    get input() {
+      inputReads++;
+
+      return { query: "history-secret" };
+    },
+  };
+  const messages = [{ role: "assistant", content: [providerCall] }];
+  const providerResult = {
+    type: "tool-result",
+    toolCallId: "deferred-tool",
+    toolName: "web_search",
+    output: { result: "public" },
+    providerExecuted: true,
+  };
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+    messages,
+    recordInputs: false,
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0, messages });
+  integ.onLanguageModelCallEnd?.({ callId, content: [providerResult] });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model,
+    content: [providerResult],
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const tools = byOperation(spanBatches[0]!, "execute_tool");
+
+  expect(inputReads).toBe(0);
+  expect(tools).toHaveLength(1);
+  expect(tools[0]!.attributes["gen_ai.tool.call.arguments"]).toBeUndefined();
+  expect(JSON.stringify(spanBatches)).not.toContain("history-secret");
+});
+
+test("a poisoned latest history input does not reuse stale provider-tool arguments", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-history-poisoned";
+  let inputReads = 0;
+  const messages = [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool-call",
+          toolCallId: "deferred-tool",
+          toolName: "web_search",
+          input: { query: "stale" },
+          providerExecuted: true,
+        },
+        {
+          type: "tool-call",
+          toolCallId: "deferred-tool",
+          toolName: "web_search",
+          providerExecuted: true,
+          get input() {
+            inputReads++;
+
+            throw new Error("poisoned input");
+          },
+        },
+      ],
+    },
+  ];
+  const providerResult = {
+    type: "tool-result",
+    toolCallId: "deferred-tool",
+    toolName: "web_search",
+    output: { result: "latest result" },
+    providerExecuted: true,
+  };
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+    messages,
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({ callId, content: [providerResult] });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model,
+    content: [providerResult],
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const tools = byOperation(spanBatches[0]!, "execute_tool");
+
+  expect(inputReads).toBeGreaterThan(0);
+  expect(tools).toHaveLength(1);
+  expect(tools[0]!.attributes["gen_ai.tool.call.arguments"]).toBeUndefined();
+  expect(tools[0]!.attributes["gen_ai.tool.call.result"]).toBe(
+    JSON.stringify({ result: "latest result" }),
+  );
+});
+
+test("provider-executed tools keep repeated call ids distinct across steps", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-repeated-id";
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+  });
+
+  for (let stepNumber = 0; stepNumber < 2; stepNumber++) {
+    const input = { query: `query-${stepNumber}` };
+    const output = { result: `result-${stepNumber}` };
+
+    integ.onStepStart?.({ callId, stepNumber });
+    integ.onLanguageModelCallEnd?.({
+      callId,
+      content: [
+        {
+          type: "tool-call",
+          toolCallId: "reused-id",
+          toolName: "web_search",
+          input,
+          providerExecuted: true,
+        },
+        {
+          type: "tool-result",
+          toolCallId: "reused-id",
+          toolName: "web_search",
+          output,
+          providerExecuted: true,
+        },
+      ],
+    });
+    integ.onStepEnd?.({
+      callId,
+      stepNumber,
+      model,
+      text: "",
+      finishReason: stepNumber === 0 ? "tool-calls" : "stop",
+      usage: { inputTokens: 1, outputTokens: 1 },
+    });
+  }
+
+  const approvalToolCall = {
+    type: "tool-call",
+    toolCallId: "reused-id",
+    toolName: "web_search",
+    input: { query: "requires-approval" },
+    providerExecuted: true,
+  };
+
+  const approvalRequest = {
+    type: "tool-approval-request",
+    approvalId: "reused-id-approval",
+    toolCall: approvalToolCall,
+  };
+
+  integ.onStepStart?.({ callId, stepNumber: 2 });
+  integ.onLanguageModelCallEnd?.({
+    callId,
+    content: [approvalToolCall, approvalRequest],
+  });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 2,
+    model,
+    content: [approvalToolCall, approvalRequest],
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 2, outputTokens: 2 },
+  });
+
+  const spans = spanBatches[0]!;
+  const steps = byOperation(spans, "chat").filter((span) => span.kind === SpanKind.CLIENT);
+  const tools = byOperation(spans, "execute_tool");
+
+  expect(steps).toHaveLength(3);
+  expect(tools).toHaveLength(2);
+
+  for (let stepNumber = 0; stepNumber < 2; stepNumber++) {
+    const tool = tools.find(
+      (span) =>
+        span.attributes["gen_ai.tool.call.arguments"] ===
+        JSON.stringify({ query: `query-${stepNumber}` }),
+    )!;
+
+    expect(tool.parentSpanContext?.spanId).toBe(spanId(steps[stepNumber]!));
+    expect(tool.attributes["gen_ai.tool.call.id"]).toBe("reused-id");
+    expect(tool.attributes["gen_ai.tool.call.result"]).toBe(
+      JSON.stringify({ result: `result-${stepNumber}` }),
+    );
+  }
+});
+
+test("provider results preceding reused calls stay with the older invocation", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-result-before-reuse";
+  const oldCall = {
+    type: "tool-call",
+    toolCallId: "reused-id",
+    toolName: "web_search",
+    input: { query: "old" },
+    providerExecuted: true,
+  };
+
+  const oldResult = {
+    type: "tool-result",
+    toolCallId: "reused-id",
+    toolName: "web_search",
+    output: { result: "old result" },
+    providerExecuted: true,
+  };
+
+  const newCall = {
+    type: "tool-call",
+    toolCallId: "reused-id",
+    toolName: "web_search",
+    input: { query: "new" },
+    providerExecuted: true,
+  };
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({ callId, content: [oldCall] });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model,
+    content: [oldCall],
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  integ.onStepStart?.({ callId, stepNumber: 1 });
+  integ.onLanguageModelCallEnd?.({ callId, content: [oldResult, newCall] });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 1,
+    model,
+    content: [oldResult, newCall],
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 2, outputTokens: 2 },
+  });
+
+  const tools = byOperation(spanBatches[0]!, "execute_tool");
+  const oldTool = tools.find(
+    (span) => span.attributes["gen_ai.tool.call.arguments"] === JSON.stringify({ query: "old" }),
+  )!;
+
+  const newTool = tools.find(
+    (span) => span.attributes["gen_ai.tool.call.arguments"] === JSON.stringify({ query: "new" }),
+  )!;
+
+  expect(tools).toHaveLength(2);
+  expect(oldTool.attributes["gen_ai.tool.call.result"]).toBe(
+    JSON.stringify({ result: "old result" }),
+  );
+  expect(event(oldTool, "tool.result_unobserved")).toBeUndefined();
+  expect(newTool.attributes["gen_ai.tool.call.result"]).toBeUndefined();
+  expect(event(newTool, "tool.result_unobserved")).toBeDefined();
+});
+
+test("provider call and result pairs with reused ids remain distinct in one model call", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-pairs-reused-id";
+  const content = [
+    {
+      type: "tool-call",
+      toolCallId: "reused-id",
+      toolName: "web_search",
+      input: { query: "first" },
+      providerExecuted: true,
+    },
+    {
+      type: "tool-result",
+      toolCallId: "reused-id",
+      toolName: "web_search",
+      output: { result: "first result" },
+      providerExecuted: true,
+    },
+    {
+      type: "tool-call",
+      toolCallId: "reused-id",
+      toolName: "web_search",
+      input: { query: "second" },
+      providerExecuted: true,
+    },
+    {
+      type: "tool-result",
+      toolCallId: "reused-id",
+      toolName: "web_search",
+      output: { result: "second result" },
+      providerExecuted: true,
+    },
+  ];
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({ callId, content });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model,
+    content,
+    text: "",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const tools = byOperation(spanBatches[0]!, "execute_tool");
+
+  expect(tools).toHaveLength(2);
+
+  for (const value of ["first", "second"]) {
+    const tool = tools.find(
+      (span) => span.attributes["gen_ai.tool.call.arguments"] === JSON.stringify({ query: value }),
+    )!;
+
+    expect(tool.attributes["gen_ai.tool.call.result"]).toBe(
+      JSON.stringify({ result: `${value} result` }),
+    );
+    expect(event(tool, "tool.result_unobserved")).toBeUndefined();
+  }
+});
+
+test("approval fallback omits only the blocked occurrence when ids are reused", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-reused-approval-fallback";
+  const completedCall = {
+    type: "tool-call",
+    toolCallId: "reused-id",
+    toolName: "web_search",
+    input: { query: "completed" },
+    providerExecuted: true,
+  };
+
+  const completedResult = {
+    type: "tool-result",
+    toolCallId: "reused-id",
+    toolName: "web_search",
+    output: { result: "completed result" },
+    providerExecuted: true,
+  };
+
+  const blockedCall = {
+    type: "tool-call",
+    toolCallId: "reused-id",
+    toolName: "web_search",
+    input: { query: "blocked" },
+    providerExecuted: true,
+  };
+
+  const content = [
+    completedCall,
+    completedResult,
+    blockedCall,
+    {
+      type: "tool-approval-request",
+      approvalId: "approval-reused-id",
+      toolCall: blockedCall,
+    },
+  ];
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model,
+    content,
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const tools = byOperation(spanBatches[0]!, "execute_tool");
+
+  expect(tools).toHaveLength(1);
+  expect(tools[0]!.attributes["gen_ai.tool.call.arguments"]).toBe(
+    JSON.stringify({ query: "completed" }),
+  );
+  expect(tools[0]!.attributes["gen_ai.tool.call.result"]).toBe(
+    JSON.stringify({ result: "completed result" }),
+  );
+  expect(event(tools[0]!, "tool.result_unobserved")).toBeUndefined();
+});
+
+test("approval cleanup preserves an unresolved same-step occurrence with a reused identity", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-reused-approval-same-step";
+  const unresolvedCall = {
+    type: "tool-call",
+    toolCallId: "reused-id",
+    toolName: "web_search",
+    input: { query: "unresolved" },
+    providerExecuted: true,
+  };
+
+  const blockedCall = {
+    type: "tool-call",
+    toolCallId: "reused-id",
+    toolName: "web_search",
+    input: { query: "blocked" },
+    providerExecuted: true,
+  };
+
+  const content = [
+    unresolvedCall,
+    blockedCall,
+    {
+      type: "tool-approval-request",
+      approvalId: "approval-reused-id",
+      toolCall: blockedCall,
+    },
+  ];
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({ callId, content });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model,
+    content,
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const tools = byOperation(spanBatches[0]!, "execute_tool");
+
+  expect(tools).toHaveLength(1);
+  expect(tools[0]!.attributes["gen_ai.tool.call.arguments"]).toBe(
+    JSON.stringify({ query: "unresolved" }),
+  );
+  expect(tools[0]!.attributes["gen_ai.tool.call.result"]).toBeUndefined();
+  expect(event(tools[0]!, "tool.result_unobserved")).toBeDefined();
+});
+
+test("mixed blocked and approved requests bind to reused tool-call occurrences", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-mixed-approval";
+  const blockedCall = {
+    type: "tool-call",
+    toolCallId: "reused-id",
+    toolName: "web_search",
+    input: { query: "blocked" },
+    providerExecuted: true,
+  };
+  const approvedCall = {
+    type: "tool-call",
+    toolCallId: "reused-id",
+    toolName: "web_search",
+    input: { query: "approved" },
+    providerExecuted: true,
+  };
+  const approvedResult = {
+    type: "tool-result",
+    toolCallId: "reused-id",
+    toolName: "web_search",
+    output: { result: "approved result" },
+    providerExecuted: true,
+  };
+  const modelContent = [blockedCall, approvedCall, approvedResult];
+  const blockedRequestCall = { ...blockedCall };
+  const approvedRequestCall = { ...approvedCall };
+  const content = [
+    ...modelContent,
+    {
+      type: "tool-approval-request",
+      approvalId: "blocked-approval",
+      toolCall: blockedRequestCall,
+    },
+    {
+      type: "tool-approval-request",
+      approvalId: "approved-approval",
+      toolCall: approvedRequestCall,
+      isAutomatic: true,
+    },
+    {
+      type: "tool-approval-response",
+      approvalId: "approved-approval",
+      toolCall: approvedRequestCall,
+      approved: true,
+      providerExecuted: true,
+    },
+  ];
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({ callId, content: modelContent });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model,
+    content,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const tools = byOperation(spanBatches[0]!, "execute_tool");
+
+  expect(tools).toHaveLength(1);
+  expect(tools[0]!.attributes["gen_ai.tool.call.arguments"]).toBe(
+    JSON.stringify({ query: "approved" }),
+  );
+  expect(tools[0]!.attributes["gen_ai.tool.call.result"]).toBe(
+    JSON.stringify({ result: "approved result" }),
+  );
+});
+
+test("automatic approval responses are consumed once when approval ids are reused", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-reused-approval-id";
+  const deniedCall = {
+    type: "tool-call",
+    toolCallId: "reused-id",
+    toolName: "web_search",
+    input: { query: "denied" },
+    providerExecuted: true,
+  };
+  const approvedCall = {
+    type: "tool-call",
+    toolCallId: "reused-id",
+    toolName: "web_search",
+    input: { query: "approved" },
+    providerExecuted: true,
+  };
+  const approvedResult = {
+    type: "tool-result",
+    toolCallId: "reused-id",
+    toolName: "web_search",
+    output: { result: "approved result" },
+    providerExecuted: true,
+  };
+  const modelContent = [deniedCall, approvedCall, approvedResult];
+  const content = [
+    ...modelContent,
+    {
+      type: "tool-approval-request",
+      approvalId: "reused-approval",
+      toolCall: deniedCall,
+      isAutomatic: true,
+    },
+    {
+      type: "tool-approval-request",
+      approvalId: "reused-approval",
+      toolCall: approvedCall,
+      isAutomatic: true,
+    },
+    {
+      type: "tool-approval-response",
+      approvalId: "reused-approval",
+      toolCall: deniedCall,
+      approved: false,
+      providerExecuted: true,
+    },
+    {
+      type: "tool-approval-response",
+      approvalId: "reused-approval",
+      toolCall: approvedCall,
+      approved: true,
+      providerExecuted: true,
+    },
+  ];
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({ callId, content: modelContent });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model,
+    content,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const tools = byOperation(spanBatches[0]!, "execute_tool");
+
+  expect(tools).toHaveLength(1);
+  expect(tools[0]!.attributes["gen_ai.tool.call.arguments"]).toBe(
+    JSON.stringify({ query: "approved" }),
+  );
+  expect(tools[0]!.attributes["gen_ai.tool.call.result"]).toBe(
+    JSON.stringify({ result: "approved result" }),
+  );
+});
+
+test("approval cleanup preserves older unresolved calls with reused ids", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-reused-approval";
+  const unresolved = {
+    type: "tool-call",
+    toolCallId: "shared-id",
+    toolName: "code_execution",
+    input: { code: "wait()" },
+    providerExecuted: true,
+  };
+  const awaitingApproval = {
+    type: "tool-call",
+    toolCallId: "shared-id",
+    toolName: "web_search",
+    input: { query: "latest" },
+    providerExecuted: true,
+  };
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "anthropic",
+    modelId: "claude-sonnet",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({ callId, content: [unresolved] });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model: { provider: "anthropic", modelId: "claude-sonnet" },
+    content: [unresolved],
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  integ.onStepStart?.({ callId, stepNumber: 1 });
+  integ.onLanguageModelCallEnd?.({ callId, content: [awaitingApproval] });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 1,
+    model: { provider: "anthropic", modelId: "claude-sonnet" },
+    content: [
+      awaitingApproval,
+      {
+        type: "tool-approval-request",
+        approvalId: "shared-approval",
+        toolCall: awaitingApproval,
+      },
+    ],
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 2, outputTokens: 2 },
+  });
+
+  const spans = spanBatches[0]!;
+  const steps = byOperation(spans, "chat").filter((span) => span.kind === SpanKind.CLIENT);
+  const tools = byOperation(spans, "execute_tool");
+
+  expect(tools).toHaveLength(1);
+  expect(tools[0]!.attributes["gen_ai.tool.name"]).toBe("code_execution");
+  expect(tools[0]!.parentSpanContext?.spanId).toBe(spanId(steps[0]!));
+  expect(event(tools[0]!, "tool.result_unobserved")).toBeDefined();
+});
+
+test("provider results match tool names when call ids are reused", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-reused-result";
+  const codeCall = {
+    type: "tool-call",
+    toolCallId: "shared-id",
+    toolName: "code_execution",
+    input: { code: "print(1)" },
+    providerExecuted: true,
+  };
+  const searchCall = {
+    type: "tool-call",
+    toolCallId: "shared-id",
+    toolName: "web_search",
+    input: { query: "latest" },
+    providerExecuted: true,
+  };
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+  });
+
+  for (const [stepNumber, toolCall] of [codeCall, searchCall].entries()) {
+    integ.onStepStart?.({ callId, stepNumber });
+    integ.onLanguageModelCallEnd?.({ callId, content: [toolCall] });
+    integ.onStepEnd?.({
+      callId,
+      stepNumber,
+      model,
+      content: [toolCall],
+      text: "",
+      finishReason: "tool-calls",
+      usage: { inputTokens: 1, outputTokens: 1 },
+    });
+  }
+
+  integ.onStepStart?.({ callId, stepNumber: 2 });
+  integ.onLanguageModelCallEnd?.({
+    callId,
+    content: [
+      {
+        type: "tool-result",
+        toolCallId: "shared-id",
+        toolName: "code_execution",
+        output: { stdout: "1\n" },
+        providerExecuted: true,
+      },
+    ],
+  });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 2,
+    model,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 3, outputTokens: 3 },
+  });
+
+  const spans = spanBatches[0]!;
+  const steps = byOperation(spans, "chat").filter((span) => span.kind === SpanKind.CLIENT);
+  const tools = byOperation(spans, "execute_tool");
+  const code = tools.find((span) => span.attributes["gen_ai.tool.name"] === "code_execution")!;
+  const search = tools.find((span) => span.attributes["gen_ai.tool.name"] === "web_search")!;
+
+  expect(tools).toHaveLength(2);
+  expect(code.parentSpanContext?.spanId).toBe(spanId(steps[0]!));
+  expect(code.attributes["gen_ai.tool.call.result"]).toBe(JSON.stringify({ stdout: "1\n" }));
+  expect(search.parentSpanContext?.spanId).toBe(spanId(steps[1]!));
+  expect(search.attributes["gen_ai.tool.call.result"]).toBeUndefined();
+  expect(event(search, "tool.result_unobserved")).toBeDefined();
+});
+
+test("provider tools awaiting approval are not recorded as failed executions", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-approval";
+
+  const toolCall = {
+    type: "tool-call",
+    toolCallId: "approval-tool",
+    toolName: "computer_use",
+    input: { action: "click" },
+    providerExecuted: true,
+  };
+
+  const deniedToolCall = {
+    type: "tool-call",
+    toolCallId: "denied-tool",
+    toolName: "computer_use",
+    input: { action: "delete" },
+    providerExecuted: true,
+  };
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "anthropic",
+    modelId: "claude-sonnet",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({
+    callId,
+    content: [toolCall, deniedToolCall],
+  });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model: { provider: "anthropic", modelId: "claude-sonnet" },
+    content: [
+      toolCall,
+      {
+        type: "tool-approval-request",
+        approvalId: "user-approval",
+        toolCall,
+      },
+      deniedToolCall,
+      {
+        type: "tool-approval-request",
+        approvalId: "denied-approval",
+        toolCall: deniedToolCall,
+        isAutomatic: true,
+      },
+      {
+        type: "tool-approval-response",
+        approvalId: "denied-approval",
+        toolCall: deniedToolCall,
+        approved: false,
+        providerExecuted: true,
+      },
+    ],
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const spans = spanBatches[0]!;
+  const root = spans.find((span) => span.kind === SpanKind.INTERNAL)!;
+
+  expect(byOperation(spans, "execute_tool")).toHaveLength(0);
+  expect(root.attributes["gen_ai.operation.name"]).toBe("chat");
+});
+
+test("automatically approved provider tools retain deferred results", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-auto-approved";
+
+  const toolCall = {
+    type: "tool-call",
+    toolCallId: "approved-tool",
+    toolName: "computer_use",
+    input: { action: "click" },
+    providerExecuted: true,
+  };
+
+  const approvalRequest = {
+    type: "tool-approval-request",
+    approvalId: "approval-1",
+    toolCall,
+    isAutomatic: true,
+  };
+
+  const approvalResponse = {
+    type: "tool-approval-response",
+    approvalId: "approval-1",
+    toolCall,
+    approved: true,
+    providerExecuted: true,
+  };
+
+  const toolResult = {
+    type: "tool-result",
+    toolCallId: "approved-tool",
+    toolName: "computer_use",
+    output: { status: "clicked" },
+    providerExecuted: true,
+  };
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "anthropic",
+    modelId: "claude-sonnet",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({ callId, content: [toolCall] });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model: { provider: "anthropic", modelId: "claude-sonnet" },
+    content: [toolCall, approvalRequest, approvalResponse],
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  integ.onStepStart?.({ callId, stepNumber: 1 });
+  integ.onLanguageModelCallEnd?.({ callId, content: [toolResult] });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 1,
+    model: { provider: "anthropic", modelId: "claude-sonnet" },
+    content: [toolResult],
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 2, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    content: [toolCall, approvalRequest, approvalResponse, toolResult],
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 3, outputTokens: 2 },
+  });
+
+  const spans = spanBatches[0]!;
+
+  const root = spans.find(
+    (span) => span.kind === SpanKind.INTERNAL && span.name !== "execute_tool",
+  )!;
+
+  const steps = byOperation(spans, "chat").filter((span) => span.kind === SpanKind.CLIENT);
+  const tool = byOperation(spans, "execute_tool")[0]!;
+
+  expect(root.attributes["gen_ai.operation.name"]).toBe("invoke_agent");
+  expect(byOperation(spans, "execute_tool")).toHaveLength(1);
+  expect(tool.parentSpanContext?.spanId).toBe(spanId(steps[0]!));
+  expect(tool.attributes["gen_ai.tool.call.arguments"]).toBe(JSON.stringify({ action: "click" }));
+  expect(tool.attributes["gen_ai.tool.call.result"]).toBe(JSON.stringify({ status: "clicked" }));
+});
+
+test("invalid provider tool calls remain observable and retain deferred results", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-invalid";
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({
+    callId,
+    content: [
+      {
+        type: "tool-call",
+        toolCallId: "invalid-tool",
+        toolName: "web_search",
+        input: { query: "latest release" },
+        error: new Error("invalid input"),
+        invalid: true,
+        providerExecuted: true,
+      },
+      {
+        type: "tool-call",
+        toolCallId: "invalid-unresolved",
+        toolName: "code_execution",
+        input: { code: "wait()" },
+        error: new Error("refinement failed"),
+        invalid: true,
+        providerExecuted: true,
+      },
+    ],
+  });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model: { provider: "openai", modelId: "gpt-4o" },
+    text: "",
+    finishReason: "error",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  integ.onStepStart?.({ callId, stepNumber: 1 });
+  integ.onLanguageModelCallEnd?.({
+    callId,
+    content: [
+      {
+        type: "tool-result",
+        toolCallId: "invalid-tool",
+        toolName: "web_search",
+        input: undefined,
+        output: { results: ["release"] },
+        providerExecuted: true,
+      },
+    ],
+  });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 1,
+    model: { provider: "openai", modelId: "gpt-4o" },
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 2, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 2, outputTokens: 1 },
+  });
+
+  const spans = spanBatches[0]!;
+  const root = spans.find((span) => span.kind === SpanKind.INTERNAL)!;
+  const tools = byOperation(spans, "execute_tool");
+  const completed = tools.find(
+    (span) => span.attributes["gen_ai.tool.call.id"] === "invalid-tool",
+  )!;
+  const unresolved = tools.find(
+    (span) => span.attributes["gen_ai.tool.call.id"] === "invalid-unresolved",
+  )!;
+
+  expect(tools).toHaveLength(2);
+  expect(root.attributes["gen_ai.operation.name"]).toBe("invoke_agent");
+  expect(completed.attributes["gen_ai.tool.call.arguments"]).toBe(
+    JSON.stringify({ query: "latest release" }),
+  );
+  expect(completed.attributes["gen_ai.tool.call.result"]).toBe(
+    JSON.stringify({ results: ["release"] }),
+  );
+  expect(completed.status.code).toBe(SpanStatusCode.UNSET);
+  expect(unresolved.status.code).toBe(SpanStatusCode.ERROR);
+  expect(unresolved.attributes["error.type"]).toBe("Error");
+  expect(event(unresolved, "exception")?.attributes?.["exception.message"]).toBe(
+    "refinement failed",
+  );
+  expect(event(unresolved, "tool.result_unobserved")).toBeUndefined();
+});
+
+test("invalid provider tool details honor disabled input capture", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-invalid-redacted";
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+    recordInputs: false,
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({
+    callId,
+    content: [
+      {
+        type: "tool-call",
+        toolCallId: "invalid-redacted",
+        toolName: "web_search",
+        input: { query: "private rejected input" },
+        error: new Error("invalid input: private rejected input"),
+        invalid: true,
+        providerExecuted: true,
+      },
+    ],
+  });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model,
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const tool = byOperation(spanBatches[0]!, "execute_tool")[0]!;
+
+  expect(tool.attributes["gen_ai.tool.call.arguments"]).toBeUndefined();
+  expect(tool.attributes["error.type"]).toBe("Error");
+  expect(event(tool, "exception")?.attributes?.["exception.message"]).toBe("Tool execution failed");
+  expect(JSON.stringify({ attributes: tool.attributes, events: tool.events })).not.toContain(
+    "private rejected input",
+  );
+});
+
+test("pending provider tools remain incomplete when a call ends without a final result", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-unresolved";
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "anthropic",
+    modelId: "claude-sonnet",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({
+    callId,
+    content: [
+      {
+        type: "tool-call",
+        toolCallId: "pending-result",
+        toolName: "code_execution",
+        input: { code: "wait()" },
+        providerExecuted: true,
+      },
+    ],
+  });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model: { provider: "anthropic", modelId: "claude-sonnet" },
+    text: "",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const tool = byOperation(spanBatches[0]!, "execute_tool")[0]!;
+
+  expect(tool.status.code).toBe(SpanStatusCode.UNSET);
+  expect(tool.attributes["error.type"]).toBeUndefined();
+  expect(event(tool, "exception")).toBeUndefined();
+  expect(event(tool, "tool.result_unobserved")?.attributes?.["log.message"]).toBe(
+    "Provider tool result was not observed",
+  );
+});
+
+test("step-end content reconstructs provider tools when model-call end is absent", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-step-fallback";
+  const toolCall = {
+    type: "tool-call",
+    toolCallId: "step-fallback",
+    toolName: "code_execution",
+    input: { code: "print(1)" },
+    providerExecuted: true,
+  };
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.streamText",
+    provider: "anthropic",
+    modelId: "claude-sonnet",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model: { provider: "anthropic", modelId: "claude-sonnet" },
+    content: [toolCall],
+    text: "",
+    finishReason: "unknown",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "",
+    finishReason: "unknown",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const spans = spanBatches[0]!;
+  const root = spans.find((span) => span.kind === SpanKind.INTERNAL)!;
+  const tool = byOperation(spans, "execute_tool")[0]!;
+
+  expect(byOperation(spans, "execute_tool")).toHaveLength(1);
+  expect(root.attributes["gen_ai.operation.name"]).toBe("invoke_agent");
+  expect(tool.attributes["gen_ai.tool.call.id"]).toBe("step-fallback");
+  expect(event(tool, "tool.result_unobserved")).toBeDefined();
+});
+
+test("terminal errors retain concrete provider results and suppress provisional calls", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-approval-error";
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "anthropic",
+    modelId: "claude-sonnet",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({
+    callId,
+    content: [
+      {
+        type: "tool-call",
+        toolCallId: "approval-pending",
+        toolName: "computer_use",
+        input: { action: "click" },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-call",
+        toolCallId: "provider-completed",
+        toolName: "web_search",
+        input: { query: "latest" },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-result",
+        toolCallId: "provider-completed",
+        toolName: "web_search",
+        output: { result: "found" },
+        providerExecuted: true,
+      },
+    ],
+  });
+  await integ.onError?.({ callId, error: new Error("approval callback failed") });
+
+  const spans = spanBatches[0]!;
+  const root = spans.find(
+    (span) => span.kind === SpanKind.INTERNAL && span.name !== "execute_tool",
+  )!;
+  const tools = byOperation(spans, "execute_tool");
+
+  expect(tools).toHaveLength(1);
+  expect(
+    tools.find((span) => span.attributes["gen_ai.tool.call.id"] === "approval-pending"),
+  ).toBeUndefined();
+
+  const completed = tools.find(
+    (span) => span.attributes["gen_ai.tool.call.id"] === "provider-completed",
+  )!;
+
+  expect(completed.attributes["gen_ai.tool.call.result"]).toBe(JSON.stringify({ result: "found" }));
+  expect(root.attributes["gen_ai.operation.name"]).toBe("invoke_agent");
+});
+
+test("confirmed pending provider tools survive error and abort termination", async () => {
+  const errorCapture = makeCapture();
+  const errorInteg = telemetryDev(baseOptions, errorCapture.overrides);
+  const errorCallId = "call-provider-pending-error";
+  const errorToolCall = {
+    type: "tool-call",
+    toolCallId: "pending-error",
+    toolName: "code_execution",
+    input: { code: "fail()" },
+    providerExecuted: true,
+  };
+
+  errorInteg.onStart?.({
+    callId: errorCallId,
+    operationId: "ai.generateText",
+    provider: "anthropic",
+    modelId: "claude-sonnet",
+    recordOutputs: false,
+  });
+  errorInteg.onStepStart?.({ callId: errorCallId, stepNumber: 0 });
+  errorInteg.onLanguageModelCallEnd?.({
+    callId: errorCallId,
+    content: [errorToolCall],
+  });
+  errorInteg.onStepEnd?.({
+    callId: errorCallId,
+    stepNumber: 0,
+    model: { provider: "anthropic", modelId: "claude-sonnet" },
+    content: [errorToolCall],
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await errorInteg.onError?.({ callId: errorCallId, error: new Error("secret failure") });
+
+  const errorSpans = errorCapture.spanBatches[0]!;
+  const errorRoot = errorSpans.find(
+    (span) => span.kind === SpanKind.INTERNAL && span.name !== "execute_tool",
+  )!;
+  const errorStep = byOperation(errorSpans, "chat").find((span) => span.kind === SpanKind.CLIENT)!;
+  const incompleteTool = byOperation(errorSpans, "execute_tool")[0]!;
+
+  expect(errorRoot.attributes["gen_ai.operation.name"]).toBe("invoke_agent");
+  expect(event(errorRoot, "exception")?.attributes?.["exception.message"]).toBe(
+    "Generation failed",
+  );
+  expect(incompleteTool.parentSpanContext?.spanId).toBe(spanId(errorStep));
+  expect(incompleteTool.status.code).toBe(SpanStatusCode.UNSET);
+  expect(incompleteTool.attributes["error.type"]).toBeUndefined();
+  expect(event(incompleteTool, "exception")).toBeUndefined();
+  expect(event(incompleteTool, "tool.result_unobserved")?.attributes?.["log.message"]).toBe(
+    "Provider tool result was not observed",
+  );
+  expect(JSON.stringify(errorSpans.map((span) => span.events))).not.toContain("secret failure");
+
+  const abortCapture = makeCapture();
+  const abortInteg = telemetryDev(baseOptions, abortCapture.overrides);
+  const abortCallId = "call-provider-pending-abort";
+  const abortToolCall = {
+    type: "tool-call",
+    toolCallId: "pending-abort",
+    toolName: "code_execution",
+    input: { code: "wait()" },
+    providerExecuted: true,
+  };
+
+  abortInteg.onStart?.({
+    callId: abortCallId,
+    operationId: "ai.streamText",
+    provider: "anthropic",
+    modelId: "claude-sonnet",
+  });
+  abortInteg.onStepStart?.({ callId: abortCallId, stepNumber: 0 });
+  abortInteg.onLanguageModelCallEnd?.({
+    callId: abortCallId,
+    content: [abortToolCall],
+  });
+  abortInteg.onStepEnd?.({
+    callId: abortCallId,
+    stepNumber: 0,
+    model: { provider: "anthropic", modelId: "claude-sonnet" },
+    content: [abortToolCall],
+    text: "",
+    finishReason: "tool-calls",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await abortInteg.onAbort?.({ callId: abortCallId });
+
+  const abortSpans = abortCapture.spanBatches[0]!;
+  const abortRoot = abortSpans.find(
+    (span) => span.kind === SpanKind.INTERNAL && span.name !== "execute_tool",
+  )!;
+  const abortStep = byOperation(abortSpans, "chat").find((span) => span.kind === SpanKind.CLIENT)!;
+  const abortedTool = byOperation(abortSpans, "execute_tool")[0]!;
+
+  expect(abortRoot.attributes["gen_ai.operation.name"]).toBe("invoke_agent");
+  expect(abortedTool.parentSpanContext?.spanId).toBe(spanId(abortStep));
+  expect(abortedTool.status.code).toBe(SpanStatusCode.UNSET);
+  expect(abortedTool.attributes["error.type"]).toBeUndefined();
+  expect(event(abortedTool, "exception")).toBeUndefined();
+  expect(event(abortedTool, "tool.result_unobserved")?.attributes?.["log.message"]).toBe(
+    "Provider tool result was not observed",
+  );
+  expect(abortSpans.every((span) => span.status.code !== SpanStatusCode.ERROR)).toBe(true);
+});
+
+test("abort before step confirmation omits provisional provider calls", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-provisional-abort";
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.streamText",
+    provider: "anthropic",
+    modelId: "claude-sonnet",
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({
+    callId,
+    content: [
+      {
+        type: "tool-call",
+        toolCallId: "provisional-abort",
+        toolName: "computer_use",
+        input: { action: "click" },
+        providerExecuted: true,
+      },
+    ],
+  });
+  await integ.onAbort?.({ callId });
+
+  const spans = spanBatches[0]!;
+  const root = spans.find((span) => span.kind === SpanKind.INTERNAL)!;
+
+  expect(byOperation(spans, "execute_tool")).toHaveLength(0);
+  expect(root.attributes["gen_ai.operation.name"]).toBe("chat");
 });
 
 test("onError marks root and open step failed and a later onEnd for the same callId is a no-op", async () => {
@@ -704,7 +2781,35 @@ test("generateObject emits json root, one chat child, and a step metric", async 
   expect(metrics.filter((m) => m.metric === "tokens")).toHaveLength(2);
 });
 
-test("embedMany flushes two embedding children and aggregated root usage on onEnd only", async () => {
+test("streamObject redacts terminal error details when output capture is disabled", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-object-redacted-error";
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.streamObject",
+    provider: "openai",
+    modelId: "gpt-4o",
+    recordOutputs: false,
+  });
+  await integ.onEnd?.({
+    callId,
+    error: new Error("private object failure"),
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 0 },
+  });
+
+  const root = spanBatches[0]!.find((span) => span.kind === SpanKind.INTERNAL)!;
+
+  expect(root.status.code).toBe(SpanStatusCode.ERROR);
+  expect(event(root, "exception")?.attributes?.["exception.message"]).toBe(
+    "Structured output parsing or validation failed",
+  );
+  expect(JSON.stringify(root.events)).not.toContain("private object failure");
+});
+
+test("embedMany records usage only on provider-call children", async () => {
   const { spanBatches, metrics, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-embed";
@@ -899,6 +3004,12 @@ test("recordInputs and recordOutputs false omit message and tool payload attrs b
   const callId = "call-redact";
   const toolCall = { toolCallId: "tc-1", toolName: "search", input: { q: "secret-in" } };
 
+  const failedToolCall = {
+    toolCallId: "tc-error",
+    toolName: "search",
+    input: { q: "local-error-secret-in" },
+  };
+
   integ.onStart?.({
     callId,
     operationId: "ai.generateText",
@@ -913,11 +3024,88 @@ test("recordInputs and recordOutputs false omit message and tool payload attrs b
     stepNumber: 0,
     messages: [{ role: "user", content: "secret step in" }],
   });
+  integ.onLanguageModelCallEnd?.({
+    callId,
+    content: [
+      {
+        type: "tool-call",
+        toolCallId: "provider-redacted",
+        toolName: "web_search",
+        input: { q: "provider-secret-in" },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-result",
+        toolCallId: "provider-redacted",
+        toolName: "web_search",
+        input: { q: "provider-secret-in" },
+        output: { secret: "provider-secret-out" },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-call",
+        toolCallId: "provider-string-error",
+        toolName: "web_search",
+        input: { q: "provider-string-secret-in" },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-error",
+        toolCallId: "provider-string-error",
+        toolName: "web_search",
+        input: { q: "provider-string-secret-in" },
+        error: "provider-string-secret-out",
+        providerExecuted: true,
+      },
+      {
+        type: "tool-call",
+        toolCallId: "provider-error-object",
+        toolName: "web_search",
+        input: { q: "provider-error-secret-in" },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-error",
+        toolCallId: "provider-error-object",
+        toolName: "web_search",
+        input: { q: "provider-error-secret-in" },
+        error: new RangeError("provider-error-secret-out"),
+        providerExecuted: true,
+      },
+      {
+        type: "tool-call",
+        toolCallId: "provider-mcp-error",
+        toolName: "mcp.delete_file",
+        input: '{"path":"provider-mcp-secret-in"}',
+        providerExecuted: true,
+        dynamic: true,
+      },
+      {
+        type: "tool-result",
+        toolCallId: "provider-mcp-error",
+        toolName: "mcp.delete_file",
+        output: {
+          type: "call",
+          serverLabel: "files",
+          name: "delete_file",
+          arguments: '{"path":"provider-mcp-secret-in"}',
+          error: "provider-mcp-secret-out",
+        },
+        providerExecuted: true,
+      },
+    ],
+  });
   integ.onToolExecutionEnd?.({
     callId,
     toolCall,
     toolExecutionMs: 50,
     toolOutput: { type: "tool-result", output: { secret: "out" } },
+  });
+  integ.onToolExecutionEnd?.({
+    callId,
+    toolCall: failedToolCall,
+    toolExecutionMs: 25,
+    toolOutput: { type: "tool-error", error: new Error("local-error-secret-out") },
   });
   integ.onStepEnd?.({
     callId,
@@ -938,21 +3126,58 @@ test("recordInputs and recordOutputs false omit message and tool payload attrs b
   const spans = spanBatches[0]!;
   const root = spans.find((s) => s.kind === SpanKind.INTERNAL)!;
   const step = byOperation(spans, "chat").find((s) => s.kind === SpanKind.CLIENT)!;
-  const tool = byOperation(spans, "execute_tool")[0]!;
+  const tools = byOperation(spans, "execute_tool");
 
   expect(root.attributes["gen_ai.input.messages"]).toBeUndefined();
   expect(root.attributes["gen_ai.output.messages"]).toBeUndefined();
   expect(step.attributes["gen_ai.input.messages"]).toBeUndefined();
   expect(step.attributes["gen_ai.output.messages"]).toBeUndefined();
-  expect(tool.attributes["gen_ai.tool.call.arguments"]).toBeUndefined();
-  expect(tool.attributes["gen_ai.tool.call.result"]).toBeUndefined();
+
+  expect(tools).toHaveLength(6);
+
+  for (const tool of tools) {
+    expect(tool.attributes["gen_ai.tool.call.arguments"]).toBeUndefined();
+    expect(tool.attributes["gen_ai.tool.call.result"]).toBeUndefined();
+  }
+
+  const failures = tools.filter((tool) => tool.status.code === SpanStatusCode.ERROR);
+
+  expect(failures).toHaveLength(4);
+  expect(
+    failures
+      .map((failure) => failure.attributes["error.type"])
+      .sort((left, right) => String(left).localeCompare(String(right))),
+  ).toEqual(["Error", "RangeError", "tool_error", "tool_error"]);
+
+  for (const failure of failures) {
+    expect(event(failure, "exception")?.attributes?.["exception.message"]).toBe(
+      "Tool execution failed",
+    );
+  }
+
+  expect(
+    JSON.stringify(spans.map((span) => ({ attributes: span.attributes, events: span.events }))),
+  ).not.toContain("secret");
 
   expect(root.attributes["gen_ai.provider.name"]).toBe("openai");
   expect(step.attributes["gen_ai.usage.input_tokens"]).toBe(9);
   expect(step.attributes["gen_ai.usage.output_tokens"]).toBe(4);
   expect(step.attributes["gen_ai.response.id"]).toBe("redact-r");
-  expect(tool.attributes["gen_ai.tool.call.id"]).toBe("tc-1");
-  expect(tool.attributes["gen_ai.tool.name"]).toBe("search");
+  expect(
+    tools
+      .map((tool) => [
+        String(tool.attributes["gen_ai.tool.call.id"]),
+        String(tool.attributes["gen_ai.tool.name"]),
+      ])
+      .sort((a, b) => a[0]!.localeCompare(b[0]!)),
+  ).toEqual([
+    ["provider-error-object", "web_search"],
+    ["provider-mcp-error", "mcp.delete_file"],
+    ["provider-redacted", "web_search"],
+    ["provider-string-error", "web_search"],
+    ["tc-1", "search"],
+    ["tc-error", "search"],
+  ]);
 });
 
 test("v7 exports session spans only when the configured sampler selects them", async () => {

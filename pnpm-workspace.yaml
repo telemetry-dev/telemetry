@@ -20,7 +20,14 @@ catalog:
   "@opentelemetry/sdk-logs": ^0.218.0
   "@opentelemetry/sdk-metrics": ^2.7.1
   "@opentelemetry/sdk-trace-base": ^2.7.1
+  "@anthropic-ai/sdk": 0.126.0
+  "@aws-sdk/client-bedrock-agent-runtime": ^3.1135.0
+  "@aws-sdk/client-bedrock-runtime": ^3.1135.0
+  "@google/genai": 2.23.0
   "@types/node": ^24
+  ai: 7.0.106
+  cross-env: 10.1.0
+  openai: 7.18.0
   typescript: ^5
   vite: npm:@voidzero-dev/vite-plus-core@0.1.20
   vite-plus: 0.1.20

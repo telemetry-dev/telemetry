@@ -26,7 +26,6 @@ import {
   SEVERITY_WARN,
   type TelemetryDevEvent,
   type JsonValue,
-  unknownErrorMessage,
 } from "./shared.ts";
 
 type TelemetryDevHook = (event: TelemetryDevEvent) => void | PromiseLike<void>;
@@ -40,6 +39,7 @@ type TelemetryDevHook = (event: TelemetryDevEvent) => void | PromiseLike<void>;
 export interface TelemetryDevIntegration {
   onStart?: TelemetryDevHook;
   onStepStart?: TelemetryDevHook;
+  onLanguageModelCallEnd?: TelemetryDevHook;
   onStepEnd?: TelemetryDevHook;
   onToolExecutionStart?: TelemetryDevHook;
   onToolExecutionEnd?: TelemetryDevHook;
@@ -93,7 +93,7 @@ export function telemetryDev(
 }
 
 // Structural shapes of the ai@7 telemetry events the v7 hooks read, grounded in
-// vercel/ai@7.0.13 (packages/ai/src/generate-text/*, generate-object/structured-output-events,
+// vercel/ai@7.0.106 (packages/ai/src/generate-text/*, generate-object/structured-output-events,
 // embed/embed-events, rerank/rerank-events). Declared locally so the emitted types never import
 // from `ai`.
 
@@ -158,6 +158,7 @@ interface V7StepEndEvent {
   callId: string;
   stepNumber: number;
   model: { provider: string; modelId: string };
+  content?: ReadonlyArray<V7LanguageModelContentPart>;
   text?: string;
   finishReason?: string;
   response?: { id?: string; modelId?: string };
@@ -165,6 +166,58 @@ interface V7StepEndEvent {
   performance?: V7Performance;
   warnings?: Array<Record<string, JsonValue>>;
   runtimeContext?: Record<string, JsonValue>;
+}
+
+interface V7LanguageModelContentPart {
+  type: string;
+  approvalId?: string;
+  approved?: boolean;
+  isAutomatic?: boolean;
+  toolCallId?: string;
+  toolName?: string;
+  toolCall?: V7LanguageModelContentPart;
+  input?: unknown;
+  output?: unknown;
+  error?: unknown;
+  invalid?: boolean;
+  providerExecuted?: boolean;
+  preliminary?: boolean;
+  dynamic?: boolean;
+}
+
+interface V7LanguageModelCallEndEvent {
+  callId: string;
+  content: ReadonlyArray<V7LanguageModelContentPart>;
+}
+
+interface ProviderToolIdentity {
+  toolCallId: string;
+  toolName: string;
+}
+
+interface BlockedProviderToolCall extends ProviderToolIdentity {
+  contentIndex: number | undefined;
+  occurrenceIndex: number | undefined;
+}
+
+interface ProviderToolFailure {
+  errorType: string;
+  message: string;
+}
+
+type ProviderToolOutput =
+  | { type: "tool-result"; result?: string }
+  | { type: "tool-error"; failure: ProviderToolFailure };
+
+interface ProviderToolCallState extends ProviderToolIdentity {
+  parentCtx: Context;
+  stepNumber: number | null;
+  occurrenceIndex: number | undefined;
+  confirmed: boolean;
+  arguments?: string;
+  invalidFailure?: ProviderToolFailure;
+  output?: ProviderToolOutput;
+  outputObservedAt?: Date;
 }
 
 interface V7ToolCall {
@@ -302,6 +355,11 @@ interface CallState {
   toolSpans: Map<string, { span: Span; startedAt: Date }>;
   childSpans: Span[];
   hasToolSpan: boolean;
+  // Ordered observations: duplicate IDs are valid; results and approvals bind to the newest unmatched call.
+  providerToolCalls: ProviderToolCallState[];
+  providerToolInputs: Map<string, string | undefined>;
+  providerToolInputHistory: Array<{ key: string; input: unknown }>;
+  languageModelContentObservedSteps: Set<number>;
   stepMetrics: StepMetric[];
   toolMetrics: Array<{ durationSec: number }>;
   objectStep: { span: Span; startedAt: Date } | undefined;
@@ -429,6 +487,526 @@ export function createV7Hooks(
     span.end(endedAt);
   };
 
+  const detailedToolErrorMessage = (value: unknown): string => {
+    try {
+      if (value instanceof Error && value.message.length > 0) return value.message;
+
+      if (typeof value === "string" && value.length > 0) return value;
+
+      if (
+        value === null ||
+        value === undefined ||
+        typeof value === "number" ||
+        typeof value === "boolean" ||
+        typeof value === "bigint" ||
+        typeof value === "symbol"
+      ) {
+        return String(value);
+      }
+
+      if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+        const message = (value as { message?: unknown }).message;
+
+        if (typeof message === "string" && message.length > 0) return message;
+      }
+    } catch {
+      return "Tool execution failed";
+    }
+
+    return "Tool execution failed";
+  };
+
+  const providerToolFailure = (value: unknown, recordOutputs: boolean): ProviderToolFailure => {
+    let errorType = "tool_error";
+
+    try {
+      if (value instanceof Error && value.name.length > 0) errorType = value.name;
+    } catch {
+      return { errorType, message: "Tool execution failed" };
+    }
+
+    return {
+      errorType,
+      message: recordOutputs ? detailedToolErrorMessage(value) : "Tool execution failed",
+    };
+  };
+
+  const providerToolResultError = (part: V7LanguageModelContentPart): unknown => {
+    if (part.type !== "tool-result") return undefined;
+
+    const result = part.output as {
+      type?: unknown;
+      serverLabel?: unknown;
+      name?: unknown;
+      arguments?: unknown;
+      error?: unknown;
+    } | null;
+
+    if (
+      result?.type !== "call" ||
+      typeof result.serverLabel !== "string" ||
+      typeof result.name !== "string" ||
+      typeof result.arguments !== "string" ||
+      part.toolName !== `mcp.${result.name}` ||
+      result.error == null ||
+      result.error === false
+    ) {
+      return undefined;
+    }
+
+    return result.error;
+  };
+
+  const providerToolIdentity = (
+    part: V7LanguageModelContentPart,
+  ): ProviderToolIdentity | undefined =>
+    part.toolCallId !== undefined && part.toolName !== undefined
+      ? { toolCallId: part.toolCallId, toolName: part.toolName }
+      : undefined;
+
+  const sameProviderToolCall = (left: ProviderToolIdentity, right: ProviderToolIdentity) =>
+    left.toolCallId === right.toolCallId && left.toolName === right.toolName;
+
+  const providerToolIdentityKey = (identity: ProviderToolIdentity) =>
+    JSON.stringify([identity.toolCallId, identity.toolName]);
+
+  const unavailableProviderToolInput = Symbol();
+
+  const rememberProviderToolInputs = (state: CallState, messages: unknown) => {
+    if (!state.recordInputs || !Array.isArray(messages)) return;
+
+    const messageCount = messages.length;
+    const currentHistory: Array<{ key: string; input: unknown }> = [];
+    let malformed = false;
+
+    for (let messageIndex = 0; messageIndex < messageCount; messageIndex++) {
+      try {
+        const value = messages[messageIndex];
+
+        if (value === null || typeof value !== "object") continue;
+        const message = value as { role?: unknown; content?: unknown };
+
+        if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+        const contentCount = message.content.length;
+
+        for (let contentIndex = 0; contentIndex < contentCount; contentIndex++) {
+          try {
+            const content = message.content[contentIndex];
+
+            if (content === null || typeof content !== "object") continue;
+            const part = content as V7LanguageModelContentPart;
+            const identity = providerToolIdentity(part);
+
+            if (
+              part.type === "tool-call" &&
+              part.providerExecuted === true &&
+              identity !== undefined
+            ) {
+              let input: unknown = unavailableProviderToolInput;
+
+              try {
+                input = part.input;
+              } catch {
+                input = unavailableProviderToolInput;
+              }
+
+              currentHistory.push({ key: providerToolIdentityKey(identity), input });
+            }
+          } catch {
+            malformed = true;
+            continue;
+          }
+        }
+      } catch {
+        malformed = true;
+        continue;
+      }
+    }
+
+    if (malformed) {
+      state.providerToolInputs.clear();
+      state.providerToolInputHistory = [];
+
+      return;
+    }
+
+    const previousHistory = state.providerToolInputHistory;
+    const appended =
+      currentHistory.length >= previousHistory.length &&
+      previousHistory.every(
+        (previous, index) =>
+          previous.key === currentHistory[index]!.key &&
+          previous.input === currentHistory[index]!.input,
+      );
+    const startIndex = appended ? previousHistory.length : 0;
+
+    if (!appended) state.providerToolInputs.clear();
+
+    for (let index = startIndex; index < currentHistory.length; index++) {
+      const { key, input } = currentHistory[index]!;
+      state.providerToolInputs.set(
+        key,
+        input === unavailableProviderToolInput ? undefined : jsonAttr(input),
+      );
+    }
+
+    state.providerToolInputHistory = currentHistory;
+  };
+
+  const providerToolOutput = (
+    state: CallState,
+    part: V7LanguageModelContentPart,
+  ): ProviderToolOutput => {
+    const resultError = providerToolResultError(part);
+
+    if (resultError !== undefined) {
+      return {
+        type: "tool-error",
+        failure: providerToolFailure(resultError, state.recordOutputs),
+      };
+    }
+
+    if (part.type === "tool-error") {
+      return {
+        type: "tool-error",
+        failure: providerToolFailure(part.error, state.recordOutputs),
+      };
+    }
+
+    return {
+      type: "tool-result",
+      result: state.recordOutputs ? jsonAttr(part.output) : undefined,
+    };
+  };
+
+  const latestProviderToolCall = (state: CallState, output: ProviderToolIdentity) => {
+    let latest: ProviderToolCallState | undefined;
+
+    for (let index = state.providerToolCalls.length - 1; index >= 0; index--) {
+      const pending = state.providerToolCalls[index]!;
+
+      if (!sameProviderToolCall(pending, output)) continue;
+
+      latest ??= pending;
+
+      if (pending.output === undefined) return pending;
+    }
+
+    return latest;
+  };
+
+  const removeLatestUnmatchedProviderToolCall = (
+    state: CallState,
+    toolCall: BlockedProviderToolCall,
+    stepNumber: number,
+  ) => {
+    if (toolCall.occurrenceIndex === undefined) return;
+
+    for (let index = state.providerToolCalls.length - 1; index >= 0; index--) {
+      const pending = state.providerToolCalls[index]!;
+
+      if (
+        pending.stepNumber === stepNumber &&
+        pending.occurrenceIndex === toolCall.occurrenceIndex &&
+        pending.output === undefined &&
+        sameProviderToolCall(pending, toolCall)
+      ) {
+        state.providerToolCalls.splice(index, 1);
+
+        return;
+      }
+    }
+  };
+
+  const recordProviderToolSpan = (
+    state: CallState,
+    pending: ProviderToolCallState,
+    endedAt: Date,
+  ) => {
+    const { toolCallId, toolName, parentCtx, output } = pending;
+
+    const spanTime = pending.outputObservedAt ?? endedAt;
+
+    const span = emitter.tracer.startSpan(
+      "execute_tool",
+      {
+        startTime: spanTime,
+        kind: SpanKind.INTERNAL,
+        attributes: omitUndefined({
+          "gen_ai.operation.name": "execute_tool",
+          "gen_ai.tool.name": toolName,
+          "gen_ai.tool.call.id": toolCallId,
+          "gen_ai.tool.type": "extension",
+          ...conversationAttributes(state),
+          "gen_ai.tool.call.arguments": pending.arguments,
+        }),
+      },
+      parentCtx,
+    );
+
+    if (output?.type === "tool-result") {
+      if (output.result !== undefined) span.setAttribute("gen_ai.tool.call.result", output.result);
+
+      span.end(spanTime);
+    } else if (output?.type === "tool-error") {
+      markSpanFailed(span, output.failure.errorType, output.failure.message, spanTime);
+    } else if (pending.invalidFailure) {
+      markSpanFailed(
+        span,
+        pending.invalidFailure.errorType,
+        pending.invalidFailure.message,
+        spanTime,
+      );
+    } else {
+      span.addEvent("tool.result_unobserved", {
+        "log.severity_number": SEVERITY_INFO,
+        "log.message": "Provider tool result was not observed",
+      });
+      span.end(spanTime);
+    }
+
+    state.childSpans.push(span);
+    state.hasToolSpan = true;
+  };
+
+  const providerToolCallsBlockedByApproval = (
+    content: ReadonlyArray<V7LanguageModelContentPart>,
+  ) => {
+    const blockedToolCalls: BlockedProviderToolCall[] = [];
+    const matchedApprovalContentIndexes = new Set<number>();
+    const providerToolCallCounts = new Map<string, number>();
+    const toolCallOccurrences: Array<
+      ProviderToolIdentity & {
+        contentIndex: number;
+        occurrenceIndex: number;
+        part: V7LanguageModelContentPart;
+        completed: boolean;
+      }
+    > = [];
+    const approvalResponses: Array<{
+      approvalId: string;
+      approved: boolean;
+      toolCall: V7LanguageModelContentPart;
+      identity: ProviderToolIdentity;
+    }> = [];
+    const consumedApprovalResponses = new Set<number>();
+
+    for (const [contentIndex, part] of content.entries()) {
+      const identity = providerToolIdentity(part);
+
+      if (part.type === "tool-call" && part.providerExecuted === true && identity !== undefined) {
+        const identityKey = providerToolIdentityKey(identity);
+        const occurrenceIndex = providerToolCallCounts.get(identityKey) ?? 0;
+        providerToolCallCounts.set(identityKey, occurrenceIndex + 1);
+        toolCallOccurrences.push({
+          ...identity,
+          contentIndex,
+          occurrenceIndex,
+          part,
+          completed: false,
+        });
+
+        continue;
+      }
+
+      if (
+        (part.type === "tool-result" || part.type === "tool-error") &&
+        part.providerExecuted === true &&
+        part.preliminary !== true &&
+        identity !== undefined
+      ) {
+        for (let index = toolCallOccurrences.length - 1; index >= 0; index--) {
+          const occurrence = toolCallOccurrences[index]!;
+
+          if (!occurrence.completed && sameProviderToolCall(occurrence, identity)) {
+            occurrence.completed = true;
+            break;
+          }
+        }
+
+        continue;
+      }
+
+      const approvalToolCall = part.type === "tool-approval-response" ? part.toolCall : undefined;
+      const approvalIdentity = approvalToolCall
+        ? providerToolIdentity(approvalToolCall)
+        : undefined;
+
+      if (
+        part.approvalId !== undefined &&
+        part.approved !== undefined &&
+        approvalToolCall !== undefined &&
+        approvalIdentity !== undefined
+      ) {
+        approvalResponses.push({
+          approvalId: part.approvalId,
+          approved: part.approved,
+          toolCall: approvalToolCall,
+          identity: approvalIdentity,
+        });
+      }
+    }
+
+    for (const [approvalIndex, part] of content.entries()) {
+      const toolCall = part.type === "tool-approval-request" ? part.toolCall : undefined;
+      const identity = toolCall ? providerToolIdentity(toolCall) : undefined;
+
+      if (toolCall?.providerExecuted !== true || identity === undefined) continue;
+
+      let responseIndex = -1;
+
+      if (part.isAutomatic === true && part.approvalId !== undefined) {
+        responseIndex = approvalResponses.findIndex(
+          (response, index) =>
+            !consumedApprovalResponses.has(index) &&
+            response.approvalId === part.approvalId &&
+            response.toolCall === toolCall,
+        );
+
+        if (responseIndex === -1) {
+          responseIndex = approvalResponses.findIndex(
+            (response, index) =>
+              !consumedApprovalResponses.has(index) &&
+              response.approvalId === part.approvalId &&
+              sameProviderToolCall(response.identity, identity),
+          );
+        }
+      }
+
+      const automaticallyApproved =
+        responseIndex !== -1 && approvalResponses[responseIndex]!.approved;
+
+      if (responseIndex !== -1) {
+        consumedApprovalResponses.add(responseIndex);
+      }
+
+      let occurrence = toolCallOccurrences.find(
+        (candidate) =>
+          candidate.contentIndex < approvalIndex &&
+          !matchedApprovalContentIndexes.has(candidate.contentIndex) &&
+          candidate.part === toolCall,
+      );
+
+      occurrence ??= toolCallOccurrences.find(
+        (candidate) =>
+          candidate.contentIndex < approvalIndex &&
+          (automaticallyApproved || !candidate.completed) &&
+          !matchedApprovalContentIndexes.has(candidate.contentIndex) &&
+          sameProviderToolCall(candidate, identity),
+      );
+
+      occurrence ??= toolCallOccurrences.find(
+        (candidate) =>
+          candidate.contentIndex < approvalIndex &&
+          !matchedApprovalContentIndexes.has(candidate.contentIndex) &&
+          sameProviderToolCall(candidate, identity),
+      );
+
+      if (occurrence) matchedApprovalContentIndexes.add(occurrence.contentIndex);
+
+      if (automaticallyApproved) continue;
+
+      blockedToolCalls.push({
+        ...identity,
+        contentIndex: occurrence?.contentIndex,
+        occurrenceIndex: occurrence?.occurrenceIndex,
+      });
+    }
+
+    return blockedToolCalls;
+  };
+
+  const recordProviderToolSpans = (
+    state: CallState,
+    content: ReadonlyArray<V7LanguageModelContentPart>,
+    blockedToolCalls = providerToolCallsBlockedByApproval(content),
+  ) => {
+    const outputObservedAt = new Date();
+    const providerToolCallCounts = new Map<string, number>();
+
+    for (const [contentIndex, part] of content.entries()) {
+      const identity = providerToolIdentity(part);
+
+      if (part.type === "tool-call" && part.providerExecuted === true && identity !== undefined) {
+        const identityKey = providerToolIdentityKey(identity);
+        const occurrenceIndex = providerToolCallCounts.get(identityKey) ?? 0;
+        providerToolCallCounts.set(identityKey, occurrenceIndex + 1);
+
+        if (blockedToolCalls.some((blocked) => blocked.contentIndex === contentIndex)) continue;
+
+        const parentCtx =
+          (state.currentStepNumber != null
+            ? state.steps.get(state.currentStepNumber)?.ctx
+            : undefined) ?? state.rootCtx;
+
+        state.providerToolCalls.push({
+          ...identity,
+          parentCtx,
+          stepNumber: state.currentStepNumber,
+          occurrenceIndex,
+          confirmed: false,
+          arguments: state.recordInputs ? jsonAttr(part.input) : undefined,
+          invalidFailure:
+            part.invalid === true
+              ? providerToolFailure(part.error, state.recordInputs && state.recordOutputs)
+              : undefined,
+        });
+
+        continue;
+      }
+
+      if (
+        (part.type !== "tool-error" && part.type !== "tool-result") ||
+        part.providerExecuted !== true ||
+        part.preliminary === true ||
+        identity === undefined
+      ) {
+        continue;
+      }
+
+      const parentCtx =
+        (state.currentStepNumber != null
+          ? state.steps.get(state.currentStepNumber)?.ctx
+          : undefined) ?? state.rootCtx;
+
+      let pending = latestProviderToolCall(state, identity);
+
+      if (!pending) {
+        pending = {
+          ...identity,
+          parentCtx,
+          stepNumber: state.currentStepNumber,
+          occurrenceIndex: undefined,
+          confirmed: false,
+          arguments: state.recordInputs
+            ? (jsonAttr(part.input) ??
+              state.providerToolInputs.get(providerToolIdentityKey(identity)))
+            : undefined,
+        };
+        state.providerToolCalls.push(pending);
+      }
+
+      pending.output = providerToolOutput(state, part);
+      pending.outputObservedAt = outputObservedAt;
+    }
+  };
+
+  const closePendingProviderToolSpans = (
+    state: CallState,
+    endedAt: Date,
+    confirmedOnly = false,
+  ) => {
+    const pendingToolCalls = state.providerToolCalls;
+
+    state.providerToolCalls = [];
+
+    for (const pending of pendingToolCalls) {
+      if (confirmedOnly && !pending.confirmed && pending.output === undefined) continue;
+
+      recordProviderToolSpan(state, pending, endedAt);
+    }
+  };
+
   // Ends every still-open child span of a call (steps, object step, embed/rerank model calls),
   // optionally marking them failed, and returns them for the final flush.
   const closeOpenChildSpans = (
@@ -541,7 +1119,7 @@ export function createV7Hooks(
           withSessionParent(otelContext.active(), runtime.sessionId ?? undefined, config.apiKey),
         );
 
-        calls.set(e.callId, {
+        const state: CallState = {
           opKind,
           rootSpan,
           rootCtx: trace.setSpan(ROOT_CONTEXT, rootSpan),
@@ -562,12 +1140,19 @@ export function createV7Hooks(
           toolSpans: new Map(),
           childSpans: [],
           hasToolSpan: false,
+          providerToolCalls: [],
+          providerToolInputs: new Map(),
+          providerToolInputHistory: [],
+          languageModelContentObservedSteps: new Set(),
           stepMetrics: [],
           toolMetrics: [],
           objectStep: undefined,
           embedSpans: new Map(),
           rerankSpan: undefined,
-        });
+        };
+
+        rememberProviderToolInputs(state, e.messages);
+        calls.set(e.callId, state);
       } catch (err) {
         onError?.(err instanceof Error ? err : String(err));
       }
@@ -580,6 +1165,7 @@ export function createV7Hooks(
         if (!state) return;
         const e = event as V7StepStartEvent;
         applyRuntimeContext(state, e.runtimeContext);
+        rememberProviderToolInputs(state, e.messages);
         // Open the step (model `chat`) span now so tool calls that finish within this step parent
         // to it. Attributes/finish state land at onStepEnd; the span ends there too.
         const startedAt = new Date();
@@ -612,6 +1198,22 @@ export function createV7Hooks(
       }
     },
 
+    onLanguageModelCallEnd(event) {
+      try {
+        const state = stateOf(event);
+
+        if (!state) return;
+        const e = event as V7LanguageModelCallEndEvent;
+        recordProviderToolSpans(state, e.content);
+
+        if (state.currentStepNumber !== null) {
+          state.languageModelContentObservedSteps.add(state.currentStepNumber);
+        }
+      } catch (err) {
+        onError?.(err instanceof Error ? err : String(err));
+      }
+    },
+
     onStepEnd(event) {
       try {
         const state = stateOf(event);
@@ -619,6 +1221,23 @@ export function createV7Hooks(
         if (!state) return;
         const e = event as V7StepEndEvent;
         applyRuntimeContext(state, e.runtimeContext);
+
+        if (e.content) {
+          const blockedToolCalls = providerToolCallsBlockedByApproval(e.content);
+
+          if (!state.languageModelContentObservedSteps.has(e.stepNumber)) {
+            recordProviderToolSpans(state, e.content, blockedToolCalls);
+          }
+
+          for (const toolCall of blockedToolCalls) {
+            removeLatestUnmatchedProviderToolCall(state, toolCall, e.stepNumber);
+          }
+        }
+
+        for (const pending of state.providerToolCalls) {
+          if (pending.stepNumber === e.stepNumber) pending.confirmed = true;
+        }
+
         const endedAt = new Date();
         let step = state.steps.get(e.stepNumber);
 
@@ -838,16 +1457,13 @@ export function createV7Hooks(
         state.toolStarts.delete(e.toolCall.toolCallId);
 
         if (e.toolOutput.type === "tool-error") {
-          const error = e.toolOutput.error;
+          const failure = providerToolFailure(e.toolOutput.error, state.recordOutputs);
 
-          const message = error instanceof Error ? error.message : unknownErrorMessage(error);
-
-          const errorType = error instanceof Error ? error.name : "tool_error";
           span.setStatus({ code: SpanStatusCode.ERROR });
-          span.setAttribute("error.type", errorType);
+          span.setAttribute("error.type", failure.errorType);
           span.addEvent("exception", {
-            "exception.type": errorType,
-            "exception.message": message,
+            "exception.type": failure.errorType,
+            "exception.message": failure.message,
             "log.severity_number": SEVERITY_ERROR,
           });
         }
@@ -1087,6 +1703,7 @@ export function createV7Hooks(
         applyRuntimeContext(state, e.runtimeContext);
         const endedAt = new Date();
         const root = state.rootSpan;
+        closePendingProviderToolSpans(state, endedAt);
 
         if (state.opKind === "text") {
           const finishReason = e.finishReason ?? "unknown";
@@ -1149,9 +1766,11 @@ export function createV7Hooks(
 
             const message =
               e.error !== undefined
-                ? e.error instanceof Error
-                  ? e.error.message
-                  : (jsonAttr(e.error) ?? "unknown error")
+                ? state.recordOutputs
+                  ? e.error instanceof Error
+                    ? e.error.message
+                    : (jsonAttr(e.error) ?? "unknown error")
+                  : "Structured output parsing or validation failed"
                 : `Generation failed (${e.finishReason})`;
 
             root.setStatus({ code: SpanStatusCode.ERROR });
@@ -1200,8 +1819,13 @@ export function createV7Hooks(
         const error = errorEvent.error;
         const endedAt = new Date();
         const errorType = error instanceof Error ? error.name || "error" : "error";
-        const message = error instanceof Error ? error.message : String(error);
+        const message = state.recordOutputs
+          ? error instanceof Error
+            ? error.message
+            : String(error)
+          : "Generation failed";
 
+        closePendingProviderToolSpans(state, endedAt, true);
         closeOpenChildSpans(state, endedAt, { errorType, message });
 
         state.rootSpan.setAttributes(
@@ -1229,6 +1853,7 @@ export function createV7Hooks(
         if (!state || callId === undefined) return;
         const endedAt = new Date();
 
+        closePendingProviderToolSpans(state, endedAt, true);
         closeOpenChildSpans(state, endedAt);
 
         state.rootSpan.setAttributes(
