@@ -582,6 +582,7 @@ test("tool success and tool error spans parent to the open step with execute_too
         },
         toString() {
           customToStringCalls += 1;
+
           return "private-custom";
         },
       },
@@ -782,6 +783,7 @@ test("provider tool observations snapshot callback payloads", async () => {
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-provider-snapshot";
+
   const toolCall = {
     type: "tool-call",
     toolCallId: "snapshot-tool",
@@ -789,6 +791,7 @@ test("provider tool observations snapshot callback payloads", async () => {
     input: { query: "original" },
     providerExecuted: true,
   };
+
   const toolResult = {
     type: "tool-result",
     toolCallId: "snapshot-tool",
@@ -1053,6 +1056,7 @@ test("provider results recover the latest matching input from a later generation
   const integ = telemetryDev(baseOptions, overrides);
   const firstCallId = "call-provider-history-source";
   const secondCallId = "call-provider-history-result";
+
   const providerCall = {
     type: "tool-call",
     toolCallId: "deferred-tool",
@@ -1097,6 +1101,7 @@ test("provider results recover the latest matching input from a later generation
       ],
     },
   ];
+
   const providerResult = {
     type: "tool-result",
     toolCallId: "deferred-tool",
@@ -1146,6 +1151,7 @@ test("provider results recover inputs from prepareStep message replacements", as
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-provider-prepare-step-history";
+
   const providerCall = {
     type: "tool-call",
     toolCallId: "deferred-tool",
@@ -1153,7 +1159,9 @@ test("provider results recover inputs from prepareStep message replacements", as
     input: { query: "initial" },
     providerExecuted: true,
   };
+
   const messages = [{ role: "assistant", content: [providerCall] }];
+
   const providerResult = {
     type: "tool-result",
     toolCallId: "deferred-tool",
@@ -1203,6 +1211,7 @@ test("provider results recover inputs from nested history mutations", async () =
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-provider-history-nested-mutation";
+
   const providerCall = {
     type: "tool-call",
     toolCallId: "deferred-tool",
@@ -1210,7 +1219,9 @@ test("provider results recover inputs from nested history mutations", async () =
     input: { query: "initial" },
     providerExecuted: true,
   };
+
   const messages = [{ role: "assistant", content: [providerCall] }];
+
   const providerResult = {
     type: "tool-result",
     toolCallId: "deferred-tool",
@@ -1261,6 +1272,7 @@ test("provider result history is not inspected when input recording is disabled"
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-provider-history-redacted";
   let inputReads = 0;
+
   const providerCall = {
     type: "tool-call",
     toolCallId: "deferred-tool",
@@ -1272,7 +1284,9 @@ test("provider result history is not inspected when input recording is disabled"
       return { query: "history-secret" };
     },
   };
+
   const messages = [{ role: "assistant", content: [providerCall] }];
+
   const providerResult = {
     type: "tool-result",
     toolCallId: "deferred-tool",
@@ -1320,6 +1334,7 @@ test("a poisoned latest history input does not reuse stale provider-tool argumen
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-provider-history-poisoned";
   let inputReads = 0;
+
   const messages = [
     {
       role: "assistant",
@@ -1345,6 +1360,7 @@ test("a poisoned latest history input does not reuse stale provider-tool argumen
       ],
     },
   ];
+
   const providerResult = {
     type: "tool-result",
     toolCallId: "deferred-tool",
@@ -1496,6 +1512,7 @@ test("provider results preceding reused calls stay with the older invocation", a
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-provider-result-before-reuse";
+
   const oldCall = {
     type: "tool-call",
     toolCallId: "reused-id",
@@ -1556,6 +1573,7 @@ test("provider results preceding reused calls stay with the older invocation", a
   });
 
   const tools = byOperation(spanBatches[0]!, "execute_tool");
+
   const oldTool = tools.find(
     (span) => span.attributes["gen_ai.tool.call.arguments"] === JSON.stringify({ query: "old" }),
   )!;
@@ -1577,6 +1595,7 @@ test("provider call and result pairs with reused ids remain distinct in one mode
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-provider-pairs-reused-id";
+
   const content = [
     {
       type: "tool-call",
@@ -1652,6 +1671,7 @@ test("approval fallback omits only the blocked occurrence when ids are reused", 
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-provider-reused-approval-fallback";
+
   const completedCall = {
     type: "tool-call",
     toolCallId: "reused-id",
@@ -1727,6 +1747,7 @@ test("approval cleanup preserves an unresolved same-step occurrence with a reuse
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-provider-reused-approval-same-step";
+
   const unresolvedCall = {
     type: "tool-call",
     toolCallId: "reused-id",
@@ -1791,6 +1812,7 @@ test("mixed blocked and approved requests bind to reused tool-call occurrences",
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-provider-mixed-approval";
+
   const blockedCall = {
     type: "tool-call",
     toolCallId: "reused-id",
@@ -1798,6 +1820,7 @@ test("mixed blocked and approved requests bind to reused tool-call occurrences",
     input: { query: "blocked" },
     providerExecuted: true,
   };
+
   const approvedCall = {
     type: "tool-call",
     toolCallId: "reused-id",
@@ -1805,6 +1828,7 @@ test("mixed blocked and approved requests bind to reused tool-call occurrences",
     input: { query: "approved" },
     providerExecuted: true,
   };
+
   const approvedResult = {
     type: "tool-result",
     toolCallId: "reused-id",
@@ -1812,9 +1836,11 @@ test("mixed blocked and approved requests bind to reused tool-call occurrences",
     output: { result: "approved result" },
     providerExecuted: true,
   };
+
   const modelContent = [blockedCall, approvedCall, approvedResult];
   const blockedRequestCall = { ...blockedCall };
   const approvedRequestCall = { ...approvedCall };
+
   const content = [
     ...modelContent,
     {
@@ -1876,6 +1902,7 @@ test("automatic approval responses are consumed once when approval ids are reuse
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-provider-reused-approval-id";
+
   const deniedCall = {
     type: "tool-call",
     toolCallId: "reused-id",
@@ -1883,6 +1910,7 @@ test("automatic approval responses are consumed once when approval ids are reuse
     input: { query: "denied" },
     providerExecuted: true,
   };
+
   const approvedCall = {
     type: "tool-call",
     toolCallId: "reused-id",
@@ -1890,6 +1918,7 @@ test("automatic approval responses are consumed once when approval ids are reuse
     input: { query: "approved" },
     providerExecuted: true,
   };
+
   const approvedResult = {
     type: "tool-result",
     toolCallId: "reused-id",
@@ -1897,7 +1926,9 @@ test("automatic approval responses are consumed once when approval ids are reuse
     output: { result: "approved result" },
     providerExecuted: true,
   };
+
   const modelContent = [deniedCall, approvedCall, approvedResult];
+
   const content = [
     ...modelContent,
     {
@@ -1967,6 +1998,7 @@ test("approval cleanup preserves older unresolved calls with reused ids", async 
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-provider-reused-approval";
+
   const unresolved = {
     type: "tool-call",
     toolCallId: "shared-id",
@@ -1974,6 +2006,7 @@ test("approval cleanup preserves older unresolved calls with reused ids", async 
     input: { code: "wait()" },
     providerExecuted: true,
   };
+
   const awaitingApproval = {
     type: "tool-call",
     toolCallId: "shared-id",
@@ -2038,6 +2071,7 @@ test("provider results match tool names when call ids are reused", async () => {
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-provider-reused-result";
+
   const codeCall = {
     type: "tool-call",
     toolCallId: "shared-id",
@@ -2045,6 +2079,7 @@ test("provider results match tool names when call ids are reused", async () => {
     input: { code: "print(1)" },
     providerExecuted: true,
   };
+
   const searchCall = {
     type: "tool-call",
     toolCallId: "shared-id",
@@ -2355,9 +2390,11 @@ test("invalid provider tool calls remain observable and retain deferred results"
   const spans = spanBatches[0]!;
   const root = spans.find((span) => span.kind === SpanKind.INTERNAL)!;
   const tools = byOperation(spans, "execute_tool");
+
   const completed = tools.find(
     (span) => span.attributes["gen_ai.tool.call.id"] === "invalid-tool",
   )!;
+
   const unresolved = tools.find(
     (span) => span.attributes["gen_ai.tool.call.id"] === "invalid-unresolved",
   )!;
@@ -2521,9 +2558,11 @@ test("terminal errors retain concrete provider results and suppress provisional 
   await integ.onError?.({ callId, error: new Error("approval callback failed") });
 
   const spans = spanBatches[0]!;
+
   const root = spans.find(
     (span) => span.kind === SpanKind.INTERNAL && span.name !== "execute_tool",
   )!;
+
   const tools = byOperation(spans, "execute_tool");
 
   expect(tools).toHaveLength(1);
@@ -2543,6 +2582,7 @@ test("confirmed pending provider tools survive error and abort termination", asy
   const errorCapture = makeCapture();
   const errorInteg = telemetryDev(baseOptions, errorCapture.overrides);
   const errorCallId = "call-provider-pending-error";
+
   const errorToolCall = {
     type: "tool-call",
     toolCallId: "pending-error",
@@ -2575,9 +2615,11 @@ test("confirmed pending provider tools survive error and abort termination", asy
   await errorInteg.onError?.({ callId: errorCallId, error: new Error("secret failure") });
 
   const errorSpans = errorCapture.spanBatches[0]!;
+
   const errorRoot = errorSpans.find(
     (span) => span.kind === SpanKind.INTERNAL && span.name !== "execute_tool",
   )!;
+
   const errorStep = byOperation(errorSpans, "chat").find((span) => span.kind === SpanKind.CLIENT)!;
   const incompleteTool = byOperation(errorSpans, "execute_tool")[0]!;
 
@@ -2597,6 +2639,7 @@ test("confirmed pending provider tools survive error and abort termination", asy
   const abortCapture = makeCapture();
   const abortInteg = telemetryDev(baseOptions, abortCapture.overrides);
   const abortCallId = "call-provider-pending-abort";
+
   const abortToolCall = {
     type: "tool-call",
     toolCallId: "pending-abort",
@@ -2628,9 +2671,11 @@ test("confirmed pending provider tools survive error and abort termination", asy
   await abortInteg.onAbort?.({ callId: abortCallId });
 
   const abortSpans = abortCapture.spanBatches[0]!;
+
   const abortRoot = abortSpans.find(
     (span) => span.kind === SpanKind.INTERNAL && span.name !== "execute_tool",
   )!;
+
   const abortStep = byOperation(abortSpans, "chat").find((span) => span.kind === SpanKind.CLIENT)!;
   const abortedTool = byOperation(abortSpans, "execute_tool")[0]!;
 
@@ -3014,6 +3059,7 @@ test("onError preserves open object and embed child classification attrs", async
 test("model warning details are redacted when payload capture is disabled", async () => {
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
+
   const warnings = [
     { type: "sensitive-warning-type", message: "secret-warning-detail" },
     { message: "secret-only-message" },
@@ -3053,13 +3099,16 @@ test("model warning details are redacted when payload capture is disabled", asyn
 
   const redactedStep = spanBatches[0]!.find((span) => span.kind === SpanKind.CLIENT)!;
   const openStep = spanBatches[1]!.find((span) => span.kind === SpanKind.CLIENT)!;
+
   const stepWarnings = (span: typeof redactedStep) =>
     span.events.filter((ev) => ev.name === "model.warning");
 
   expect(stepWarnings(redactedStep)).toHaveLength(2);
+
   for (const warningEvent of stepWarnings(redactedStep)) {
     expect(warningEvent.attributes?.["log.message"]).toBe("Model warning");
   }
+
   expect(stepWarnings(redactedStep)[0]!.attributes?.["warning.type"]).toBe(
     "sensitive-warning-type",
   );
@@ -3077,9 +3126,11 @@ test("model warning details are redacted when payload capture is disabled", asyn
   for (const mixedBatch of [spanBatches[2]!, spanBatches[3]!]) {
     const mixedStep = mixedBatch.find((span) => span.kind === SpanKind.CLIENT)!;
     expect(stepWarnings(mixedStep)).toHaveLength(2);
+
     for (const warningEvent of stepWarnings(mixedStep)) {
       expect(warningEvent.attributes?.["log.message"]).toBe("Model warning");
     }
+
     expect(stepWarnings(mixedStep)[0]!.attributes?.["warning.type"]).toBe("sensitive-warning-type");
     expect(JSON.stringify(mixedBatch)).not.toContain("secret-warning-detail");
     expect(JSON.stringify(mixedBatch)).not.toContain("secret-only-message");

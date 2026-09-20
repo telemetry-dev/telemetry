@@ -752,6 +752,7 @@ export function createV7Hooks(
     const blockedToolCalls: BlockedProviderToolCall[] = [];
     const matchedApprovalContentIndexes = new Set<number>();
     const providerToolCallCounts = new Map<string, number>();
+
     const toolCallOccurrences: Array<
       ProviderToolIdentity & {
         contentIndex: number;
@@ -760,12 +761,14 @@ export function createV7Hooks(
         completed: boolean;
       }
     > = [];
+
     const approvalResponses: Array<{
       approvalId: string;
       approved: boolean;
       toolCall: V7LanguageModelContentPart;
       identity: ProviderToolIdentity;
     }> = [];
+
     const consumedApprovalResponses = new Set<number>();
 
     for (const [contentIndex, part] of content.entries()) {
@@ -805,6 +808,7 @@ export function createV7Hooks(
       }
 
       const approvalToolCall = part.type === "tool-approval-response" ? part.toolCall : undefined;
+
       const approvalIdentity = approvalToolCall
         ? providerToolIdentity(approvalToolCall)
         : undefined;
@@ -1789,6 +1793,7 @@ export function createV7Hooks(
         const error = errorEvent.error;
         const endedAt = new Date();
         const errorType = error instanceof Error ? error.name || "error" : "error";
+
         const message = state.recordOutputs
           ? error instanceof Error
             ? error.message
