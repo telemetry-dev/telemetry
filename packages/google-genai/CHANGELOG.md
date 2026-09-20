@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/google-genai-v0.1.5...google-genai-v0.1.6) (2026-09-20)
+
+
+### Features
+
+* **ai:** support current provider SDKs ([#10](https://github.com/telemetry-dev/telemetry/issues/10)) ([ed9e664](https://github.com/telemetry-dev/telemetry/commit/ed9e664aaf78d0725f3e86b11a1d818a0785bacb))
+
 ## [0.1.5](https://github.com/telemetry-dev/telemetry/compare/google-genai-v0.1.4...google-genai-v0.1.5) (2026-09-12)
 
 ### Bug Fixes

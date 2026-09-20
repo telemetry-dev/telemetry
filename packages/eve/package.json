@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/eve",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Eve (Vercel agent framework) telemetry integration for telemetry.dev.",
   "keywords": [
     "agents",
