@@ -46,8 +46,9 @@
   "scripts": {
     "build": "pnpm exec vp pack",
     "dev": "pnpm exec vp pack --watch",
-    "test": "vp test",
+    "test": "cross-env OPENAI_SDK_VERSION=7 vp test && cross-env OPENAI_SDK_VERSION=6 vp test",
     "check": "vp check",
+    "check:v6": "tsc --project tsconfig.v6.json",
     "prepublishOnly": "vp run build"
   },
   "devDependencies": {
@@ -56,13 +57,15 @@
     "@opentelemetry/sdk-trace-base": "catalog:",
     "@telemetry-dev/sdk": "workspace:*",
     "@types/node": "^25.5.0",
-    "openai": "6.45.0",
+    "cross-env": "catalog:",
+    "openai": "catalog:",
+    "openai-v6": "npm:openai@6.45.0",
     "typescript": "catalog:",
     "vite-plus": "catalog:",
     "vitest": "catalog:"
   },
   "peerDependencies": {
     "@telemetry-dev/sdk": "workspace:^",
-    "openai": ">=6 <7"
+    "openai": ">=6 <8"
   }
 }

@@ -52,7 +52,7 @@
     "prepublishOnly": "vp run build"
   },
   "devDependencies": {
-    "@google/genai": "2.10.0",
+    "@google/genai": "catalog:",
     "@opentelemetry/sdk-logs": "catalog:",
     "@opentelemetry/sdk-metrics": "catalog:",
     "@opentelemetry/sdk-trace-base": "catalog:",

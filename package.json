@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "vp run -r build",
-    "check": "vp check",
+    "check": "cross-env OPENAI_SDK_VERSION=7 vp check && vp run @telemetry-dev/openai#check:v6",
     "test": "vp run -r test",
     "py:sync": "uv sync --directory sdks/python && uv sync --directory sdks/python-anthropic && uv sync --directory sdks/python-bedrock && uv sync --directory sdks/python-google-genai && uv sync --directory sdks/python-litellm && uv sync --directory sdks/python-openai && uv sync --directory sdks/python-openrouter",
     "py:check": "uv run --directory sdks/python ruff format --check . && uv run --directory sdks/python ruff check . && uv run --directory sdks/python pyright && uv run --directory sdks/python pyright --verifytypes telemetry_dev --ignoreexternal && uv run --directory sdks/python-anthropic ruff format --check . && uv run --directory sdks/python-anthropic ruff check . && uv run --directory sdks/python-anthropic pyright && uv run --directory sdks/python-anthropic pyright --verifytypes telemetry_dev_anthropic --ignoreexternal && uv run --directory sdks/python-bedrock ruff format --check . && uv run --directory sdks/python-bedrock ruff check . && uv run --directory sdks/python-bedrock pyright && uv run --directory sdks/python-bedrock pyright --verifytypes telemetry_dev_bedrock --ignoreexternal && uv run --directory sdks/python-google-genai ruff format --check . && uv run --directory sdks/python-google-genai ruff check . && uv run --directory sdks/python-google-genai pyright && uv run --directory sdks/python-google-genai pyright --verifytypes telemetry_dev_google_genai --ignoreexternal && uv run --directory sdks/python-litellm ruff format --check . && uv run --directory sdks/python-litellm ruff check . && uv run --directory sdks/python-litellm pyright && uv run --directory sdks/python-litellm pyright --verifytypes telemetry_dev_litellm --ignoreexternal && uv run --directory sdks/python-openai ruff format --check . && uv run --directory sdks/python-openai ruff check . && uv run --directory sdks/python-openai pyright && uv run --directory sdks/python-openai pyright --verifytypes telemetry_dev_openai --ignoreexternal && uv run --directory sdks/python-openrouter ruff format --check . && uv run --directory sdks/python-openrouter ruff check . && uv run --directory sdks/python-openrouter pyright && uv run --directory sdks/python-openrouter pyright --verifytypes telemetry_dev_openrouter --ignoreexternal",
@@ -14,6 +14,7 @@
     "prepare": "vp config"
   },
   "devDependencies": {
+    "cross-env": "catalog:",
     "vite-plus": "catalog:"
   },
   "engines": {

@@ -18,6 +18,15 @@ On `ai@7`, provider requests and a tool's `execute` run inside the step/tool spa
 auto-instrumented provider spans and nested AI SDK calls made from within a tool parent into the
 outer call's trace instead of starting their own.
 
+Provider-executed tools exposed through a completed model-call callback are recorded as
+zero-duration `extension` spans when their final result is observed. AI SDK does not expose their
+execution timing, so they are excluded from the `execute_tool` duration histogram. If the call ends
+after the SDK confirms a valid provider-tool execution but before it reports a final result, the
+span remains non-error and records that the result was not observed. Calls awaiting or denied
+approval are omitted because no execution occurred. A confirmed tool call flagged as invalid is
+recorded as an error unless a later concrete result resolves it. AI SDK does not expose partial
+provider-tool stream content to telemetry before an abort or error.
+
 ## Install
 
 ```sh
@@ -69,6 +78,23 @@ default none of it reaches telemetry integrations**; opt keys in per call via
 the `user.id` span attribute and `sessionId` as `gen_ai.conversation.id`; any remaining included
 keys ride along as `td.metadata.<key>` attributes. Calls that share a `sessionId` share one trace;
 a call without one is its own trace.
+
+AI SDK records inputs and outputs by default. This includes provider-tool arguments and results,
+which can contain shell commands, code, search data, or MCP payloads. To suppress payload capture:
+
+```ts
+telemetry: {
+  recordInputs: false,
+  recordOutputs: false,
+  integrations: [telemetryDev()],
+}
+```
+
+These flags omit prompt, response, tool-argument, tool-result, and detailed error payloads. Tool
+identity, status, error type, token usage, and other non-payload metadata are still recorded. On
+text generation steps, model warning messages are reduced to a generic "Model warning" unless both
+input and output recording are enabled; a warning that supplies a string `type` still records it
+as `warning.type`.
 
 `ai@7` still accepts `experimental_telemetry` as a deprecated alias for `telemetry`.
 

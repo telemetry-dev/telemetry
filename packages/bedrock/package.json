@@ -63,8 +63,8 @@
     "prepublishOnly": "vp run build"
   },
   "devDependencies": {
-    "@aws-sdk/client-bedrock-agent-runtime": "^3.1000.0",
-    "@aws-sdk/client-bedrock-runtime": "^3.1000.0",
+    "@aws-sdk/client-bedrock-agent-runtime": "catalog:",
+    "@aws-sdk/client-bedrock-runtime": "catalog:",
     "@opentelemetry/api": "catalog:",
     "@opentelemetry/sdk-logs": "catalog:",
     "@opentelemetry/sdk-trace-base": "catalog:",

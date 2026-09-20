@@ -8,8 +8,10 @@ import { flush, init, shutdown } from "@telemetry-dev/sdk";
 import * as sdk from "@telemetry-dev/sdk";
 import OpenAI, { AzureOpenAI } from "openai";
 import { Stream } from "openai/core/streaming";
+import { VERSION } from "openai/version";
 import { afterEach, expect, test, vi } from "vitest";
 
+import packageJson from "../package.json" with { type: "json" };
 import {
   instrumentOpenAI,
   type InstrumentOpenAIOptions,
@@ -19,6 +21,26 @@ import {
 
 const SPAN_STATUS_UNSET = 0;
 const SPAN_STATUS_ERROR = 2;
+
+test("runs the compatibility suite against the selected OpenAI major", () => {
+  expect(VERSION).toBe(process.env.OPENAI_SDK_VERSION === "6" ? "6.45.0" : "7.18.0");
+});
+
+test("package exports resolve to built files inside the package", () => {
+  expect(packageJson.exports["."].default).toBe("./dist/index.mjs");
+  expect(packageJson.publishConfig.exports["."].types).toBe("./dist/index.d.mts");
+  expect(packageJson.publishConfig.exports["."].import).toBe("./dist/index.mjs");
+  expect(packageJson.publishConfig.exports["."].default).toBe("./dist/index.mjs");
+});
+
+test.each(["", "8"])("rejects unsupported OpenAI SDK selector %j", async (version) => {
+  vi.stubEnv("OPENAI_SDK_VERSION", version);
+  vi.resetModules();
+
+  await expect(import("../vite.config.ts")).rejects.toThrow(
+    `Unsupported OPENAI_SDK_VERSION: ${JSON.stringify(version)}`,
+  );
+});
 
 interface CapturedRequest {
   method: string | undefined;
@@ -229,6 +251,7 @@ afterEach(async () => {
   uninstrumentOpenAI();
   await shutdown();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 test("chat completions map request, response, usage, finish reason, provider, and sampling attributes", async () => {
@@ -1104,7 +1127,12 @@ test("responses create maps instructions to system instructions", async () => {
   const spans = setupSpans();
 
   const output = [
-    { type: "message", role: "assistant", content: [{ type: "output_text", text: "No." }] },
+    {
+      id: "msg_1",
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "No." }],
+    },
   ];
 
   const fake = createFakeFetch(
@@ -1150,7 +1178,12 @@ test("responses create failed body records error while completed body stays OK",
   const failedError = { code: "server_error", message: "model exploded" };
 
   const successOutput = [
-    { type: "message", role: "assistant", content: [{ type: "output_text", text: "Recovered" }] },
+    {
+      id: "msg_recovered",
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "Recovered" }],
+    },
   ];
 
   const fake = createFakeFetch(
@@ -1267,7 +1300,12 @@ test("responses streams end from response.completed terminal event", async () =>
     status: "completed",
     model: "gpt-4.1-2025-04-14",
     output: [
-      { type: "message", role: "assistant", content: [{ type: "output_text", text: "Done" }] },
+      {
+        id: "msg_stream",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "Done" }],
+      },
     ],
     usage: { input_tokens: 8, output_tokens: 2, total_tokens: 10 },
   };
@@ -1311,7 +1349,12 @@ test("responses stream helper routes through wrapped create and ends span", asyn
     status: "completed",
     model: "gpt-4.1-2025-04-14",
     output: [
-      { type: "message", role: "assistant", content: [{ type: "output_text", text: "Done" }] },
+      {
+        id: "msg_stream_helper",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "Done" }],
+      },
     ],
     usage: { input_tokens: 8, output_tokens: 2, total_tokens: 10 },
   };
@@ -1350,7 +1393,12 @@ test("responses stream helper traces response-id retrieval streams", async () =>
     status: "completed",
     model: "gpt-4.1-2025-04-14",
     output: [
-      { type: "message", role: "assistant", content: [{ type: "output_text", text: "Done" }] },
+      {
+        id: "msg_existing",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "Done" }],
+      },
     ],
     usage: { input_tokens: 8, output_tokens: 2, total_tokens: 10 },
   };
@@ -1389,7 +1437,12 @@ test("responses streams end from terminal event before reading the stream sentin
     status: "completed",
     model: "gpt-4.1-2025-04-14",
     output: [
-      { type: "message", role: "assistant", content: [{ type: "output_text", text: "Done" }] },
+      {
+        id: "msg_stream_terminal",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "Done" }],
+      },
     ],
     usage: { input_tokens: 8, output_tokens: 2, total_tokens: 10 },
   };
@@ -1566,7 +1619,12 @@ test("global instrumentation records responses and embeddings with wrapOpenAI pa
   instrumentOpenAI();
 
   const output = [
-    { type: "message", role: "assistant", content: [{ type: "output_text", text: "No." }] },
+    {
+      id: "msg_global",
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "No." }],
+    },
   ];
 
   const fake = createFakeFetch(
