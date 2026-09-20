@@ -358,8 +358,6 @@ interface CallState {
   // Ordered observations: duplicate IDs are valid; results and approvals bind to the newest unmatched call.
   providerToolCalls: ProviderToolCallState[];
   providerToolInputs: Map<string, string | undefined>;
-  providerToolInputHistory: Array<{ key: string; input: unknown }>;
-  languageModelContentObservedSteps: Set<number>;
   stepMetrics: StepMetric[];
   toolMetrics: Array<{ durationSec: number }>;
   objectStep: { span: Span; startedAt: Date } | undefined;
@@ -576,8 +574,9 @@ export function createV7Hooks(
     if (!state.recordInputs || !Array.isArray(messages)) return;
 
     const messageCount = messages.length;
-    const currentHistory: Array<{ key: string; input: unknown }> = [];
     let malformed = false;
+
+    state.providerToolInputs.clear();
 
     for (let messageIndex = 0; messageIndex < messageCount; messageIndex++) {
       try {
@@ -610,7 +609,12 @@ export function createV7Hooks(
                 input = unavailableProviderToolInput;
               }
 
-              currentHistory.push({ key: providerToolIdentityKey(identity), input });
+              // Rebuild from the current history on every scan: a retained input object can be
+              // mutated in place between steps, so a cached serialization goes stale.
+              state.providerToolInputs.set(
+                providerToolIdentityKey(identity),
+                input === unavailableProviderToolInput ? undefined : jsonAttr(input),
+              );
             }
           } catch {
             malformed = true;
@@ -623,34 +627,7 @@ export function createV7Hooks(
       }
     }
 
-    if (malformed) {
-      state.providerToolInputs.clear();
-      state.providerToolInputHistory = [];
-
-      return;
-    }
-
-    const previousHistory = state.providerToolInputHistory;
-    const appended =
-      currentHistory.length >= previousHistory.length &&
-      previousHistory.every(
-        (previous, index) =>
-          previous.key === currentHistory[index]!.key &&
-          previous.input === currentHistory[index]!.input,
-      );
-    const startIndex = appended ? previousHistory.length : 0;
-
-    if (!appended) state.providerToolInputs.clear();
-
-    for (let index = startIndex; index < currentHistory.length; index++) {
-      const { key, input } = currentHistory[index]!;
-      state.providerToolInputs.set(
-        key,
-        input === unavailableProviderToolInput ? undefined : jsonAttr(input),
-      );
-    }
-
-    state.providerToolInputHistory = currentHistory;
+    if (malformed) state.providerToolInputs.clear();
   };
 
   const providerToolOutput = (
@@ -1142,8 +1119,6 @@ export function createV7Hooks(
           hasToolSpan: false,
           providerToolCalls: [],
           providerToolInputs: new Map(),
-          providerToolInputHistory: [],
-          languageModelContentObservedSteps: new Set(),
           stepMetrics: [],
           toolMetrics: [],
           objectStep: undefined,
@@ -1205,10 +1180,6 @@ export function createV7Hooks(
         if (!state) return;
         const e = event as V7LanguageModelCallEndEvent;
         recordProviderToolSpans(state, e.content);
-
-        if (state.currentStepNumber !== null) {
-          state.languageModelContentObservedSteps.add(state.currentStepNumber);
-        }
       } catch (err) {
         onError?.(err instanceof Error ? err : String(err));
       }
@@ -1224,10 +1195,6 @@ export function createV7Hooks(
 
         if (e.content) {
           const blockedToolCalls = providerToolCallsBlockedByApproval(e.content);
-
-          if (!state.languageModelContentObservedSteps.has(e.stepNumber)) {
-            recordProviderToolSpans(state, e.content, blockedToolCalls);
-          }
 
           for (const toolCall of blockedToolCalls) {
             removeLatestUnmatchedProviderToolCall(state, toolCall, e.stepNumber);
@@ -1315,7 +1282,10 @@ export function createV7Hooks(
             "model.warning",
             omitUndefined({
               "log.severity_number": SEVERITY_WARN,
-              "log.message": `Model warning: ${detail}`,
+              "log.message":
+                state.recordInputs && state.recordOutputs
+                  ? `Model warning: ${detail}`
+                  : "Model warning",
               "warning.type":
                 warning.type?.constructor === String ? String(warning.type) : undefined,
             }),

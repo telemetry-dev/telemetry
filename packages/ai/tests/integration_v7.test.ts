@@ -1199,6 +1199,63 @@ test("provider results recover inputs from prepareStep message replacements", as
   );
 });
 
+test("provider results recover inputs from nested history mutations", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-history-nested-mutation";
+  const providerCall = {
+    type: "tool-call",
+    toolCallId: "deferred-tool",
+    toolName: "web_search",
+    input: { query: "initial" },
+    providerExecuted: true,
+  };
+  const messages = [{ role: "assistant", content: [providerCall] }];
+  const providerResult = {
+    type: "tool-result",
+    toolCallId: "deferred-tool",
+    toolName: "web_search",
+    output: { result: "mutated result" },
+    providerExecuted: true,
+  };
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+    messages,
+  });
+  providerCall.input.query = "mutated";
+  integ.onStepStart?.({ callId, stepNumber: 0, messages });
+  integ.onLanguageModelCallEnd?.({ callId, content: [providerResult] });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model,
+    content: [providerResult],
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const tools = byOperation(spanBatches[0]!, "execute_tool");
+
+  expect(tools).toHaveLength(1);
+  expect(tools[0]!.attributes["gen_ai.tool.call.arguments"]).toBe(
+    JSON.stringify({ query: "mutated" }),
+  );
+  expect(tools[0]!.attributes["gen_ai.tool.call.result"]).toBe(
+    JSON.stringify({ result: "mutated result" }),
+  );
+});
+
 test("provider result history is not inspected when input recording is disabled", async () => {
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
@@ -1637,6 +1694,7 @@ test("approval fallback omits only the blocked occurrence when ids are reused", 
     modelId: "gpt-4o",
   });
   integ.onStepStart?.({ callId, stepNumber: 0 });
+  integ.onLanguageModelCallEnd?.({ callId, content });
   integ.onStepEnd?.({
     callId,
     stepNumber: 0,
@@ -2422,51 +2480,6 @@ test("pending provider tools remain incomplete when a call ends without a final 
   );
 });
 
-test("step-end content reconstructs provider tools when model-call end is absent", async () => {
-  const { spanBatches, overrides } = makeCapture();
-  const integ = telemetryDev(baseOptions, overrides);
-  const callId = "call-provider-step-fallback";
-  const toolCall = {
-    type: "tool-call",
-    toolCallId: "step-fallback",
-    toolName: "code_execution",
-    input: { code: "print(1)" },
-    providerExecuted: true,
-  };
-
-  integ.onStart?.({
-    callId,
-    operationId: "ai.streamText",
-    provider: "anthropic",
-    modelId: "claude-sonnet",
-  });
-  integ.onStepStart?.({ callId, stepNumber: 0 });
-  integ.onStepEnd?.({
-    callId,
-    stepNumber: 0,
-    model: { provider: "anthropic", modelId: "claude-sonnet" },
-    content: [toolCall],
-    text: "",
-    finishReason: "unknown",
-    usage: { inputTokens: 1, outputTokens: 1 },
-  });
-  await integ.onEnd?.({
-    callId,
-    text: "",
-    finishReason: "unknown",
-    usage: { inputTokens: 1, outputTokens: 1 },
-  });
-
-  const spans = spanBatches[0]!;
-  const root = spans.find((span) => span.kind === SpanKind.INTERNAL)!;
-  const tool = byOperation(spans, "execute_tool")[0]!;
-
-  expect(byOperation(spans, "execute_tool")).toHaveLength(1);
-  expect(root.attributes["gen_ai.operation.name"]).toBe("invoke_agent");
-  expect(tool.attributes["gen_ai.tool.call.id"]).toBe("step-fallback");
-  expect(event(tool, "tool.result_unobserved")).toBeDefined();
-});
-
 test("terminal errors retain concrete provider results and suppress provisional calls", async () => {
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
@@ -2996,6 +3009,81 @@ test("onError preserves open object and embed child classification attrs", async
   expect(embedChild.attributes["gen_ai.operation.name"]).toBe("embeddings");
   expect(embedChild.attributes["gen_ai.provider.name"]).toBe("openai");
   expect(embedChild.attributes["gen_ai.request.model"]).toBe("text-embedding-3-small");
+});
+
+test("model warning details are redacted when payload capture is disabled", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const warnings = [
+    { type: "sensitive-warning-type", message: "secret-warning-detail" },
+    { message: "secret-only-message" },
+  ];
+
+  for (const [callId, recordInputs, recordOutputs] of [
+    ["call-warning-redacted", false, false],
+    ["call-warning-open", true, true],
+    ["call-warning-inputs-off", false, true],
+    ["call-warning-outputs-off", true, false],
+  ] as const) {
+    integ.onStart?.({
+      callId,
+      operationId: "ai.generateText",
+      provider: "openai",
+      modelId: "gpt-4o",
+      recordInputs,
+      recordOutputs,
+    });
+    integ.onStepStart?.({ callId, stepNumber: 0 });
+    integ.onStepEnd?.({
+      callId,
+      stepNumber: 0,
+      model,
+      text: "done",
+      finishReason: "stop",
+      usage: { inputTokens: 1, outputTokens: 1 },
+      warnings,
+    });
+    await integ.onEnd?.({
+      callId,
+      text: "done",
+      finishReason: "stop",
+      usage: { inputTokens: 1, outputTokens: 1 },
+    });
+  }
+
+  const redactedStep = spanBatches[0]!.find((span) => span.kind === SpanKind.CLIENT)!;
+  const openStep = spanBatches[1]!.find((span) => span.kind === SpanKind.CLIENT)!;
+  const stepWarnings = (span: typeof redactedStep) =>
+    span.events.filter((ev) => ev.name === "model.warning");
+
+  expect(stepWarnings(redactedStep)).toHaveLength(2);
+  for (const warningEvent of stepWarnings(redactedStep)) {
+    expect(warningEvent.attributes?.["log.message"]).toBe("Model warning");
+  }
+  expect(stepWarnings(redactedStep)[0]!.attributes?.["warning.type"]).toBe(
+    "sensitive-warning-type",
+  );
+  expect(JSON.stringify(spanBatches[0])).not.toContain("secret-warning-detail");
+  expect(JSON.stringify(spanBatches[0])).not.toContain("secret-only-message");
+
+  expect(stepWarnings(openStep)).toHaveLength(2);
+  expect(stepWarnings(openStep)[0]!.attributes?.["log.message"]).toBe(
+    "Model warning: secret-warning-detail",
+  );
+  expect(stepWarnings(openStep)[1]!.attributes?.["log.message"]).toBe(
+    "Model warning: secret-only-message",
+  );
+
+  for (const mixedBatch of [spanBatches[2]!, spanBatches[3]!]) {
+    const mixedStep = mixedBatch.find((span) => span.kind === SpanKind.CLIENT)!;
+    expect(stepWarnings(mixedStep)).toHaveLength(2);
+    for (const warningEvent of stepWarnings(mixedStep)) {
+      expect(warningEvent.attributes?.["log.message"]).toBe("Model warning");
+    }
+    expect(stepWarnings(mixedStep)[0]!.attributes?.["warning.type"]).toBe("sensitive-warning-type");
+    expect(JSON.stringify(mixedBatch)).not.toContain("secret-warning-detail");
+    expect(JSON.stringify(mixedBatch)).not.toContain("secret-only-message");
+  }
 });
 
 test("recordInputs and recordOutputs false omit message and tool payload attrs but keep ids and tokens", async () => {

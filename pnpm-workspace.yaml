@@ -21,8 +21,8 @@ catalog:
   "@opentelemetry/sdk-metrics": ^2.7.1
   "@opentelemetry/sdk-trace-base": ^2.7.1
   "@anthropic-ai/sdk": 0.126.0
-  "@aws-sdk/client-bedrock-agent-runtime": ^3.1135.0
-  "@aws-sdk/client-bedrock-runtime": ^3.1135.0
+  "@aws-sdk/client-bedrock-agent-runtime": 3.1135.0
+  "@aws-sdk/client-bedrock-runtime": 3.1135.0
   "@google/genai": 2.23.0
   "@types/node": ^24
   ai: 7.0.106

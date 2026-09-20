@@ -91,7 +91,10 @@ telemetry: {
 ```
 
 These flags omit prompt, response, tool-argument, tool-result, and detailed error payloads. Tool
-identity, status, error type, token usage, and other non-payload metadata are still recorded.
+identity, status, error type, token usage, and other non-payload metadata are still recorded. On
+text generation steps, model warning messages are reduced to a generic "Model warning" unless both
+input and output recording are enabled; a warning that supplies a string `type` still records it
+as `warning.type`.
 
 `ai@7` still accepts `experimental_telemetry` as a deprecated alias for `telemetry`.
 
