@@ -10,8 +10,11 @@ import httpx
 import pytest
 import telemetry_dev
 from anthropic import Anthropic, AsyncAnthropic
+from anthropic.resources.beta.messages import AsyncMessages as AsyncBetaMessages
+from anthropic.resources.beta.messages import Messages as BetaMessages
 from anthropic.resources.messages import AsyncMessages, Messages
 from anthropic.types import MessageParam, TextBlock
+from anthropic.types.beta import BetaMessageParam
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import StatusCode
 
@@ -21,6 +24,7 @@ SyncHandler = Callable[[httpx.Request], httpx.Response]
 AsyncHandler = Callable[[httpx.Request], Coroutine[Any, Any, httpx.Response]]
 
 MESSAGES: list[MessageParam] = [{"role": "user", "content": "Say hi"}]
+BETA_MESSAGES: list[BetaMessageParam] = [{"role": "user", "content": "Say hi"}]
 
 
 def only_span(env: SimpleNamespace) -> ReadableSpan:
@@ -1004,3 +1008,192 @@ def test_provider_mapping_for_bedrock_vertex_and_plain_client(memory: SimpleName
     assert attrs(bedrock_span)["gen_ai.provider.name"] == "aws.bedrock"
     assert attrs(vertex_span)["gen_ai.provider.name"] == "gcp.vertex_ai"
     assert attrs(plain_span)["gen_ai.provider.name"] == "anthropic"
+
+
+def test_beta_create_records_generation_span(memory: SimpleNamespace) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return json_response(message_payload(id="msg_beta"))
+
+    client = wrapped_sync_client(handler)
+    client.beta.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=64,
+        messages=MESSAGES,
+        betas=["context-management-2025-06-27"],
+    )
+
+    assert requests[0].url.params.get("beta") == "true"
+    a = attrs(only_span(memory))
+    assert a["gen_ai.operation.name"] == "chat"
+    assert a["gen_ai.provider.name"] == "anthropic"
+    assert a["gen_ai.response.id"] == "msg_beta"
+    assert a["gen_ai.usage.input_tokens"] == 11
+    assert a["gen_ai.response.finish_reasons"] == ("end_turn",)
+
+
+async def test_async_beta_create_records_generation_span(memory: SimpleNamespace) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload(id="msg_beta_async"))
+
+    client = wrapped_async_client(handler)
+    await client.beta.messages.create(model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES)
+    await client.close()
+
+    assert attrs(only_span(memory))["gen_ai.response.id"] == "msg_beta_async"
+
+
+def test_beta_stream_context_manager_records_one_span(memory: SimpleNamespace) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(stream_events())
+
+    client = wrapped_sync_client(handler)
+    with client.beta.messages.stream(
+        model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES
+    ) as stream:
+        text = "".join(stream.text_stream)
+
+    assert text == "Hello world"
+    a = attrs(only_span(memory))
+    assert json.loads(str(a["gen_ai.output.messages"])) == [
+        {"role": "assistant", "content": [{"type": "text", "text": "Hello world"}]}
+    ]
+    assert a["gen_ai.usage.output_tokens"] == 2
+
+
+async def test_async_beta_stream_context_manager_records_one_span(
+    memory: SimpleNamespace,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(stream_events())
+
+    client = wrapped_async_client(handler)
+    async with client.beta.messages.stream(
+        model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES
+    ) as stream:
+        parts = [text async for text in stream.text_stream]
+    await client.close()
+
+    assert "".join(parts) == "Hello world"
+    assert attrs(only_span(memory))["gen_ai.usage.output_tokens"] == 2
+
+
+@pytest.mark.parametrize("namespace", ["stable", "beta"])
+def test_parse_records_one_generation_span(memory: SimpleNamespace, namespace: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload(id=f"msg_parse_{namespace}"))
+
+    client = wrapped_sync_client(handler)
+    messages = client.messages if namespace == "stable" else client.beta.messages
+    parsed = messages.parse(model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES)
+
+    assert parsed.id == f"msg_parse_{namespace}"
+    a = attrs(only_span(memory))
+    assert a["gen_ai.response.id"] == f"msg_parse_{namespace}"
+    assert a["gen_ai.usage.output_tokens"] == 7
+
+
+@pytest.mark.parametrize("namespace", ["stable", "beta"])
+async def test_async_parse_records_one_generation_span(
+    memory: SimpleNamespace, namespace: str
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload(id=f"msg_async_parse_{namespace}"))
+
+    client = wrapped_async_client(handler)
+    messages = client.messages if namespace == "stable" else client.beta.messages
+    await messages.parse(model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES)
+    await client.close()
+
+    assert attrs(only_span(memory))["gen_ai.response.id"] == f"msg_async_parse_{namespace}"
+
+
+def test_beta_tool_runner_records_one_generation_span_per_turn(memory: SimpleNamespace) -> None:
+    responses = [
+        json_response(
+            message_payload(
+                id="msg_tool_turn",
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "weather",
+                        "input": {"city": "Accra"},
+                    }
+                ],
+                stop_reason="tool_use",
+            )
+        ),
+        json_response(message_payload(id="msg_final_turn")),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    calls: list[str] = []
+
+    @anthropic.beta_tool
+    def weather(city: str) -> str:
+        """Look up the weather.
+
+        Args:
+            city: City name.
+        """
+        calls.append(city)
+        return "sunny"
+
+    client = wrapped_sync_client(handler)
+    final = client.beta.messages.tool_runner(
+        model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES, tools=[weather]
+    ).until_done()
+
+    assert final.id == "msg_final_turn"
+    assert calls == ["Accra"]
+    spans = memory.span_exporter.get_finished_spans()
+    assert [attrs(span)["gen_ai.response.id"] for span in spans] == [
+        "msg_tool_turn",
+        "msg_final_turn",
+    ]
+
+
+def test_global_instrumentation_covers_beta_and_parse_and_restores(
+    memory: SimpleNamespace,
+) -> None:
+    patched = [
+        (cls, name)
+        for cls in (Messages, AsyncMessages, BetaMessages, AsyncBetaMessages)
+        for name in ("create", "stream", "parse")
+    ]
+    originals = [getattr(cls, name) for cls, name in patched]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload())
+
+    instrument_anthropic()
+    assert all(
+        getattr(cls, name) is not original
+        for (cls, name), original in zip(patched, originals, strict=True)
+    )
+    client = sync_client(handler)
+    client.beta.messages.create(model="claude-sonnet-4-6", max_tokens=64, messages=BETA_MESSAGES)
+    client.messages.parse(model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES)
+    assert len(memory.span_exporter.get_finished_spans()) == 2
+
+    uninstrument_anthropic()
+    assert [getattr(cls, name) for cls, name in patched] == originals
+    client.beta.messages.create(model="claude-sonnet-4-6", max_tokens=64, messages=BETA_MESSAGES)
+    assert len(memory.span_exporter.get_finished_spans()) == 2
+
+
+def test_global_and_wrapped_beta_record_one_span_per_call(memory: SimpleNamespace) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload())
+
+    instrument_anthropic()
+    client = wrapped_sync_client(handler)
+    client.beta.messages.create(model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES)
+    client.beta.messages.parse(model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES)
+
+    assert len(memory.span_exporter.get_finished_spans()) == 2

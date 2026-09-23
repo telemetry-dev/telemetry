@@ -58,6 +58,9 @@ finally:
 - `client.messages.create(...)`
 - `client.messages.create(..., stream=True)`
 - `client.messages.stream(...)` context managers, sync and async
+- `client.messages.parse(...)`, sync and async
+- `client.beta.messages.create(...)`, `stream(...)`, and `parse(...)`, sync and async
+- `client.beta.messages.tool_runner(...)`: each model request in the tool loop records its own generation span
 
 The integration maps native Anthropic request and response shapes directly into telemetry.dev fields. It does not normalize messages into another schema.
 
@@ -69,11 +72,10 @@ Native Anthropic stream events pass through unmodified. The span records time to
 
 ## Bedrock and Vertex
 
-Class instrumentation covers Bedrock and Vertex clients because the Anthropic SDK reuses the same `Messages` and `AsyncMessages` resource classes. Provider attribution is recorded as `aws.bedrock` or `gcp.vertex_ai` when the client class identifies those runtimes.
+Class instrumentation covers Bedrock and Vertex clients because the Anthropic SDK reuses the same stable and beta `Messages` and `AsyncMessages` resource classes. Provider attribution is recorded as `aws.bedrock` or `gcp.vertex_ai` when the client class identifies those runtimes.
 
 ## Limitations
 
-- `client.beta.messages` is not instrumented.
-- `messages.parse()` and `messages.count_tokens()` are not instrumented.
+- `messages.count_tokens()`, `beta.messages.count_tokens()`, and batches are not instrumented.
 - `with_raw_response` snapshots bound methods; wrap or instrument clients before creating raw-response wrappers.
 - Unconsumed streams end spans only on exhaustion, close, context-manager exit, or error.

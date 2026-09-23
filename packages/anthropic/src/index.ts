@@ -5,6 +5,7 @@ import {
   type StartSpanOptions,
 } from "@telemetry-dev/sdk";
 import { Stream } from "@anthropic-ai/sdk/core/streaming";
+import { Messages as BetaMessages } from "@anthropic-ai/sdk/resources/beta/messages";
 import { Messages } from "@anthropic-ai/sdk/resources/messages";
 
 export type { SpanFields, SpanHandle, StartSpanOptions } from "@telemetry-dev/sdk";
@@ -44,6 +45,7 @@ type ProviderResolver = (resource: Value) => string;
 
 interface AnthropicClient {
   messages: object;
+  beta?: { messages?: object };
 }
 
 interface RequestMapping {
@@ -691,10 +693,14 @@ let restorePatches: Array<() => void> = [];
 export function wrapAnthropic<T extends AnthropicClient>(client: T): T {
   if (wrappedClients.has(client)) return client;
   const provider = providerForClient(client);
-  const messages = asRecord(client.messages);
+  // beta.messages.stream(), parse(), and toolRunner() all route through beta.messages.create().
+  for (const resource of [client.messages, client.beta?.messages]) {
+    const messages = asRecord(resource);
 
-  if (messages)
-    patchInstanceMethod(messages, "create", messagesRequest, messagesResponse, provider);
+    if (messages)
+      patchInstanceMethod(messages, "create", messagesRequest, messagesResponse, provider);
+  }
+
   wrappedClients.add(client);
 
   return client;
@@ -702,7 +708,10 @@ export function wrapAnthropic<T extends AnthropicClient>(client: T): T {
 
 export function instrumentAnthropic(): void {
   if (installed) return;
-  restorePatches = [patchPrototype(Messages, "create", messagesRequest, messagesResponse)];
+  restorePatches = [
+    patchPrototype(Messages, "create", messagesRequest, messagesResponse),
+    patchPrototype(BetaMessages, "create", messagesRequest, messagesResponse),
+  ];
   installed = true;
 }
 

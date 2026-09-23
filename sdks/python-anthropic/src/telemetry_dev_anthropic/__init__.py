@@ -9,6 +9,8 @@ from typing import Any, TypeVar, cast
 
 import anthropic
 import telemetry_dev
+from anthropic.resources.beta.messages import AsyncMessages as AsyncBetaMessages
+from anthropic.resources.beta.messages import Messages as BetaMessages
 from anthropic.resources.messages import AsyncMessages, Messages
 
 __version__ = "0.1.2"
@@ -23,6 +25,14 @@ _ORIGINALS: list[tuple[type[Any], str, Any]] = []
 _installed = False
 _install_lock = threading.Lock()
 _T = TypeVar("_T")
+# Each of these issues its own request: parse() and stream() do not route through create().
+_RESPONSE_METHODS = ("create", "parse")
+_MESSAGES_CLASSES: tuple[tuple[type[Any], bool], ...] = (
+    (Messages, False),
+    (AsyncMessages, True),
+    (BetaMessages, False),
+    (AsyncBetaMessages, True),
+)
 
 
 def _field(value: Any, name: str) -> Any:
@@ -750,55 +760,51 @@ def _original_method(current: Any, resource: object) -> Any:
     return bind(resource, type(resource)) if bind is not None else original
 
 
-def _patch_instance_create(resource: object, async_resource: bool, provider_name: str) -> None:
-    resource_any: Any = resource
-    current = resource_any.create
-    if getattr(current, _WRAPPED_ATTR, False) and _own_method(resource, "create"):
+def _wrap_method(
+    original: Callable[..., Any], name: str, async_resource: bool, provider: ProviderResolver
+) -> Callable[..., Any]:
+    if name == "stream":
+        factory = _wrap_stream_manager_async if async_resource else _wrap_stream_manager_sync
+        return factory(original, _messages_request, provider)
+    response_factory = _wrap_async if async_resource else _wrap_sync
+    return response_factory(original, _messages_request, _messages_response, provider)
+
+
+def _patch_instance_method(
+    resource: object, name: str, async_resource: bool, provider_name: str
+) -> None:
+    current = getattr(resource, name, None)
+    if current is None:
+        return
+    if getattr(current, _WRAPPED_ATTR, False) and _own_method(resource, name):
         return
     original = _original_method(current, resource)
-    factory = _wrap_async if async_resource else _wrap_sync
-    wrapped = factory(original, _messages_request, _messages_response, lambda _: provider_name)
-    resource_any.create = wrapped
+    setattr(resource, name, _wrap_method(original, name, async_resource, lambda _: provider_name))
 
 
-def _patch_instance_stream(resource: object, async_resource: bool, provider_name: str) -> None:
-    resource_any: Any = resource
-    current = resource_any.stream
-    if getattr(current, _WRAPPED_ATTR, False) and _own_method(resource, "stream"):
+def _patch_class_method(cls: type[Any], name: str, async_resource: bool) -> None:
+    original = getattr(cls, name, None)
+    if original is None or getattr(original, _WRAPPED_ATTR, False):
         return
-    original = _original_method(current, resource)
-    factory = _wrap_stream_manager_async if async_resource else _wrap_stream_manager_sync
-    wrapped = factory(original, _messages_request, lambda _: provider_name)
-    resource_any.stream = wrapped
+    _ORIGINALS.append((cls, name, original))
+    setattr(cls, name, _wrap_method(original, name, async_resource, _provider_for_resource))
 
 
-def _patch_class_create(cls: type[Any], async_resource: bool) -> None:
-    original = cls.create
-    if getattr(original, _WRAPPED_ATTR, False):
-        return
-    _ORIGINALS.append((cls, "create", original))
-    factory = _wrap_async if async_resource else _wrap_sync
-    cls.create = factory(original, _messages_request, _messages_response, _provider_for_resource)
-
-
-def _patch_class_stream(cls: type[Any], async_resource: bool) -> None:
-    original = cls.stream
-    if getattr(original, _WRAPPED_ATTR, False):
-        return
-    _ORIGINALS.append((cls, "stream", original))
-    factory = _wrap_stream_manager_async if async_resource else _wrap_stream_manager_sync
-    cls.stream = factory(original, _messages_request, _provider_for_resource)
+def _beta_messages(client: object) -> object | None:
+    return getattr(getattr(client, "beta", None), "messages", None)
 
 
 def wrap_anthropic(client: _T) -> _T:
     if getattr(client, _WRAPPED_ATTR, False):
         return client
     client_any: Any = client
-    messages = client_any.messages
-    async_resource = isinstance(messages, AsyncMessages)
     provider_name = _provider_for_client(cast(object, client))
-    _patch_instance_create(messages, async_resource, provider_name)
-    _patch_instance_stream(messages, async_resource, provider_name)
+    for messages in (client_any.messages, _beta_messages(cast(object, client))):
+        if messages is None:
+            continue
+        async_resource = isinstance(messages, AsyncMessages | AsyncBetaMessages)
+        for name in (*_RESPONSE_METHODS, "stream"):
+            _patch_instance_method(messages, name, async_resource, provider_name)
     setattr(client, _WRAPPED_ATTR, True)
     return client
 
@@ -808,10 +814,9 @@ def instrument_anthropic() -> None:
     with _install_lock:
         if _installed:
             return
-        _patch_class_create(Messages, async_resource=False)
-        _patch_class_stream(Messages, async_resource=False)
-        _patch_class_create(AsyncMessages, async_resource=True)
-        _patch_class_stream(AsyncMessages, async_resource=True)
+        for cls, async_resource in _MESSAGES_CLASSES:
+            for name in (*_RESPONSE_METHODS, "stream"):
+                _patch_class_method(cls, name, async_resource)
         _installed = True
 
 

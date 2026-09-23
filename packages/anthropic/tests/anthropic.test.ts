@@ -840,3 +840,162 @@ test("wrapAnthropic records Bedrock provider names from client constructor names
   const span = await exportedSpan(spans);
   expect(span.attributes["gen_ai.provider.name"]).toBe("aws.bedrock");
 });
+
+test("beta.messages.create records a generation span for the beta endpoint", async () => {
+  const spans = setupSpans();
+  const messages = [{ role: "user" as const, content: "Say hello" }];
+  const fake = createFakeFetch(jsonResponse(messagePayload({ id: "msg_beta" })));
+  const client = clientWith(fake.fetch);
+
+  await client.beta.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages,
+    betas: ["context-management-2025-06-27"],
+  });
+
+  const span = await exportedSpan(spans);
+  expect(fake.requests).toHaveLength(1);
+  expect(fake.requests[0]?.path).toBe("/v1/messages");
+  expect(fake.requests[0]?.body).not.toHaveProperty("betas");
+  expect(span.name).toBe("chat claude-sonnet-4-6");
+  expect(span.attributes["gen_ai.operation.name"]).toBe("chat");
+  expect(span.attributes["gen_ai.provider.name"]).toBe("anthropic");
+  expect(span.attributes["gen_ai.response.id"]).toBe("msg_beta");
+  expect(span.attributes["gen_ai.input.messages"]).toBe(JSON.stringify(messages));
+  expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(10);
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["end_turn"]);
+});
+
+test("beta.messages.stream helper routes through create and records one span", async () => {
+  const spans = setupSpans();
+  const fake = createFakeFetch(namedSseResponse(streamEvents()));
+  const client = clientWith(fake.fetch);
+
+  const stream = client.beta.messages.stream({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Say hello" }],
+  });
+
+  const finalMessage = await stream.finalMessage();
+
+  expect(finalMessage.id).toBe("msg_stream");
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ type: "text", text: "Hello world" }] },
+  ]);
+  expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(2);
+});
+
+test("beta.messages.parse routes through create and records one span", async () => {
+  const spans = setupSpans();
+
+  const fake = createFakeFetch(
+    jsonResponse(messagePayload({ content: [{ type: "text", text: '{"city":"Accra"}' }] })),
+  );
+
+  const client = clientWith(fake.fetch);
+
+  const parsed = await client.beta.messages.parse({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Where?" }],
+  });
+
+  expect(parsed.id).toBe("msg_1");
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ type: "text", text: '{"city":"Accra"}' }] },
+  ]);
+});
+
+test("beta.messages.toolRunner records one generation span per model turn", async () => {
+  const spans = setupSpans();
+
+  const fake = createFakeFetch(
+    jsonResponse(
+      messagePayload({
+        id: "msg_tool_turn",
+        content: [{ type: "tool_use", id: "toolu_1", name: "weather", input: { city: "Accra" } }],
+        stop_reason: "tool_use",
+      }),
+    ),
+    jsonResponse(messagePayload({ id: "msg_final_turn" })),
+  );
+
+  const client = clientWith(fake.fetch);
+  const run = vi.fn(() => "sunny");
+
+  const finalMessage = await client.beta.messages.toolRunner({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Weather in Accra?" }],
+    tools: [
+      {
+        type: "custom",
+        name: "weather",
+        description: "Look up the weather",
+        input_schema: { type: "object", properties: { city: { type: "string" } } },
+        run,
+        parse: (input: unknown) => input,
+      },
+    ],
+  });
+
+  expect(finalMessage.id).toBe("msg_final_turn");
+  expect(run).toHaveBeenCalledOnce();
+  expect(fake.requests).toHaveLength(2);
+  const turns = await finishedSpans(spans, 2);
+  expect(turns.map((span) => span.attributes["gen_ai.response.id"])).toEqual([
+    "msg_tool_turn",
+    "msg_final_turn",
+  ]);
+  expect(turns.map((span) => span.attributes["gen_ai.response.finish_reasons"])).toEqual([
+    ["tool_use"],
+    ["end_turn"],
+  ]);
+});
+
+test("instrumentAnthropic covers beta.messages and uninstrumentAnthropic restores it", async () => {
+  const spans = setupSpans();
+  instrumentAnthropic();
+
+  const fake = createFakeFetch(
+    jsonResponse(messagePayload({ id: "msg_beta_global" })),
+    jsonResponse(messagePayload({ id: "msg_beta_restored" })),
+  );
+
+  const client = new Anthropic({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 });
+  const params = {
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [{ role: "user" as const, content: "Hi" }],
+  };
+
+  await client.beta.messages.create(params);
+  await finishedSpans(spans, 1);
+
+  uninstrumentAnthropic();
+  await client.beta.messages.create(params);
+  await flush();
+
+  expect(fake.requests).toHaveLength(2);
+  expect(spans.getFinishedSpans()).toHaveLength(1);
+});
+
+test("instrumentAnthropic and wrapAnthropic together record one beta span per call", async () => {
+  const spans = setupSpans();
+  instrumentAnthropic();
+  const fake = createFakeFetch(jsonResponse(messagePayload({ id: "msg_beta_both" })));
+  const client = wrapAnthropic(new Anthropic({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 }));
+
+  await client.beta.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Hi" }],
+  });
+
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.response.id"]).toBe("msg_beta_both");
+});
