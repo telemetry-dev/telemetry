@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.1.5...sdk-v0.1.6) (2026-09-24)
+
+
+### Features
+
+* **sdk:** add evaluation telemetry ([#14](https://github.com/telemetry-dev/telemetry/issues/14)) ([b1b5218](https://github.com/telemetry-dev/telemetry/commit/b1b521866763b4f090b083530671714823a2384f))
+
 ## [0.1.5](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.1.4...sdk-v0.1.5) (2026-09-12)
 
 ### Bug Fixes

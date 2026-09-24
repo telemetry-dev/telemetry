@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/google-genai-v0.1.6...google-genai-v0.1.7) (2026-09-24)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.1.6
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.1.6
+
 ## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/google-genai-v0.1.5...google-genai-v0.1.6) (2026-09-20)
 
 ### Features
