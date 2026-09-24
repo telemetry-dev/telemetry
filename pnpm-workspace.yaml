@@ -25,7 +25,7 @@ catalog:
   "@aws-sdk/client-bedrock-runtime": 3.1135.0
   "@google/genai": 2.23.0
   "@types/node": ^24
-  ai: 7.0.106
+  ai: 7.0.111
   cross-env: 10.1.0
   openai: 7.18.0
   typescript: ^5

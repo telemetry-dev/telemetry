@@ -3373,3 +3373,290 @@ test("v7 exports session spans only when the configured sampler selects them", a
     expect(errors).toEqual([]);
   }
 });
+
+test.each([
+  [true, true],
+  [true, false],
+  [false, true],
+  [false, false],
+])(
+  "AI SDK evaluate respects recordInputs=%s and recordOutputs=%s",
+  async (recordInputs, recordOutputs) => {
+    const { experimental_evaluate: evaluate } = await import("ai");
+    const { spanBatches, overrides } = makeCapture();
+    const integration = telemetryDev(baseOptions, overrides);
+
+    await evaluate({
+      model: {
+        specificationVersion: "v4",
+        provider: "typesafe",
+        modelId: "jev",
+        supportedQuestionTypes: ["boolean"],
+        doEvaluate: async () => ({
+          answers: { safe: { type: "boolean", probability: 0.73 } },
+          usage: { inputTokens: 19, outputTokens: 2 },
+          warnings: [],
+        }),
+      },
+      state: "private-action",
+      questions: { safe: { type: "boolean", instructions: "private-policy" } },
+      telemetry: { integrations: [integration], recordInputs, recordOutputs },
+    });
+
+    expect(spanBatches).toHaveLength(1);
+
+    for (const batch of spanBatches) {
+      expect(batch).toHaveLength(2);
+      expect(batch.every((span) => span.attributes["gen_ai.operation.name"] === "evaluate")).toBe(
+        true,
+      );
+      expect(
+        batch.reduce(
+          (sum, span) => sum + Number(span.attributes["gen_ai.usage.input_tokens"] ?? 0),
+          0,
+        ),
+      ).toBe(19);
+      expect(
+        batch.reduce(
+          (sum, span) => sum + Number(span.attributes["gen_ai.usage.output_tokens"] ?? 0),
+          0,
+        ),
+      ).toBe(2);
+    }
+
+    for (const span of spanBatches[0]!) {
+      expect(span.attributes["gen_ai.provider.name"]).toBe("typesafe");
+      expect(span.attributes["gen_ai.request.model"]).toBe("jev");
+      expect(span.attributes["gen_ai.input.messages"]).toBe(
+        recordInputs
+          ? JSON.stringify({
+              state: "private-action",
+              questions: { safe: { type: "boolean", instructions: "private-policy" } },
+            })
+          : undefined,
+      );
+      expect(span.attributes["gen_ai.output.messages"]).toBe(
+        recordOutputs
+          ? JSON.stringify({
+              safe: { type: "boolean", probability: 0.73 },
+            })
+          : undefined,
+      );
+    }
+  },
+);
+
+test.each([true, false])(
+  "evaluate preserves arbitrary rejections and cleans up with recordOutputs=%s",
+  async (recordOutputs) => {
+    const { experimental_evaluate: evaluate } = await import("ai");
+    const { spanBatches, overrides } = makeCapture();
+    const integration = telemetryDev(baseOptions, overrides);
+
+    for (const error of [
+      Object.create(null),
+      Object.assign(Object.create(null), { message: "private failure" }),
+      Object.defineProperty({}, "message", {
+        get() {
+          throw new Error("getter failed");
+        },
+      }),
+    ]) {
+      let callId: string | undefined;
+      await expect(
+        evaluate({
+          model: {
+            specificationVersion: "v4",
+            provider: "typesafe",
+            modelId: "jev",
+            supportedQuestionTypes: ["boolean"],
+            doEvaluate: async () => {
+              throw error;
+            },
+          },
+          maxRetries: 0,
+          state: "action",
+          questions: { safe: { type: "boolean", instructions: "policy" } },
+          telemetry: {
+            integrations: [
+              {
+                ...integration,
+                experimental_onEvaluateStart(event) {
+                  callId = event.callId;
+
+                  return integration.experimental_onEvaluateStart?.(event);
+                },
+              },
+            ],
+            recordOutputs,
+          },
+        }),
+      ).rejects.toBe(error);
+
+      const batch = spanBatches.at(-1)!;
+      expect(batch).toHaveLength(2);
+
+      for (const span of batch) {
+        expect(span.ended).toBe(true);
+        expect(span.status.code).toBe(SpanStatusCode.ERROR);
+        expect(span.attributes["gen_ai.operation.name"]).toBe("evaluate");
+
+        if (!recordOutputs) expect(JSON.stringify(span.events)).not.toContain("private failure");
+      }
+
+      expect(callId).toBeDefined();
+      const count = spanBatches.length;
+      await integration.onError?.({ callId, error });
+      expect(spanBatches).toHaveLength(count);
+    }
+
+    expect(spanBatches).toHaveLength(3);
+  },
+);
+
+test("evaluation hooks emit correlated root and model spans without duplicate token metrics", async () => {
+  const { spanBatches, metrics, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "evaluation-1";
+
+  const input = {
+    state: { response: "Paris" },
+    questions: { correct: { type: "boolean", question: "Is this correct?" } },
+  };
+
+  const answers = { correct: { type: "boolean", probability: 0.98 } };
+
+  integ.experimental_onEvaluateStart?.({
+    callId,
+    operationId: "ai.evaluate",
+    provider: "vercel",
+    modelId: "judge-1",
+    functionId: "quality-check",
+    runtimeContext: { userId: "reviewer", sessionId: "eval-session", suite: "facts" },
+    ...input,
+  });
+  integ.experimental_onEvaluationModelCallStart?.({
+    callId,
+    operationId: "ai.evaluate.doEvaluate",
+    provider: "vercel",
+    modelId: "judge-1",
+    ...input,
+  });
+  integ.experimental_onEvaluationModelCallEnd?.({
+    callId,
+    operationId: "ai.evaluate.doEvaluate",
+    provider: "vercel",
+    modelId: "judge-1",
+    ...input,
+    answers,
+    usage: { inputTokens: 12, outputTokens: 3 },
+    response: { id: "eval-response", modelId: "judge-1.1", timestamp: new Date() },
+  });
+  await integ.experimental_onEvaluateEnd?.({
+    callId,
+    operationId: "ai.evaluate",
+    provider: "vercel",
+    modelId: "judge-1",
+    runtimeContext: { userId: "reviewer", sessionId: "eval-session", suite: "facts" },
+    ...input,
+    answers,
+    usage: { inputTokens: 12, outputTokens: 3 },
+    response: { id: "eval-response", modelId: "judge-1.1", timestamp: new Date() },
+  });
+
+  const spans = spanBatches[0]!;
+  const root = spans.find((span) => span.name === "quality-check")!;
+  const modelCall = spans.find((span) => span.kind === SpanKind.CLIENT)!;
+  expect(spans).toHaveLength(2);
+  expect(modelCall.parentSpanContext?.spanId).toBe(spanId(root));
+  expect(root.attributes["gen_ai.operation.name"]).toBe("evaluate");
+  expect(root.attributes["gen_ai.response.model"]).toBe("judge-1.1");
+  expect(root.attributes["gen_ai.response.id"]).toBe("eval-response");
+  expect(root.attributes["gen_ai.input.messages"]).toBe(JSON.stringify(input));
+  expect(root.attributes["gen_ai.output.messages"]).toBe(JSON.stringify(answers));
+  expect(root.attributes["user.id"]).toBe("reviewer");
+  expect(root.attributes["td.metadata.suite"]).toBe("facts");
+  expect(modelCall.attributes["gen_ai.usage.input_tokens"]).toBe(12);
+  expect(modelCall.attributes["gen_ai.usage.output_tokens"]).toBe(3);
+  expect(root.attributes["gen_ai.usage.input_tokens"]).toBeUndefined();
+  expect(root.attributes["gen_ai.usage.output_tokens"]).toBeUndefined();
+  expect(metrics.filter((metric) => metric.metric === "tokens")).toEqual([
+    expect.objectContaining({ tokenType: "input", value: 12 }),
+    expect.objectContaining({ tokenType: "output", value: 3 }),
+  ]);
+});
+
+test("evaluation capture flags redact payloads while preserving identity and usage", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "evaluation-redacted";
+
+  integ.experimental_onEvaluateStart?.({
+    callId,
+    provider: "openai",
+    modelId: "judge",
+    state: { secret: "input" },
+    questions: { secret: { type: "score", question: "private" } },
+    recordInputs: false,
+    recordOutputs: false,
+  });
+  integ.experimental_onEvaluationModelCallStart?.({ callId });
+  integ.experimental_onEvaluationModelCallEnd?.({
+    callId,
+    answers: { secret: { type: "score", score: 1 } },
+    usage: { inputTokens: 4, outputTokens: 2 },
+  });
+  await integ.experimental_onEvaluateEnd?.({
+    callId,
+    provider: "openai",
+    modelId: "judge",
+    answers: { secret: { type: "score", score: 1 } },
+    usage: { inputTokens: 4, outputTokens: 2 },
+  });
+
+  const spans = spanBatches[0]!;
+  expect(JSON.stringify(spans.map((span) => span.attributes))).not.toContain("secret");
+  expect(spans.every((span) => span.attributes["gen_ai.input.messages"] === undefined)).toBe(true);
+  expect(spans.every((span) => span.attributes["gen_ai.output.messages"] === undefined)).toBe(true);
+  expect(
+    spans.find((span) => span.kind === SpanKind.CLIENT)?.attributes["gen_ai.usage.input_tokens"],
+  ).toBe(4);
+});
+
+test("overlapping evaluations stay isolated and errors clean up their call state", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+
+  for (const callId of ["evaluation-a", "evaluation-b"]) {
+    integ.experimental_onEvaluateStart?.({
+      callId,
+      provider: "provider",
+      modelId: callId,
+      state: callId,
+      questions: {},
+    });
+    integ.experimental_onEvaluationModelCallStart?.({ callId });
+  }
+
+  await integ.onError?.({ callId: "evaluation-a", error: new Error("judge failed") });
+  integ.experimental_onEvaluationModelCallEnd?.({
+    callId: "evaluation-b",
+    answers: { result: { type: "boolean", probability: 1 } },
+    usage: { inputTokens: 7, outputTokens: 1 },
+  });
+  await integ.experimental_onEvaluateEnd?.({
+    callId: "evaluation-b",
+    provider: "provider",
+    modelId: "evaluation-b",
+    answers: { result: { type: "boolean", probability: 1 } },
+    usage: { inputTokens: 7, outputTokens: 1 },
+  });
+  await integ.experimental_onEvaluateEnd?.({ callId: "evaluation-a" });
+
+  expect(spanBatches).toHaveLength(2);
+  const failed = spanBatches.flat().filter((span) => span.status.code === SpanStatusCode.ERROR);
+  expect(failed).toHaveLength(2);
+  expect(new Set(spanBatches[0]!.map(traceId)).size).toBe(1);
+  expect(new Set(spanBatches[1]!.map(traceId)).size).toBe(1);
+  expect(traceId(spanBatches[0]![0]!)).not.toBe(traceId(spanBatches[1]![0]!));
+});

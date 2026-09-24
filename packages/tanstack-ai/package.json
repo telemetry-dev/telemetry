@@ -1,7 +1,7 @@
 {
   "name": "@telemetry-dev/tanstack-ai",
   "version": "0.1.5",
-  "description": "TanStack AI telemetry integration for telemetry.dev: chat() middleware emitting OpenTelemetry GenAI spans.",
+  "description": "TanStack AI telemetry integration for telemetry.dev: chat() and decide() middleware emitting OpenTelemetry GenAI spans.",
   "keywords": [
     "genai",
     "llm",
@@ -56,7 +56,7 @@
     "@telemetry-dev/otel": "workspace:^"
   },
   "devDependencies": {
-    "@tanstack/ai": "0.28.0",
+    "@tanstack/ai": "0.57.0",
     "@types/node": "^25.5.0",
     "@typescript/native-preview": "7.0.0-dev.20260328.1",
     "typescript": "^6.0.2",

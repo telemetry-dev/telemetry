@@ -1,7 +1,7 @@
 # @telemetry-dev/tanstack-ai
 
-TanStack AI telemetry integration for [telemetry.dev](https://telemetry.dev). A `chat()` middleware
-that streams every run to the telemetry.dev ingest API. Each `chat()` call produces a root span
+TanStack AI telemetry integration for [telemetry.dev](https://telemetry.dev). Middleware for
+`chat()` and `decide()` that streams every run to the telemetry.dev ingest API. Each `chat()` call produces a root span
 (operation `chat`, or `invoke_agent` once tools are used), a `chat` span per agent-loop iteration,
 and an `execute_tool` span per tool call — spans are typed by `gen_ai.operation.name`. All calls of
 one conversation (`metadata.sessionId`, falling back to the chat's `threadId`) share one trace, with
@@ -14,7 +14,8 @@ the root of each call as a sibling in start order; the id is also stamped as
 npm install @telemetry-dev/tanstack-ai @tanstack/ai
 ```
 
-Requires `@tanstack/ai >= 0.28.0 < 1`.
+Requires `@tanstack/ai >= 0.28.0 < 1` for `chat()`. The `decide()` activity requires
+`@tanstack/ai >= 0.57.0`.
 
 ## Environment
 
@@ -48,6 +49,21 @@ const stream = chat({
   middleware: [telemetryDev()],
 });
 ```
+
+TanStack AI 0.57.0 and newer can use the same middleware with `decide()`:
+
+```ts
+const result = await decide({
+  adapter,
+  state: ticket,
+  questions,
+  middleware: [telemetryDev()],
+});
+```
+
+Evaluation telemetry includes the activity, request id, provider, requested model, duration, and
+provider-reported token usage. TanStack AI's generation middleware does not expose the evaluation
+state, questions, answers, or resolved response model, so the integration does not capture them.
 
 `metadata.userId` is recorded as the `user.id` span attribute and `metadata.sessionId` as
 `gen_ai.conversation.id` (when absent, the chat's `threadId` is used); any remaining metadata keys

@@ -4,19 +4,21 @@ Vercel AI SDK telemetry integration for [telemetry.dev](https://telemetry.dev). 
 runs to the telemetry.dev ingest API. The package ships one entry per supported `ai` major:
 
 - `@telemetry-dev/ai-sdk` — for `ai@7`. Covers `generateText` / `streamText` / `Agent` /
-  `generateObject` / `streamObject` / `embed` / `embedMany` / `rerank`.
+  `generateObject` / `streamObject` / `embed` / `embedMany` / `rerank` / `evaluate`.
 - `@telemetry-dev/ai-sdk/v6` — for `ai@6`. Covers `generateText` / `streamText` / `Agent`.
 
 Each call produces a root span (operation `chat`, or `invoke_agent` once tools are used;
-`embeddings` / `rerank` for those ops), a `chat` span per model step, and an `execute_tool` span
-per tool call — spans are typed by `gen_ai.operation.name`. Calls that carry a `sessionId` share
+`embeddings` / `rerank` / `evaluate` for those operations), a client span per model call, and an
+`execute_tool` span per tool call — spans are typed by `gen_ai.operation.name`. Calls that carry a `sessionId` share
 one trace per session (the root of each call is a sibling under a session parent that is never
 emitted, so the trace shows the calls in start order); a call without a session id is its own
 trace. The session is also stamped as `gen_ai.conversation.id` on every span.
 
-On `ai@7`, provider requests and a tool's `execute` run inside the step/tool span context, so
+On `ai@7`, language-model requests and a tool's `execute` run inside the step/tool span context, so
 auto-instrumented provider spans and nested AI SDK calls made from within a tool parent into the
 outer call's trace instead of starting their own.
+Evaluation calls have correlated root and model spans, but AI SDK does not expose an evaluation
+execution wrapper, so provider HTTP spans do not automatically parent to the evaluation model span.
 
 Provider-executed tools exposed through a completed model-call callback are recorded as
 zero-duration `extension` spans when their final result is observed. AI SDK does not expose their
@@ -34,6 +36,7 @@ npm install @telemetry-dev/ai-sdk ai
 ```
 
 Requires `ai >= 6.0.111 < 8` (import from the entry matching your major).
+Evaluation telemetry requires `ai >= 7.0.111`.
 
 ## Environment
 
@@ -167,6 +170,7 @@ On `ai@7` (root entry):
 - **Thrown errors** are captured via the SDK's `onError` telemetry hook: the trace is flushed with
   `status: "error"` and an `exception` event.
 - `generateObject` / `streamObject` / `embed` / `embedMany` / `rerank` are covered.
+- Experimental `evaluate` telemetry is covered with `ai >= 7.0.111`.
 
 On `ai@6` (`/v6` entry) all three remain limitations:
 
