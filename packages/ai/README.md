@@ -4,7 +4,8 @@ Vercel AI SDK telemetry integration for [telemetry.dev](https://telemetry.dev). 
 runs to the telemetry.dev ingest API. The package ships one entry per supported `ai` major:
 
 - `@telemetry-dev/ai-sdk` — for `ai@7`. Covers `generateText` / `streamText` / `Agent` /
-  `generateObject` / `streamObject` / `embed` / `embedMany` / `rerank` / `evaluate`.
+  `generateObject` / `streamObject` / `embed` / `embedMany` / `rerank` /
+  `experimental_evaluate`.
 - `@telemetry-dev/ai-sdk/v6` — for `ai@6`. Covers `generateText` / `streamText` / `Agent`.
 
 Each call produces a root span (operation `chat`, or `invoke_agent` once tools are used;
@@ -74,9 +75,23 @@ const { text } = await generateText({
 });
 ```
 
-`functionId` becomes the root-span name (it defaults to `chat`, or `embeddings` / `rerank` for
-those operations). User context flows through the call-level `runtimeContext` option — **by
-default none of it reaches telemetry integrations**; opt keys in per call via
+AI SDK exports evaluation as `experimental_evaluate`:
+
+```ts
+import { experimental_evaluate } from "ai";
+import { telemetryDev } from "@telemetry-dev/ai-sdk";
+
+await experimental_evaluate({
+  model: evaluationModel,
+  state,
+  questions,
+  telemetry: { integrations: [telemetryDev()] },
+});
+```
+
+`functionId` becomes the root-span name (it defaults to `chat`, or `embeddings` / `rerank` /
+`evaluate` for those operations). User context flows through the call-level `runtimeContext`
+option — **by default none of it reaches telemetry integrations**; opt keys in per call via
 `telemetry.includeRuntimeContext: { <key>: true }`. Of the included keys, `userId` is recorded as
 the `user.id` span attribute and `sessionId` as `gen_ai.conversation.id`; any remaining included
 keys ride along as `td.metadata.<key>` attributes. Calls that share a `sessionId` share one trace;
@@ -170,7 +185,7 @@ On `ai@7` (root entry):
 - **Thrown errors** are captured via the SDK's `onError` telemetry hook: the trace is flushed with
   `status: "error"` and an `exception` event.
 - `generateObject` / `streamObject` / `embed` / `embedMany` / `rerank` are covered.
-- Experimental `evaluate` telemetry is covered with `ai >= 7.0.111`.
+- `experimental_evaluate` telemetry is covered with `ai >= 7.0.111`.
 
 On `ai@6` (`/v6` entry) all three remain limitations:
 
