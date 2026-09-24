@@ -95,7 +95,9 @@ telemetryDev({ waitUntil: (p) => ctx.waitUntil(p) });
   breakdowns and provider-reported cost when the adapter supplies them
   (`gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_creation.input_tokens`,
   `gen_ai.usage.reasoning.output_tokens`, `gen_ai.usage.cost`). Absent fields are omitted, never
-  zeroed; when no provider cost is reported, cost is computed server-side from pricing tables.
+  zeroed. Provider-reported cost takes precedence; otherwise, the server estimates standard token cost when
+  reported usage and matching model pricing are available. Missing pricing leaves cost
+  unavailable, not zero, and does not prevent tracing or token accounting.
 - **Content:** the per-iteration request messages (`gen_ai.input.messages`, exactly what the
   adapter sends) and the assistant text (`gen_ai.output.messages`); tool calls carry
   `gen_ai.tool.call.arguments` / `gen_ai.tool.call.result`.

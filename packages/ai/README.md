@@ -184,7 +184,9 @@ On `ai@6` (`/v6` entry) all three remain limitations:
 
 On both majors:
 
-- **Cost:** cost is computed server-side and is never sent by this client.
+- **Cost:** this client does not send cost. The server estimates standard token cost when reported usage and
+  matching model pricing are available. Missing pricing leaves cost unavailable, not zero,
+  and does not prevent tracing or token accounting.
 - Integration hook exceptions are swallowed by the AI SDK; this client additionally wraps every
   hook in `try/catch` and routes errors to the optional `onError` callback so instrumentation can
   never break your generation.
