@@ -95,7 +95,9 @@ The SDK installs the [session sampling wrapper](../otel/README.md#correlation-at
 Span types: `span` (default) | `generation` | `tool` | `agent` | `embedding` — mapped to
 `gen_ai.operation.name` `function` / `chat` / `execute_tool` / `invoke_agent` / `embeddings`.
 Generation fields (`model`, `provider`, `usage`, `costUsd`, sampling params, …) map to the OTel
-GenAI semantic conventions; cost is computed server-side from usage unless `costUsd` is set.
+GenAI semantic conventions. An explicit `costUsd` takes precedence; otherwise, the server estimates
+standard token cost when reported usage and matching model pricing are available. Missing pricing leaves cost
+unavailable, not zero, and does not prevent tracing or token accounting.
 
 Duration and token-usage histograms (`gen_ai.client.operation.duration`,
 `gen_ai.client.token.usage`) are recorded automatically for generation/agent/embedding/tool spans.

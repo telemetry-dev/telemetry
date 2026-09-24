@@ -54,7 +54,7 @@ function makeCapture() {
 // Mutable stand-in for the engine's per-chat middleware context. The middleware only reads
 // identity fields, `phase`, `options.metadata`, `modelOptions`, and `accumulatedContent`.
 function makeCtx(over?: Record<string, TestValue>): ChatMiddlewareContext {
-  return {
+  const ctx: Partial<ChatMiddlewareContext> = {
     requestId: "req_1",
     streamId: "stream_1",
     runId: "run_1",
@@ -77,10 +77,14 @@ function makeCtx(over?: Record<string, TestValue>): ChatMiddlewareContext {
     hasTools: false,
     currentMessageId: null,
     accumulatedContent: "",
-    createId: (prefix) => `${prefix}_1`,
+    createId: (prefix: string) => `${prefix}_1`,
     defer: () => {},
+    activity: "chat",
+    emitCustomEvent: () => {},
     ...over,
-  } as ChatMiddlewareContext;
+  };
+
+  return ctx as ChatMiddlewareContext;
 }
 
 const chatConfig = (over?: Record<string, TestValue>) =>
@@ -102,113 +106,118 @@ const event = (s: ReadableSpan, name: string) => s.events.find((ev) => ev.name =
 const middleware = (overrides: ReturnType<typeof makeCapture>["overrides"]) =>
   telemetryDev({ apiKey: "td_live_test", environment: "test", serviceName: "svc" }, overrides);
 
-test("single-iteration chat emits a root + CLIENT iteration with all five token kinds and cost", async () => {
-  const { spanBatches, metrics, overrides } = makeCapture();
-  const mw = middleware(overrides);
-  const ctx = makeCtx({ options: { metadata: { userId: "u1", feature: "support" } } });
+test.each([true, false])(
+  "single-iteration chat emits spans and usage with activity present=%s",
+  async (hasActivity) => {
+    const { spanBatches, metrics, overrides } = makeCapture();
+    const mw = middleware(overrides);
+    const ctx = makeCtx({ options: { metadata: { userId: "u1", feature: "support" } } });
 
-  await mw.onStart?.(ctx);
-  await mw.onConfig?.(
-    ctx,
-    chatConfig({
-      systemPrompts: ["be helpful"],
-      modelOptions: { temperature: 0.7, top_p: 0.9, max_output_tokens: 256 },
-    }),
-  );
-  (ctx as { accumulatedContent: string }).accumulatedContent = "hello there";
-  await mw.onChunk?.(ctx, {
-    type: "RUN_FINISHED",
-    finishReason: "stop",
-    model: "gpt-4o-2024-11-20",
-  } as never);
-  await mw.onUsage?.(ctx, {
-    promptTokens: 10,
-    completionTokens: 5,
-    totalTokens: 15,
-    promptTokensDetails: { cachedTokens: 3, cacheWriteTokens: 2 },
-    completionTokensDetails: { reasoningTokens: 4 },
-    cost: 0.012,
-  } as never);
-  await mw.onFinish?.(ctx, {
-    finishReason: "stop",
-    duration: 120,
-    content: "hello there",
-  } as never);
+    if (!hasActivity) Reflect.deleteProperty(ctx, "activity");
 
-  expect(spanBatches).toHaveLength(1);
-  const spans = spanBatches[0]!;
-  expect(spans).toHaveLength(2);
+    await mw.onStart?.(ctx);
+    await mw.onConfig?.(
+      ctx,
+      chatConfig({
+        systemPrompts: ["be helpful"],
+        modelOptions: { temperature: 0.7, top_p: 0.9, max_output_tokens: 256 },
+      }),
+    );
+    (ctx as { accumulatedContent: string }).accumulatedContent = "hello there";
+    await mw.onChunk?.(ctx, {
+      type: "RUN_FINISHED",
+      finishReason: "stop",
+      model: "gpt-4o-2024-11-20",
+    } as never);
+    await mw.onUsage?.(ctx, {
+      promptTokens: 10,
+      completionTokens: 5,
+      totalTokens: 15,
+      promptTokensDetails: { cachedTokens: 3, cacheWriteTokens: 2 },
+      completionTokensDetails: { reasoningTokens: 4 },
+      cost: 0.012,
+    } as never);
+    await mw.onFinish?.(ctx, {
+      finishReason: "stop",
+      duration: 120,
+      content: "hello there",
+    } as never);
 
-  const root = spans.find((s) => s.kind === SpanKind.INTERNAL)!;
-  const iteration = spans.find((s) => s.kind === SpanKind.CLIENT)!;
+    expect(spanBatches).toHaveLength(1);
+    const spans = spanBatches[0]!;
+    expect(spans).toHaveLength(2);
 
-  // Resource + scope ride along on every span (proves they serialize as gen_ai OTLP).
-  expect(root.resource.attributes["service.name"]).toBe("svc");
-  expect(root.resource.attributes["deployment.environment.name"]).toBe("test");
-  expect(root.instrumentationScope.name).toBe("@telemetry-dev/tanstack-ai");
+    const root = spans.find((s) => s.kind === SpanKind.INTERNAL)!;
+    const iteration = spans.find((s) => s.kind === SpanKind.CLIENT)!;
 
-  expect(root.name).toBe("chat");
-  expect(root.attributes["gen_ai.operation.name"]).toBe("chat");
-  expect(root.attributes["gen_ai.provider.name"]).toBe("openai");
-  expect(root.attributes["gen_ai.request.model"]).toBe("gpt-4o");
-  expect(root.attributes["gen_ai.response.model"]).toBe("gpt-4o-2024-11-20");
-  expect(root.attributes["user.id"]).toBe("u1");
-  expect(root.attributes["td.metadata.feature"]).toBe("support");
-  expect(root.attributes["gen_ai.request.temperature"]).toBe(0.7);
-  expect(root.attributes["gen_ai.output.messages"]).toBe("hello there");
-  expect(root.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
-  expect(root.status.code).toBe(SpanStatusCode.UNSET);
-  expect(root.parentSpanContext?.spanId).toBe(
-    sessionSpanContext("td_live_test", "thread_1").spanId,
-  );
-  // Rolled-up usage lives on the summary event only — root usage attrs would double-count in
-  // the ingest's per-trace sum.
-  expect(root.attributes["gen_ai.usage.input_tokens"]).toBeUndefined();
-  expect(root.attributes["gen_ai.usage.output_tokens"]).toBeUndefined();
+    // Resource + scope ride along on every span (proves they serialize as gen_ai OTLP).
+    expect(root.resource.attributes["service.name"]).toBe("svc");
+    expect(root.resource.attributes["deployment.environment.name"]).toBe("test");
+    expect(root.instrumentationScope.name).toBe("@telemetry-dev/tanstack-ai");
 
-  expect(iteration.name).toBe("chat");
-  expect(iteration.parentSpanContext?.spanId).toBe(spanId(root));
-  expect(traceId(iteration)).toBe(traceId(root));
-  expect(iteration.attributes["gen_ai.operation.name"]).toBe("chat");
-  expect(iteration.attributes["gen_ai.request.temperature"]).toBe(0.7);
-  expect(iteration.attributes["gen_ai.request.top_p"]).toBe(0.9);
-  expect(iteration.attributes["gen_ai.request.max_tokens"]).toBe(256);
-  expect(JSON.parse(String(iteration.attributes["gen_ai.input.messages"]))).toEqual([
-    { role: "system", content: "be helpful" },
-    { role: "user", content: "hi" },
-  ]);
-  expect(iteration.attributes["gen_ai.usage.input_tokens"]).toBe(10);
-  expect(iteration.attributes["gen_ai.usage.output_tokens"]).toBe(5);
-  expect(iteration.attributes["gen_ai.usage.cache_read.input_tokens"]).toBe(3);
-  expect(iteration.attributes["gen_ai.usage.cache_creation.input_tokens"]).toBe(2);
-  expect(iteration.attributes["gen_ai.usage.reasoning.output_tokens"]).toBe(4);
-  expect(iteration.attributes["gen_ai.usage.cost"]).toBe(0.012);
-  expect(iteration.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
-  expect(iteration.attributes["gen_ai.response.model"]).toBe("gpt-4o-2024-11-20");
-  expect(iteration.attributes["gen_ai.output.messages"]).toBe("hello there");
+    expect(root.name).toBe("chat");
+    expect(root.attributes["gen_ai.operation.name"]).toBe("chat");
+    expect(root.attributes["gen_ai.provider.name"]).toBe("openai");
+    expect(root.attributes["gen_ai.request.model"]).toBe("gpt-4o");
+    expect(root.attributes["gen_ai.response.model"]).toBe("gpt-4o-2024-11-20");
+    expect(root.attributes["user.id"]).toBe("u1");
+    expect(root.attributes["td.metadata.feature"]).toBe("support");
+    expect(root.attributes["gen_ai.request.temperature"]).toBe(0.7);
+    expect(root.attributes["gen_ai.output.messages"]).toBe("hello there");
+    expect(root.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
+    expect(root.status.code).toBe(SpanStatusCode.UNSET);
+    expect(root.parentSpanContext?.spanId).toBe(
+      sessionSpanContext("td_live_test", "thread_1").spanId,
+    );
+    // Rolled-up usage lives on the summary event only — root usage attrs would double-count in
+    // the ingest's per-trace sum.
+    expect(root.attributes["gen_ai.usage.input_tokens"]).toBeUndefined();
+    expect(root.attributes["gen_ai.usage.output_tokens"]).toBeUndefined();
 
-  // No explicit sessionId: conversation.id falls back to the chat's threadId.
-  for (const s of spans) {
-    expect(s.attributes["gen_ai.conversation.id"]).toBe("thread_1");
-  }
+    expect(iteration.name).toBe("chat");
+    expect(iteration.parentSpanContext?.spanId).toBe(spanId(root));
+    expect(traceId(iteration)).toBe(traceId(root));
+    expect(iteration.attributes["gen_ai.operation.name"]).toBe("chat");
+    expect(iteration.attributes["gen_ai.request.temperature"]).toBe(0.7);
+    expect(iteration.attributes["gen_ai.request.top_p"]).toBe(0.9);
+    expect(iteration.attributes["gen_ai.request.max_tokens"]).toBe(256);
+    expect(JSON.parse(String(iteration.attributes["gen_ai.input.messages"]))).toEqual([
+      { role: "system", content: "be helpful" },
+      { role: "user", content: "hi" },
+    ]);
+    expect(iteration.attributes["gen_ai.usage.input_tokens"]).toBe(10);
+    expect(iteration.attributes["gen_ai.usage.output_tokens"]).toBe(5);
+    expect(iteration.attributes["gen_ai.usage.cache_read.input_tokens"]).toBe(3);
+    expect(iteration.attributes["gen_ai.usage.cache_creation.input_tokens"]).toBe(2);
+    expect(iteration.attributes["gen_ai.usage.reasoning.output_tokens"]).toBe(4);
+    expect(iteration.attributes["gen_ai.usage.cost"]).toBe(0.012);
+    expect(iteration.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
+    expect(iteration.attributes["gen_ai.response.model"]).toBe("gpt-4o-2024-11-20");
+    expect(iteration.attributes["gen_ai.output.messages"]).toBe("hello there");
 
-  const durations = metrics.filter((m) => m.metric === "duration");
-  const tokens = metrics.filter((m) => m.metric === "tokens");
-  expect(durations).toHaveLength(1);
-  expect(tokens).toHaveLength(2);
-  expect(durations[0]!.attributes["gen_ai.operation.name"]).toBe("chat");
-  expect(durations[0]!.attributes["gen_ai.provider.name"]).toBe("openai");
-  expect(durations[0]!.attributes["gen_ai.request.model"]).toBe("gpt-4o");
-  expect(durations[0]!.attributes["gen_ai.response.model"]).toBe("gpt-4o-2024-11-20");
-  expect(tokens.find((m) => m.tokenType === "input")?.value).toBe(10);
-  expect(tokens.find((m) => m.tokenType === "output")?.value).toBe(5);
+    // No explicit sessionId: conversation.id falls back to the chat's threadId.
+    for (const s of spans) {
+      expect(s.attributes["gen_ai.conversation.id"]).toBe("thread_1");
+    }
 
-  const summary = event(root, "generation.summary");
-  expect(summary?.attributes?.["log.severity_number"]).toBe(9);
-  expect(String(summary?.attributes?.["log.message"])).toContain("10 in / 5 out");
-  expect(summary?.attributes?.["gen_ai.usage.input_tokens"]).toBe(10);
-  expect(summary?.attributes?.["gen_ai.usage.output_tokens"]).toBe(5);
-});
+    const durations = metrics.filter((m) => m.metric === "duration");
+    const tokens = metrics.filter((m) => m.metric === "tokens");
+    expect(durations).toHaveLength(1);
+    expect(tokens).toHaveLength(2);
+    expect(durations[0]!.attributes["gen_ai.operation.name"]).toBe("chat");
+    expect(durations[0]!.attributes["gen_ai.provider.name"]).toBe("openai");
+    expect(durations[0]!.attributes["gen_ai.request.model"]).toBe("gpt-4o");
+    expect(durations[0]!.attributes["gen_ai.response.model"]).toBe("gpt-4o-2024-11-20");
+    expect(tokens.find((m) => m.tokenType === "input")?.value).toBe(10);
+    expect(tokens.find((m) => m.tokenType === "output")?.value).toBe(5);
+
+    const summary = event(root, "generation.summary");
+    expect(summary?.attributes?.["log.severity_number"]).toBe(9);
+    expect(String(summary?.attributes?.["log.message"])).toContain("10 in / 5 out");
+    expect(summary?.attributes?.["gen_ai.usage.input_tokens"]).toBe(10);
+    expect(summary?.attributes?.["gen_ai.usage.output_tokens"]).toBe(5);
+  },
+);
 
 test("bigint metadata IDs populate user and conversation attributes", async () => {
   const { spanBatches, overrides } = makeCapture();
@@ -386,6 +395,54 @@ test("onError marks open iteration and root ERROR and still flushes the batch", 
   const summary = event(root, "generation.summary");
   expect(summary?.attributes?.["log.severity_number"]).toBe(17);
 });
+
+test.each(["chat", "tool"])(
+  "%s errors with throwing getters still close and export spans",
+  async (path) => {
+    const { spanBatches, overrides } = makeCapture();
+    const mw = middleware(overrides);
+    const ctx = makeCtx();
+
+    const error = Object.defineProperty({}, "message", {
+      get() {
+        throw new Error("getter failed");
+      },
+    });
+
+    await mw.onStart?.(ctx);
+    await mw.onConfig?.(ctx, chatConfig());
+
+    if (path === "tool") {
+      await mw.onBeforeToolCall?.(ctx, {
+        toolName: "lookup",
+        toolCallId: "call_error",
+        args: {},
+      } as never);
+      await mw.onAfterToolCall?.(ctx, {
+        toolName: "lookup",
+        toolCallId: "call_error",
+        ok: false,
+        error,
+        duration: 5,
+      } as never);
+    }
+
+    await mw.onError?.(ctx, { error, duration: 30 } as never);
+    await mw.onError?.(ctx, { error, duration: 30 } as never);
+
+    expect(spanBatches).toHaveLength(1);
+    expect(spanBatches[0]).toHaveLength(path === "tool" ? 3 : 2);
+
+    for (const span of spanBatches[0]!) {
+      expect(span.ended).toBe(true);
+      expect(span.status.code).toBe(SpanStatusCode.ERROR);
+
+      if (span.kind !== SpanKind.CLIENT) {
+        expect(event(span, "exception")?.attributes?.["exception.message"]).toBe("Unknown error");
+      }
+    }
+  },
+);
 
 test("onAbort closes everything as cancelled", async () => {
   const { spanBatches, overrides } = makeCapture();

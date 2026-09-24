@@ -30,6 +30,7 @@ import {
 } from "@telemetry-dev/otel";
 
 import { resolveConfig, type TelemetryDevOptions } from "./config.ts";
+import { errorDetails } from "./errors.ts";
 
 type JsonValue =
   | string
@@ -68,32 +69,6 @@ function firstNumber<T>(...candidates: T[]): number | undefined {
   }
 
   return undefined;
-}
-
-function errorTypeName<T>(err: T): string {
-  if (err instanceof Error) return err.name || "Error";
-
-  if (err && isObject(err) && "name" in err) {
-    const n = (err as { name?: unknown }).name;
-
-    if (isString(n) && n.length > 0) return n;
-  }
-
-  return "Error";
-}
-
-function errorMessage<T>(err: T): string {
-  if (err instanceof Error) return err.message;
-
-  if (isString(err)) return err;
-
-  if (err && isObject(err) && "message" in err) {
-    const m = (err as { message?: unknown }).message;
-
-    if (isString(m)) return m;
-  }
-
-  return String(err);
 }
 
 const SEVERITY_INFO = 9;
@@ -176,7 +151,7 @@ interface RunState {
  * middleware context in a WeakMap, so a single `telemetryDev()` instance is safe to share across
  * concurrent and overlapping `chat()` calls (e.g. registered once at module scope).
  */
-export function telemetryDev(
+export function chatTelemetryDev(
   options?: TelemetryDevOptions,
   overrides?: GenerationEmitterOverrides,
 ): ChatMiddleware {
@@ -464,7 +439,16 @@ export function telemetryDev(
     },
 
     onChunk(ctx, chunk) {
-      if (chunk.type !== "RUN_FINISHED" && chunk.type !== "CUSTOM") return undefined;
+      const event = chunk as {
+        type: string;
+        name?: string;
+        value?: unknown;
+        finishReason?: string;
+        model?: string;
+        usage?: TokenUsage;
+      };
+
+      if (event.type !== "RUN_FINISHED" && event.type !== "CUSTOM") return undefined;
 
       try {
         const state = states.get(ctx);
@@ -472,11 +456,11 @@ export function telemetryDev(
 
         if (!state || !iteration) return undefined;
 
-        if (chunk.type === "CUSTOM") {
+        if (event.type === "CUSTOM") {
           // The finalization stream reports its JSON via this event; `ctx.accumulatedContent`
           // still holds the agent loop's text, so this is the structured span's only output.
-          if (iteration.structured && chunk.name === "structured-output.complete") {
-            const raw = (chunk.value as { raw?: unknown } | null | undefined)?.raw;
+          if (iteration.structured && event.name === "structured-output.complete") {
+            const raw = (event.value as { raw?: unknown } | null | undefined)?.raw;
 
             if (isString(raw)) iteration.outputText = raw;
           }
@@ -484,14 +468,14 @@ export function telemetryDev(
           return undefined;
         }
 
-        iteration.finishReason = chunk.finishReason ?? null;
+        iteration.finishReason = event.finishReason ?? null;
 
-        if (chunk.model) {
-          iteration.responseModel = chunk.model;
-          state.responseModel = chunk.model;
+        if (event.model) {
+          iteration.responseModel = event.model;
+          state.responseModel = event.model;
         }
 
-        if (chunk.usage) iteration.usage = chunk.usage;
+        if (event.usage) iteration.usage = event.usage;
 
         if (!iteration.structured) {
           iteration.outputText = ctx.accumulatedContent.length > 0 ? ctx.accumulatedContent : null;
@@ -563,8 +547,7 @@ export function telemetryDev(
             span.setAttribute("gen_ai.tool.call.result", result);
           }
         } else {
-          const message = errorMessage(info.error);
-          const errType = info.error instanceof Error ? info.error.name : "tool_error";
+          const { type: errType, message } = errorDetails(info.error, "tool_error");
           span.setStatus({ code: SpanStatusCode.ERROR });
           span.setAttribute("error.type", errType);
           span.addEvent("exception", {
@@ -697,8 +680,7 @@ export function telemetryDev(
         if (!state) return;
         states.delete(ctx);
 
-        const errType = errorTypeName(info.error);
-        const message = errorMessage(info.error);
+        const { type: errType, message } = errorDetails(info.error);
         failOpenSpans(state, errType, message);
 
         setRootBaseAttributes(state);

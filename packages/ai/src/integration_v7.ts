@@ -49,6 +49,10 @@ export interface TelemetryDevIntegration {
   onEmbedEnd?: TelemetryDevHook;
   onRerankStart?: TelemetryDevHook;
   onRerankEnd?: TelemetryDevHook;
+  experimental_onEvaluateStart?: TelemetryDevHook;
+  experimental_onEvaluationModelCallStart?: TelemetryDevHook;
+  experimental_onEvaluationModelCallEnd?: TelemetryDevHook;
+  experimental_onEvaluateEnd?: TelemetryDevHook;
   // Context wrappers: run the provider model call / tool execute function inside this
   // integration's span context, so auto-instrumented provider requests parent to the step span
   // and nested AI SDK calls made inside tools parent to the tool span. Params are minimal
@@ -69,7 +73,7 @@ export interface TelemetryDevIntegration {
 
 /**
  * Build the Vercel AI SDK telemetry integration for ai@7. Streams generateText / streamText /
- * Agent / generateObject / streamObject / embed / embedMany / rerank runs to telemetry.dev as
+ * Agent / generateObject / streamObject / embed / embedMany / rerank / evaluate runs to telemetry.dev as
  * OpenTelemetry GenAI (`gen_ai.*`) spans + metrics. State is keyed by the SDK's per-call
  * `callId`, so a single instance — including one registered globally via `registerTelemetry` —
  * is safe across overlapping concurrent generations. On ai@6, use the `./v6` entry instead.
@@ -93,9 +97,9 @@ export function telemetryDev(
 }
 
 // Structural shapes of the ai@7 telemetry events the v7 hooks read, grounded in
-// vercel/ai@7.0.106 (packages/ai/src/generate-text/*, generate-object/structured-output-events,
-// embed/embed-events, rerank/rerank-events). Declared locally so the emitted types never import
-// from `ai`.
+// vercel/ai@7.0.111 (packages/ai/src/generate-text/*, generate-object/structured-output-events,
+// embed/embed-events, rerank/rerank-events, evaluate/evaluate-events). Declared locally so the
+// emitted types never import from `ai`.
 
 interface V7Usage {
   inputTokens?: number;
@@ -285,12 +289,37 @@ interface V7EndEvent {
   runtimeContext?: Record<string, JsonValue>;
 }
 
+interface V7EvaluateStartEvent {
+  callId: string;
+  provider: string;
+  modelId: string;
+  functionId?: string;
+  recordInputs?: boolean;
+  recordOutputs?: boolean;
+  runtimeContext?: Record<string, JsonValue>;
+  state?: JsonValue;
+  questions?: JsonValue;
+}
+
+interface V7EvaluationModelCallEndEvent {
+  callId: string;
+  answers?: JsonValue;
+  usage?: V7Usage;
+  response?: { id?: string; modelId?: string; timestamp?: Date };
+}
+
+interface V7EvaluateEndEvent extends V7EvaluateStartEvent {
+  answers?: JsonValue;
+  usage?: V7Usage;
+  response?: { id?: string; modelId?: string; timestamp?: Date };
+}
+
 // The ai@7 `callId` correlation key, when the event carries one (every v7 event does; no v6
 // event has the field).
 const callIdOf = (event: TelemetryDevEvent): string | undefined =>
   "callId" in event && event.callId?.constructor === String ? String(event.callId) : undefined;
 
-type OpKind = "text" | "object" | "embed" | "rerank";
+type OpKind = "text" | "object" | "embed" | "rerank" | "evaluate";
 
 const opKindOf = (operationId: string): OpKind => {
   switch (operationId) {
@@ -312,6 +341,7 @@ const ROOT_NAME_BY_KIND = {
   object: "chat",
   embed: "embeddings",
   rerank: "rerank",
+  evaluate: "evaluate",
 } satisfies Record<OpKind, string>;
 
 interface StepState {
@@ -363,6 +393,7 @@ interface CallState {
   objectStep: { span: Span; startedAt: Date } | undefined;
   embedSpans: Map<string, { span: Span; startedAt: Date }>;
   rerankSpan: { span: Span; startedAt: Date } | undefined;
+  evaluationSpan: { span: Span; startedAt: Date } | undefined;
 }
 
 /**
@@ -485,7 +516,7 @@ export function createV7Hooks(
     span.end(endedAt);
   };
 
-  const detailedToolErrorMessage = (value: unknown): string => {
+  const detailedErrorMessage = (value: unknown, fallback: string): string => {
     try {
       if (value instanceof Error && value.message.length > 0) return value.message;
 
@@ -508,24 +539,27 @@ export function createV7Hooks(
         if (typeof message === "string" && message.length > 0) return message;
       }
     } catch {
-      return "Tool execution failed";
+      return fallback;
     }
 
-    return "Tool execution failed";
+    return fallback;
   };
 
-  const providerToolFailure = (value: unknown, recordOutputs: boolean): ProviderToolFailure => {
-    let errorType = "tool_error";
-
+  const failureDetails = (
+    value: unknown,
+    recordOutputs: boolean,
+    errorType = "tool_error",
+    fallback = "Tool execution failed",
+  ): ProviderToolFailure => {
     try {
       if (value instanceof Error && value.name.length > 0) errorType = value.name;
     } catch {
-      return { errorType, message: "Tool execution failed" };
+      return { errorType, message: fallback };
     }
 
     return {
       errorType,
-      message: recordOutputs ? detailedToolErrorMessage(value) : "Tool execution failed",
+      message: recordOutputs ? detailedErrorMessage(value, fallback) : fallback,
     };
   };
 
@@ -639,14 +673,14 @@ export function createV7Hooks(
     if (resultError !== undefined) {
       return {
         type: "tool-error",
-        failure: providerToolFailure(resultError, state.recordOutputs),
+        failure: failureDetails(resultError, state.recordOutputs),
       };
     }
 
     if (part.type === "tool-error") {
       return {
         type: "tool-error",
-        failure: providerToolFailure(part.error, state.recordOutputs),
+        failure: failureDetails(part.error, state.recordOutputs),
       };
     }
 
@@ -929,7 +963,7 @@ export function createV7Hooks(
           arguments: state.recordInputs ? jsonAttr(part.input) : undefined,
           invalidFailure:
             part.invalid === true
-              ? providerToolFailure(part.error, state.recordInputs && state.recordOutputs)
+              ? failureDetails(part.error, state.recordInputs && state.recordOutputs)
               : undefined,
         });
 
@@ -1026,6 +1060,11 @@ export function createV7Hooks(
     if (state.rerankSpan) {
       close(state.rerankSpan.span);
       state.rerankSpan = undefined;
+    }
+
+    if (state.evaluationSpan) {
+      close(state.evaluationSpan.span);
+      state.evaluationSpan = undefined;
     }
 
     for (const tool of state.toolSpans.values()) {
@@ -1128,6 +1167,7 @@ export function createV7Hooks(
           objectStep: undefined,
           embedSpans: new Map(),
           rerankSpan: undefined,
+          evaluationSpan: undefined,
         };
 
         rememberProviderToolInputs(state, e.messages);
@@ -1431,7 +1471,7 @@ export function createV7Hooks(
         state.toolStarts.delete(e.toolCall.toolCallId);
 
         if (e.toolOutput.type === "tool-error") {
-          const failure = providerToolFailure(e.toolOutput.error, state.recordOutputs);
+          const failure = failureDetails(e.toolOutput.error, state.recordOutputs);
 
           span.setStatus({ code: SpanStatusCode.ERROR });
           span.setAttribute("error.type", failure.errorType);
@@ -1667,6 +1707,145 @@ export function createV7Hooks(
       }
     },
 
+    experimental_onEvaluateStart(event) {
+      try {
+        const e = event as V7EvaluateStartEvent;
+
+        if (callIdOf(e) === undefined) return;
+        const startedAt = new Date();
+        const runtime = readRuntimeContext(e.runtimeContext);
+
+        const rootSpan = emitter.tracer.startSpan(
+          e.functionId || "evaluate",
+          { startTime: startedAt, kind: SpanKind.INTERNAL },
+          withSessionParent(otelContext.active(), runtime.sessionId ?? undefined, config.apiKey),
+        );
+
+        calls.set(e.callId, {
+          opKind: "evaluate",
+          rootSpan,
+          rootCtx: trace.setSpan(ROOT_CONTEXT, rootSpan),
+          rootStartedAt: startedAt,
+          provider: providerLabel(e.provider),
+          model: e.modelId,
+          responseModel: null,
+          userId: runtime.userId,
+          sessionId: runtime.sessionId,
+          restMetadata: runtime.restMetadata,
+          recordInputs: e.recordInputs !== false,
+          recordOutputs: e.recordOutputs !== false,
+          rootInput: { state: e.state, questions: e.questions },
+          samplingAttributes: {},
+          steps: new Map(),
+          currentStepNumber: null,
+          toolStarts: new Map(),
+          toolSpans: new Map(),
+          childSpans: [],
+          hasToolSpan: false,
+          providerToolCalls: [],
+          providerToolInputs: new Map(),
+          stepMetrics: [],
+          toolMetrics: [],
+          objectStep: undefined,
+          embedSpans: new Map(),
+          rerankSpan: undefined,
+          evaluationSpan: undefined,
+        });
+      } catch (err) {
+        onError?.(err instanceof Error ? err : String(err));
+      }
+    },
+
+    experimental_onEvaluationModelCallStart(event) {
+      try {
+        const state = stateOf(event);
+
+        if (!state) return;
+        const startedAt = new Date();
+
+        const span = emitter.tracer.startSpan(
+          "evaluate",
+          {
+            startTime: startedAt,
+            kind: SpanKind.CLIENT,
+            attributes: omitUndefined({
+              ...conversationAttributes(state),
+              "gen_ai.operation.name": "evaluate",
+              "gen_ai.provider.name": state.provider,
+              "gen_ai.request.model": state.model,
+              "gen_ai.input.messages": state.recordInputs ? jsonAttr(state.rootInput) : undefined,
+            }),
+          },
+          state.rootCtx,
+        );
+
+        state.evaluationSpan = { span, startedAt };
+      } catch (err) {
+        onError?.(err instanceof Error ? err : String(err));
+      }
+    },
+
+    experimental_onEvaluationModelCallEnd(event) {
+      try {
+        const state = stateOf(event);
+
+        if (!state?.evaluationSpan) return;
+        const e = event as V7EvaluationModelCallEndEvent;
+        const endedAt = new Date();
+        const { span, startedAt } = state.evaluationSpan;
+        const inputTokens = e.usage?.inputTokens ?? null;
+        const outputTokens = e.usage?.outputTokens ?? null;
+        state.responseModel = e.response?.modelId ?? state.responseModel;
+        span.setAttributes(
+          omitUndefined({
+            "gen_ai.response.model": e.response?.modelId,
+            "gen_ai.response.id": e.response?.id,
+            "gen_ai.usage.input_tokens": inputTokens ?? undefined,
+            "gen_ai.usage.output_tokens": outputTokens ?? undefined,
+            "gen_ai.output.messages": state.recordOutputs ? jsonAttr(e.answers) : undefined,
+          }),
+        );
+        span.end(endedAt);
+        state.childSpans.push(span);
+        state.evaluationSpan = undefined;
+        state.stepMetrics.push({
+          operation: "evaluate",
+          durationSec: Math.max(endedAt.getTime() - startedAt.getTime(), 0) / 1000,
+          inputTokens,
+          outputTokens,
+          provider: state.provider,
+          requestModel: state.model,
+          responseModel: e.response?.modelId ?? null,
+        });
+      } catch (err) {
+        onError?.(err instanceof Error ? err : String(err));
+      }
+    },
+
+    async experimental_onEvaluateEnd(event) {
+      try {
+        const callId = callIdOf(event);
+        const state = callId === undefined ? undefined : calls.get(callId);
+
+        if (!state || callId === undefined) return;
+        const e = event as V7EvaluateEndEvent;
+        applyRuntimeContext(state, e.runtimeContext);
+        state.responseModel = e.response?.modelId ?? state.responseModel;
+        state.rootSpan.setAttributes(
+          omitUndefined({
+            "gen_ai.operation.name": "evaluate",
+            ...rootBaseAttributes(state),
+            "gen_ai.response.id": e.response?.id,
+            "gen_ai.output.messages": state.recordOutputs ? jsonAttr(e.answers) : undefined,
+          }),
+        );
+        state.rootSpan.end(new Date());
+        await finishCall(state, callId);
+      } catch (err) {
+        onError?.(err instanceof Error ? err : String(err));
+      }
+    },
+
     async onEnd(event) {
       try {
         const callId = callIdOf(event);
@@ -1736,16 +1915,14 @@ export function createV7Hooks(
           // streamObject reports parse/schema-validation failures via `error` on the end event
           // (finishReason may still be "stop"); generateObject throws into onError instead.
           if (e.error !== undefined || e.finishReason === "error") {
-            const errorType = e.error instanceof Error ? e.error.name || "error" : "error";
-
-            const message =
+            const { errorType, message } = failureDetails(
+              e.error,
+              state.recordOutputs && e.error !== undefined,
+              "error",
               e.error !== undefined
-                ? state.recordOutputs
-                  ? e.error instanceof Error
-                    ? e.error.message
-                    : (jsonAttr(e.error) ?? "unknown error")
-                  : "Structured output parsing or validation failed"
-                : `Generation failed (${e.finishReason})`;
+                ? "Structured output parsing or validation failed"
+                : `Generation failed (${e.finishReason})`,
+            );
 
             root.setStatus({ code: SpanStatusCode.ERROR });
             root.setAttribute("error.type", errorType);
@@ -1792,13 +1969,13 @@ export function createV7Hooks(
         if (!state || callId === undefined) return;
         const error = errorEvent.error;
         const endedAt = new Date();
-        const errorType = error instanceof Error ? error.name || "error" : "error";
 
-        const message = state.recordOutputs
-          ? error instanceof Error
-            ? error.message
-            : String(error)
-          : "Generation failed";
+        const { errorType, message } = failureDetails(
+          error,
+          state.recordOutputs,
+          "error",
+          "Generation failed",
+        );
 
         closePendingProviderToolSpans(state, endedAt, true);
         closeOpenChildSpans(state, endedAt, { errorType, message });

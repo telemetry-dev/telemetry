@@ -4,19 +4,22 @@ Vercel AI SDK telemetry integration for [telemetry.dev](https://telemetry.dev). 
 runs to the telemetry.dev ingest API. The package ships one entry per supported `ai` major:
 
 - `@telemetry-dev/ai-sdk` — for `ai@7`. Covers `generateText` / `streamText` / `Agent` /
-  `generateObject` / `streamObject` / `embed` / `embedMany` / `rerank`.
+  `generateObject` / `streamObject` / `embed` / `embedMany` / `rerank` /
+  `experimental_evaluate`.
 - `@telemetry-dev/ai-sdk/v6` — for `ai@6`. Covers `generateText` / `streamText` / `Agent`.
 
 Each call produces a root span (operation `chat`, or `invoke_agent` once tools are used;
-`embeddings` / `rerank` for those ops), a `chat` span per model step, and an `execute_tool` span
-per tool call — spans are typed by `gen_ai.operation.name`. Calls that carry a `sessionId` share
+`embeddings` / `rerank` / `evaluate` for those operations), a client span per model call, and an
+`execute_tool` span per tool call — spans are typed by `gen_ai.operation.name`. Calls that carry a `sessionId` share
 one trace per session (the root of each call is a sibling under a session parent that is never
 emitted, so the trace shows the calls in start order); a call without a session id is its own
 trace. The session is also stamped as `gen_ai.conversation.id` on every span.
 
-On `ai@7`, provider requests and a tool's `execute` run inside the step/tool span context, so
+On `ai@7`, language-model requests and a tool's `execute` run inside the step/tool span context, so
 auto-instrumented provider spans and nested AI SDK calls made from within a tool parent into the
 outer call's trace instead of starting their own.
+Evaluation calls have correlated root and model spans, but AI SDK does not expose an evaluation
+execution wrapper, so provider HTTP spans do not automatically parent to the evaluation model span.
 
 Provider-executed tools exposed through a completed model-call callback are recorded as
 zero-duration `extension` spans when their final result is observed. AI SDK does not expose their
@@ -34,6 +37,7 @@ npm install @telemetry-dev/ai-sdk ai
 ```
 
 Requires `ai >= 6.0.111 < 8` (import from the entry matching your major).
+Evaluation telemetry requires `ai >= 7.0.111`.
 
 ## Environment
 
@@ -71,9 +75,23 @@ const { text } = await generateText({
 });
 ```
 
-`functionId` becomes the root-span name (it defaults to `chat`, or `embeddings` / `rerank` for
-those operations). User context flows through the call-level `runtimeContext` option — **by
-default none of it reaches telemetry integrations**; opt keys in per call via
+AI SDK exports evaluation as `experimental_evaluate`:
+
+```ts
+import { experimental_evaluate } from "ai";
+import { telemetryDev } from "@telemetry-dev/ai-sdk";
+
+await experimental_evaluate({
+  model: evaluationModel,
+  state,
+  questions,
+  telemetry: { integrations: [telemetryDev()] },
+});
+```
+
+`functionId` becomes the root-span name (it defaults to `chat`, or `embeddings` / `rerank` /
+`evaluate` for those operations). User context flows through the call-level `runtimeContext`
+option — **by default none of it reaches telemetry integrations**; opt keys in per call via
 `telemetry.includeRuntimeContext: { <key>: true }`. Of the included keys, `userId` is recorded as
 the `user.id` span attribute and `sessionId` as `gen_ai.conversation.id`; any remaining included
 keys ride along as `td.metadata.<key>` attributes. Calls that share a `sessionId` share one trace;
@@ -167,6 +185,7 @@ On `ai@7` (root entry):
 - **Thrown errors** are captured via the SDK's `onError` telemetry hook: the trace is flushed with
   `status: "error"` and an `exception` event.
 - `generateObject` / `streamObject` / `embed` / `embedMany` / `rerank` are covered.
+- `experimental_evaluate` telemetry is covered with `ai >= 7.0.111`.
 
 On `ai@6` (`/v6` entry) all three remain limitations:
 
@@ -180,7 +199,9 @@ On `ai@6` (`/v6` entry) all three remain limitations:
 
 On both majors:
 
-- **Cost:** cost is computed server-side and is never sent by this client.
+- **Cost:** this client does not send cost. The server estimates standard token cost when reported usage and
+  matching model pricing are available. Missing pricing leaves cost unavailable, not zero,
+  and does not prevent tracing or token accounting.
 - Integration hook exceptions are swallowed by the AI SDK; this client additionally wraps every
   hook in `try/catch` and routes errors to the optional `onError` callback so instrumentation can
   never break your generation.
