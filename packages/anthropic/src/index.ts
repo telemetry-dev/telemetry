@@ -505,7 +505,7 @@ function recordContentBlockDelta(event: ValueRecord, state: StreamState): void {
   // Match the TypeScript SDK (0.127+): each delta carries the block's final content, where null
   // means the compaction failed, and encrypted_content changes only when the key is present.
   if (deltaType === "compaction_delta") {
-    data.content = delta.content ?? null;
+    data.content = delta.content;
 
     if ("encrypted_content" in delta) data.encrypted_content = delta.encrypted_content;
   }

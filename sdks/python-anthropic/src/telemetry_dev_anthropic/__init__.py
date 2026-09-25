@@ -241,6 +241,8 @@ class _StreamState:
         self.finish_reason: str | None = None
         self.response_model: str | None = None
         self.budget = telemetry_dev.CaptureBudget.from_client()
+        # Budget bytes and items held by each block's latest replacement delta.
+        self.replacement_reservations: dict[int, tuple[int, int]] = {}
 
 
 def _parse_tool_input(raw: str) -> Any:
@@ -362,13 +364,45 @@ def _block_for_delta(index: int, delta_type: str | None, state: _StreamState) ->
     return state.blocks[index]
 
 
+# Deltas whose value replaces the block's previous value instead of appending to it.
+_REPLACEMENT_DELTAS = frozenset({"compaction_delta", "signature_delta"})
+
+
+def _reserve_replacement_delta(index: int, delta: Any, state: _StreamState) -> bool:
+    """Reserve budget for a delta that replaces its block's previous value.
+
+    The previous delta's reservation is handed back first, so a shorter replacement fits
+    where adding it on top would not. Other blocks keep their reservations.
+    """
+    budget = state.budget
+    released_bytes, released_items = state.replacement_reservations.pop(index, (0, 0))
+    budget.bytes_used -= released_bytes
+    budget.items_used -= released_items
+    before_bytes, before_items = budget.bytes_used, budget.items_used
+    if not budget.accept(delta):
+        # The previous value is still retained, so it keeps its reservation.
+        budget.bytes_used += released_bytes
+        budget.items_used += released_items
+        if released_bytes or released_items:
+            state.replacement_reservations[index] = (released_bytes, released_items)
+        return False
+    state.replacement_reservations[index] = (
+        budget.bytes_used - before_bytes,
+        budget.items_used - before_items,
+    )
+    return True
+
+
 def _record_content_block_delta(event: Any, state: _StreamState) -> None:
     index = _field(event, "index")
     block_index = index if isinstance(index, int) else 0
     delta = _native(_field(event, "delta"))
-    if not state.budget.accept(delta):
-        return
     delta_type = _string(_field(delta, "type"))
+    if delta_type in _REPLACEMENT_DELTAS:
+        if not _reserve_replacement_delta(block_index, delta, state):
+            return
+    elif not state.budget.accept(delta):
+        return
     block = _block_for_delta(block_index, delta_type, state)
     if delta_type == "input_json_delta":
         state.tool_json[block_index] = (

@@ -1091,6 +1091,11 @@ test.each<{ name: string; deltas: JsonRecord[]; expected: JsonRecord }>([
     expected: { content: null, encrypted_content: null },
   },
   {
+    name: "omitted content is left out like the SDK does",
+    deltas: [{ content: "Summary", encrypted_content: "enc_1" }, { encrypted_content: "enc_2" }],
+    expected: { encrypted_content: "enc_2" },
+  },
+  {
     name: "omitted encrypted_content keeps the earlier value",
     deltas: [{ content: "Summary", encrypted_content: "enc_1" }, { content: "Summary." }],
     expected: { content: "Summary.", encrypted_content: "enc_1" },
