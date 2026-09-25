@@ -72,7 +72,7 @@ Native Anthropic stream events pass through unmodified. The span records time to
 
 ## Bedrock and Vertex
 
-Class instrumentation covers Bedrock and Vertex clients because the Anthropic SDK reuses the same stable and beta `Messages` and `AsyncMessages` resource classes. Provider attribution is recorded as `aws.bedrock` or `gcp.vertex_ai` when the client class identifies those runtimes.
+Class instrumentation covers Bedrock and Vertex clients. Their `messages` resources reuse the stable `Messages` and `AsyncMessages` classes. Their `beta.messages` resources are separate provider classes, which are patched too: Bedrock exposes `create()` and Vertex exposes `create()` and `stream()`. Provider attribution is recorded as `aws.bedrock` or `gcp.vertex_ai` when the client class identifies those runtimes.
 
 ## Limitations
 

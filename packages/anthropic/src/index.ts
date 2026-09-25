@@ -68,6 +68,7 @@ interface StreamState {
   blocks: Map<number, ValueRecord | ToolBlockState>;
   usage?: SpanFields["usage"];
   finishReason?: string;
+  responseModel?: string;
 }
 
 function asRecord<T>(value: T): (T & ValueRecord) | undefined {
@@ -395,7 +396,15 @@ function streamOutput(state: StreamState): ValueRecord[] | undefined {
 }
 
 function streamPartialFields(state: StreamState): SpanFields {
-  return { output: streamOutput(state), usage: state.usage, finishReason: state.finishReason };
+  const fields: SpanFields = {
+    output: streamOutput(state),
+    usage: state.usage,
+    finishReason: state.finishReason,
+  };
+
+  if (state.responseModel !== undefined) fields.responseModel = state.responseModel;
+
+  return fields;
 }
 
 function recordContentBlockStart(event: ValueRecord, state: StreamState): void {
@@ -403,13 +412,17 @@ function recordContentBlockStart(event: ValueRecord, state: StreamState): void {
   const contentBlock: ValueRecord = asRecord(event.content_block) ?? {};
   const type = readString(contentBlock.type);
 
+  // The final fallback block names the model that served the response.
+  if (type === "fallback")
+    state.responseModel = readString(asRecord(contentBlock.to)?.model) ?? state.responseModel;
+
   if (type === "text") {
     state.blocks.set(index, { type, text: readString(contentBlock.text) ?? "" });
 
     return;
   }
 
-  if (type === "tool_use" || type === "server_tool_use") {
+  if (type === "tool_use" || type === "server_tool_use" || type === "mcp_tool_use") {
     const data = { ...contentBlock, type };
     state.blocks.set(index, { data, inputJson: "" });
 
@@ -486,6 +499,12 @@ function recordContentBlockDelta(event: ValueRecord, state: StreamState): void {
 
   if (deltaType === "signature_delta" && delta.signature !== undefined)
     data.signature = delta.signature;
+
+  // Each compaction delta carries the full summary, so it replaces rather than appends.
+  if (deltaType === "compaction_delta") {
+    data.content = delta.content;
+    data.encrypted_content = delta.encrypted_content;
+  }
 }
 
 function recordStreamEvent<T>(event: T, state: StreamState): SpanFields {

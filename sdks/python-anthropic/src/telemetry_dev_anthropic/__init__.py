@@ -9,6 +9,11 @@ from typing import Any, TypeVar, cast
 
 import anthropic
 import telemetry_dev
+from anthropic._resource import AsyncAPIResource
+from anthropic.lib.bedrock._beta_messages import AsyncMessages as AsyncBedrockBetaMessages
+from anthropic.lib.bedrock._beta_messages import Messages as BedrockBetaMessages
+from anthropic.lib.vertex._beta_messages import AsyncMessages as AsyncVertexBetaMessages
+from anthropic.lib.vertex._beta_messages import Messages as VertexBetaMessages
 from anthropic.resources.beta.messages import AsyncMessages as AsyncBetaMessages
 from anthropic.resources.beta.messages import Messages as BetaMessages
 from anthropic.resources.messages import AsyncMessages, Messages
@@ -32,6 +37,12 @@ _MESSAGES_CLASSES: tuple[tuple[type[Any], bool], ...] = (
     (AsyncMessages, True),
     (BetaMessages, False),
     (AsyncBetaMessages, True),
+    # Bedrock and Vertex clients expose their own beta resource classes, which copy the
+    # first-party methods instead of subclassing, so patching BetaMessages misses them.
+    (BedrockBetaMessages, False),
+    (AsyncBedrockBetaMessages, True),
+    (VertexBetaMessages, False),
+    (AsyncVertexBetaMessages, True),
 )
 
 
@@ -222,6 +233,7 @@ class _StreamState:
         self.tool_json: dict[int, str] = {}
         self.usage: dict[str, int | float] | None = None
         self.finish_reason: str | None = None
+        self.response_model: str | None = None
         self.budget = telemetry_dev.CaptureBudget.from_client()
 
 
@@ -269,6 +281,7 @@ def _stream_partial(state: _StreamState) -> dict[str, Any]:
         "output": _stream_output(state),
         "usage": state.usage,
         "finish_reason": state.finish_reason,
+        "response_model": state.response_model,
     }
 
 
@@ -299,13 +312,18 @@ def _record_content_block_start(event: Any, state: _StreamState) -> None:
     if not state.budget.accept(content_block):
         return
     block_type = _string(_field(content_block, "type"))
+    if block_type == "fallback":
+        # The final fallback block names the model that served the response.
+        state.response_model = (
+            _string(_field(_field(content_block, "to"), "model")) or state.response_model
+        )
     if block_type == "text":
         state.blocks[block_index] = {
             "type": "text",
             "text": _string(_field(content_block, "text")) or "",
         }
         return
-    if block_type in {"tool_use", "server_tool_use"}:
+    if block_type in {"tool_use", "server_tool_use", "mcp_tool_use"}:
         state.blocks[block_index] = (
             content_block if isinstance(content_block, dict) else {"type": block_type}
         )
@@ -355,6 +373,10 @@ def _record_content_block_delta(event: Any, state: _StreamState) -> None:
         _append_string(block, "thinking", _field(delta, "thinking"))
     elif delta_type == "signature_delta" and _field(delta, "signature") is not None:
         block["signature"] = _field(delta, "signature")
+    elif delta_type == "compaction_delta":
+        # Each compaction delta carries the full summary, so it replaces rather than appends.
+        block["content"] = _field(delta, "content")
+        block["encrypted_content"] = _field(delta, "encrypted_content")
 
 
 def _record_stream_event(event: Any, state: _StreamState) -> dict[str, Any]:
@@ -802,7 +824,8 @@ def wrap_anthropic(client: _T) -> _T:
     for messages in (client_any.messages, _beta_messages(cast(object, client))):
         if messages is None:
             continue
-        async_resource = isinstance(messages, AsyncMessages | AsyncBetaMessages)
+        # Every async resource, including provider beta classes, derives from AsyncAPIResource.
+        async_resource = isinstance(messages, AsyncAPIResource)
         for name in (*_RESPONSE_METHODS, "stream"):
             _patch_instance_method(messages, name, async_resource, provider_name)
     setattr(client, _WRAPPED_ATTR, True)

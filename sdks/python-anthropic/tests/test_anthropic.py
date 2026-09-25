@@ -10,6 +10,8 @@ import httpx
 import pytest
 import telemetry_dev
 from anthropic import Anthropic, AsyncAnthropic
+from anthropic.lib.bedrock import AnthropicBedrock, AsyncAnthropicBedrock
+from anthropic.lib.vertex import AnthropicVertex, AsyncAnthropicVertex
 from anthropic.resources.beta.messages import AsyncMessages as AsyncBetaMessages
 from anthropic.resources.beta.messages import Messages as BetaMessages
 from anthropic.resources.messages import AsyncMessages, Messages
@@ -1197,3 +1199,195 @@ def test_global_and_wrapped_beta_record_one_span_per_call(memory: SimpleNamespac
     client.beta.messages.parse(model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES)
 
     assert len(memory.span_exporter.get_finished_spans()) == 2
+
+
+def no_bedrock_signing(**_kwargs: object) -> dict[str, str]:
+    return {}
+
+
+def provider_clients(
+    monkeypatch: pytest.MonkeyPatch, handler: AsyncHandler, sync_handler: SyncHandler
+) -> dict[str, tuple[Any, Any]]:
+    # Bedrock signs requests with botocore; the resource classes under test do not need it.
+    monkeypatch.setattr("anthropic.lib.bedrock._auth.get_auth_headers", no_bedrock_signing)
+
+    def sync_http() -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(sync_handler))
+
+    def async_http() -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    return {
+        "aws.bedrock": (
+            AnthropicBedrock(
+                aws_region="us-east-1",
+                aws_access_key="a",
+                aws_secret_key="b",
+                http_client=sync_http(),
+            ),
+            AsyncAnthropicBedrock(
+                aws_region="us-east-1",
+                aws_access_key="a",
+                aws_secret_key="b",
+                http_client=async_http(),
+            ),
+        ),
+        "gcp.vertex_ai": (
+            AnthropicVertex(
+                region="us-east5", project_id="p", access_token="t", http_client=sync_http()
+            ),
+            AsyncAnthropicVertex(
+                region="us-east5", project_id="p", access_token="t", http_client=async_http()
+            ),
+        ),
+    }
+
+
+@pytest.mark.parametrize("provider", ["aws.bedrock", "gcp.vertex_ai"])
+@pytest.mark.parametrize("mode", ["wrap", "instrument"])
+async def test_provider_beta_create_records_response_sync_and_async(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, provider: str, mode: str
+) -> None:
+    def sync_handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload(id="msg_provider_sync"))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload(id="msg_provider_async"))
+
+    if mode == "instrument":
+        instrument_anthropic()
+    sync_provider, async_provider = provider_clients(monkeypatch, handler, sync_handler)[provider]
+    if mode == "wrap":
+        sync_provider = wrap_anthropic(sync_provider)
+        async_provider = wrap_anthropic(async_provider)
+
+    sync_provider.beta.messages.create(
+        model="claude-sonnet-4-6", max_tokens=64, messages=BETA_MESSAGES
+    )
+    await async_provider.beta.messages.create(
+        model="claude-sonnet-4-6", max_tokens=64, messages=BETA_MESSAGES
+    )
+    await async_provider.close()
+
+    spans = memory.span_exporter.get_finished_spans()
+    assert [attrs(span)["gen_ai.response.id"] for span in spans] == [
+        "msg_provider_sync",
+        "msg_provider_async",
+    ]
+    for span in spans:
+        assert attrs(span)["gen_ai.provider.name"] == provider
+        assert "gen_ai.output.messages" in attrs(span)
+
+
+def beta_stream_events(
+    *blocks: tuple[dict[str, Any], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = [
+        {
+            "type": "message_start",
+            "message": message_payload(
+                id="msg_beta_stream",
+                model="claude-opus-5",
+                content=[],
+                usage={"input_tokens": 5, "output_tokens": 0},
+            ),
+        }
+    ]
+    for index, (block, deltas) in enumerate(blocks):
+        events.append({"type": "content_block_start", "index": index, "content_block": block})
+        events.extend(
+            {"type": "content_block_delta", "index": index, "delta": delta} for delta in deltas
+        )
+        events.append({"type": "content_block_stop", "index": index})
+    events.extend(
+        [
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 2},
+            },
+            {"type": "message_stop"},
+        ]
+    )
+    return events
+
+
+def streamed_beta_span(events: list[dict[str, Any]], memory: SimpleNamespace) -> dict[str, object]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(events)
+
+    client = wrapped_sync_client(handler)
+    for _event in client.beta.messages.create(
+        model="claude-opus-5", max_tokens=64, messages=BETA_MESSAGES, stream=True
+    ):
+        pass
+    return attrs(only_span(memory))
+
+
+def test_beta_stream_records_model_that_served_a_fallback(memory: SimpleNamespace) -> None:
+    fallback = {
+        "type": "fallback",
+        "from": {"model": "claude-opus-5"},
+        "to": {"model": "claude-opus-4-8"},
+    }
+    a = streamed_beta_span(
+        beta_stream_events(
+            (fallback, []),
+            ({"type": "text", "text": ""}, [{"type": "text_delta", "text": "Hi"}]),
+        ),
+        memory,
+    )
+
+    assert a["gen_ai.response.model"] == "claude-opus-4-8"
+
+
+def test_beta_stream_records_compaction_content(memory: SimpleNamespace) -> None:
+    a = streamed_beta_span(
+        beta_stream_events(
+            (
+                {"type": "compaction", "content": None},
+                [
+                    {
+                        "type": "compaction_delta",
+                        "content": "Summary so far.",
+                        "encrypted_content": "enc_1",
+                    }
+                ],
+            )
+        ),
+        memory,
+    )
+
+    assert json.loads(str(a["gen_ai.output.messages"])) == [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "compaction", "content": "Summary so far.", "encrypted_content": "enc_1"}
+            ],
+        }
+    ]
+
+
+def test_beta_stream_records_mcp_tool_use_input(memory: SimpleNamespace) -> None:
+    block: dict[str, Any] = {
+        "type": "mcp_tool_use",
+        "id": "mcptoolu_1",
+        "name": "search",
+        "server_name": "docs",
+        "input": {},
+    }
+    a = streamed_beta_span(
+        beta_stream_events(
+            (
+                block,
+                [
+                    {"type": "input_json_delta", "partial_json": '{"q": '},
+                    {"type": "input_json_delta", "partial_json": '"otel"}'},
+                ],
+            )
+        ),
+        memory,
+    )
+
+    content = json.loads(str(a["gen_ai.output.messages"]))[0]["content"]
+    assert content == [{**block, "input": {"q": "otel"}}]

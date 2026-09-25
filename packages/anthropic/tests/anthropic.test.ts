@@ -999,3 +999,103 @@ test("instrumentAnthropic and wrapAnthropic together record one beta span per ca
   const span = await exportedSpan(spans);
   expect(span.attributes["gen_ai.response.id"]).toBe("msg_beta_both");
 });
+
+function betaStreamEvents(...blocks: [JsonRecord, JsonRecord[]][]): JsonRecord[] {
+  const events: JsonRecord[] = [
+    {
+      type: "message_start",
+      message: messagePayload({
+        id: "msg_beta_stream",
+        model: "claude-opus-5",
+        content: [],
+        usage: { input_tokens: 5, output_tokens: 0 },
+      }),
+    },
+  ];
+
+  blocks.forEach(([block, deltas], index) => {
+    events.push({ type: "content_block_start", index, content_block: block });
+    for (const delta of deltas) events.push({ type: "content_block_delta", index, delta });
+    events.push({ type: "content_block_stop", index });
+  });
+
+  events.push(
+    { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } },
+    { type: "message_stop" },
+  );
+
+  return events;
+}
+
+async function streamedBetaSpan(events: JsonRecord[]): Promise<ReadableSpan> {
+  const spans = setupSpans();
+  const client = clientWith(createFakeFetch(namedSseResponse(events)).fetch);
+
+  const stream = await client.beta.messages.create({
+    model: "claude-opus-5",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Hi" }],
+    stream: true,
+  });
+
+  await collectStream(stream);
+
+  return exportedSpan(spans);
+}
+
+test("beta streams record the model that served a fallback", async () => {
+  const fallback = {
+    type: "fallback",
+    from: { model: "claude-opus-5" },
+    to: { model: "claude-opus-4-8" },
+  };
+
+  const span = await streamedBetaSpan(
+    betaStreamEvents(
+      [fallback, []],
+      [{ type: "text", text: "" }, [{ type: "text_delta", text: "Hi" }]],
+    ),
+  );
+
+  expect(span.attributes["gen_ai.response.model"]).toBe("claude-opus-4-8");
+});
+
+test("beta streams record compaction content", async () => {
+  const span = await streamedBetaSpan(
+    betaStreamEvents([
+      { type: "compaction", content: null },
+      [{ type: "compaction_delta", content: "Summary so far.", encrypted_content: "enc_1" }],
+    ]),
+  );
+
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: [{ type: "compaction", content: "Summary so far.", encrypted_content: "enc_1" }],
+    },
+  ]);
+});
+
+test("beta streams record mcp_tool_use input", async () => {
+  const block = {
+    type: "mcp_tool_use",
+    id: "mcptoolu_1",
+    name: "search",
+    server_name: "docs",
+    input: {},
+  };
+
+  const span = await streamedBetaSpan(
+    betaStreamEvents([
+      block,
+      [
+        { type: "input_json_delta", partial_json: '{"q": ' },
+        { type: "input_json_delta", partial_json: '"otel"}' },
+      ],
+    ]),
+  );
+
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ ...block, input: { q: "otel" } }] },
+  ]);
+});

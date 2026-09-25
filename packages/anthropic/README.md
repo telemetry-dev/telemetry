@@ -41,7 +41,7 @@ instrumentAnthropic();
 uninstrumentAnthropic();
 ```
 
-Global instrumentation patches `Messages.prototype.create`; call it once during process startup.
+Global instrumentation patches both the stable and beta `Messages.prototype.create`, so it covers `messages` and `beta.messages` on every client in the process. Call it once during process startup. `uninstrumentAnthropic()` restores both methods.
 
 ## Instrumented surfaces
 
