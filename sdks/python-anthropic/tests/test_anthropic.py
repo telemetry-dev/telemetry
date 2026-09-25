@@ -1574,23 +1574,76 @@ def test_stream_keeps_short_compaction_replacement_within_budget(make: Any) -> N
     ]
 
 
-def test_oversized_compaction_replacement_keeps_previous_reservation(make: Any) -> None:
+def test_oversized_compaction_replacement_keeps_previous_reservation_and_recovers(
+    make: Any,
+) -> None:
     make(max_attribute_length=300)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+    start = {"type": "compaction"}
     first = {"type": "compaction_delta", "content": "ok"}
 
-    record(
-        {"type": "content_block_start", "index": 0, "content_block": {"type": "compaction"}},
-        state,
-    )
+    record({"type": "content_block_start", "index": 0, "content_block": start}, state)
     record({"type": "content_block_delta", "index": 0, "delta": first}, state)
     reserved = state.budget.bytes_used
     oversized = {"type": "compaction_delta", "content": "x" * 400}
     record({"type": "content_block_delta", "index": 0, "delta": oversized}, state)
 
-    assert state.budget.truncated is True
     assert state.budget.bytes_used == reserved
+    assert state.blocks[0]["content"] == "ok"
+
+    final = {"type": "compaction_delta", "content": "final"}
+    record({"type": "content_block_delta", "index": 0, "delta": final}, state)
+
+    expected = telemetry_dev.CaptureBudget(max_bytes=300)
+    for retained in (start, final):
+        assert expected.accept(retained)
+    assert state.budget.truncated is False
+    assert state.budget.bytes_used == expected.bytes_used
+    assert state.blocks[0]["content"] == "final"
+
+
+def test_replacement_after_other_block_truncation_stays_rejected(make: Any) -> None:
+    make(max_attribute_length=300)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+
+    record(
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "compaction"}},
+        state,
+    )
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "compaction_delta", "content": "ok"},
+        },
+        state,
+    )
+    record(
+        {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}},
+        state,
+    )
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "text_delta", "text": "y" * 400},
+        },
+        state,
+    )
+    assert state.budget.truncated is True
+
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "compaction_delta", "content": "hi"},
+        },
+        state,
+    )
+
+    assert state.budget.truncated is True
     assert state.blocks[0]["content"] == "ok"
 
 

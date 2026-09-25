@@ -373,16 +373,23 @@ def _reserve_replacement_delta(index: int, delta: Any, state: _StreamState) -> b
 
     The previous delta's reservation is handed back first, so a shorter replacement fits
     where adding it on top would not. Other blocks keep their reservations.
+
+    A replacement that does not fit is rejected on its own: the budget stays usable for a
+    later replacement that does fit. Truncation caused by another block still applies.
     """
     budget = state.budget
+    if budget.truncated:
+        return False
     released_bytes, released_items = state.replacement_reservations.pop(index, (0, 0))
     budget.bytes_used -= released_bytes
     budget.items_used -= released_items
     before_bytes, before_items = budget.bytes_used, budget.items_used
     if not budget.accept(delta):
-        # The previous value is still retained, so it keeps its reservation.
+        # The previous value is still retained, so it keeps its reservation, and the
+        # rejection belongs to this candidate alone.
         budget.bytes_used += released_bytes
         budget.items_used += released_items
+        budget.truncated = False
         if released_bytes or released_items:
             state.replacement_reservations[index] = (released_bytes, released_items)
         return False
