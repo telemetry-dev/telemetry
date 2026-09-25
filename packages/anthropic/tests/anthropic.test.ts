@@ -1,3 +1,8 @@
+import {
+  AggregationTemporality,
+  InMemoryMetricExporter,
+  type PushMetricExporter,
+} from "@opentelemetry/sdk-metrics";
 import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import { flush, init, shutdown } from "@telemetry-dev/sdk";
 import Anthropic from "@anthropic-ai/sdk";
@@ -149,7 +154,7 @@ function createFakeFetch(...responses: Response[]): FakeFetch {
   return { fetch: fetchImpl, requests };
 }
 
-function setupSpans(): InMemorySpanExporter {
+function setupSpans(metricExporter?: PushMetricExporter): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
   init(
     {
@@ -160,7 +165,7 @@ function setupSpans(): InMemorySpanExporter {
       logLevel: "silent",
       fetch: async () => new Response(null, { status: 200 }),
     },
-    { spanExporter },
+    { spanExporter, metricExporter },
   );
 
   return spanExporter;
@@ -839,4 +844,328 @@ test("wrapAnthropic records Bedrock provider names from client constructor names
 
   const span = await exportedSpan(spans);
   expect(span.attributes["gen_ai.provider.name"]).toBe("aws.bedrock");
+});
+
+test("beta.messages.create records a generation span for the beta endpoint", async () => {
+  const spans = setupSpans();
+  const messages = [{ role: "user" as const, content: "Say hello" }];
+  const fake = createFakeFetch(jsonResponse(messagePayload({ id: "msg_beta" })));
+  const client = clientWith(fake.fetch);
+
+  await client.beta.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages,
+    betas: ["context-management-2025-06-27"],
+  });
+
+  const span = await exportedSpan(spans);
+  expect(fake.requests).toHaveLength(1);
+  expect(fake.requests[0]?.path).toBe("/v1/messages");
+  expect(fake.requests[0]?.body).not.toHaveProperty("betas");
+  expect(span.name).toBe("chat claude-sonnet-4-6");
+  expect(span.attributes["gen_ai.operation.name"]).toBe("chat");
+  expect(span.attributes["gen_ai.provider.name"]).toBe("anthropic");
+  expect(span.attributes["gen_ai.response.id"]).toBe("msg_beta");
+  expect(span.attributes["gen_ai.input.messages"]).toBe(JSON.stringify(messages));
+  expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(10);
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["end_turn"]);
+});
+
+test("beta.messages.stream helper routes through create and records one span", async () => {
+  const spans = setupSpans();
+  const fake = createFakeFetch(namedSseResponse(streamEvents()));
+  const client = clientWith(fake.fetch);
+
+  const stream = client.beta.messages.stream({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Say hello" }],
+  });
+
+  const finalMessage = await stream.finalMessage();
+
+  expect(finalMessage.id).toBe("msg_stream");
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ type: "text", text: "Hello world" }] },
+  ]);
+  expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(2);
+});
+
+test("beta.messages.parse routes through create and records one span", async () => {
+  const spans = setupSpans();
+
+  const fake = createFakeFetch(
+    jsonResponse(messagePayload({ content: [{ type: "text", text: '{"city":"Accra"}' }] })),
+  );
+
+  const client = clientWith(fake.fetch);
+
+  const parsed = await client.beta.messages.parse({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Where?" }],
+  });
+
+  expect(parsed.id).toBe("msg_1");
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ type: "text", text: '{"city":"Accra"}' }] },
+  ]);
+});
+
+test("beta.messages.toolRunner records one generation span per model turn", async () => {
+  const spans = setupSpans();
+
+  const fake = createFakeFetch(
+    jsonResponse(
+      messagePayload({
+        id: "msg_tool_turn",
+        content: [{ type: "tool_use", id: "toolu_1", name: "weather", input: { city: "Accra" } }],
+        stop_reason: "tool_use",
+      }),
+    ),
+    jsonResponse(messagePayload({ id: "msg_final_turn" })),
+  );
+
+  const client = clientWith(fake.fetch);
+  const run = vi.fn(() => "sunny");
+
+  const finalMessage = await client.beta.messages.toolRunner({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Weather in Accra?" }],
+    tools: [
+      {
+        type: "custom",
+        name: "weather",
+        description: "Look up the weather",
+        input_schema: { type: "object", properties: { city: { type: "string" } } },
+        run,
+        parse: (input: unknown) => input,
+      },
+    ],
+  });
+
+  expect(finalMessage.id).toBe("msg_final_turn");
+  expect(run).toHaveBeenCalledOnce();
+  expect(fake.requests).toHaveLength(2);
+  const turns = await finishedSpans(spans, 2);
+  expect(turns.map((span) => span.attributes["gen_ai.response.id"])).toEqual([
+    "msg_tool_turn",
+    "msg_final_turn",
+  ]);
+  expect(turns.map((span) => span.attributes["gen_ai.response.finish_reasons"])).toEqual([
+    ["tool_use"],
+    ["end_turn"],
+  ]);
+});
+
+test("instrumentAnthropic covers beta.messages and uninstrumentAnthropic restores it", async () => {
+  const spans = setupSpans();
+  instrumentAnthropic();
+
+  const fake = createFakeFetch(
+    jsonResponse(messagePayload({ id: "msg_beta_global" })),
+    jsonResponse(messagePayload({ id: "msg_beta_restored" })),
+  );
+
+  const client = new Anthropic({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 });
+  const params = {
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [{ role: "user" as const, content: "Hi" }],
+  };
+
+  await client.beta.messages.create(params);
+  await finishedSpans(spans, 1);
+
+  uninstrumentAnthropic();
+  await client.beta.messages.create(params);
+  await flush();
+
+  expect(fake.requests).toHaveLength(2);
+  expect(spans.getFinishedSpans()).toHaveLength(1);
+});
+
+test("instrumentAnthropic and wrapAnthropic together record one beta span per call", async () => {
+  const spans = setupSpans();
+  instrumentAnthropic();
+  const fake = createFakeFetch(jsonResponse(messagePayload({ id: "msg_beta_both" })));
+  const client = wrapAnthropic(new Anthropic({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 }));
+
+  await client.beta.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Hi" }],
+  });
+
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.response.id"]).toBe("msg_beta_both");
+});
+
+function betaStreamEvents(...blocks: [JsonRecord, JsonRecord[]][]): JsonRecord[] {
+  const events: JsonRecord[] = [
+    {
+      type: "message_start",
+      message: messagePayload({
+        id: "msg_beta_stream",
+        model: "claude-opus-5",
+        content: [],
+        usage: { input_tokens: 5, output_tokens: 0 },
+      }),
+    },
+  ];
+
+  blocks.forEach(([block, deltas], index) => {
+    events.push({ type: "content_block_start", index, content_block: block });
+    for (const delta of deltas) events.push({ type: "content_block_delta", index, delta });
+    events.push({ type: "content_block_stop", index });
+  });
+
+  events.push(
+    { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } },
+    { type: "message_stop" },
+  );
+
+  return events;
+}
+
+async function streamedBetaSpan(
+  events: JsonRecord[],
+  spans: InMemorySpanExporter = setupSpans(),
+): Promise<ReadableSpan> {
+  const client = clientWith(createFakeFetch(namedSseResponse(events)).fetch);
+
+  const stream = await client.beta.messages.create({
+    model: "claude-opus-5",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Hi" }],
+    stream: true,
+  });
+
+  await collectStream(stream);
+
+  return exportedSpan(spans);
+}
+
+test("beta streams record the model that served a fallback", async () => {
+  const fallback = {
+    type: "fallback",
+    from: { model: "claude-opus-5" },
+    to: { model: "claude-opus-4-8" },
+  };
+
+  const span = await streamedBetaSpan(
+    betaStreamEvents(
+      [fallback, []],
+      [{ type: "text", text: "" }, [{ type: "text_delta", text: "Hi" }]],
+    ),
+  );
+
+  expect(span.attributes["gen_ai.response.model"]).toBe("claude-opus-4-8");
+});
+
+const compactionStream = (...deltas: JsonRecord[]) =>
+  betaStreamEvents([
+    { type: "compaction", content: null },
+    deltas.map((delta) => ({ type: "compaction_delta", ...delta })),
+  ]);
+
+test.each<{ name: string; deltas: JsonRecord[]; expected: JsonRecord }>([
+  {
+    name: "repeated content replaces the earlier value",
+    deltas: [
+      { content: "Summary ", encrypted_content: "enc_1" },
+      { content: "Summary so far.", encrypted_content: "enc_2" },
+    ],
+    expected: { content: "Summary so far.", encrypted_content: "enc_2" },
+  },
+  {
+    name: "null content marks a failed compaction",
+    deltas: [
+      { content: "Summary", encrypted_content: "enc_1" },
+      { content: null, encrypted_content: null },
+    ],
+    expected: { content: null, encrypted_content: null },
+  },
+  {
+    name: "omitted content is left out like the SDK does",
+    deltas: [{ content: "Summary", encrypted_content: "enc_1" }, { encrypted_content: "enc_2" }],
+    expected: { encrypted_content: "enc_2" },
+  },
+  {
+    name: "omitted encrypted_content keeps the earlier value",
+    deltas: [{ content: "Summary", encrypted_content: "enc_1" }, { content: "Summary." }],
+    expected: { content: "Summary.", encrypted_content: "enc_1" },
+  },
+])("beta streams match SDK compaction semantics: $name", async ({ deltas, expected }) => {
+  const span = await streamedBetaSpan(compactionStream(...deltas));
+
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ type: "compaction", ...expected }] },
+  ]);
+});
+
+test("beta streams record output chunk timing for compaction content", async () => {
+  const metricExporter = new InMemoryMetricExporter(AggregationTemporality.DELTA);
+  await streamedBetaSpan(
+    compactionStream(
+      { content: "Summary ", encrypted_content: "enc_1" },
+      { content: "Summary so far.", encrypted_content: "enc_2" },
+    ),
+    setupSpans(metricExporter),
+  );
+
+  const histogram = metricExporter
+    .getMetrics()
+    .flatMap((batch) => batch.scopeMetrics.flatMap((scope) => scope.metrics))
+    .find((metric) => metric.descriptor.name === "gen_ai.client.operation.time_per_output_chunk");
+
+  expect(histogram?.dataPoints).toEqual([
+    expect.objectContaining({ value: expect.objectContaining({ count: 1 }) }),
+  ]);
+});
+
+test("beta streams record mcp_tool_use input", async () => {
+  const block = {
+    type: "mcp_tool_use",
+    id: "mcptoolu_1",
+    name: "search",
+    server_name: "docs",
+    input: {},
+  };
+
+  const span = await streamedBetaSpan(
+    betaStreamEvents([
+      block,
+      [
+        { type: "input_json_delta", partial_json: '{"q": ' },
+        { type: "input_json_delta", partial_json: '"otel"}' },
+      ],
+    ]),
+  );
+
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ ...block, input: { q: "otel" } }] },
+  ]);
+});
+
+test("beta streams keep a compaction delta without a start block as compaction", async () => {
+  const events = betaStreamEvents();
+  events.splice(1, 0, {
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "compaction_delta", content: "Summary.", encrypted_content: "e" },
+  });
+
+  const span = await streamedBetaSpan(events);
+
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: [{ type: "compaction", content: "Summary.", encrypted_content: "e" }],
+    },
+  ]);
 });

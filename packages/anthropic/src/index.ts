@@ -5,6 +5,7 @@ import {
   type StartSpanOptions,
 } from "@telemetry-dev/sdk";
 import { Stream } from "@anthropic-ai/sdk/core/streaming";
+import { Messages as BetaMessages } from "@anthropic-ai/sdk/resources/beta/messages";
 import { Messages } from "@anthropic-ai/sdk/resources/messages";
 
 export type { SpanFields, SpanHandle, StartSpanOptions } from "@telemetry-dev/sdk";
@@ -44,6 +45,7 @@ type ProviderResolver = (resource: Value) => string;
 
 interface AnthropicClient {
   messages: object;
+  beta?: { messages?: object };
 }
 
 interface RequestMapping {
@@ -66,6 +68,7 @@ interface StreamState {
   blocks: Map<number, ValueRecord | ToolBlockState>;
   usage?: SpanFields["usage"];
   finishReason?: string;
+  responseModel?: string;
 }
 
 function asRecord<T>(value: T): (T & ValueRecord) | undefined {
@@ -393,7 +396,15 @@ function streamOutput(state: StreamState): ValueRecord[] | undefined {
 }
 
 function streamPartialFields(state: StreamState): SpanFields {
-  return { output: streamOutput(state), usage: state.usage, finishReason: state.finishReason };
+  const fields: SpanFields = {
+    output: streamOutput(state),
+    usage: state.usage,
+    finishReason: state.finishReason,
+  };
+
+  if (state.responseModel !== undefined) fields.responseModel = state.responseModel;
+
+  return fields;
 }
 
 function recordContentBlockStart(event: ValueRecord, state: StreamState): void {
@@ -401,13 +412,17 @@ function recordContentBlockStart(event: ValueRecord, state: StreamState): void {
   const contentBlock: ValueRecord = asRecord(event.content_block) ?? {};
   const type = readString(contentBlock.type);
 
+  // The final fallback block names the model that served the response.
+  if (type === "fallback")
+    state.responseModel = readString(asRecord(contentBlock.to)?.model) ?? state.responseModel;
+
   if (type === "text") {
     state.blocks.set(index, { type, text: readString(contentBlock.text) ?? "" });
 
     return;
   }
 
-  if (type === "tool_use" || type === "server_tool_use") {
+  if (type === "tool_use" || type === "server_tool_use" || type === "mcp_tool_use") {
     const data = { ...contentBlock, type };
     state.blocks.set(index, { data, inputJson: "" });
 
@@ -442,7 +457,9 @@ function blockForDelta(
   const block =
     deltaType === "thinking_delta"
       ? { type: "thinking", thinking: "" }
-      : { type: "text", text: "" };
+      : deltaType === "compaction_delta"
+        ? { type: "compaction" }
+        : { type: "text", text: "" };
 
   state.blocks.set(index, block);
 
@@ -484,6 +501,14 @@ function recordContentBlockDelta(event: ValueRecord, state: StreamState): void {
 
   if (deltaType === "signature_delta" && delta.signature !== undefined)
     data.signature = delta.signature;
+
+  // Match the TypeScript SDK (0.127+): each delta carries the block's final content, where null
+  // means the compaction failed, and encrypted_content changes only when the key is present.
+  if (deltaType === "compaction_delta") {
+    data.content = delta.content;
+
+    if ("encrypted_content" in delta) data.encrypted_content = delta.encrypted_content;
+  }
 }
 
 function recordStreamEvent<T>(event: T, state: StreamState): SpanFields {
@@ -591,6 +616,9 @@ function streamEventHasOutput(event: unknown): boolean {
   const value = asRecord(type === "content_block_delta" ? record.delta : record.content_block);
   const input = asRecord(value?.input);
 
+  if (value?.type === "compaction" || value?.type === "compaction_delta")
+    return typeof value.content === "string" && value.content.length > 0;
+
   return (
     [value?.text, value?.thinking, value?.partial_json].some(
       (part) => typeof part === "string" && part.length > 0,
@@ -691,10 +719,14 @@ let restorePatches: Array<() => void> = [];
 export function wrapAnthropic<T extends AnthropicClient>(client: T): T {
   if (wrappedClients.has(client)) return client;
   const provider = providerForClient(client);
-  const messages = asRecord(client.messages);
+  // beta.messages.stream(), parse(), and toolRunner() all route through beta.messages.create().
+  for (const resource of [client.messages, client.beta?.messages]) {
+    const messages = asRecord(resource);
 
-  if (messages)
-    patchInstanceMethod(messages, "create", messagesRequest, messagesResponse, provider);
+    if (messages)
+      patchInstanceMethod(messages, "create", messagesRequest, messagesResponse, provider);
+  }
+
   wrappedClients.add(client);
 
   return client;
@@ -702,7 +734,10 @@ export function wrapAnthropic<T extends AnthropicClient>(client: T): T {
 
 export function instrumentAnthropic(): void {
   if (installed) return;
-  restorePatches = [patchPrototype(Messages, "create", messagesRequest, messagesResponse)];
+  restorePatches = [
+    patchPrototype(Messages, "create", messagesRequest, messagesResponse),
+    patchPrototype(BetaMessages, "create", messagesRequest, messagesResponse),
+  ];
   installed = true;
 }
 

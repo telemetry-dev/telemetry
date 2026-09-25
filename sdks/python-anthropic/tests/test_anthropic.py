@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import inspect
 import json
+import sys
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any, cast
@@ -10,17 +12,24 @@ import httpx
 import pytest
 import telemetry_dev
 from anthropic import Anthropic, AsyncAnthropic
+from anthropic.lib.bedrock import AnthropicBedrock, AsyncAnthropicBedrock
+from anthropic.lib.vertex import AnthropicVertex, AsyncAnthropicVertex
+from anthropic.resources.beta.messages import AsyncMessages as AsyncBetaMessages
+from anthropic.resources.beta.messages import Messages as BetaMessages
 from anthropic.resources.messages import AsyncMessages, Messages
 from anthropic.types import MessageParam, TextBlock
+from anthropic.types.beta import BetaMessageParam
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import StatusCode
 
+import telemetry_dev_anthropic
 from telemetry_dev_anthropic import instrument_anthropic, uninstrument_anthropic, wrap_anthropic
 
 SyncHandler = Callable[[httpx.Request], httpx.Response]
 AsyncHandler = Callable[[httpx.Request], Coroutine[Any, Any, httpx.Response]]
 
 MESSAGES: list[MessageParam] = [{"role": "user", "content": "Say hi"}]
+BETA_MESSAGES: list[BetaMessageParam] = [{"role": "user", "content": "Say hi"}]
 
 
 def only_span(env: SimpleNamespace) -> ReadableSpan:
@@ -1004,3 +1013,657 @@ def test_provider_mapping_for_bedrock_vertex_and_plain_client(memory: SimpleName
     assert attrs(bedrock_span)["gen_ai.provider.name"] == "aws.bedrock"
     assert attrs(vertex_span)["gen_ai.provider.name"] == "gcp.vertex_ai"
     assert attrs(plain_span)["gen_ai.provider.name"] == "anthropic"
+
+
+def test_beta_create_records_generation_span(memory: SimpleNamespace) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return json_response(message_payload(id="msg_beta"))
+
+    client = wrapped_sync_client(handler)
+    client.beta.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=64,
+        messages=MESSAGES,
+        betas=["context-management-2025-06-27"],
+    )
+
+    assert requests[0].url.params.get("beta") == "true"
+    a = attrs(only_span(memory))
+    assert a["gen_ai.operation.name"] == "chat"
+    assert a["gen_ai.provider.name"] == "anthropic"
+    assert a["gen_ai.response.id"] == "msg_beta"
+    assert a["gen_ai.usage.input_tokens"] == 11
+    assert a["gen_ai.response.finish_reasons"] == ("end_turn",)
+
+
+async def test_async_beta_create_records_generation_span(memory: SimpleNamespace) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload(id="msg_beta_async"))
+
+    client = wrapped_async_client(handler)
+    await client.beta.messages.create(model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES)
+    await client.close()
+
+    assert attrs(only_span(memory))["gen_ai.response.id"] == "msg_beta_async"
+
+
+def test_beta_stream_context_manager_records_one_span(memory: SimpleNamespace) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(stream_events())
+
+    client = wrapped_sync_client(handler)
+    with client.beta.messages.stream(
+        model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES
+    ) as stream:
+        text = "".join(stream.text_stream)
+
+    assert text == "Hello world"
+    a = attrs(only_span(memory))
+    assert json.loads(str(a["gen_ai.output.messages"])) == [
+        {"role": "assistant", "content": [{"type": "text", "text": "Hello world"}]}
+    ]
+    assert a["gen_ai.usage.output_tokens"] == 2
+
+
+async def test_async_beta_stream_context_manager_records_one_span(
+    memory: SimpleNamespace,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(stream_events())
+
+    client = wrapped_async_client(handler)
+    async with client.beta.messages.stream(
+        model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES
+    ) as stream:
+        parts = [text async for text in stream.text_stream]
+    await client.close()
+
+    assert "".join(parts) == "Hello world"
+    assert attrs(only_span(memory))["gen_ai.usage.output_tokens"] == 2
+
+
+@pytest.mark.parametrize("namespace", ["stable", "beta"])
+def test_parse_records_one_generation_span(memory: SimpleNamespace, namespace: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload(id=f"msg_parse_{namespace}"))
+
+    client = wrapped_sync_client(handler)
+    messages = client.messages if namespace == "stable" else client.beta.messages
+    parsed = messages.parse(model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES)
+
+    assert parsed.id == f"msg_parse_{namespace}"
+    a = attrs(only_span(memory))
+    assert a["gen_ai.response.id"] == f"msg_parse_{namespace}"
+    assert a["gen_ai.usage.output_tokens"] == 7
+
+
+@pytest.mark.parametrize("namespace", ["stable", "beta"])
+async def test_async_parse_records_one_generation_span(
+    memory: SimpleNamespace, namespace: str
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload(id=f"msg_async_parse_{namespace}"))
+
+    client = wrapped_async_client(handler)
+    messages = client.messages if namespace == "stable" else client.beta.messages
+    await messages.parse(model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES)
+    await client.close()
+
+    assert attrs(only_span(memory))["gen_ai.response.id"] == f"msg_async_parse_{namespace}"
+
+
+def test_beta_tool_runner_records_one_generation_span_per_turn(memory: SimpleNamespace) -> None:
+    responses = [
+        json_response(
+            message_payload(
+                id="msg_tool_turn",
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "weather",
+                        "input": {"city": "Accra"},
+                    }
+                ],
+                stop_reason="tool_use",
+            )
+        ),
+        json_response(message_payload(id="msg_final_turn")),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    calls: list[str] = []
+
+    @anthropic.beta_tool
+    def weather(city: str) -> str:
+        """Look up the weather.
+
+        Args:
+            city: City name.
+        """
+        calls.append(city)
+        return "sunny"
+
+    client = wrapped_sync_client(handler)
+    final = client.beta.messages.tool_runner(
+        model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES, tools=[weather]
+    ).until_done()
+
+    assert final.id == "msg_final_turn"
+    assert calls == ["Accra"]
+    spans = memory.span_exporter.get_finished_spans()
+    assert [attrs(span)["gen_ai.response.id"] for span in spans] == [
+        "msg_tool_turn",
+        "msg_final_turn",
+    ]
+
+
+def test_global_instrumentation_covers_beta_and_parse_and_restores(
+    memory: SimpleNamespace,
+) -> None:
+    patched = [
+        (cls, name)
+        for cls in (Messages, AsyncMessages, BetaMessages, AsyncBetaMessages)
+        for name in ("create", "stream", "parse")
+    ]
+    originals = [getattr(cls, name) for cls, name in patched]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload())
+
+    instrument_anthropic()
+    assert all(
+        getattr(cls, name) is not original
+        for (cls, name), original in zip(patched, originals, strict=True)
+    )
+    client = sync_client(handler)
+    client.beta.messages.create(model="claude-sonnet-4-6", max_tokens=64, messages=BETA_MESSAGES)
+    client.messages.parse(model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES)
+    assert len(memory.span_exporter.get_finished_spans()) == 2
+
+    uninstrument_anthropic()
+    assert [getattr(cls, name) for cls, name in patched] == originals
+    client.beta.messages.create(model="claude-sonnet-4-6", max_tokens=64, messages=BETA_MESSAGES)
+    assert len(memory.span_exporter.get_finished_spans()) == 2
+
+
+def test_global_and_wrapped_beta_record_one_span_per_call(memory: SimpleNamespace) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload())
+
+    instrument_anthropic()
+    client = wrapped_sync_client(handler)
+    client.beta.messages.create(model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES)
+    client.beta.messages.parse(model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES)
+
+    assert len(memory.span_exporter.get_finished_spans()) == 2
+
+
+def no_bedrock_signing(**_kwargs: object) -> dict[str, str]:
+    return {}
+
+
+def provider_clients(
+    monkeypatch: pytest.MonkeyPatch, handler: AsyncHandler, sync_handler: SyncHandler
+) -> dict[str, tuple[Any, Any]]:
+    # Bedrock signs requests with botocore; the resource classes under test do not need it.
+    monkeypatch.setattr("anthropic.lib.bedrock._auth.get_auth_headers", no_bedrock_signing)
+
+    def sync_http() -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(sync_handler))
+
+    def async_http() -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    return {
+        "aws.bedrock": (
+            AnthropicBedrock(
+                aws_region="us-east-1",
+                aws_access_key="a",
+                aws_secret_key="b",
+                http_client=sync_http(),
+            ),
+            AsyncAnthropicBedrock(
+                aws_region="us-east-1",
+                aws_access_key="a",
+                aws_secret_key="b",
+                http_client=async_http(),
+            ),
+        ),
+        "gcp.vertex_ai": (
+            AnthropicVertex(
+                region="us-east5", project_id="p", access_token="t", http_client=sync_http()
+            ),
+            AsyncAnthropicVertex(
+                region="us-east5", project_id="p", access_token="t", http_client=async_http()
+            ),
+        ),
+    }
+
+
+@pytest.mark.parametrize("provider", ["aws.bedrock", "gcp.vertex_ai"])
+@pytest.mark.parametrize("mode", ["wrap", "instrument"])
+async def test_provider_beta_create_records_response_sync_and_async(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, provider: str, mode: str
+) -> None:
+    def sync_handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload(id="msg_provider_sync"))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload(id="msg_provider_async"))
+
+    if mode == "instrument":
+        instrument_anthropic()
+    sync_provider, async_provider = provider_clients(monkeypatch, handler, sync_handler)[provider]
+    if mode == "wrap":
+        sync_provider = wrap_anthropic(sync_provider)
+        async_provider = wrap_anthropic(async_provider)
+
+    sync_provider.beta.messages.create(
+        model="claude-sonnet-4-6", max_tokens=64, messages=BETA_MESSAGES
+    )
+    await async_provider.beta.messages.create(
+        model="claude-sonnet-4-6", max_tokens=64, messages=BETA_MESSAGES
+    )
+    await async_provider.close()
+
+    spans = memory.span_exporter.get_finished_spans()
+    assert [attrs(span)["gen_ai.response.id"] for span in spans] == [
+        "msg_provider_sync",
+        "msg_provider_async",
+    ]
+    for span in spans:
+        assert attrs(span)["gen_ai.provider.name"] == provider
+        assert "gen_ai.output.messages" in attrs(span)
+
+
+def beta_stream_events(
+    *blocks: tuple[dict[str, Any], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = [
+        {
+            "type": "message_start",
+            "message": message_payload(
+                id="msg_beta_stream",
+                model="claude-opus-5",
+                content=[],
+                usage={"input_tokens": 5, "output_tokens": 0},
+            ),
+        }
+    ]
+    for index, (block, deltas) in enumerate(blocks):
+        events.append({"type": "content_block_start", "index": index, "content_block": block})
+        events.extend(
+            {"type": "content_block_delta", "index": index, "delta": delta} for delta in deltas
+        )
+        events.append({"type": "content_block_stop", "index": index})
+    events.extend(
+        [
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 2},
+            },
+            {"type": "message_stop"},
+        ]
+    )
+    return events
+
+
+def streamed_beta_span(events: list[dict[str, Any]], memory: SimpleNamespace) -> dict[str, object]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(events)
+
+    client = wrapped_sync_client(handler)
+    for _event in client.beta.messages.create(
+        model="claude-opus-5", max_tokens=64, messages=BETA_MESSAGES, stream=True
+    ):
+        pass
+    return attrs(only_span(memory))
+
+
+def test_beta_stream_records_model_that_served_a_fallback(memory: SimpleNamespace) -> None:
+    fallback = {
+        "type": "fallback",
+        "from": {"model": "claude-opus-5"},
+        "to": {"model": "claude-opus-4-8"},
+    }
+    a = streamed_beta_span(
+        beta_stream_events(
+            (fallback, []),
+            ({"type": "text", "text": ""}, [{"type": "text_delta", "text": "Hi"}]),
+        ),
+        memory,
+    )
+
+    assert a["gen_ai.response.model"] == "claude-opus-4-8"
+
+
+def test_beta_stream_records_compaction_content(memory: SimpleNamespace) -> None:
+    a = streamed_beta_span(
+        beta_stream_events(
+            (
+                {"type": "compaction", "content": None},
+                [
+                    {
+                        "type": "compaction_delta",
+                        "content": "Summary so far.",
+                        "encrypted_content": "enc_1",
+                    }
+                ],
+            )
+        ),
+        memory,
+    )
+
+    assert json.loads(str(a["gen_ai.output.messages"])) == [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "compaction", "content": "Summary so far.", "encrypted_content": "enc_1"}
+            ],
+        }
+    ]
+
+
+def test_beta_stream_records_mcp_tool_use_input(memory: SimpleNamespace) -> None:
+    block: dict[str, Any] = {
+        "type": "mcp_tool_use",
+        "id": "mcptoolu_1",
+        "name": "search",
+        "server_name": "docs",
+        "input": {},
+    }
+    a = streamed_beta_span(
+        beta_stream_events(
+            (
+                block,
+                [
+                    {"type": "input_json_delta", "partial_json": '{"q": '},
+                    {"type": "input_json_delta", "partial_json": '"otel"}'},
+                ],
+            )
+        ),
+        memory,
+    )
+
+    content = json.loads(str(a["gen_ai.output.messages"]))[0]["content"]
+    assert content == [{**block, "input": {"q": "otel"}}]
+
+
+def test_beta_stream_records_fallback_model_after_capture_budget_is_exhausted(make: Any) -> None:
+    memory = make(max_attribute_length=64)
+    fallback = {
+        "type": "fallback",
+        "from": {"model": "claude-opus-5"},
+        "to": {"model": "claude-opus-4-8"},
+    }
+    events = beta_stream_events(
+        ({"type": "text", "text": ""}, [{"type": "text_delta", "text": "x" * 60}]),
+        (fallback, []),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(events)
+
+    stream = wrapped_sync_client(handler).beta.messages.create(
+        model="claude-opus-5", max_tokens=64, messages=BETA_MESSAGES, stream=True
+    )
+    list(stream)
+
+    assert stream._state.budget.truncated is True
+    assert attrs(only_span(memory))["gen_ai.response.model"] == "claude-opus-4-8"
+
+
+def test_beta_stream_records_output_chunks_for_compaction_content(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timestamps: list[float] = []
+    original = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        assert timestamp_ms is not None
+        timestamps.append(timestamp_ms)
+        return original(handle, timestamp_ms)
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
+    streamed_beta_span(
+        beta_stream_events(
+            (
+                {"type": "compaction", "content": None},
+                [
+                    {"type": "compaction_delta", "content": "Summary ", "encrypted_content": None},
+                    {"type": "compaction_delta", "content": "so far.", "encrypted_content": "enc"},
+                ],
+            )
+        ),
+        memory,
+    )
+
+    assert len(timestamps) == 2
+
+
+@pytest.mark.parametrize("mode", ["wrap", "instrument"])
+async def test_vertex_beta_stream_records_one_span_sync_and_async(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    def sync_handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(stream_events())
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(stream_events())
+
+    if mode == "instrument":
+        instrument_anthropic()
+    sync_vertex, async_vertex = provider_clients(monkeypatch, handler, sync_handler)[
+        "gcp.vertex_ai"
+    ]
+    if mode == "wrap":
+        sync_vertex = wrap_anthropic(sync_vertex)
+        async_vertex = wrap_anthropic(async_vertex)
+
+    with sync_vertex.beta.messages.stream(
+        model="claude-sonnet-4-6", max_tokens=64, messages=BETA_MESSAGES
+    ) as stream:
+        sync_text = "".join(stream.text_stream)
+    async with async_vertex.beta.messages.stream(
+        model="claude-sonnet-4-6", max_tokens=64, messages=BETA_MESSAGES
+    ) as stream:
+        async_text = "".join([text async for text in stream.text_stream])
+    await async_vertex.close()
+
+    assert sync_text == async_text == "Hello world"
+    spans = memory.span_exporter.get_finished_spans()
+    assert len(spans) == 2
+    for span in spans:
+        assert attrs(span)["gen_ai.provider.name"] == "gcp.vertex_ai"
+        assert json.loads(str(attrs(span)["gen_ai.output.messages"])) == [
+            {"role": "assistant", "content": [{"type": "text", "text": "Hello world"}]}
+        ]
+
+
+def test_missing_provider_beta_module_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A future SDK may rename these private modules; importing must still fail open.
+    monkeypatch.setitem(sys.modules, "anthropic.lib.bedrock._beta_messages", None)
+    classes = telemetry_dev_anthropic._provider_beta_classes()  # pyright: ignore[reportPrivateUsage]
+
+    assert (
+        AnthropicVertex(region="us-east5", project_id="p", access_token="t").beta.messages.__class__
+        in classes
+    )
+    assert all("bedrock" not in cls.__module__ for cls in classes)
+
+
+def test_global_instrumentation_wraps_async_provider_classes_as_async() -> None:
+    instrument_anthropic()
+    for cls in telemetry_dev_anthropic._provider_beta_classes():  # pyright: ignore[reportPrivateUsage]
+        original = getattr(cls.create, "_telemetry_dev_anthropic_original", None)
+        assert original is not None
+        assert inspect.iscoroutinefunction(cls.create) == cls.__name__.startswith("Async")
+
+
+def test_beta_stream_compaction_delta_without_start_is_a_compaction_block(
+    memory: SimpleNamespace,
+) -> None:
+    events = beta_stream_events()
+    events.insert(
+        1,
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "compaction_delta", "content": "Summary.", "encrypted_content": "e"},
+        },
+    )
+    a = streamed_beta_span(events, memory)
+
+    assert json.loads(str(a["gen_ai.output.messages"]))[0]["content"] == [
+        {"type": "compaction", "content": "Summary.", "encrypted_content": "e"}
+    ]
+
+
+def test_compaction_replacement_releases_only_its_own_budget_reservation(make: Any) -> None:
+    # 400 bytes fits the sibling, start, and the long summary (363 bytes), and the final
+    # state after "ok" replaces it (265 bytes), but not both summaries at once (472 bytes).
+    make(max_attribute_length=400)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+    sibling = {"type": "text", "text": "hi"}
+    final = {"type": "compaction_delta", "content": "ok"}
+
+    record({"type": "content_block_start", "index": 0, "content_block": sibling}, state)
+    record(
+        {"type": "content_block_start", "index": 1, "content_block": {"type": "compaction"}},
+        state,
+    )
+    for content in ("x" * 100, "ok"):
+        delta = {**final, "content": content}
+        record({"type": "content_block_delta", "index": 1, "delta": delta}, state)
+
+    expected = telemetry_dev.CaptureBudget(max_bytes=400)
+    for retained in (sibling, {"type": "compaction"}, final):
+        assert expected.accept(retained)
+    assert state.budget.truncated is False
+    assert state.budget.bytes_used == expected.bytes_used
+    assert state.blocks[1] == {"type": "compaction", "content": "ok", "encrypted_content": None}
+
+
+def test_stream_keeps_short_compaction_replacement_within_budget(make: Any) -> None:
+    memory = make(max_attribute_length=300)
+    a = streamed_beta_span(
+        beta_stream_events(
+            (
+                {"type": "compaction", "content": None},
+                [
+                    {"type": "compaction_delta", "content": "x" * 100},
+                    {"type": "compaction_delta", "content": "ok"},
+                ],
+            )
+        ),
+        memory,
+    )
+
+    assert json.loads(str(a["gen_ai.output.messages"]))[0]["content"] == [
+        {"type": "compaction", "content": "ok", "encrypted_content": None}
+    ]
+
+
+def test_oversized_compaction_replacement_keeps_previous_reservation_and_recovers(
+    make: Any,
+) -> None:
+    make(max_attribute_length=300)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+    start = {"type": "compaction"}
+    first = {"type": "compaction_delta", "content": "ok"}
+
+    record({"type": "content_block_start", "index": 0, "content_block": start}, state)
+    record({"type": "content_block_delta", "index": 0, "delta": first}, state)
+    reserved = state.budget.bytes_used
+    oversized = {"type": "compaction_delta", "content": "x" * 400}
+    record({"type": "content_block_delta", "index": 0, "delta": oversized}, state)
+
+    assert state.budget.bytes_used == reserved
+    assert state.blocks[0]["content"] == "ok"
+
+    final = {"type": "compaction_delta", "content": "final"}
+    record({"type": "content_block_delta", "index": 0, "delta": final}, state)
+
+    expected = telemetry_dev.CaptureBudget(max_bytes=300)
+    for retained in (start, final):
+        assert expected.accept(retained)
+    assert state.budget.truncated is False
+    assert state.budget.bytes_used == expected.bytes_used
+    assert state.blocks[0]["content"] == "final"
+
+
+def test_replacement_after_other_block_truncation_stays_rejected(make: Any) -> None:
+    make(max_attribute_length=300)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+
+    record(
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "compaction"}},
+        state,
+    )
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "compaction_delta", "content": "ok"},
+        },
+        state,
+    )
+    record(
+        {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}},
+        state,
+    )
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "text_delta", "text": "y" * 400},
+        },
+        state,
+    )
+    assert state.budget.truncated is True
+
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "compaction_delta", "content": "hi"},
+        },
+        state,
+    )
+
+    assert state.budget.truncated is True
+    assert state.blocks[0]["content"] == "ok"
+
+
+def test_signature_replacement_releases_its_previous_budget_reservation(make: Any) -> None:
+    # 350 bytes fits the long signature (308 bytes) and the final state (211 bytes),
+    # but not both signatures at once (419 bytes).
+    make(max_attribute_length=350)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+    start = {"type": "thinking", "thinking": ""}
+    final = {"type": "signature_delta", "signature": "sig"}
+
+    record({"type": "content_block_start", "index": 0, "content_block": start}, state)
+    for signature in ("s" * 100, "sig"):
+        delta = {**final, "signature": signature}
+        record({"type": "content_block_delta", "index": 0, "delta": delta}, state)
+
+    expected = telemetry_dev.CaptureBudget(max_bytes=350)
+    for retained in (start, final):
+        assert expected.accept(retained)
+    assert state.budget.truncated is False
+    assert state.budget.bytes_used == expected.bytes_used
+    assert state.blocks[0]["signature"] == "sig"

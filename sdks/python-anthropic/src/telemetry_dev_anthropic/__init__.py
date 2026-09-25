@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import threading
 import time
@@ -9,6 +10,9 @@ from typing import Any, TypeVar, cast
 
 import anthropic
 import telemetry_dev
+from anthropic._resource import AsyncAPIResource
+from anthropic.resources.beta.messages import AsyncMessages as AsyncBetaMessages
+from anthropic.resources.beta.messages import Messages as BetaMessages
 from anthropic.resources.messages import AsyncMessages, Messages
 
 __version__ = "0.1.2"
@@ -23,6 +27,29 @@ _ORIGINALS: list[tuple[type[Any], str, Any]] = []
 _installed = False
 _install_lock = threading.Lock()
 _T = TypeVar("_T")
+# Each of these issues its own request: parse() and stream() do not route through create().
+_RESPONSE_METHODS = ("create", "parse")
+# Bedrock and Vertex clients expose their own beta resource classes, which copy the
+# first-party methods instead of subclassing, so patching BetaMessages misses them.
+_PROVIDER_BETA_MODULES = (
+    "anthropic.lib.bedrock._beta_messages",
+    "anthropic.lib.vertex._beta_messages",
+)
+
+
+def _provider_beta_classes() -> tuple[type[Any], ...]:
+    """Load provider beta resources, skipping any a future SDK renames or removes."""
+    classes: list[type[Any]] = []
+    for module_name in _PROVIDER_BETA_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        for name in ("Messages", "AsyncMessages"):
+            cls = getattr(module, name, None)
+            if isinstance(cls, type):
+                classes.append(cast(type[Any], cls))
+    return tuple(classes)
 
 
 def _field(value: Any, name: str) -> Any:
@@ -212,7 +239,10 @@ class _StreamState:
         self.tool_json: dict[int, str] = {}
         self.usage: dict[str, int | float] | None = None
         self.finish_reason: str | None = None
+        self.response_model: str | None = None
         self.budget = telemetry_dev.CaptureBudget.from_client()
+        # Budget bytes and items held by each block's latest replacement delta.
+        self.replacement_reservations: dict[int, tuple[int, int]] = {}
 
 
 def _parse_tool_input(raw: str) -> Any:
@@ -259,6 +289,7 @@ def _stream_partial(state: _StreamState) -> dict[str, Any]:
         "output": _stream_output(state),
         "usage": state.usage,
         "finish_reason": state.finish_reason,
+        "response_model": state.response_model,
     }
 
 
@@ -286,16 +317,22 @@ def _record_content_block_start(event: Any, state: _StreamState) -> None:
     index = _field(event, "index")
     block_index = index if isinstance(index, int) else len(state.blocks)
     content_block = _native(_field(event, "content_block"))
+    block_type = _string(_field(content_block, "type"))
+    if block_type == "fallback":
+        # The final fallback block names the model that served the response. Read it before
+        # the capture budget check: it is span metadata, not retained output.
+        state.response_model = (
+            _string(_field(_field(content_block, "to"), "model")) or state.response_model
+        )
     if not state.budget.accept(content_block):
         return
-    block_type = _string(_field(content_block, "type"))
     if block_type == "text":
         state.blocks[block_index] = {
             "type": "text",
             "text": _string(_field(content_block, "text")) or "",
         }
         return
-    if block_type in {"tool_use", "server_tool_use"}:
+    if block_type in {"tool_use", "server_tool_use", "mcp_tool_use"}:
         state.blocks[block_index] = (
             content_block if isinstance(content_block, dict) else {"type": block_type}
         )
@@ -320,18 +357,59 @@ def _block_for_delta(index: int, delta_type: str | None, state: _StreamState) ->
         state.tool_json[index] = ""
     elif delta_type == "thinking_delta":
         state.blocks[index] = {"type": "thinking", "thinking": ""}
+    elif delta_type == "compaction_delta":
+        state.blocks[index] = {"type": "compaction"}
     else:
         state.blocks[index] = {"type": "text", "text": ""}
     return state.blocks[index]
+
+
+# Deltas whose value replaces the block's previous value instead of appending to it.
+_REPLACEMENT_DELTAS = frozenset({"compaction_delta", "signature_delta"})
+
+
+def _reserve_replacement_delta(index: int, delta: Any, state: _StreamState) -> bool:
+    """Reserve budget for a delta that replaces its block's previous value.
+
+    The previous delta's reservation is handed back first, so a shorter replacement fits
+    where adding it on top would not. Other blocks keep their reservations.
+
+    A replacement that does not fit is rejected on its own: the budget stays usable for a
+    later replacement that does fit. Truncation caused by another block still applies.
+    """
+    budget = state.budget
+    if budget.truncated:
+        return False
+    released_bytes, released_items = state.replacement_reservations.pop(index, (0, 0))
+    budget.bytes_used -= released_bytes
+    budget.items_used -= released_items
+    before_bytes, before_items = budget.bytes_used, budget.items_used
+    if not budget.accept(delta):
+        # The previous value is still retained, so it keeps its reservation, and the
+        # rejection belongs to this candidate alone.
+        budget.bytes_used += released_bytes
+        budget.items_used += released_items
+        budget.truncated = False
+        if released_bytes or released_items:
+            state.replacement_reservations[index] = (released_bytes, released_items)
+        return False
+    state.replacement_reservations[index] = (
+        budget.bytes_used - before_bytes,
+        budget.items_used - before_items,
+    )
+    return True
 
 
 def _record_content_block_delta(event: Any, state: _StreamState) -> None:
     index = _field(event, "index")
     block_index = index if isinstance(index, int) else 0
     delta = _native(_field(event, "delta"))
-    if not state.budget.accept(delta):
-        return
     delta_type = _string(_field(delta, "type"))
+    if delta_type in _REPLACEMENT_DELTAS:
+        if not _reserve_replacement_delta(block_index, delta, state):
+            return
+    elif not state.budget.accept(delta):
+        return
     block = _block_for_delta(block_index, delta_type, state)
     if delta_type == "input_json_delta":
         state.tool_json[block_index] = (
@@ -345,6 +423,10 @@ def _record_content_block_delta(event: Any, state: _StreamState) -> None:
         _append_string(block, "thinking", _field(delta, "thinking"))
     elif delta_type == "signature_delta" and _field(delta, "signature") is not None:
         block["signature"] = _field(delta, "signature")
+    elif delta_type == "compaction_delta":
+        # Each compaction delta carries the full summary, so it replaces rather than appends.
+        block["content"] = _field(delta, "content")
+        block["encrypted_content"] = _field(delta, "encrypted_content")
 
 
 def _record_stream_event(event: Any, state: _StreamState) -> dict[str, Any]:
@@ -380,6 +462,8 @@ def _stream_event_has_output(event: Any) -> bool:
         for key in ("text", "thinking", "partial_json")
     ):
         return True
+    if _string(_field(value, "type")) in ("compaction", "compaction_delta"):
+        return bool(_string(_field(value, "content")))
     input_value = _field(value, "input")
     return input_value not in (None, "", [], {})
 
@@ -750,55 +834,52 @@ def _original_method(current: Any, resource: object) -> Any:
     return bind(resource, type(resource)) if bind is not None else original
 
 
-def _patch_instance_create(resource: object, async_resource: bool, provider_name: str) -> None:
-    resource_any: Any = resource
-    current = resource_any.create
-    if getattr(current, _WRAPPED_ATTR, False) and _own_method(resource, "create"):
+def _wrap_method(
+    original: Callable[..., Any], name: str, async_resource: bool, provider: ProviderResolver
+) -> Callable[..., Any]:
+    if name == "stream":
+        factory = _wrap_stream_manager_async if async_resource else _wrap_stream_manager_sync
+        return factory(original, _messages_request, provider)
+    response_factory = _wrap_async if async_resource else _wrap_sync
+    return response_factory(original, _messages_request, _messages_response, provider)
+
+
+def _patch_instance_method(
+    resource: object, name: str, async_resource: bool, provider_name: str
+) -> None:
+    current = getattr(resource, name, None)
+    if current is None:
+        return
+    if getattr(current, _WRAPPED_ATTR, False) and _own_method(resource, name):
         return
     original = _original_method(current, resource)
-    factory = _wrap_async if async_resource else _wrap_sync
-    wrapped = factory(original, _messages_request, _messages_response, lambda _: provider_name)
-    resource_any.create = wrapped
+    setattr(resource, name, _wrap_method(original, name, async_resource, lambda _: provider_name))
 
 
-def _patch_instance_stream(resource: object, async_resource: bool, provider_name: str) -> None:
-    resource_any: Any = resource
-    current = resource_any.stream
-    if getattr(current, _WRAPPED_ATTR, False) and _own_method(resource, "stream"):
+def _patch_class_method(cls: type[Any], name: str, async_resource: bool) -> None:
+    original = getattr(cls, name, None)
+    if original is None or getattr(original, _WRAPPED_ATTR, False):
         return
-    original = _original_method(current, resource)
-    factory = _wrap_stream_manager_async if async_resource else _wrap_stream_manager_sync
-    wrapped = factory(original, _messages_request, lambda _: provider_name)
-    resource_any.stream = wrapped
+    _ORIGINALS.append((cls, name, original))
+    setattr(cls, name, _wrap_method(original, name, async_resource, _provider_for_resource))
 
 
-def _patch_class_create(cls: type[Any], async_resource: bool) -> None:
-    original = cls.create
-    if getattr(original, _WRAPPED_ATTR, False):
-        return
-    _ORIGINALS.append((cls, "create", original))
-    factory = _wrap_async if async_resource else _wrap_sync
-    cls.create = factory(original, _messages_request, _messages_response, _provider_for_resource)
-
-
-def _patch_class_stream(cls: type[Any], async_resource: bool) -> None:
-    original = cls.stream
-    if getattr(original, _WRAPPED_ATTR, False):
-        return
-    _ORIGINALS.append((cls, "stream", original))
-    factory = _wrap_stream_manager_async if async_resource else _wrap_stream_manager_sync
-    cls.stream = factory(original, _messages_request, _provider_for_resource)
+def _beta_messages(client: object) -> object | None:
+    return getattr(getattr(client, "beta", None), "messages", None)
 
 
 def wrap_anthropic(client: _T) -> _T:
     if getattr(client, _WRAPPED_ATTR, False):
         return client
     client_any: Any = client
-    messages = client_any.messages
-    async_resource = isinstance(messages, AsyncMessages)
     provider_name = _provider_for_client(cast(object, client))
-    _patch_instance_create(messages, async_resource, provider_name)
-    _patch_instance_stream(messages, async_resource, provider_name)
+    for messages in (client_any.messages, _beta_messages(cast(object, client))):
+        if messages is None:
+            continue
+        # Every async resource, including provider beta classes, derives from AsyncAPIResource.
+        async_resource = isinstance(messages, AsyncAPIResource)
+        for name in (*_RESPONSE_METHODS, "stream"):
+            _patch_instance_method(messages, name, async_resource, provider_name)
     setattr(client, _WRAPPED_ATTR, True)
     return client
 
@@ -808,10 +889,11 @@ def instrument_anthropic() -> None:
     with _install_lock:
         if _installed:
             return
-        _patch_class_create(Messages, async_resource=False)
-        _patch_class_stream(Messages, async_resource=False)
-        _patch_class_create(AsyncMessages, async_resource=True)
-        _patch_class_stream(AsyncMessages, async_resource=True)
+        classes = (Messages, AsyncMessages, BetaMessages, AsyncBetaMessages)
+        for cls in (*classes, *_provider_beta_classes()):
+            async_resource = issubclass(cls, AsyncAPIResource)
+            for name in (*_RESPONSE_METHODS, "stream"):
+                _patch_class_method(cls, name, async_resource)
         _installed = True
 
 
