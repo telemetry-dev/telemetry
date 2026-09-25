@@ -1067,29 +1067,51 @@ test("beta streams record the model that served a fallback", async () => {
   expect(span.attributes["gen_ai.response.model"]).toBe("claude-opus-4-8");
 });
 
-const compactionStream = () =>
+const compactionStream = (...deltas: JsonRecord[]) =>
   betaStreamEvents([
     { type: "compaction", content: null },
-    [
-      { type: "compaction_delta", content: "Summary ", encrypted_content: "enc_1" },
-      { type: "compaction_delta", content: "so far.", encrypted_content: "enc_2" },
-    ],
+    deltas.map((delta) => ({ type: "compaction_delta", ...delta })),
   ]);
 
-test("beta streams append compaction content fragments", async () => {
-  const span = await streamedBetaSpan(compactionStream());
+test.each<{ name: string; deltas: JsonRecord[]; expected: JsonRecord }>([
+  {
+    name: "repeated content replaces the earlier value",
+    deltas: [
+      { content: "Summary ", encrypted_content: "enc_1" },
+      { content: "Summary so far.", encrypted_content: "enc_2" },
+    ],
+    expected: { content: "Summary so far.", encrypted_content: "enc_2" },
+  },
+  {
+    name: "null content marks a failed compaction",
+    deltas: [
+      { content: "Summary", encrypted_content: "enc_1" },
+      { content: null, encrypted_content: null },
+    ],
+    expected: { content: null, encrypted_content: null },
+  },
+  {
+    name: "omitted encrypted_content keeps the earlier value",
+    deltas: [{ content: "Summary", encrypted_content: "enc_1" }, { content: "Summary." }],
+    expected: { content: "Summary.", encrypted_content: "enc_1" },
+  },
+])("beta streams match SDK compaction semantics: $name", async ({ deltas, expected }) => {
+  const span = await streamedBetaSpan(compactionStream(...deltas));
 
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
-    {
-      role: "assistant",
-      content: [{ type: "compaction", content: "Summary so far.", encrypted_content: "enc_2" }],
-    },
+    { role: "assistant", content: [{ type: "compaction", ...expected }] },
   ]);
 });
 
 test("beta streams record output chunk timing for compaction content", async () => {
   const metricExporter = new InMemoryMetricExporter(AggregationTemporality.DELTA);
-  await streamedBetaSpan(compactionStream(), setupSpans(metricExporter));
+  await streamedBetaSpan(
+    compactionStream(
+      { content: "Summary ", encrypted_content: "enc_1" },
+      { content: "Summary so far.", encrypted_content: "enc_2" },
+    ),
+    setupSpans(metricExporter),
+  );
 
   const histogram = metricExporter
     .getMetrics()

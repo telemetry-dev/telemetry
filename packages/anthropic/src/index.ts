@@ -502,10 +502,12 @@ function recordContentBlockDelta(event: ValueRecord, state: StreamState): void {
   if (deltaType === "signature_delta" && delta.signature !== undefined)
     data.signature = delta.signature;
 
-  // Match the TypeScript SDK: summary text arrives in fragments, encrypted content is replaced.
+  // Match the TypeScript SDK (0.127+): each delta carries the block's final content, where null
+  // means the compaction failed, and encrypted_content changes only when the key is present.
   if (deltaType === "compaction_delta") {
-    appendStringField(data, "content", readString(delta.content));
-    data.encrypted_content = delta.encrypted_content;
+    data.content = delta.content ?? null;
+
+    if ("encrypted_content" in delta) data.encrypted_content = delta.encrypted_content;
   }
 }
 
