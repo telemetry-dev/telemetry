@@ -457,7 +457,9 @@ function blockForDelta(
   const block =
     deltaType === "thinking_delta"
       ? { type: "thinking", thinking: "" }
-      : { type: "text", text: "" };
+      : deltaType === "compaction_delta"
+        ? { type: "compaction" }
+        : { type: "text", text: "" };
 
   state.blocks.set(index, block);
 
@@ -500,9 +502,9 @@ function recordContentBlockDelta(event: ValueRecord, state: StreamState): void {
   if (deltaType === "signature_delta" && delta.signature !== undefined)
     data.signature = delta.signature;
 
-  // Each compaction delta carries the full summary, so it replaces rather than appends.
+  // Match the TypeScript SDK: summary text arrives in fragments, encrypted content is replaced.
   if (deltaType === "compaction_delta") {
-    data.content = delta.content;
+    appendStringField(data, "content", readString(delta.content));
     data.encrypted_content = delta.encrypted_content;
   }
 }
@@ -611,6 +613,9 @@ function streamEventHasOutput(event: unknown): boolean {
   if (!record || (type !== "content_block_start" && type !== "content_block_delta")) return false;
   const value = asRecord(type === "content_block_delta" ? record.delta : record.content_block);
   const input = asRecord(value?.input);
+
+  if (value?.type === "compaction" || value?.type === "compaction_delta")
+    return typeof value.content === "string" && value.content.length > 0;
 
   return (
     [value?.text, value?.thinking, value?.partial_json].some(

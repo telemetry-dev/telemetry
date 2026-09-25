@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import inspect
 import json
+import sys
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any, cast
@@ -20,6 +22,7 @@ from anthropic.types.beta import BetaMessageParam
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import StatusCode
 
+import telemetry_dev_anthropic
 from telemetry_dev_anthropic import instrument_anthropic, uninstrument_anthropic, wrap_anthropic
 
 SyncHandler = Callable[[httpx.Request], httpx.Response]
@@ -1391,3 +1394,135 @@ def test_beta_stream_records_mcp_tool_use_input(memory: SimpleNamespace) -> None
 
     content = json.loads(str(a["gen_ai.output.messages"]))[0]["content"]
     assert content == [{**block, "input": {"q": "otel"}}]
+
+
+def test_beta_stream_records_fallback_model_after_capture_budget_is_exhausted(make: Any) -> None:
+    memory = make(max_attribute_length=64)
+    fallback = {
+        "type": "fallback",
+        "from": {"model": "claude-opus-5"},
+        "to": {"model": "claude-opus-4-8"},
+    }
+    events = beta_stream_events(
+        ({"type": "text", "text": ""}, [{"type": "text_delta", "text": "x" * 60}]),
+        (fallback, []),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(events)
+
+    stream = wrapped_sync_client(handler).beta.messages.create(
+        model="claude-opus-5", max_tokens=64, messages=BETA_MESSAGES, stream=True
+    )
+    list(stream)
+
+    assert stream._state.budget.truncated is True
+    assert attrs(only_span(memory))["gen_ai.response.model"] == "claude-opus-4-8"
+
+
+def test_beta_stream_records_output_chunks_for_compaction_content(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timestamps: list[float] = []
+    original = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        assert timestamp_ms is not None
+        timestamps.append(timestamp_ms)
+        return original(handle, timestamp_ms)
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
+    streamed_beta_span(
+        beta_stream_events(
+            (
+                {"type": "compaction", "content": None},
+                [
+                    {"type": "compaction_delta", "content": "Summary ", "encrypted_content": None},
+                    {"type": "compaction_delta", "content": "so far.", "encrypted_content": "enc"},
+                ],
+            )
+        ),
+        memory,
+    )
+
+    assert len(timestamps) == 2
+
+
+@pytest.mark.parametrize("mode", ["wrap", "instrument"])
+async def test_vertex_beta_stream_records_one_span_sync_and_async(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    def sync_handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(stream_events())
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(stream_events())
+
+    if mode == "instrument":
+        instrument_anthropic()
+    sync_vertex, async_vertex = provider_clients(monkeypatch, handler, sync_handler)[
+        "gcp.vertex_ai"
+    ]
+    if mode == "wrap":
+        sync_vertex = wrap_anthropic(sync_vertex)
+        async_vertex = wrap_anthropic(async_vertex)
+
+    with sync_vertex.beta.messages.stream(
+        model="claude-sonnet-4-6", max_tokens=64, messages=BETA_MESSAGES
+    ) as stream:
+        sync_text = "".join(stream.text_stream)
+    async with async_vertex.beta.messages.stream(
+        model="claude-sonnet-4-6", max_tokens=64, messages=BETA_MESSAGES
+    ) as stream:
+        async_text = "".join([text async for text in stream.text_stream])
+    await async_vertex.close()
+
+    assert sync_text == async_text == "Hello world"
+    spans = memory.span_exporter.get_finished_spans()
+    assert len(spans) == 2
+    for span in spans:
+        assert attrs(span)["gen_ai.provider.name"] == "gcp.vertex_ai"
+        assert json.loads(str(attrs(span)["gen_ai.output.messages"])) == [
+            {"role": "assistant", "content": [{"type": "text", "text": "Hello world"}]}
+        ]
+
+
+def test_missing_provider_beta_module_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A future SDK may rename these private modules; importing must still fail open.
+    monkeypatch.setitem(sys.modules, "anthropic.lib.bedrock._beta_messages", None)
+    classes = telemetry_dev_anthropic._provider_beta_classes()  # pyright: ignore[reportPrivateUsage]
+
+    assert (
+        AnthropicVertex(region="us-east5", project_id="p", access_token="t").beta.messages.__class__
+        in classes
+    )
+    assert all("bedrock" not in cls.__module__ for cls in classes)
+
+
+def test_global_instrumentation_wraps_async_provider_classes_as_async() -> None:
+    instrument_anthropic()
+    for cls in telemetry_dev_anthropic._provider_beta_classes():  # pyright: ignore[reportPrivateUsage]
+        original = getattr(cls.create, "_telemetry_dev_anthropic_original", None)
+        assert original is not None
+        assert inspect.iscoroutinefunction(cls.create) == cls.__name__.startswith("Async")
+
+
+def test_beta_stream_compaction_delta_without_start_is_a_compaction_block(
+    memory: SimpleNamespace,
+) -> None:
+    events = beta_stream_events()
+    events.insert(
+        1,
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "compaction_delta", "content": "Summary.", "encrypted_content": "e"},
+        },
+    )
+    a = streamed_beta_span(events, memory)
+
+    assert json.loads(str(a["gen_ai.output.messages"]))[0]["content"] == [
+        {"type": "compaction", "content": "Summary.", "encrypted_content": "e"}
+    ]

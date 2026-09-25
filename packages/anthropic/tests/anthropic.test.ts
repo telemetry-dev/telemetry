@@ -1,3 +1,8 @@
+import {
+  AggregationTemporality,
+  InMemoryMetricExporter,
+  type PushMetricExporter,
+} from "@opentelemetry/sdk-metrics";
 import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import { flush, init, shutdown } from "@telemetry-dev/sdk";
 import Anthropic from "@anthropic-ai/sdk";
@@ -149,7 +154,7 @@ function createFakeFetch(...responses: Response[]): FakeFetch {
   return { fetch: fetchImpl, requests };
 }
 
-function setupSpans(): InMemorySpanExporter {
+function setupSpans(metricExporter?: PushMetricExporter): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
   init(
     {
@@ -160,7 +165,7 @@ function setupSpans(): InMemorySpanExporter {
       logLevel: "silent",
       fetch: async () => new Response(null, { status: 200 }),
     },
-    { spanExporter },
+    { spanExporter, metricExporter },
   );
 
   return spanExporter;
@@ -1027,8 +1032,10 @@ function betaStreamEvents(...blocks: [JsonRecord, JsonRecord[]][]): JsonRecord[]
   return events;
 }
 
-async function streamedBetaSpan(events: JsonRecord[]): Promise<ReadableSpan> {
-  const spans = setupSpans();
+async function streamedBetaSpan(
+  events: JsonRecord[],
+  spans: InMemorySpanExporter = setupSpans(),
+): Promise<ReadableSpan> {
   const client = clientWith(createFakeFetch(namedSseResponse(events)).fetch);
 
   const stream = await client.beta.messages.create({
@@ -1060,19 +1067,37 @@ test("beta streams record the model that served a fallback", async () => {
   expect(span.attributes["gen_ai.response.model"]).toBe("claude-opus-4-8");
 });
 
-test("beta streams record compaction content", async () => {
-  const span = await streamedBetaSpan(
-    betaStreamEvents([
-      { type: "compaction", content: null },
-      [{ type: "compaction_delta", content: "Summary so far.", encrypted_content: "enc_1" }],
-    ]),
-  );
+const compactionStream = () =>
+  betaStreamEvents([
+    { type: "compaction", content: null },
+    [
+      { type: "compaction_delta", content: "Summary ", encrypted_content: "enc_1" },
+      { type: "compaction_delta", content: "so far.", encrypted_content: "enc_2" },
+    ],
+  ]);
+
+test("beta streams append compaction content fragments", async () => {
+  const span = await streamedBetaSpan(compactionStream());
 
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
     {
       role: "assistant",
-      content: [{ type: "compaction", content: "Summary so far.", encrypted_content: "enc_1" }],
+      content: [{ type: "compaction", content: "Summary so far.", encrypted_content: "enc_2" }],
     },
+  ]);
+});
+
+test("beta streams record output chunk timing for compaction content", async () => {
+  const metricExporter = new InMemoryMetricExporter(AggregationTemporality.DELTA);
+  await streamedBetaSpan(compactionStream(), setupSpans(metricExporter));
+
+  const histogram = metricExporter
+    .getMetrics()
+    .flatMap((batch) => batch.scopeMetrics.flatMap((scope) => scope.metrics))
+    .find((metric) => metric.descriptor.name === "gen_ai.client.operation.time_per_output_chunk");
+
+  expect(histogram?.dataPoints).toEqual([
+    expect.objectContaining({ value: expect.objectContaining({ count: 1 }) }),
   ]);
 });
 
@@ -1097,5 +1122,23 @@ test("beta streams record mcp_tool_use input", async () => {
 
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
     { role: "assistant", content: [{ ...block, input: { q: "otel" } }] },
+  ]);
+});
+
+test("beta streams keep a compaction delta without a start block as compaction", async () => {
+  const events = betaStreamEvents();
+  events.splice(1, 0, {
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "compaction_delta", content: "Summary.", encrypted_content: "e" },
+  });
+
+  const span = await streamedBetaSpan(events);
+
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: [{ type: "compaction", content: "Summary.", encrypted_content: "e" }],
+    },
   ]);
 });

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import threading
 import time
@@ -10,10 +11,6 @@ from typing import Any, TypeVar, cast
 import anthropic
 import telemetry_dev
 from anthropic._resource import AsyncAPIResource
-from anthropic.lib.bedrock._beta_messages import AsyncMessages as AsyncBedrockBetaMessages
-from anthropic.lib.bedrock._beta_messages import Messages as BedrockBetaMessages
-from anthropic.lib.vertex._beta_messages import AsyncMessages as AsyncVertexBetaMessages
-from anthropic.lib.vertex._beta_messages import Messages as VertexBetaMessages
 from anthropic.resources.beta.messages import AsyncMessages as AsyncBetaMessages
 from anthropic.resources.beta.messages import Messages as BetaMessages
 from anthropic.resources.messages import AsyncMessages, Messages
@@ -32,18 +29,27 @@ _install_lock = threading.Lock()
 _T = TypeVar("_T")
 # Each of these issues its own request: parse() and stream() do not route through create().
 _RESPONSE_METHODS = ("create", "parse")
-_MESSAGES_CLASSES: tuple[tuple[type[Any], bool], ...] = (
-    (Messages, False),
-    (AsyncMessages, True),
-    (BetaMessages, False),
-    (AsyncBetaMessages, True),
-    # Bedrock and Vertex clients expose their own beta resource classes, which copy the
-    # first-party methods instead of subclassing, so patching BetaMessages misses them.
-    (BedrockBetaMessages, False),
-    (AsyncBedrockBetaMessages, True),
-    (VertexBetaMessages, False),
-    (AsyncVertexBetaMessages, True),
+# Bedrock and Vertex clients expose their own beta resource classes, which copy the
+# first-party methods instead of subclassing, so patching BetaMessages misses them.
+_PROVIDER_BETA_MODULES = (
+    "anthropic.lib.bedrock._beta_messages",
+    "anthropic.lib.vertex._beta_messages",
 )
+
+
+def _provider_beta_classes() -> tuple[type[Any], ...]:
+    """Load provider beta resources, skipping any a future SDK renames or removes."""
+    classes: list[type[Any]] = []
+    for module_name in _PROVIDER_BETA_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        for name in ("Messages", "AsyncMessages"):
+            cls = getattr(module, name, None)
+            if isinstance(cls, type):
+                classes.append(cast(type[Any], cls))
+    return tuple(classes)
 
 
 def _field(value: Any, name: str) -> Any:
@@ -309,14 +315,15 @@ def _record_content_block_start(event: Any, state: _StreamState) -> None:
     index = _field(event, "index")
     block_index = index if isinstance(index, int) else len(state.blocks)
     content_block = _native(_field(event, "content_block"))
-    if not state.budget.accept(content_block):
-        return
     block_type = _string(_field(content_block, "type"))
     if block_type == "fallback":
-        # The final fallback block names the model that served the response.
+        # The final fallback block names the model that served the response. Read it before
+        # the capture budget check: it is span metadata, not retained output.
         state.response_model = (
             _string(_field(_field(content_block, "to"), "model")) or state.response_model
         )
+    if not state.budget.accept(content_block):
+        return
     if block_type == "text":
         state.blocks[block_index] = {
             "type": "text",
@@ -348,6 +355,8 @@ def _block_for_delta(index: int, delta_type: str | None, state: _StreamState) ->
         state.tool_json[index] = ""
     elif delta_type == "thinking_delta":
         state.blocks[index] = {"type": "thinking", "thinking": ""}
+    elif delta_type == "compaction_delta":
+        state.blocks[index] = {"type": "compaction"}
     else:
         state.blocks[index] = {"type": "text", "text": ""}
     return state.blocks[index]
@@ -412,6 +421,8 @@ def _stream_event_has_output(event: Any) -> bool:
         for key in ("text", "thinking", "partial_json")
     ):
         return True
+    if _string(_field(value, "type")) in ("compaction", "compaction_delta"):
+        return bool(_string(_field(value, "content")))
     input_value = _field(value, "input")
     return input_value not in (None, "", [], {})
 
@@ -837,7 +848,9 @@ def instrument_anthropic() -> None:
     with _install_lock:
         if _installed:
             return
-        for cls, async_resource in _MESSAGES_CLASSES:
+        classes = (Messages, AsyncMessages, BetaMessages, AsyncBetaMessages)
+        for cls in (*classes, *_provider_beta_classes()):
+            async_resource = issubclass(cls, AsyncAPIResource)
             for name in (*_RESPONSE_METHODS, "stream"):
                 _patch_class_method(cls, name, async_resource)
         _installed = True
