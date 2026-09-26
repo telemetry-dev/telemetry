@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import random
 import sys
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mapping, Sequence
 from types import SimpleNamespace
@@ -1529,8 +1530,8 @@ def test_beta_stream_compaction_delta_without_start_is_a_compaction_block(
 
 
 def test_compaction_replacement_releases_only_its_own_budget_reservation(make: Any) -> None:
-    # 400 bytes fits the sibling, start, and the long summary (363 bytes), and the final
-    # state after "ok" replaces it (265 bytes), but not both summaries at once (472 bytes).
+    # 400 bytes fits the sibling with the long summary block (344 bytes) and with the "ok"
+    # block that replaces it (246 bytes), but not both blocks stacked (496 bytes).
     make(max_attribute_length=400)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
@@ -1547,7 +1548,7 @@ def test_compaction_replacement_releases_only_its_own_budget_reservation(make: A
         record({"type": "content_block_delta", "index": 1, "delta": delta}, state)
 
     expected = telemetry_dev.CaptureBudget(max_bytes=400)
-    for retained in (sibling, {"type": "compaction"}, final):
+    for retained in (sibling, {"type": "compaction", "content": "ok", "encrypted_content": None}):
         assert expected.accept(retained)
     assert state.budget.truncated is False
     assert state.budget.bytes_used == expected.bytes_used
@@ -1596,7 +1597,7 @@ def test_oversized_compaction_replacement_keeps_previous_reservation_and_recover
     record({"type": "content_block_delta", "index": 0, "delta": final}, state)
 
     expected = telemetry_dev.CaptureBudget(max_bytes=300)
-    for retained in (start, final):
+    for retained in ({**start, "content": "final", "encrypted_content": None},):
         assert expected.accept(retained)
     assert state.budget.truncated is False
     assert state.budget.bytes_used == expected.bytes_used
@@ -1648,8 +1649,8 @@ def test_replacement_after_other_block_truncation_stays_rejected(make: Any) -> N
 
 
 def test_signature_replacement_releases_its_previous_budget_reservation(make: Any) -> None:
-    # 350 bytes fits the long signature (308 bytes) and the final state (211 bytes),
-    # but not both signatures at once (419 bytes).
+    # 350 bytes fits the block with the long signature (241 bytes) and the block with the
+    # short one (144 bytes), but not both stacked (385 bytes).
     make(max_attribute_length=350)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
@@ -1662,8 +1663,95 @@ def test_signature_replacement_releases_its_previous_budget_reservation(make: An
         record({"type": "content_block_delta", "index": 0, "delta": delta}, state)
 
     expected = telemetry_dev.CaptureBudget(max_bytes=350)
-    for retained in (start, final):
+    for retained in ({**start, "signature": "sig"},):
         assert expected.accept(retained)
     assert state.budget.truncated is False
     assert state.budget.bytes_used == expected.bytes_used
     assert state.blocks[0]["signature"] == "sig"
+
+
+def test_first_compaction_delta_replaces_the_start_shell_reservation(make: Any) -> None:
+    # The start shell costs 62 bytes and the completed block measures exactly 200.
+    make(max_attribute_length=200)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+    completed = {"type": "compaction", "content": "x" * 50, "encrypted_content": None}
+
+    record(
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "compaction"}},
+        state,
+    )
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "compaction_delta", "content": "x" * 50},
+        },
+        state,
+    )
+
+    assert state.blocks[0] == completed
+    assert state.budget.bytes_used == state.budget.max_bytes == 200
+    assert state.budget.truncated is False
+
+
+def test_replacement_budget_invariants_hold_for_random_streams(make: Any) -> None:
+    make(max_attribute_length=600)
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+    rng = random.Random(1729)
+
+    def measure(value: dict[str, Any]) -> int:
+        budget = telemetry_dev.CaptureBudget()
+        assert budget.accept(value)
+        return budget.bytes_used
+
+    def random_event(index: int, kind: str) -> dict[str, Any]:
+        if kind == "compaction":
+            delta: dict[str, Any] = {"type": "compaction_delta"}
+            if rng.random() < 0.9:
+                delta["content"] = None if rng.random() < 0.1 else "c" * rng.randrange(120)
+            if rng.random() < 0.5:
+                delta["encrypted_content"] = "e" * rng.randrange(40)
+        elif kind == "thinking" and rng.random() < 0.5:
+            delta = {"type": "signature_delta", "signature": "s" * rng.randrange(120)}
+        elif kind == "thinking":
+            delta = {"type": "thinking_delta", "thinking": "t" * rng.randrange(20)}
+        else:
+            delta = {"type": "text_delta", "text": "x" * rng.randrange(20)}
+        return {"type": "content_block_delta", "index": index, "delta": delta}
+
+    starts = {
+        "compaction": {"type": "compaction"},
+        "thinking": {"type": "thinking", "thinking": ""},
+        "text": {"type": "text", "text": ""},
+    }
+    for _ in range(1000):
+        state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+        kinds = [rng.choice(list(starts)) for _ in range(rng.randrange(1, 4))]
+        for index, kind in enumerate(kinds):
+            record(
+                {"type": "content_block_start", "index": index, "content_block": starts[kind]},
+                state,
+            )
+        for _ in range(rng.randrange(1, 12)):
+            index = rng.randrange(len(kinds))
+            event = random_event(index, kinds[index])
+            delta = event["delta"]
+            replacing = delta["type"] in ("compaction_delta", "signature_delta")
+            was_truncated = state.budget.truncated
+            held = state.block_reservations.get(index, (0, 0))[0]
+            others = state.budget.bytes_used - held
+            before = (dict(state.blocks.get(index, {})), state.budget.bytes_used)
+            candidate = telemetry_dev_anthropic._replaced_block(index, delta, state)  # pyright: ignore[reportPrivateUsage]
+
+            record(event, state)
+
+            reserved = sum(bytes_held for bytes_held, _ in state.block_reservations.values())
+            assert reserved == state.budget.bytes_used
+            if not replacing or was_truncated or candidate is None:
+                continue
+            fits = measure(candidate) <= state.budget.max_bytes - others
+            assert (state.blocks.get(index) == candidate) == fits
+            if not fits:
+                assert (dict(state.blocks.get(index, {})), state.budget.bytes_used) == before
+                assert state.budget.truncated is False

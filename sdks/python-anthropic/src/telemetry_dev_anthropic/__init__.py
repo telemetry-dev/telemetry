@@ -241,8 +241,22 @@ class _StreamState:
         self.finish_reason: str | None = None
         self.response_model: str | None = None
         self.budget = telemetry_dev.CaptureBudget.from_client()
-        # Budget bytes and items held by each block's latest replacement delta.
-        self.replacement_reservations: dict[int, tuple[int, int]] = {}
+        # Budget bytes and items each block holds: its start plus every accepted delta.
+        self.block_reservations: dict[int, tuple[int, int]] = {}
+
+
+def _reserve(index: int, value: Any, state: _StreamState) -> bool:
+    """Reserve budget for a value retained as part of a block, recording it for that block."""
+    budget = state.budget
+    before_bytes, before_items = budget.bytes_used, budget.items_used
+    if not budget.accept(value):
+        return False
+    held_bytes, held_items = state.block_reservations.get(index, (0, 0))
+    state.block_reservations[index] = (
+        held_bytes + budget.bytes_used - before_bytes,
+        held_items + budget.items_used - before_items,
+    )
+    return True
 
 
 def _parse_tool_input(raw: str) -> Any:
@@ -324,7 +338,7 @@ def _record_content_block_start(event: Any, state: _StreamState) -> None:
         state.response_model = (
             _string(_field(_field(content_block, "to"), "model")) or state.response_model
         )
-    if not state.budget.accept(content_block):
+    if not _reserve(block_index, content_block, state):
         return
     if block_type == "text":
         state.blocks[block_index] = {
@@ -349,18 +363,23 @@ def _record_content_block_start(event: Any, state: _StreamState) -> None:
     )
 
 
+def _default_block(delta_type: str | None) -> dict[str, Any]:
+    """The block a delta implies when its content_block_start was never recorded."""
+    if delta_type == "input_json_delta":
+        return {"type": "tool_use"}
+    if delta_type == "thinking_delta":
+        return {"type": "thinking", "thinking": ""}
+    if delta_type == "compaction_delta":
+        return {"type": "compaction"}
+    return {"type": "text", "text": ""}
+
+
 def _block_for_delta(index: int, delta_type: str | None, state: _StreamState) -> dict[str, Any]:
     if index in state.blocks:
         return state.blocks[index]
+    state.blocks[index] = _default_block(delta_type)
     if delta_type == "input_json_delta":
-        state.blocks[index] = {"type": "tool_use"}
         state.tool_json[index] = ""
-    elif delta_type == "thinking_delta":
-        state.blocks[index] = {"type": "thinking", "thinking": ""}
-    elif delta_type == "compaction_delta":
-        state.blocks[index] = {"type": "compaction"}
-    else:
-        state.blocks[index] = {"type": "text", "text": ""}
     return state.blocks[index]
 
 
@@ -368,36 +387,44 @@ def _block_for_delta(index: int, delta_type: str | None, state: _StreamState) ->
 _REPLACEMENT_DELTAS = frozenset({"compaction_delta", "signature_delta"})
 
 
-def _reserve_replacement_delta(index: int, delta: Any, state: _StreamState) -> bool:
-    """Reserve budget for a delta that replaces its block's previous value.
+def _replaced_block(index: int, delta: Any, state: _StreamState) -> dict[str, Any] | None:
+    """The block that results from applying a replacement delta, or None if it changes nothing."""
+    delta_type = _string(_field(delta, "type"))
+    block = dict(state.blocks.get(index) or _default_block(delta_type))
+    if delta_type == "compaction_delta":
+        block["content"] = _field(delta, "content")
+        block["encrypted_content"] = _field(delta, "encrypted_content")
+    elif _field(delta, "signature") is not None:
+        block["signature"] = _field(delta, "signature")
+    else:
+        return None
+    return block
 
-    The previous delta's reservation is handed back first, so a shorter replacement fits
-    where adding it on top would not. Other blocks keep their reservations.
 
-    A replacement that does not fit is rejected on its own: the budget stays usable for a
-    later replacement that does fit. Truncation caused by another block still applies.
+def _reserve_replacement(index: int, block: dict[str, Any], state: _StreamState) -> bool:
+    """Reserve the block that a replacement delta produces in place of what the block held.
+
+    Everything the block held (its start and earlier deltas) is handed back first, then the
+    resulting block is reserved. Other blocks keep their reservations.
+
+    A replacement that does not fit is rejected on its own: the previous block keeps its
+    reservation and the budget stays usable for a later replacement that does fit.
+    Truncation caused by another block still applies.
     """
     budget = state.budget
     if budget.truncated:
         return False
-    released_bytes, released_items = state.replacement_reservations.pop(index, (0, 0))
+    released_bytes, released_items = state.block_reservations.pop(index, (0, 0))
     budget.bytes_used -= released_bytes
     budget.items_used -= released_items
-    before_bytes, before_items = budget.bytes_used, budget.items_used
-    if not budget.accept(delta):
-        # The previous value is still retained, so it keeps its reservation, and the
-        # rejection belongs to this candidate alone.
-        budget.bytes_used += released_bytes
-        budget.items_used += released_items
-        budget.truncated = False
-        if released_bytes or released_items:
-            state.replacement_reservations[index] = (released_bytes, released_items)
-        return False
-    state.replacement_reservations[index] = (
-        budget.bytes_used - before_bytes,
-        budget.items_used - before_items,
-    )
-    return True
+    if _reserve(index, block, state):
+        return True
+    budget.bytes_used += released_bytes
+    budget.items_used += released_items
+    budget.truncated = False
+    if released_bytes or released_items:
+        state.block_reservations[index] = (released_bytes, released_items)
+    return False
 
 
 def _record_content_block_delta(event: Any, state: _StreamState) -> None:
@@ -406,9 +433,11 @@ def _record_content_block_delta(event: Any, state: _StreamState) -> None:
     delta = _native(_field(event, "delta"))
     delta_type = _string(_field(delta, "type"))
     if delta_type in _REPLACEMENT_DELTAS:
-        if not _reserve_replacement_delta(block_index, delta, state):
-            return
-    elif not state.budget.accept(delta):
+        replaced = _replaced_block(block_index, delta, state)
+        if replaced is not None and _reserve_replacement(block_index, replaced, state):
+            state.blocks[block_index] = replaced
+        return
+    if not _reserve(block_index, delta, state):
         return
     block = _block_for_delta(block_index, delta_type, state)
     if delta_type == "input_json_delta":
@@ -421,12 +450,6 @@ def _record_content_block_delta(event: Any, state: _StreamState) -> None:
         _append_item(block, "citations", _field(delta, "citation"))
     elif delta_type == "thinking_delta":
         _append_string(block, "thinking", _field(delta, "thinking"))
-    elif delta_type == "signature_delta" and _field(delta, "signature") is not None:
-        block["signature"] = _field(delta, "signature")
-    elif delta_type == "compaction_delta":
-        # Each compaction delta carries the full summary, so it replaces rather than appends.
-        block["content"] = _field(delta, "content")
-        block["encrypted_content"] = _field(delta, "encrypted_content")
 
 
 def _record_stream_event(event: Any, state: _StreamState) -> dict[str, Any]:
