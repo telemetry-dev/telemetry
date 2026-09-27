@@ -151,8 +151,8 @@ function chatBody(
     prompt_tokens: 10,
     completion_tokens: 5,
     total_tokens: 15,
-    prompt_tokens_details: { cached_tokens: 3, cache_write_tokens: 6 },
-    completion_tokens_details: { reasoning_tokens: 2 },
+    prompt_tokens_details: { cached_tokens: 3, cache_write_tokens: 6, audio_tokens: 1 },
+    completion_tokens_details: { reasoning_tokens: 2, audio_tokens: 4 },
   };
 
   if (options.cost !== undefined) Object.assign(usage, { cost: options.cost });
@@ -265,6 +265,7 @@ function embeddingsBody(id: string) {
     usage: {
       prompt_tokens: 8,
       total_tokens: 8,
+      prompt_tokens_details: { text_tokens: 1, image_tokens: 2, audio_tokens: 5 },
       cost: 0.0004,
       cost_details: {
         upstream_inference_completions_cost: 0,
@@ -366,6 +367,8 @@ test("chat maps request, response, usage, primary cost, provider, and sampling f
   expect(span.attributes["gen_ai.usage.cache_read.input_tokens"]).toBe(3);
   expect(span.attributes["gen_ai.usage.cache_creation.input_tokens"]).toBe(6);
   expect(span.attributes["gen_ai.usage.reasoning.output_tokens"]).toBe(2);
+  expect(span.attributes["gen_ai.usage.audio.input_tokens"]).toBe(1);
+  expect(span.attributes["gen_ai.usage.audio.output_tokens"]).toBe(4);
   expect(span.attributes["gen_ai.usage.cost"]).toBe(0.012);
   expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
   expect(span.attributes["gen_ai.request.temperature"]).toBe(0.7);
@@ -2315,6 +2318,9 @@ test("embeddings map input, model, usage, and cost without capturing vectors", a
   expect(span.attributes["gen_ai.input.messages"]).toBe(JSON.stringify(input));
   expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(8);
   expect(span.attributes["gen_ai.usage.total_tokens"]).toBe(8);
+  expect(span.attributes["gen_ai.usage.text.input_tokens"]).toBe(1);
+  expect(span.attributes["gen_ai.usage.image.input_tokens"]).toBe(2);
+  expect(span.attributes["gen_ai.usage.audio.input_tokens"]).toBe(5);
   expect(span.attributes["gen_ai.usage.cost"]).toBe(0.0004);
   expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
   expect(JSON.stringify(span.attributes)).not.toContain("0.1");

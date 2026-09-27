@@ -80,7 +80,20 @@ def main() -> int:
                 log("inside generation", event_name="e2e.inside")
                 generation.update(
                     output={"role": "assistant", "content": "It is sunny."},
-                    usage={"input_tokens": 11, "output_tokens": 7},
+                    usage={
+                        "input_tokens": 11,
+                        "output_tokens": 7,
+                        "cache_read_input_tokens": 4,
+                        "text_input_tokens": 6,
+                        "text_output_tokens": 4,
+                        "text_cache_read_input_tokens": 2,
+                        "image_input_tokens": 3,
+                        "image_output_tokens": 2,
+                        "image_cache_read_input_tokens": 1,
+                        "audio_input_tokens": 2,
+                        "audio_output_tokens": 1,
+                        "audio_cache_read_input_tokens": 1,
+                    },
                     finish_reason="stop",
                 )
 

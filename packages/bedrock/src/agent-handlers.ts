@@ -1,4 +1,4 @@
-import type { SpanFields } from "@telemetry-dev/sdk";
+import { boundedCapture, captureEnabled, type SpanFields } from "@telemetry-dev/sdk";
 
 import {
   arrayValue,
@@ -187,6 +187,75 @@ export function retrieveResponseFields<T>(output: T): SpanFields {
     metadata: omitUndefined({
       citation_count: retrievalResults?.length,
       guardrail_action: stringValue(result.guardrailAction),
+    }),
+  });
+}
+
+function rerankConfiguration(input: JsonRecord) {
+  const configuration = isRecord(input.rerankingConfiguration)
+    ? input.rerankingConfiguration
+    : undefined;
+
+  const bedrock = isRecord(configuration?.bedrockRerankingConfiguration)
+    ? configuration.bedrockRerankingConfiguration
+    : undefined;
+
+  return {
+    bedrock,
+    model: isRecord(bedrock?.modelConfiguration) ? bedrock.modelConfiguration : undefined,
+  };
+}
+
+export function rerankModel(input: JsonRecord): string | undefined {
+  return stringValue(rerankConfiguration(input).model?.modelArn);
+}
+
+export function rerankName(input: JsonRecord): string {
+  const model = rerankModel(input);
+
+  return `rerank ${model?.split("/").at(-1) ?? "unknown"}`;
+}
+
+export function rerankRequestFields(input: JsonRecord): SpanFields {
+  const { bedrock, model } = rerankConfiguration(input);
+
+  const capture = captureEnabled("input")
+    ? boundedCapture(
+        omitUndefined({
+          queries: input.queries,
+          sources: input.sources,
+          additionalModelRequestFields: model?.additionalModelRequestFields,
+          nextToken: input.nextToken,
+        }),
+      )
+    : undefined;
+
+  return omitUndefined({
+    provider: PROVIDER,
+    model: stringValue(model?.modelArn),
+    input: capture?.value,
+    attributes: {
+      "gen_ai.operation.name": "rerank",
+      ...(capture?.truncated ? { "telemetry.dev.capture.truncated": true } : undefined),
+    },
+    metadata: omitUndefined({
+      requested_result_count: numberValue(bedrock?.numberOfResults),
+    }),
+  });
+}
+
+export function rerankResponseFields<T>(output: T): SpanFields {
+  const raw: unknown = output;
+  const result = isRecord(raw) ? raw : {};
+  const results = arrayValue<unknown>(result.results);
+  const capture = captureEnabled("output") ? boundedCapture(results) : undefined;
+
+  return mergeFields(awsMetadataFields(result.$metadata), {
+    output: capture?.value,
+    attributes: capture?.truncated ? { "telemetry.dev.capture.truncated": true } : undefined,
+    metadata: omitUndefined({
+      result_count: results?.length,
+      has_next_token: stringValue(result.nextToken) ? true : undefined,
     }),
   });
 }

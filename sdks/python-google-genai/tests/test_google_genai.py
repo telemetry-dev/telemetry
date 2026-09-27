@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import gc
 import json
-from collections.abc import AsyncIterator, Iterator
+import weakref
+from collections.abc import AsyncIterator, Iterator, Sequence
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -17,6 +19,7 @@ from google.genai import errors, types
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import StatusCode
 
+import telemetry_dev_google_genai as google_genai_instrumentation
 from telemetry_dev_google_genai import (
     instrument_google_genai,
     uninstrument_google_genai,
@@ -25,6 +28,10 @@ from telemetry_dev_google_genai import (
 
 USER_CONTENT = [{"role": "user", "parts": [{"text": "Tell me a joke about OpenTelemetry"}]}]
 SYSTEM_INSTRUCTION = {"parts": [{"text": "You must never tell jokes"}]}
+
+
+def redact_media(_value: Any, context: telemetry_dev.MaskContext) -> str:
+    return f"redacted:{context.key}"
 
 
 def only_span(env: SimpleNamespace) -> ReadableSpan:
@@ -143,6 +150,12 @@ def happy_payload(**overrides: Any) -> dict[str, Any]:
             "cachedContentTokenCount": 3,
             "thoughtsTokenCount": 2,
             "toolUsePromptTokenCount": 1,
+            "promptTokensDetails": [
+                {"modality": "TEXT", "tokenCount": 8},
+                {"modality": "IMAGE", "tokenCount": 3},
+            ],
+            "candidatesTokensDetails": [{"modality": "AUDIO", "tokenCount": 7}],
+            "cacheTokensDetails": [{"modality": "TEXT", "tokenCount": 3}],
         },
     }
     payload.update(overrides)
@@ -186,6 +199,423 @@ def embed_payload() -> dict[str, Any]:
         "embeddings": [{"values": [0.1, 0.2, 0.3], "statistics": {"tokenCount": 6}}],
         "metadata": {"billableCharacterCount": 12},
     }
+
+
+def test_generate_images_is_media_span_without_binary_capture(memory: SimpleNamespace) -> None:
+    client, _transport = client_with_transport(
+        [{"generatedImages": [{"image": {"imageBytes": "AAAA", "mimeType": "image/png"}}]}]
+    )
+    wrapped = wrap_google_genai(client)
+
+    wrapped.models.generate_images(model="imagen-4.0-generate-001", prompt="A graph")
+
+    a = attrs(only_span(memory))
+    assert a["gen_ai.operation.name"] == "generate_content"
+    assert a["gen_ai.output.type"] == "image"
+    assert a["gen_ai.provider.name"] == "gcp.gemini"
+    assert "AAAA" not in json.dumps(a)
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        ({"capture_input": False, "capture_output": False}, None),
+        ({"mask": redact_media}, "redacted"),
+    ],
+    ids=["disabled", "masked"],
+)
+def test_media_content_obeys_capture_privacy_controls(
+    make: Any, options: dict[str, Any], expected: str | None
+) -> None:
+    env = make(**options)
+    client, _transport = client_with_transport([])
+
+    def generate_images(**_kwargs: Any) -> dict[str, Any]:
+        return {"generatedImages": [{"image": {"gcsUri": "gs://secret/output.png"}}]}
+
+    client.models.generate_images = generate_images
+    wrapped = wrap_google_genai(client)
+
+    wrapped.models.generate_images(
+        model="imagen-4.0-generate-001",
+        prompt="secret prompt",
+        config={
+            "negative_prompt": "secret negative prompt",
+            "labels": {"private": "secret label"},
+            "output_gcs_uri": "gs://secret/output-prefix",
+        },
+    )
+
+    a = attrs(only_span(env))
+    serialized = json.dumps(a)
+    assert "secret prompt" not in serialized
+    assert "secret label" not in serialized
+    assert "gs://secret" not in serialized
+    assert a["google_genai.response.image_count"] == 1
+    if expected is None:
+        assert "gen_ai.input.messages" not in a
+        assert "gen_ai.output.messages" not in a
+    else:
+        assert expected in str(a["gen_ai.input.messages"])
+        assert expected in str(a["gen_ai.output.messages"])
+
+
+class _TraversalGuard(Sequence[Any]):
+    def __len__(self) -> int:
+        raise AssertionError("media input was traversed")
+
+    def __getitem__(self, _index: int | slice) -> Any:
+        raise AssertionError("media input was traversed")
+
+
+class _LargeReferences(Sequence[Any]):
+    def __init__(self) -> None:
+        self.reads = 0
+
+    def __len__(self) -> int:
+        return 10_000
+
+    def __getitem__(self, index: int | slice) -> Any:
+        if isinstance(index, slice):
+            raise AssertionError("reference images must be traversed incrementally")
+        if index >= len(self):
+            raise IndexError
+        self.reads += 1
+        if self.reads > 400:
+            raise AssertionError("reference image traversal exceeded the capture budget")
+        return {"reference_image": {"uri": f"gs://bucket/reference-{index}.png"}}
+
+
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_media_capture_disabled_does_not_traverse_inputs(make: Any, async_mode: bool) -> None:
+    env = make(capture_input=False)
+    client, _transport = client_with_transport([])
+    called = False
+
+    if async_mode:
+
+        async def async_generate_images(**_kwargs: Any) -> dict[str, Any]:
+            nonlocal called
+            called = True
+            return {"generatedImages": []}
+
+        client.aio.models.generate_images = async_generate_images
+    else:
+
+        def sync_generate_images(**_kwargs: Any) -> dict[str, Any]:
+            nonlocal called
+            called = True
+            return {"generatedImages": []}
+
+        client.models.generate_images = sync_generate_images
+    wrapped = wrap_google_genai(client)
+
+    if async_mode:
+        import asyncio
+
+        asyncio.run(
+            wrapped.aio.models.generate_images(
+                model="imagen-4.0", reference_images=_TraversalGuard()
+            )
+        )
+    else:
+        wrapped.models.generate_images(model="imagen-4.0", reference_images=_TraversalGuard())
+
+    assert called
+    assert "gen_ai.input.messages" not in attrs(only_span(env))
+
+
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_media_capture_bounds_large_and_cyclic_inputs(
+    memory: SimpleNamespace, async_mode: bool
+) -> None:
+    client, _transport = client_with_transport([])
+    references = _LargeReferences()
+    labels: dict[str, Any] = {}
+    labels["cycle"] = labels
+
+    if async_mode:
+
+        async def async_generate_images(**_kwargs: Any) -> dict[str, Any]:
+            return {"generatedImages": []}
+
+        client.aio.models.generate_images = async_generate_images
+    else:
+
+        def sync_generate_images(**_kwargs: Any) -> dict[str, Any]:
+            return {"generatedImages": []}
+
+        client.models.generate_images = sync_generate_images
+    wrapped = wrap_google_genai(client)
+
+    if async_mode:
+        import asyncio
+
+        asyncio.run(
+            wrapped.aio.models.generate_images(
+                model="imagen-4.0",
+                reference_images=references,
+                config={"labels": labels},
+            )
+        )
+    else:
+        wrapped.models.generate_images(
+            model="imagen-4.0", reference_images=references, config={"labels": labels}
+        )
+
+    a = attrs(only_span(memory))
+    assert a["telemetry.dev.capture.truncated"] is True
+    assert references.reads <= 400
+
+
+def test_media_capture_projects_cyclic_labels(memory: SimpleNamespace) -> None:
+    labels: dict[str, Any] = {"ordinary": "value"}
+    labels["cycle"] = labels
+
+    contents, truncated = google_genai_instrumentation._media_contents(
+        {"config": {"labels": labels}}
+    )
+
+    assert truncated is False
+    assert contents == {"labels": {"ordinary": "value", "cycle": None}}
+
+
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("submission_done", [False, None], ids=["done-false", "done-omitted"])
+def test_generate_videos_span_stays_open_until_terminal_poll(
+    memory: SimpleNamespace, async_mode: bool, submission_done: bool | None
+) -> None:
+    submission: dict[str, Any] = {"name": "operations/video-1"}
+    if submission_done is not None:
+        submission["done"] = submission_done
+    client, _transport = client_with_transport([submission])
+    pending_operation = types.GenerateVideosOperation.model_validate(
+        {"name": "operations/video-1", "done": False}
+    )
+    completed_operation = types.GenerateVideosOperation.model_validate(
+        {
+            "name": "operations/video-1",
+            "done": True,
+            "response": {"generatedVideos": [{"video": {"uri": "gs://bucket/video.mp4"}}]},
+        }
+    )
+    polls = iter((pending_operation, completed_operation))
+
+    def get_operation(operation: Any) -> Any:
+        return next(polls)
+
+    client.operations.get = get_operation
+
+    async def async_get(operation: Any) -> Any:
+        return next(polls)
+
+    client.aio.operations.get = async_get
+    wrapped = wrap_google_genai(client)
+    source = types.GenerateVideosSource(
+        prompt="A telemetry graph in motion",
+        image=types.Image(image_bytes=b"image-secret", mime_type="image/png"),
+        video=types.Video(video_bytes=b"video-secret", mime_type="video/mp4"),
+    )
+
+    if async_mode:
+
+        async def run() -> tuple[Any, Any, Any]:
+            submitted = await wrapped.aio.models.generate_videos(model="veo-3.0", source=source)
+            assert memory.span_exporter.get_finished_spans() == ()
+            pending = await wrapped.aio.operations.get(submitted)
+            assert memory.span_exporter.get_finished_spans() == ()
+            completed = await wrapped.aio.operations.get(pending)
+            return submitted, pending, completed
+
+        import asyncio
+
+        submitted, pending, completed = asyncio.run(run())
+    else:
+        submitted = wrapped.models.generate_videos(model="veo-3.0", source=source)
+        assert memory.span_exporter.get_finished_spans() == ()
+        pending = wrapped.operations.get(submitted)
+        assert memory.span_exporter.get_finished_spans() == ()
+        completed = wrapped.operations.get(pending)
+
+    assert submitted.name == pending.name == completed.name
+    a = attrs(only_span(memory))
+    serialized = json.dumps(a)
+    assert a["gen_ai.output.type"] == "video"
+    assert a["gen_ai.response.id"] == "operations/video-1"
+    assert a["google_genai.response.operation_done"] is True
+    assert a["google_genai.response.video_count"] == 1
+    assert json.loads(str(a["gen_ai.output.messages"])) == [
+        {"type": "video", "uri": "gs://bucket/video.mp4"}
+    ]
+    assert "google_genai.response.video_uris" not in a
+    assert "A telemetry graph in motion" in serialized
+    assert "image-secret" not in serialized
+    assert "video-secret" not in serialized
+
+
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("global_instrumentation", [False, True], ids=["wrapped", "global"])
+def test_client_close_ends_pending_video_span(
+    memory: SimpleNamespace, async_mode: bool, global_instrumentation: bool
+) -> None:
+    if global_instrumentation:
+        instrument_google_genai()
+    client, _transport = client_with_transport([{"name": "operations/close", "done": False}])
+    wrapped = client if global_instrumentation else wrap_google_genai(client)
+
+    if async_mode:
+
+        async def run() -> None:
+            await wrapped.aio.models.generate_videos(model="veo-3.0", prompt="storm")
+            assert memory.span_exporter.get_finished_spans() == ()
+            await wrapped.aio.aclose()
+
+        import asyncio
+
+        asyncio.run(run())
+    else:
+        wrapped.models.generate_videos(model="veo-3.0", prompt="storm")
+        assert memory.span_exporter.get_finished_spans() == ()
+        wrapped.close()
+
+    span = only_span(memory)
+    assert span.status.status_code is StatusCode.ERROR
+    event = next(event for event in span.events if event.name == "exception")
+    assert "client closed" in str((event.attributes or {})["exception.message"])
+
+
+@pytest.mark.parametrize(
+    ("async_mode", "global_instrumentation"),
+    [(False, False), (True, True)],
+    ids=["wrapped-sync", "global-async"],
+)
+def test_client_context_exit_ends_pending_video_span(
+    memory: SimpleNamespace, async_mode: bool, global_instrumentation: bool
+) -> None:
+    if global_instrumentation:
+        instrument_google_genai()
+    client, _transport = client_with_transport([{"name": "operations/context", "done": False}])
+    wrapped = client if global_instrumentation else wrap_google_genai(client)
+
+    if async_mode:
+
+        async def run() -> None:
+            async with wrapped.aio:
+                await wrapped.aio.models.generate_videos(model="veo-3.0", prompt="storm")
+                assert memory.span_exporter.get_finished_spans() == ()
+
+        import asyncio
+
+        asyncio.run(run())
+    else:
+        with wrapped:
+            wrapped.models.generate_videos(model="veo-3.0", prompt="storm")
+            assert memory.span_exporter.get_finished_spans() == ()
+
+    span = only_span(memory)
+    assert span.status.status_code is StatusCode.ERROR
+    event = next(event for event in span.events if event.name == "exception")
+    assert "client closed" in str((event.attributes or {})["exception.message"])
+
+
+def test_global_video_tracker_releases_closed_client_identity() -> None:
+    class Scope:
+        pass
+
+    class Resource:
+        def __init__(self, scope: Scope) -> None:
+            self._api_client = scope
+
+    tracker = google_genai_instrumentation._VideoOperationTracker(scoped=True)
+    scope = Scope()
+    resource = Resource(scope)
+    tracker.close_scope(resource, "sync")
+    scope_reference = weakref.ref(scope)
+
+    assert len(tracker._closed_scopes) == 1
+
+    del resource
+    del scope
+    gc.collect()
+
+    assert scope_reference() is None
+    assert len(tracker._closed_scopes) == 0
+
+
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_generate_videos_poll_exception_ends_span_and_preserves_error(
+    memory: SimpleNamespace, async_mode: bool
+) -> None:
+    failure = RuntimeError("poll transport failed")
+    client, _transport = client_with_transport(
+        [{"name": "operations/video-error", "done": False}, failure]
+    )
+    wrapped = wrap_google_genai(client)
+
+    if async_mode:
+
+        async def run() -> None:
+            submitted = await wrapped.aio.models.generate_videos(model="veo-3.0", prompt="storm")
+            with pytest.raises(RuntimeError, match="poll transport failed") as caught:
+                await wrapped.aio.operations.get(submitted)
+            assert caught.value is failure
+
+        import asyncio
+
+        asyncio.run(run())
+    else:
+        submitted = wrapped.models.generate_videos(model="veo-3.0", prompt="storm")
+        with pytest.raises(RuntimeError, match="poll transport failed") as caught:
+            wrapped.operations.get(submitted)
+        assert caught.value is failure
+
+    span = only_span(memory)
+    assert span.status.status_code is StatusCode.ERROR
+
+
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_generate_videos_terminal_operation_error_ends_span(
+    memory: SimpleNamespace, async_mode: bool
+) -> None:
+    client, _transport = client_with_transport(
+        [{"name": "operations/video-terminal-error", "done": False}]
+    )
+    failed = types.GenerateVideosOperation.model_validate(
+        {
+            "name": "operations/video-terminal-error",
+            "done": True,
+            "error": {"code": 13, "message": "generation failed"},
+        }
+    )
+
+    def get_operation(operation: Any) -> Any:
+        return failed
+
+    client.operations.get = get_operation
+
+    async def async_get(operation: Any) -> Any:
+        return failed
+
+    client.aio.operations.get = async_get
+    wrapped = wrap_google_genai(client)
+
+    if async_mode:
+
+        async def run() -> Any:
+            submitted = await wrapped.aio.models.generate_videos(model="veo-3.0", prompt="storm")
+            return await wrapped.aio.operations.get(submitted)
+
+        import asyncio
+
+        result = asyncio.run(run())
+    else:
+        submitted = wrapped.models.generate_videos(model="veo-3.0", prompt="storm")
+        result = wrapped.operations.get(submitted)
+
+    assert result is failed
+    span = only_span(memory)
+    assert span.status.status_code is StatusCode.ERROR
+    assert attrs(span)["google_genai.response.operation_done"] is True
 
 
 @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
@@ -248,6 +678,10 @@ def test_generate_content_maps_request_response_usage_and_sampling(
     assert a["gen_ai.usage.total_tokens"] == 18
     assert a["gen_ai.usage.cache_read.input_tokens"] == 3
     assert a["gen_ai.usage.reasoning.output_tokens"] == 2
+    assert a["gen_ai.usage.text.input_tokens"] == 8
+    assert a["gen_ai.usage.image.input_tokens"] == 3
+    assert a["gen_ai.usage.audio.output_tokens"] == 7
+    assert a["gen_ai.usage.text.cache_read.input_tokens"] == 3
     assert a["google_genai.usage.tool_use_prompt_tokens"] == 1
     assert json.loads(str(a["gen_ai.input.messages"])) == expected_input
     assert expected_input == USER_CONTENT
@@ -1226,6 +1660,172 @@ def test_instrument_and_uninstrument_global(memory: SimpleNamespace) -> None:
         uninstrumented.aio.models.generate_content(model="gemini-2.5-flash", contents=USER_CONTENT)
     )
     assert len(memory.span_exporter.get_finished_spans()) == 2
+
+
+def test_uninstrument_ends_pending_global_video_span(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from google.genai.models import Models
+
+    def generate_videos(_self: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"name": "operations/pending", "done": False}
+
+    monkeypatch.setattr(Models, "generate_videos", generate_videos)
+    instrument_google_genai()
+    client = genai.Client(api_key="test")
+
+    result = client.models.generate_videos(model="veo-3.0")
+    assert cast(Any, result)["done"] is False
+    assert memory.span_exporter.get_finished_spans() == ()
+
+    uninstrument_google_genai()
+
+    span = only_span(memory)
+    assert span.status.status_code is StatusCode.ERROR
+    event = next(event for event in span.events if event.name == "exception")
+    assert "instrumentation removed" in str((event.attributes or {})["exception.message"])
+
+
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("poll_fails", [False, True], ids=["terminal", "exception"])
+def test_uninstrument_claims_callback_while_video_poll_is_blocked(
+    memory: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    async_mode: bool,
+    poll_fails: bool,
+) -> None:
+    callback_calls = 0
+    original_end_once = google_genai_instrumentation._end_once
+
+    def counted_end_once(handle: telemetry_dev.SpanHandle) -> Any:
+        end = original_end_once(handle)
+
+        def counted_end(**fields: Any) -> None:
+            nonlocal callback_calls
+            callback_calls += 1
+            end(**fields)
+
+        return counted_end
+
+    monkeypatch.setattr(google_genai_instrumentation, "_end_once", counted_end_once)
+    failure = RuntimeError("blocked poll failed")
+
+    if async_mode:
+        import asyncio
+
+        from google.genai.models import AsyncModels
+        from google.genai.operations import AsyncOperations
+
+        async def run() -> None:
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def generate_videos(_self: Any, **_kwargs: Any) -> dict[str, Any]:
+                return {"name": "operations/blocked", "done": False}
+
+            async def get_operation(_self: Any, operation: Any) -> dict[str, Any]:
+                started.set()
+                await release.wait()
+                if poll_fails:
+                    raise failure
+                return {"name": operation["name"], "done": True}
+
+            monkeypatch.setattr(AsyncModels, "generate_videos", generate_videos)
+            monkeypatch.setattr(AsyncOperations, "get", get_operation)
+            instrument_google_genai()
+            client = genai.Client(api_key="test")
+            submitted = await client.aio.models.generate_videos(model="veo-3.0")
+            poll = asyncio.create_task(client.aio.operations.get(submitted))
+            await started.wait()
+            uninstrument_google_genai()
+            release.set()
+            if poll_fails:
+                with pytest.raises(RuntimeError, match="blocked poll failed") as caught:
+                    await poll
+                assert caught.value is failure
+            else:
+                assert cast(Any, await poll)["done"] is True
+
+        asyncio.run(run())
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        from google.genai.models import Models
+        from google.genai.operations import Operations
+
+        started = Event()
+        release = Event()
+
+        def generate_videos(_self: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {"name": "operations/blocked", "done": False}
+
+        def get_operation(_self: Any, operation: Any) -> dict[str, Any]:
+            started.set()
+            assert release.wait(timeout=5)
+            if poll_fails:
+                raise failure
+            return {"name": operation["name"], "done": True}
+
+        monkeypatch.setattr(Models, "generate_videos", generate_videos)
+        monkeypatch.setattr(Operations, "get", get_operation)
+        instrument_google_genai()
+        client = genai.Client(api_key="test")
+        submitted = client.models.generate_videos(model="veo-3.0")
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            poll = executor.submit(client.operations.get, submitted)
+            assert started.wait(timeout=5)
+            uninstrument_google_genai()
+            release.set()
+            if poll_fails:
+                with pytest.raises(RuntimeError, match="blocked poll failed") as caught:
+                    poll.result(timeout=5)
+                assert caught.value is failure
+            else:
+                assert cast(Any, poll.result(timeout=5))["done"] is True
+
+    assert callback_calls == 1
+    span = only_span(memory)
+    assert span.status.status_code is StatusCode.ERROR
+    assert "google_genai.response.operation_done" not in attrs(span)
+    exceptions = [event for event in span.events if event.name == "exception"]
+    assert len(exceptions) == 1
+    assert "instrumentation removed" in str((exceptions[0].attributes or {})["exception.message"])
+
+
+def test_uninstrument_ends_global_video_submission_that_finishes_late(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from google.genai.models import AsyncModels
+
+    async def run() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def generate_videos(_self: Any, **_kwargs: Any) -> dict[str, Any]:
+            started.set()
+            await release.wait()
+            return {"name": "operations/late", "done": False}
+
+        monkeypatch.setattr(AsyncModels, "generate_videos", generate_videos)
+        instrument_google_genai()
+        client = genai.Client(api_key="test")
+        task = asyncio.create_task(client.aio.models.generate_videos(model="veo-3.0"))
+        await started.wait()
+        uninstrument_google_genai()
+        assert memory.span_exporter.get_finished_spans() == ()
+        release.set()
+        result = await task
+        assert cast(Any, result)["done"] is False
+
+    asyncio.run(run())
+
+    span = only_span(memory)
+    assert span.status.status_code is StatusCode.ERROR
+    event = next(event for event in span.events if event.name == "exception")
+    assert "instrumentation removed" in str((event.attributes or {})["exception.message"])
 
 
 def test_uninstrument_preserves_later_class_patch(monkeypatch: pytest.MonkeyPatch) -> None:

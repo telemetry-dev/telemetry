@@ -111,9 +111,12 @@ the core SDK with provider integrations to enable the new metric.
 ### Span fields (start/update/end)
 
 `input`, `output`, `model`, `provider`, `system_instructions`, `response_model`, `response_id`,
-`output_type`, `finish_reason`, `usage` (dict with exactly `input_tokens`, `output_tokens`,
+`output_type`, `finish_reason`, `usage` (dict with `input_tokens`, `output_tokens`,
 `total_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`,
-`reasoning_output_tokens`), `cost_usd`, `temperature`, `top_p`, `top_k`, `max_tokens`,
+`reasoning_output_tokens`, `text_input_tokens`, `text_output_tokens`, `image_input_tokens`,
+`image_output_tokens`, `audio_input_tokens`, `audio_output_tokens`,
+`text_cache_read_input_tokens`, `image_cache_read_input_tokens`, and
+`audio_cache_read_input_tokens`), `cost_usd`, `temperature`, `top_p`, `top_k`, `max_tokens`,
 `stop_sequences`, `seed`, `frequency_penalty`, `presence_penalty`, `time_to_first_chunk_ms`,
 `tool_name`, `tool_call_id`, `tool_description`, `agent_name`, `agent_id`, `metadata`
 (→ `td.metadata.*`, this span only), `attributes` (raw escape hatch, merged last), `error`.

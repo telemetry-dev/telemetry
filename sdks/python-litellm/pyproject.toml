@@ -19,7 +19,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "telemetry-dev>=0.2.0",
+  "telemetry-dev>=0.2.6",
   "litellm>=1.90.2,<2.0",
   "opentelemetry-api>=1.35.0,<2",
 ]

@@ -10,6 +10,9 @@ import {
   ragName,
   ragRequestFields,
   ragResponseFields,
+  rerankName,
+  rerankRequestFields,
+  rerankResponseFields,
   retrieveRequestFields,
   retrieveResponseFields,
 } from "./agent-handlers.ts";
@@ -145,6 +148,16 @@ export const AGENT_HANDLERS = {
     spanType: () => "agent",
     requestFields: inlineAgentRequestFields,
     onResult: streamAgentResult("completion"),
+  },
+  RerankCommand: {
+    spanName: rerankName,
+    spanType: () => "span",
+    requestFields: rerankRequestFields,
+    onResult(result, span) {
+      endSpan(span, rerankResponseFields(result));
+
+      return result;
+    },
   },
   RetrieveCommand: {
     spanName: (input) => `retrieve ${stringValue(input.knowledgeBaseId) ?? "unknown"}`,

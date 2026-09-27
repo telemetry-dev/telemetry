@@ -8,7 +8,14 @@
  */
 
 import type { AsyncLocalStorage } from "node:async_hooks";
-import { startSpan, type SpanFields, type SpanHandle } from "@telemetry-dev/sdk";
+import {
+  boundedCapture,
+  boundedCaptureDetails,
+  captureEnabled,
+  startSpan,
+  type SpanFields,
+  type SpanHandle,
+} from "@telemetry-dev/sdk";
 
 type AttributeValue = NonNullable<SpanFields["attributes"]>[string];
 
@@ -58,8 +65,13 @@ interface RequestMapping {
   fields: SpanFields & { type: "generation" | "embedding" };
 }
 
+interface VideoOperationTracker {
+  operations: WeakSet<object>;
+}
+
 export interface GoogleGenAIClientLike {
   models: object;
+  operations?: object;
   vertexai?: boolean;
 }
 
@@ -91,6 +103,31 @@ function readString(value: unknown): string | undefined {
 
 function readNumber(value: unknown): number | undefined {
   return typeof value === "number" ? value : undefined;
+}
+
+const skipBinaryCapture = (
+  key: string,
+  _item: unknown,
+  _parent: unknown,
+  path: readonly string[],
+) => {
+  const container = path.at(-1);
+  const inContentPart = path.length === 1 || path.at(-2) === "parts";
+
+  return (
+    inContentPart &&
+    ((key === "data" && (container === "inlineData" || container === "inline_data")) ||
+      (key === "imageBytes" && container === "image") ||
+      (key === "videoBytes" && container === "video"))
+  );
+};
+
+function boundedTelemetryCapture(value: unknown) {
+  return boundedCapture(value, { skip: skipBinaryCapture });
+}
+
+function boundedTelemetryCaptureDetails(value: unknown) {
+  return boundedCaptureDetails(value, { skip: skipBinaryCapture });
 }
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {
@@ -237,19 +274,55 @@ function usageFromMetadata(usage: unknown): SpanFields["usage"] {
 
   if (!metadata) return undefined;
 
-  return compactUsage({
+  const result: NonNullable<SpanFields["usage"]> = {
     inputTokens: readNumber(metadata.promptTokenCount),
     outputTokens: readNumber(metadata.candidatesTokenCount),
     totalTokens: readNumber(metadata.totalTokenCount),
     cacheReadInputTokens: readNumber(metadata.cachedContentTokenCount),
     reasoningOutputTokens: readNumber(metadata.thoughtsTokenCount),
-  });
+  };
+
+  mapModalityTokens(metadata.promptTokensDetails, result, "input");
+  mapModalityTokens(metadata.candidatesTokensDetails, result, "output");
+  mapModalityTokens(metadata.cacheTokensDetails, result, "cache");
+
+  return compactUsage(result);
 }
 
-function candidateOutput(response: UnknownRecord): unknown[] | undefined {
-  const candidates = asArray(response.candidates);
+function mapModalityTokens(
+  details: unknown,
+  usage: NonNullable<SpanFields["usage"]>,
+  kind: "input" | "output" | "cache",
+): void {
+  for (const detail of asArray(details) ?? []) {
+    const record = asRecord(detail);
+    const count = readNumber(record?.tokenCount);
+    const modality = readString(record?.modality)?.toUpperCase();
 
-  if (!candidates || candidates.length === 0) return undefined;
+    if (count === undefined || !modality || !["TEXT", "IMAGE", "AUDIO"].includes(modality))
+      continue;
+    const prefix = modality.toLowerCase() as "text" | "image" | "audio";
+
+    const suffix = {
+      cache: "CacheReadInputTokens",
+      input: "InputTokens",
+      output: "OutputTokens",
+    }[kind];
+
+    const key = `${prefix}${suffix}`;
+
+    const typedKey = key as keyof NonNullable<SpanFields["usage"]>;
+    usage[typedKey] = (usage[typedKey] ?? 0) + count;
+  }
+}
+
+function candidateOutput(response: UnknownRecord) {
+  if (!captureEnabled("output")) return { value: undefined, truncated: false };
+  const capture = boundedTelemetryCapture(response.candidates);
+  const candidates = asArray(capture.value);
+
+  if (!candidates || candidates.length === 0)
+    return { value: undefined, truncated: capture.truncated };
 
   const output = candidates
     .map((candidate) => {
@@ -265,7 +338,7 @@ function candidateOutput(response: UnknownRecord): unknown[] | undefined {
     })
     .filter((entry) => entry !== undefined);
 
-  return output.length > 0 ? output : undefined;
+  return { value: output.length > 0 ? output : undefined, truncated: capture.truncated };
 }
 
 function responseAttributes(response: UnknownRecord) {
@@ -347,12 +420,17 @@ function generateRequestFields(params: UnknownRecord): RequestMapping {
   const model = readString(params.model);
   const config = asRecord(params.config);
   const attributes = requestAttributesFromConfig(config);
+  const input = captureEnabled("input") ? normalizeContentInput(params.contents) : undefined;
+
+  const systemInstructions = captureEnabled("input")
+    ? boundedTelemetryCapture(config?.systemInstruction)
+    : undefined;
 
   const fields: RequestMapping["fields"] = {
     type: "generation",
     model,
-    input: normalizeContentInput(params.contents),
-    systemInstructions: config?.systemInstruction,
+    input: input?.value,
+    systemInstructions: systemInstructions?.value,
     temperature: readNumber(config?.temperature),
     topP: readNumber(config?.topP),
     topK: readNumber(config?.topK),
@@ -363,6 +441,9 @@ function generateRequestFields(params: UnknownRecord): RequestMapping {
     presencePenalty: readNumber(config?.presencePenalty),
     outputType: outputTypeFromConfig(config),
   };
+
+  if (input?.truncated || systemInstructions?.truncated)
+    attributes["telemetry.dev.capture.truncated"] = true;
 
   if (Object.keys(attributes).length > 0) fields.attributes = attributes;
 
@@ -379,18 +460,26 @@ function generateResponseFields(response: unknown): SpanFields {
 
   const attributes = responseAttributes(record);
   const afcHistory = asArray(record.automaticFunctionCallingHistory);
+  const output = candidateOutput(record);
 
   const fields: SpanFields = {
     responseModel: readString(record.modelVersion),
     responseId: readString(record.responseId),
     finishReason: finishReasons[0],
-    output: candidateOutput(record),
+    output: output.value,
     usage: usageFromMetadata(record.usageMetadata),
   };
 
-  if (Object.keys(attributes).length > 0) fields.attributes = attributes;
+  if (output.truncated) attributes["telemetry.dev.capture.truncated"] = true;
 
-  if (afcHistory && afcHistory.length > 0) fields.input = afcHistory;
+  if (captureEnabled("input") && afcHistory && afcHistory.length > 0) {
+    const capture = boundedTelemetryCapture(afcHistory);
+    fields.input = capture.value;
+
+    if (capture.truncated) attributes["telemetry.dev.capture.truncated"] = true;
+  }
+
+  if (Object.keys(attributes).length > 0) fields.attributes = attributes;
 
   if (readString(asRecord(record.promptFeedback)?.blockReason)) {
     delete fields.output;
@@ -454,6 +543,176 @@ function embedResponseFields(response: unknown): SpanFields {
   if (Object.keys(attributes).length > 0) fields.attributes = attributes;
 
   return fields;
+}
+
+const MEDIA_CONFIG_KEYS = [
+  "numberOfImages",
+  "numberOfVideos",
+  "aspectRatio",
+  "guidanceScale",
+  "seed",
+  "safetyFilterLevel",
+  "personGeneration",
+  "language",
+  "outputMimeType",
+  "outputCompressionQuality",
+  "addWatermark",
+  "editMode",
+  "baseSteps",
+  "imageSize",
+  "enhancePrompt",
+  "fps",
+  "durationSeconds",
+  "resolution",
+  "generateAudio",
+  "compressionQuality",
+  "resizeMode",
+  "enhanceInputImage",
+  "imagePreservationFactor",
+] as const;
+
+function mediaReference(value: unknown): UnknownRecord | undefined {
+  const record = asRecord(value);
+
+  if (!record) return undefined;
+  const result: UnknownRecord = {};
+
+  for (const key of ["gcsUri", "uri", "mimeType"] as const) {
+    const item = readString(record[key]);
+
+    if (item !== undefined) result[key] = item;
+  }
+
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function mediaRequestFields(
+  params: UnknownRecord,
+  kind: string,
+  outputType: string,
+): RequestMapping {
+  const model = readString(params.model);
+  const config = asRecord(params.config);
+
+  const attributes: NonNullable<SpanFields["attributes"]> = {
+    "gen_ai.operation.name": "generate_content",
+    "google_genai.operation.type": kind,
+  };
+
+  const safeConfig: UnknownRecord = {};
+
+  for (const key of MEDIA_CONFIG_KEYS) {
+    const value = config?.[key];
+
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      safeConfig[key] = value;
+    }
+  }
+
+  if (Object.keys(safeConfig).length > 0) {
+    setJsonAttribute(attributes, "google_genai.request.config", safeConfig);
+  }
+
+  const referenceCount = asArray(params.referenceImages)?.length;
+
+  if (referenceCount !== undefined)
+    attributes["google_genai.request.reference_image_count"] = referenceCount;
+  const upscaleFactor = readString(params.upscaleFactor);
+
+  if (upscaleFactor) attributes["google_genai.request.upscale_factor"] = upscaleFactor;
+  const prompt = readString(params.prompt) ?? readString(asRecord(params.source)?.prompt);
+  const source = asRecord(params.source);
+
+  const inputMedia = [
+    mediaReference(params.image),
+    mediaReference(params.video),
+    mediaReference(source?.image),
+    mediaReference(source?.video),
+  ].filter((value): value is UnknownRecord => value !== undefined);
+
+  const contentInput: UnknownRecord = {};
+
+  if (prompt) contentInput.prompt = prompt;
+  const negativePrompt = readString(config?.negativePrompt);
+
+  if (negativePrompt) contentInput.negativePrompt = negativePrompt;
+
+  if (inputMedia.length > 0) contentInput.media = inputMedia;
+
+  if (config?.labels !== undefined) contentInput.labels = config.labels;
+
+  for (const key of ["outputGcsUri", "pubsubTopic"] as const) {
+    const value = readString(config?.[key]);
+
+    if (value !== undefined) contentInput[key] = value;
+  }
+
+  const input =
+    captureEnabled("input") && Object.keys(contentInput).length > 0
+      ? boundedTelemetryCapture(contentInput)
+      : undefined;
+
+  if (input?.truncated) attributes["telemetry.dev.capture.truncated"] = true;
+
+  return {
+    name: `generate_content ${model ?? "unknown"}`,
+    fields: {
+      type: "generation",
+      model,
+      input: input?.value,
+      outputType,
+      attributes,
+    },
+  };
+}
+
+function mediaResponseFields(response: unknown, outputType: "image" | "video"): SpanFields {
+  const record = asRecord(response) ?? {};
+  const operationResponse = asRecord(record.response);
+  const responseRecord = operationResponse ?? record;
+
+  const items =
+    outputType === "image"
+      ? (asArray(responseRecord.generatedImages) ?? [])
+      : (asArray(responseRecord.generatedVideos) ?? []);
+
+  const attributes: Record<string, AttributeValue> = {};
+
+  attributes[`google_genai.response.${outputType}_count`] = items.length;
+
+  const uris = items.flatMap((item) => {
+    const media = asRecord(asRecord(item)?.[outputType]);
+    const uri = readString(media?.gcsUri) ?? readString(media?.uri);
+
+    return uri ? [uri] : [];
+  });
+
+  const operationName = readString(record.name);
+
+  if (operationName) attributes["google_genai.response.operation_name"] = operationName;
+
+  if (typeof record.done === "boolean")
+    attributes["google_genai.response.operation_done"] = record.done;
+
+  return {
+    responseId: readString(record.responseId) ?? operationName,
+    output: uris.length > 0 ? uris.map((uri) => ({ type: outputType, uri })) : undefined,
+    attributes,
+    error: record.error,
+  };
+}
+
+function imageResponseFields(response: unknown): SpanFields {
+  return mediaResponseFields(response, "image");
+}
+
+function videoResponseFields(response: unknown, tracker: VideoOperationTracker): SpanFields {
+  const record = asRecord(response);
+  const done = record?.done === true;
+
+  if (record && !done) tracker.operations.add(record);
+
+  return mediaResponseFields(response, "video");
 }
 
 function isWrapped<T>(fn: T): fn is T & WrappedFunction {
@@ -640,6 +899,7 @@ function wrapUnary(
 interface CandidateAggregate {
   role: string;
   parts: UnknownRecord[];
+  captured: boolean;
   finishReason?: string;
 }
 
@@ -660,6 +920,10 @@ function appendPart(parts: UnknownRecord[], incoming: UnknownRecord): void {
   parts.push({ ...incoming });
 }
 
+function serializedByteLength(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
 function sumUsage(
   left: SpanFields["usage"] | undefined,
   right: SpanFields["usage"] | undefined,
@@ -677,6 +941,15 @@ function sumUsage(
     totalTokens: add(left.totalTokens, right.totalTokens),
     cacheReadInputTokens: add(left.cacheReadInputTokens, right.cacheReadInputTokens),
     reasoningOutputTokens: add(left.reasoningOutputTokens, right.reasoningOutputTokens),
+    textInputTokens: add(left.textInputTokens, right.textInputTokens),
+    textOutputTokens: add(left.textOutputTokens, right.textOutputTokens),
+    textCacheReadInputTokens: add(left.textCacheReadInputTokens, right.textCacheReadInputTokens),
+    imageInputTokens: add(left.imageInputTokens, right.imageInputTokens),
+    imageOutputTokens: add(left.imageOutputTokens, right.imageOutputTokens),
+    imageCacheReadInputTokens: add(left.imageCacheReadInputTokens, right.imageCacheReadInputTokens),
+    audioInputTokens: add(left.audioInputTokens, right.audioInputTokens),
+    audioOutputTokens: add(left.audioOutputTokens, right.audioOutputTokens),
+    audioCacheReadInputTokens: add(left.audioCacheReadInputTokens, right.audioCacheReadInputTokens),
   });
 }
 
@@ -691,37 +964,44 @@ function copyContent(content: UnknownRecord) {
   };
 }
 
-function normalizeContentInput(input: unknown): unknown[] {
-  if (input === undefined) return [];
+function normalizeContentInput(input: unknown) {
+  const capture = boundedTelemetryCapture(input);
+  const bounded = capture.value;
 
-  if (typeof input === "string") return [{ role: "user", parts: [{ text: input }] }];
-  const items = asArray(input);
+  if (bounded === undefined) return { value: [], truncated: capture.truncated };
+
+  if (typeof bounded === "string")
+    return { value: [{ role: "user", parts: [{ text: bounded }] }], truncated: capture.truncated };
+  const items = asArray(bounded);
 
   if (items) {
     if (items.some((item) => readString(asRecord(item)?.role) || asArray(asRecord(item)?.parts))) {
-      return [...items];
+      return { value: items, truncated: capture.truncated };
     }
 
-    return [
-      {
-        role: "user",
-        parts: items.flatMap((item) => {
-          if (typeof item === "string") return [{ text: item }];
-          const record = asRecord(item);
+    return {
+      value: [
+        {
+          role: "user",
+          parts: items.flatMap((item) => {
+            if (typeof item === "string") return [{ text: item }];
+            const record = asRecord(item);
 
-          return record ? [{ ...record }] : [];
-        }),
-      },
-    ];
+            return record ? [record] : [];
+          }),
+        },
+      ],
+      truncated: capture.truncated,
+    };
   }
 
-  const record = asRecord(input);
+  const record = asRecord(bounded);
 
   if (record && !readString(record.role) && !asArray(record.parts)) {
-    return [{ role: "user", parts: [{ ...record }] }];
+    return { value: [{ role: "user", parts: [record] }], truncated: capture.truncated };
   }
 
-  return [input];
+  return { value: [bounded], truncated: capture.truncated };
 }
 
 function hasFunctionResponse(content: UnknownRecord | undefined): boolean {
@@ -739,15 +1019,52 @@ class StreamAggregator {
   private attributes: Record<string, AttributeValue> = {};
   private priorOutput: unknown[] = [];
   private afcHistory?: unknown[];
+  private automaticFunctionCalling = false;
   private responseId?: string;
   private responseModel?: string;
+  private outputCaptureBytes = 2;
+  private outputCaptureItems = 0;
+  private outputCaptureEntries = 0;
+  private outputCaptureTruncated = false;
+  private afcCaptureTruncated = false;
 
   constructor(private readonly requestInput: unknown) {}
 
-  private currentOutput(): unknown[] {
+  private currentCandidates(): unknown[] {
     return [...this.candidates.entries()]
       .sort(([left], [right]) => left - right)
+      .filter(([, state]) => state.captured)
       .map(([, state]) => ({ role: state.role, parts: state.parts }));
+  }
+
+  private reserveOutput(byteCount: number, itemCount: number): boolean {
+    if (
+      this.outputCaptureBytes + byteCount > 48 * 1024 ||
+      this.outputCaptureItems + itemCount > 1_000
+    ) {
+      this.outputCaptureTruncated = true;
+
+      return false;
+    }
+
+    this.outputCaptureBytes += byteCount;
+    this.outputCaptureItems += itemCount;
+
+    return true;
+  }
+
+  private resetOutputCapture(): void {
+    this.priorOutput = [];
+    this.outputCaptureBytes = 2;
+    this.outputCaptureItems = 0;
+    this.outputCaptureEntries = 0;
+    this.outputCaptureTruncated = false;
+  }
+
+  private currentOutput(forInput = false): unknown[] {
+    if (!captureEnabled(forInput ? "input" : "output")) return [];
+
+    return this.currentCandidates();
   }
 
   private finishReasons(): string[] {
@@ -758,20 +1075,49 @@ class StreamAggregator {
   }
 
   private ensureAfcHistory(): unknown[] {
+    this.automaticFunctionCalling = true;
+
+    if (!captureEnabled("input")) return [];
+
     if (!this.afcHistory) {
-      this.afcHistory = normalizeContentInput(this.requestInput);
+      this.afcHistory = [...(asArray(this.requestInput) ?? [])];
     }
 
     return this.afcHistory;
   }
 
+  private appendAfcHistory(...entries: unknown[]): void {
+    if (!captureEnabled("input")) return;
+
+    for (const entry of entries) {
+      const capture = boundedTelemetryCapture([...this.ensureAfcHistory(), entry]);
+
+      if (capture.truncated) {
+        this.afcCaptureTruncated = true;
+        continue;
+      }
+
+      this.afcHistory = asArray(capture.value) ?? [];
+    }
+
+    if (this.outputCaptureTruncated) this.afcCaptureTruncated = true;
+  }
+
+  private replaceAfcHistory(history: unknown[]): void {
+    const capture = boundedTelemetryCapture(history);
+    this.afcHistory = asArray(capture.value) ?? [];
+    this.afcCaptureTruncated = capture.truncated;
+  }
+
   private foldTurn(toAfcHistory: boolean): void {
-    const output = this.currentOutput();
+    const output = this.currentOutput(toAfcHistory);
 
     if (output.length > 0) {
-      if (toAfcHistory) this.ensureAfcHistory().push(...output);
+      if (toAfcHistory) this.appendAfcHistory(...output);
       else this.priorOutput.push(...output);
     }
+
+    if (toAfcHistory) this.resetOutputCapture();
 
     this.committedUsage = sumUsage(this.committedUsage, this.usage);
     this.candidates.clear();
@@ -791,13 +1137,31 @@ class StreamAggregator {
 
     if (nextResponseModel) this.responseModel = nextResponseModel;
 
-    for (const candidate of asArray(record.candidates) ?? []) {
+    const afcHistory = asArray(record.automaticFunctionCallingHistory);
+
+    if (afcHistory && afcHistory.length > 0) {
+      this.automaticFunctionCalling = true;
+
+      if (this.candidates.size === 0) this.resetOutputCapture();
+
+      if (captureEnabled("input")) this.replaceAfcHistory(afcHistory);
+    }
+
+    const capturesContent = captureEnabled("input") || captureEnabled("output");
+    const candidates = asArray(record.candidates) ?? [];
+
+    for (const candidate of candidates) {
       const candidateRecord = asRecord(candidate) ?? {};
-      const content = asRecord(candidateRecord.content);
+      const content = capturesContent ? asRecord(candidateRecord.content) : undefined;
 
       if (content && hasFunctionResponse(content)) {
+        const capture = boundedTelemetryCapture(copyContent(content));
+
+        if (capture.truncated) this.outputCaptureTruncated = true;
+        const capturedContent = asRecord(capture.value);
         this.foldTurn(true);
-        this.ensureAfcHistory().push(copyContent(content));
+
+        if (capturedContent) this.appendAfcHistory(copyContent(capturedContent));
         continue;
       }
 
@@ -805,19 +1169,50 @@ class StreamAggregator {
       let state = this.candidates.get(index);
 
       if (!state) {
-        state = { role: "model", parts: [] };
+        const role = "model";
+
+        const byteCount =
+          (this.outputCaptureEntries > 0 ? 1 : 0) + serializedByteLength({ role, parts: [] });
+
+        const captured = capturesContent && this.reserveOutput(byteCount, 1);
+        state = { role, parts: [], captured };
+
+        if (captured) this.outputCaptureEntries += 1;
         this.candidates.set(index, state);
       }
 
       if (content) {
-        const role = readString(content.role);
+        const roleCapture = boundedTelemetryCaptureDetails(content.role);
 
-        if (role) state.role = role;
+        if (roleCapture.truncated) this.outputCaptureTruncated = true;
+        const role = readString(roleCapture.value);
+
+        if (role && role !== state.role) {
+          const byteCount = roleCapture.bytes - serializedByteLength(state.role);
+
+          if (!state.captured || this.reserveOutput(byteCount, 0)) state.role = role;
+        }
 
         for (const part of asArray(content.parts) ?? []) {
-          const partRecord = asRecord(part);
+          const capture = boundedTelemetryCaptureDetails(part);
 
-          if (partRecord) appendPart(state.parts, partRecord);
+          if (capture.truncated) this.outputCaptureTruncated = true;
+          const partRecord = asRecord(capture.value);
+
+          if (!partRecord || !state.captured) continue;
+          const last = state.parts[state.parts.length - 1];
+
+          const mergesText =
+            last &&
+            typeof last.text === "string" &&
+            typeof partRecord.text === "string" &&
+            last.thought === partRecord.thought;
+
+          const byteCount = mergesText
+            ? serializedByteLength(partRecord.text) - 2
+            : (state.parts.length > 0 ? 1 : 0) + capture.bytes;
+
+          if (this.reserveOutput(byteCount, 1)) appendPart(state.parts, partRecord);
         }
       }
 
@@ -829,18 +1224,15 @@ class StreamAggregator {
     const chunkUsage = usageFromMetadata(record.usageMetadata);
 
     if (chunkUsage) this.usage = chunkUsage;
-    const afcHistory = asArray(record.automaticFunctionCallingHistory);
 
-    if (afcHistory && afcHistory.length > 0) this.afcHistory = [...afcHistory];
     const chunkAttributes = responseAttributes(record);
     Object.assign(this.attributes, chunkAttributes);
   }
 
   finish(): SpanFields {
-    const output =
-      this.afcHistory && this.afcHistory.length > 0
-        ? this.currentOutput()
-        : [...this.priorOutput, ...this.currentOutput()];
+    const output = this.automaticFunctionCalling
+      ? this.currentOutput()
+      : [...this.priorOutput, ...this.currentOutput()];
 
     const finishReasons = this.finishReasons();
 
@@ -854,12 +1246,16 @@ class StreamAggregator {
 
     const attributes = { ...this.attributes };
 
-    if (this.afcHistory && this.afcHistory.length > 0) {
-      fields.input = this.afcHistory;
+    if (this.automaticFunctionCalling) {
+      if (this.afcHistory && this.afcHistory.length > 0) fields.input = this.afcHistory;
       attributes["google_genai.automatic_function_calling"] = true;
     }
 
     if (finishReasons.length > 1) attributes["gen_ai.response.finish_reasons"] = finishReasons;
+
+    if (this.afcCaptureTruncated || (captureEnabled("output") && this.outputCaptureTruncated)) {
+      attributes["telemetry.dev.capture.truncated"] = true;
+    }
 
     if (Object.keys(attributes).length > 0) fields.attributes = attributes;
 
@@ -1086,10 +1482,80 @@ function patchModelsMethod(
       );
 }
 
+function patchOperationsMethod(
+  operations: UnknownRecord | undefined,
+  method: "get" | "getVideosOperation",
+  provider: string,
+  tracker: VideoOperationTracker,
+): void {
+  if (!operations) return;
+  const current = operations[method];
+
+  if (isWrapped(current) && Object.prototype.hasOwnProperty.call(operations, method)) return;
+  const original = isWrapped(current) ? current[ORIGINAL] : current;
+
+  if (typeof original !== "function") return;
+  const bound = original.bind(operations) as (...args: unknown[]) => unknown;
+
+  const wrapped = function (...args: unknown[]) {
+    const result = bound(...args);
+
+    let operation: UnknownRecord | undefined;
+    let operationName: string | undefined;
+
+    try {
+      operation = asRecord(asRecord(args[0])?.operation);
+      operationName = readString(operation?.name);
+    } catch {
+      return result;
+    }
+
+    if (!operation || !tracker.operations.has(operation)) {
+      return result;
+    }
+
+    const request = mediaRequestFields({}, "generateVideos.poll", "video");
+    request.fields.responseId = operationName;
+    const span = startSpan("generate_content video operation", { ...request.fields, provider });
+    const end = endOnce(span);
+
+    const finishResponse = (response: unknown) => {
+      try {
+        const record = asRecord(response);
+
+        if (record?.done === true) tracker.operations.delete(operation);
+        else if (record) tracker.operations.add(record);
+      } catch {}
+
+      const fields = safeResponseFields((value) => mediaResponseFields(value, "video"), response);
+      end(fields);
+
+      return response;
+    };
+
+    try {
+      if (isThenable(result)) {
+        return result.then(finishResponse, (error) => {
+          end({ error });
+          throw error;
+        });
+      }
+
+      return finishResponse(result);
+    } catch (error) {
+      end({ error });
+      throw error;
+    }
+  };
+
+  operations[method] = markWrapped(wrapped as WrappedFunction, bound);
+}
+
 export function wrapGoogleGenAI<T extends GoogleGenAIClientLike>(client: T): T {
   if (wrappedClients.has(client)) return client;
   const provider = client.vertexai === true ? "gcp.vertex_ai" : "gcp.gemini";
   const models = client.models as UnknownRecord;
+  const videoTracker: VideoOperationTracker = { operations: new WeakSet() };
   patchModelsMethod(
     models,
     "generateContent",
@@ -1111,6 +1577,28 @@ export function wrapGoogleGenAI<T extends GoogleGenAIClientLike>(client: T): T {
     namePrefix: "embeddings",
     type: "embedding",
   });
+
+  for (const [key, outputType] of [
+    ["generateImages", "image"],
+    ["editImage", "image"],
+    ["upscaleImage", "image"],
+    ["generateVideos", "video"],
+  ] as const) {
+    patchModelsMethod(
+      models,
+      key,
+      (params) => mediaRequestFields(params, key, outputType),
+      outputType === "video"
+        ? (response) => videoResponseFields(response, videoTracker)
+        : imageResponseFields,
+      provider,
+      { namePrefix: "generate_content", type: "generation" },
+    );
+  }
+
+  const operations = asRecord(client.operations);
+  patchOperationsMethod(operations, "get", provider, videoTracker);
+  patchOperationsMethod(operations, "getVideosOperation", provider, videoTracker);
   wrappedClients.add(client);
 
   return client;

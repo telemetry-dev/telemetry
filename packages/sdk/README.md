@@ -90,6 +90,11 @@ The SDK installs the [session sampling wrapper](../otel/README.md#correlation-at
   context.
 - `extractW3cContext(carrier, options?)` / `injectW3cContext(context, carrier, options?)` — extract
   or inject W3C trace context. Baggage is omitted unless `includeBaggage` is true.
+- `captureEnabled("input" | "output")` — report whether the active initialized client permits that
+  capture direction. Returns `false` when no client is initialized.
+- `boundedCapture(value, options?)` — copy a JSON-compatible value within bounded work and retained
+  size. Defaults to 48 KiB, depth 32, and 1,000 traversal items. Returns `{ value, truncated }`;
+  `value` can be partial or `undefined` when a limit, cycle, getter, or skip rule prevents capture.
 - `flush()` / `shutdown()` — export pending data; required before serverless freeze/exit.
 
 Span types: `span` (default) | `generation` | `tool` | `agent` | `embedding` — mapped to

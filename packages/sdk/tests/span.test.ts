@@ -101,6 +101,15 @@ test("generation fields map to gen_ai.* attributes", async () => {
       cacheReadInputTokens: 3,
       cacheCreationInputTokens: 2,
       reasoningOutputTokens: 4,
+      textInputTokens: 5,
+      textOutputTokens: 2,
+      textCacheReadInputTokens: 1,
+      imageInputTokens: 3,
+      imageOutputTokens: 7,
+      imageCacheReadInputTokens: 2,
+      audioInputTokens: 2,
+      audioOutputTokens: 1,
+      audioCacheReadInputTokens: 0,
     },
     costUsd: 0.0123,
     finishReason: "stop",
@@ -134,6 +143,15 @@ test("generation fields map to gen_ai.* attributes", async () => {
   expect(a["gen_ai.usage.cache_read.input_tokens"]).toBe(3);
   expect(a["gen_ai.usage.cache_creation.input_tokens"]).toBe(2);
   expect(a["gen_ai.usage.reasoning.output_tokens"]).toBe(4);
+  expect(a["gen_ai.usage.text.input_tokens"]).toBe(5);
+  expect(a["gen_ai.usage.text.output_tokens"]).toBe(2);
+  expect(a["gen_ai.usage.text.cache_read.input_tokens"]).toBe(1);
+  expect(a["gen_ai.usage.image.input_tokens"]).toBe(3);
+  expect(a["gen_ai.usage.image.output_tokens"]).toBe(7);
+  expect(a["gen_ai.usage.image.cache_read.input_tokens"]).toBe(2);
+  expect(a["gen_ai.usage.audio.input_tokens"]).toBe(2);
+  expect(a["gen_ai.usage.audio.output_tokens"]).toBe(1);
+  expect(a["gen_ai.usage.audio.cache_read.input_tokens"]).toBe(0);
   expect(a["gen_ai.usage.cost"]).toBe(0.0123);
   expect(a["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
   expect(a["gen_ai.output.type"]).toBe("text");

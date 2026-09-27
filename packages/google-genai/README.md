@@ -45,7 +45,7 @@ Call `wrapGoogleGenAI` on each `GoogleGenAI` client you want instrumented. Wrapp
 
 ## What gets captured
 
-Span names are `chat ${model}` for generation calls and `embeddings ${model}` for embeddings. Provider is `gcp.gemini` for the Gemini Developer API and `gcp.vertex_ai` when `client.vertexai === true`.
+Span names are `chat ${model}` for content generation, `generate_content ${model}` for image/video operations, and `embeddings ${model}` for embeddings. Provider is `gcp.gemini` for the Gemini Developer API and `gcp.vertex_ai` when `client.vertexai === true`.
 
 | Gemini request/response                                 | telemetry.dev field / attribute                                                                                                  |
 | ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
@@ -67,7 +67,7 @@ Span names are `chat ${model}` for generation calls and `embeddings ${model}` fo
 | `modelVersion`, `responseId`                            | `gen_ai.response.model`, `gen_ai.response.id`                                                                                    |
 | `candidates[].finishReason`                             | `gen_ai.response.finish_reasons`                                                                                                 |
 | `candidates[].content`                                  | `gen_ai.output.messages`                                                                                                         |
-| `usageMetadata.*` token fields                          | `gen_ai.usage.*` (+ `google_genai.usage.tool_use_prompt_tokens`)                                                                 |
+| `usageMetadata.*` token fields and modality details     | `gen_ai.usage.*` (+ `google_genai.usage.tool_use_prompt_tokens`; text/image/audio modality attributes)                           |
 | `promptFeedback.blockReason`                            | `google_genai.response.block_reason` (+ message attr)                                                                            |
 | Safety / grounding metadata                             | `google_genai.response.safety_ratings`, `google_genai.response.grounding_metadata`, `google_genai.response.url_context_metadata` |
 | AFC history present                                     | span `input` replaced with `automaticFunctionCallingHistory`, `google_genai.automatic_function_calling=true`                     |
@@ -87,9 +87,15 @@ Span names are `chat ${model}` for generation calls and `embeddings ${model}` fo
 
 `embedContent` emits `gen_ai.operation.name = "embeddings"` with request model/input, embedding count/dimensions, optional token usage, and billable character metadata. Vectors are not captured.
 
+## Images and video
+
+`generateImages`, `editImage`, `upscaleImage`, and `generateVideos` emit generation spans with `gen_ai.operation.name = "generate_content"`. They capture the model, text prompt, an allowlist of non-binary config and input metadata, output count, and operation/response IDs and storage URIs where returned. Image and video bytes are never recorded.
+
+`generateVideos` records submission as one span. Calls to `client.operations.get` for operations submitted through the same wrapped client emit separate polling spans, including final output metadata when available. This intentionally does not imply that one span remains open across polling loops or process restarts.
+
 ## Why no global instrumentation in TypeScript
 
-In `@google/genai` v2, `Models.generateContent`, `generateContentStream`, and `embedContent` are arrow-function **instance fields**, not prototype methods. Prototype patching cannot intercept them, so this package exposes per-client `wrapGoogleGenAI` only.
+In `@google/genai` v2, model methods are arrow-function **instance fields**, not prototype methods. Prototype patching cannot intercept them, so this package exposes per-client `wrapGoogleGenAI` only.
 
 ## Fail-open guarantee
 
@@ -101,4 +107,4 @@ When the SDK performs an internal AFC loop for callable tools, one wrapped `gene
 
 ## Not instrumented
 
-`countTokens`, `computeTokens`, `generateImages`, `generateVideos`, `live`, `caches`, `files`, `tunings`, and `batches` are not wrapped in this package.
+`countTokens`, `computeTokens`, `live`, `caches`, `files`, `tunings`, and `batches` are not wrapped in this package.

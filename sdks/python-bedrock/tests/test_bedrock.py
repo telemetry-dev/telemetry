@@ -197,6 +197,122 @@ def test_converse_happy_path(memory: SimpleNamespace, monkeypatch: pytest.Monkey
     ]
 
 
+def test_rerank_captures_query_sources_model_and_results(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _client("bedrock-agent-runtime")
+    model_arn = "arn:aws:bedrock:us-west-2::foundation-model/cohere.rerank-v3-5:0"
+    request = {
+        "queries": [{"type": "TEXT", "textQuery": {"text": "best observability platform"}}],
+        "sources": [
+            {
+                "type": "INLINE",
+                "inlineDocumentSource": {
+                    "type": "TEXT",
+                    "textDocument": {"text": "Telemetry data"},
+                },
+            },
+            {
+                "type": "INLINE",
+                "inlineDocumentSource": {
+                    "type": "JSON",
+                    "jsonDocument": {"title": "Other result"},
+                },
+            },
+        ],
+        "rerankingConfiguration": {
+            "type": "BEDROCK_RERANKING_MODEL",
+            "bedrockRerankingConfiguration": {
+                "numberOfResults": 2,
+                "modelConfiguration": {
+                    "modelArn": model_arn,
+                    "additionalModelRequestFields": {"max_tokens_per_doc": 256},
+                },
+            },
+        },
+    }
+    request_snapshot = copy.deepcopy(request)
+    results = [
+        {
+            "index": 0,
+            "relevanceScore": 0.91,
+            "document": {"type": "TEXT", "textDocument": {"text": "Telemetry data"}},
+        },
+        {"index": 1, "relevanceScore": 0.12},
+    ]
+    calls = _stub_api_call(
+        client,
+        [
+            {
+                "results": results,
+                "nextToken": "page-2",
+                "ResponseMetadata": {"RequestId": "rerank-1", "HTTPStatusCode": 200},
+            }
+        ],
+        monkeypatch,
+    )
+    wrap_bedrock(client)
+
+    client.rerank(**request)  # type: ignore[attr-defined]
+
+    assert request == request_snapshot
+    assert calls == [("Rerank", request_snapshot)]
+    span = memory.span_exporter.get_finished_spans()[0]
+    assert span.name == "rerank cohere.rerank-v3-5:0"
+    assert span.attributes["gen_ai.operation.name"] == "rerank"
+    assert span.attributes["gen_ai.provider.name"] == "amazon-bedrock"
+    assert span.attributes["gen_ai.request.model"] == model_arn
+    assert span.attributes["gen_ai.response.id"] == "rerank-1"
+    assert span.attributes["td.metadata.requested_result_count"] == "2"
+    assert span.attributes["td.metadata.result_count"] == "2"
+    assert span.attributes["td.metadata.has_next_token"] == "true"
+    assert _json_attr(span, "gen_ai.input.messages") == {
+        "queries": request["queries"],
+        "sources": request["sources"],
+        "additionalModelRequestFields": {"max_tokens_per_doc": 256},
+    }
+    assert _json_attr(span, "gen_ai.output.messages") == results
+
+
+def test_rerank_bounds_large_inputs_and_outputs_without_changing_request(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _client("bedrock-agent-runtime")
+    shared_source = {
+        "type": "INLINE",
+        "inlineDocumentSource": {
+            "type": "TEXT",
+            "textDocument": {"text": "x" * 1_000},
+        },
+    }
+    sources = [shared_source] * 2_000
+    request = {
+        "queries": [{"type": "TEXT", "textQuery": {"text": "best"}}],
+        "sources": sources,
+        "rerankingConfiguration": {
+            "type": "BEDROCK_RERANKING_MODEL",
+            "bedrockRerankingConfiguration": {
+                "modelConfiguration": {"modelArn": "cohere.rerank-v3-5:0"}
+            },
+        },
+    }
+    results = [
+        {"index": index, "relevanceScore": 0.5, "document": {"text": "x" * 1_000}}
+        for index in range(2_000)
+    ]
+    calls = _stub_api_call(client, [{"results": results}], monkeypatch)
+    wrap_bedrock(client)
+
+    client.rerank(**request)  # type: ignore[attr-defined]
+
+    assert calls[0][1]["sources"] == sources
+    span = memory.span_exporter.get_finished_spans()[0]
+    assert span.attributes["telemetry.dev.capture.truncated"] is True
+    assert span.attributes["td.metadata.result_count"] == "2000"
+    assert "gen_ai.input.messages" not in span.attributes
+    assert "gen_ai.output.messages" not in span.attributes
+
+
 def test_converse_stream_accumulates_and_errors(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:

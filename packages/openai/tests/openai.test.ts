@@ -6,8 +6,11 @@ import {
 } from "@opentelemetry/sdk-metrics";
 import { flush, init, shutdown } from "@telemetry-dev/sdk";
 import * as sdk from "@telemetry-dev/sdk";
+import { EventEmitter } from "node:events";
 import OpenAI, { AzureOpenAI } from "openai";
 import { Stream } from "openai/core/streaming";
+import { Completions } from "openai/resources/chat/completions/completions";
+import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses";
 import { VERSION } from "openai/version";
 import { afterEach, expect, test, vi } from "vitest";
 
@@ -17,6 +20,7 @@ import {
   type InstrumentOpenAIOptions,
   uninstrumentOpenAI,
   wrapOpenAI,
+  wrapOpenAIRealtime,
 } from "../src/index.ts";
 
 const SPAN_STATUS_UNSET = 0;
@@ -172,7 +176,10 @@ function createFakeFetch(...responses: Response[]): FakeFetch {
   return { fetch: fetchImpl, requests };
 }
 
-function setupSpans(metricExporter?: PushMetricExporter): InMemorySpanExporter {
+function setupSpans(
+  metricExporter?: PushMetricExporter,
+  options: { captureOutput?: boolean } = {},
+): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
   init(
     {
@@ -182,6 +189,7 @@ function setupSpans(metricExporter?: PushMetricExporter): InMemorySpanExporter {
       exportMode: "immediate",
       logLevel: "silent",
       fetch: async () => new Response(null, { status: 200 }),
+      ...options,
     },
     { spanExporter, metricExporter },
   );
@@ -275,8 +283,14 @@ test("chat completions map request, response, usage, finish reason, provider, an
         prompt_tokens: 10,
         completion_tokens: 5,
         total_tokens: 15,
-        prompt_tokens_details: { cached_tokens: 3 },
-        completion_tokens_details: { reasoning_tokens: 2 },
+        prompt_tokens_details: {
+          cached_tokens: 3,
+          text_tokens: 6,
+          image_tokens: 4,
+          audio_tokens: 0,
+          cached_tokens_details: { text_tokens: 2, image_tokens: 1 },
+        },
+        completion_tokens_details: { reasoning_tokens: 2, text_tokens: 3, audio_tokens: 2 },
       },
     }),
   );
@@ -313,6 +327,15 @@ test("chat completions map request, response, usage, finish reason, provider, an
   expect(span.attributes["gen_ai.usage.total_tokens"]).toBe(15);
   expect(span.attributes["gen_ai.usage.cache_read.input_tokens"]).toBe(3);
   expect(span.attributes["gen_ai.usage.reasoning.output_tokens"]).toBe(2);
+  expect(span.attributes["gen_ai.usage.text.input_tokens"]).toBe(6);
+  expect(span.attributes["gen_ai.usage.image.input_tokens"]).toBe(4);
+  expect(span.attributes["gen_ai.usage.audio.input_tokens"]).toBe(0);
+  expect(span.attributes["gen_ai.usage.text.cache_read.input_tokens"]).toBe(2);
+  expect(span.attributes["gen_ai.usage.image.cache_read.input_tokens"]).toBe(1);
+  expect(span.attributes["gen_ai.usage.audio.cache_read.input_tokens"]).toBeUndefined();
+  expect(span.attributes["gen_ai.usage.text.output_tokens"]).toBe(3);
+  expect(span.attributes["gen_ai.usage.audio.output_tokens"]).toBe(2);
+  expect(span.attributes["gen_ai.usage.image.output_tokens"]).toBeUndefined();
   expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
   expect(span.attributes["gen_ai.request.temperature"]).toBe(0.7);
   expect(span.attributes["gen_ai.request.top_p"]).toBe(0.9);
@@ -1173,6 +1196,110 @@ test("responses create maps instructions to system instructions", async () => {
   expect(span.attributes["gen_ai.request.max_tokens"]).toBe(50);
 });
 
+test("responses recursively omit binary media from request and response capture", async () => {
+  const spans = setupSpans();
+
+  const fake = createFakeFetch(
+    jsonResponse({
+      id: "resp_media",
+      status: "completed",
+      output: [
+        { type: "output_audio", data: "OUTPUT_AUDIO", transcript: "hello" },
+        { type: "image_generation_call", result: "IMAGE_RESULT", status: "completed" },
+      ],
+    }),
+    sseResponse([
+      {
+        type: "response.completed",
+        response: {
+          id: "resp_media_stream",
+          status: "completed",
+          output: [{ type: "image_generation_call", result: "STREAM_IMAGE", status: "completed" }],
+        },
+      },
+    ]),
+  );
+
+  const client = clientWith(fake.fetch);
+
+  const input = [
+    {
+      role: "user",
+      content: [
+        { type: "input_audio", input_audio: { data: "INPUT_AUDIO", format: "wav" } },
+        { type: "input_image", image_url: "data:image/png;base64,INPUT_IMAGE" },
+        { type: "input_image", image_url: "https://example.com/image.png" },
+        { type: "input_file", file_data: "INPUT_FILE", filename: "report.pdf" },
+      ],
+    },
+  ];
+
+  await client.responses.create({ model: "gpt-4.1", input } as never);
+
+  const stream = await client.responses.create({
+    model: "gpt-4.1",
+    input,
+    stream: true,
+  } as ResponseCreateParamsStreaming);
+
+  await collectStream(stream);
+
+  for (const span of await finishedSpans(spans, 2)) {
+    const captured = JSON.stringify(span.attributes);
+    expect(captured).not.toMatch(
+      /INPUT_AUDIO|INPUT_IMAGE|INPUT_FILE|OUTPUT_AUDIO|IMAGE_RESULT|STREAM_IMAGE/,
+    );
+    expect(captured).toContain("https://example.com/image.png");
+  }
+
+  expect(JSON.stringify((await finishedSpans(spans, 2))[0]!.attributes)).toContain("hello");
+});
+
+test("chat completions recursively omit binary media from request and response capture", async () => {
+  const spans = setupSpans();
+
+  const fake = createFakeFetch(
+    jsonResponse({
+      id: "chatcmpl_media",
+      model: "gpt-4o-audio-preview",
+      choices: [
+        {
+          finish_reason: "stop",
+          message: {
+            role: "assistant",
+            content: "spoken reply",
+            audio: { id: "audio_1", data: "OUTPUT_AUDIO", transcript: "spoken reply" },
+          },
+        },
+      ],
+    }),
+  );
+
+  const client = clientWith(fake.fetch);
+
+  await client.chat.completions.create({
+    model: "gpt-4o-audio-preview",
+    modalities: ["text", "audio"],
+    audio: { format: "wav", voice: "alloy" },
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Describe this" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,INPUT_IMAGE" } },
+          { type: "image_url", image_url: { url: "https://example.com/image.png" } },
+          { type: "input_audio", input_audio: { data: "INPUT_AUDIO", format: "wav" } },
+        ],
+      },
+    ],
+  } as never);
+
+  const captured = JSON.stringify((await exportedSpan(spans)).attributes);
+  expect(captured).not.toMatch(/INPUT_IMAGE|INPUT_AUDIO|OUTPUT_AUDIO/);
+  expect(captured).toContain("https://example.com/image.png");
+  expect(captured).toContain("spoken reply");
+});
+
 test("responses create failed body records error while completed body stays OK", async () => {
   const spans = setupSpans();
   const failedError = { code: "server_error", message: "model exploded" };
@@ -1338,6 +1465,122 @@ test("responses streams end from response.completed terminal event", async () =>
       ? "number"
       : "other",
   ).toBe("number");
+});
+
+test("responses streams retain the last fitting output when the terminal snapshot truncates", async () => {
+  const spans = setupSpans();
+
+  const retainedOutput = [
+    {
+      id: "msg_retained",
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "Useful partial output" }],
+    },
+  ];
+
+  const completed = {
+    id: "resp_truncated_terminal",
+    status: "completed",
+    model: "gpt-4.1-2025-04-14",
+    output: [
+      {
+        id: "msg_terminal",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "x".repeat(70_000) }],
+      },
+    ],
+    usage: { input_tokens: 8, output_tokens: 20, total_tokens: 28 },
+  };
+
+  const fake = createFakeFetch(
+    sseResponse([
+      {
+        type: "response.in_progress",
+        response: {
+          id: "resp_truncated_terminal",
+          status: "in_progress",
+          model: "gpt-4.1-2025-04-14",
+          output: retainedOutput,
+        },
+      },
+      { type: "response.completed", response: completed },
+    ]),
+  );
+
+  const stream = await clientWith(fake.fetch).responses.create({
+    model: "gpt-4.1",
+    input: "Finish",
+    stream: true,
+  });
+
+  await collectStream(stream);
+
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual(retainedOutput);
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
+  expect(span.attributes["gen_ai.usage.total_tokens"]).toBe(28);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("responses streams keep the bounded terminal output over an empty created snapshot", async () => {
+  const spans = setupSpans();
+
+  const toolCall = {
+    id: "fc_1",
+    type: "function_call",
+    call_id: "call_1",
+    name: "lookup",
+    arguments: '{"q":"a"}',
+    status: "completed",
+  };
+
+  const fake = createFakeFetch(
+    sseResponse([
+      {
+        type: "response.created",
+        response: {
+          id: "resp_empty_created",
+          status: "in_progress",
+          model: "gpt-4.1-2025-04-14",
+          output: [],
+        },
+      },
+      {
+        type: "response.completed",
+        response: {
+          id: "resp_empty_created",
+          status: "completed",
+          model: "gpt-4.1-2025-04-14",
+          output: [
+            toolCall,
+            {
+              id: "msg_terminal",
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "x".repeat(70_000) }],
+            },
+          ],
+          usage: { input_tokens: 8, output_tokens: 20, total_tokens: 28 },
+        },
+      },
+    ]),
+  );
+
+  const stream = await clientWith(fake.fetch).responses.create({
+    model: "gpt-4.1",
+    input: "Finish",
+    stream: true,
+  });
+
+  await collectStream(stream);
+
+  const span = await exportedSpan(spans);
+  const output = jsonAttr(span, "gen_ai.output.messages") as unknown[];
+
+  expect(output[0]).toMatchObject({ type: "function_call", name: "lookup" });
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
 test("responses stream helper routes through wrapped create and ends span", async () => {
@@ -1928,6 +2171,34 @@ test.each([
   },
 );
 
+test.each([
+  ["https://api.groq.com/openai/v1", "groq"],
+  ["https://edge.api.x.ai/v1", "x_ai"],
+  ["https://api.deepseek.com/v1", "deepseek"],
+  ["https://api.together.xyz/v1", "together_ai"],
+  ["https://api.fireworks.ai/inference/v1", "fireworks_ai"],
+  ["https://api.groq.com.example.test/v1", "openai"],
+])("attributes compatible provider host %s", async (baseURL, provider) => {
+  const spans = setupSpans();
+
+  const fake = createFakeFetch(
+    jsonResponse({
+      id: "chatcmpl_provider",
+      model: "model",
+      choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+    }),
+  );
+
+  await wrapOpenAI(
+    new OpenAI({ apiKey: "test", baseURL, fetch: fake.fetch }),
+  ).chat.completions.create({
+    model: "model",
+    messages: [{ role: "user", content: "hi" }],
+  });
+
+  expect((await exportedSpan(spans)).attributes["gen_ai.provider.name"]).toBe(provider);
+});
+
 test("wrapOpenAI resolves the provider from the current base URL for each operation", async () => {
   const spans = setupSpans();
 
@@ -2101,4 +2372,1273 @@ test("instrumentOpenAI and wrapOpenAI are idempotent and uninstrumentOpenAI rest
   expect(wrapped.requests).toHaveLength(1);
   expect(restored.requests).toHaveLength(1);
   expect(spans.getFinishedSpans()).toHaveLength(2);
+});
+
+test("uninstrumentOpenAI preserves a later prototype owner", () => {
+  const original = Object.getOwnPropertyDescriptor(Completions.prototype, "create");
+  const laterOwner = vi.fn();
+
+  if (!original) throw new Error("Completions.create descriptor is missing");
+
+  instrumentOpenAI();
+  Object.defineProperty(Completions.prototype, "create", { ...original, value: laterOwner });
+  uninstrumentOpenAI();
+
+  expect(Object.getOwnPropertyDescriptor(Completions.prototype, "create")?.value).toBe(laterOwner);
+  Object.defineProperty(Completions.prototype, "create", original);
+});
+
+test("images generate maps modality usage without capturing image bytes", async () => {
+  const spans = setupSpans();
+
+  const fake = createFakeFetch(
+    jsonResponse({
+      created: 1,
+      data: [{ b64_json: "secret-image-bytes", revised_prompt: "A revised prompt" }],
+      usage: {
+        input_tokens: 8,
+        output_tokens: 12,
+        total_tokens: 20,
+        input_tokens_details: {
+          text_tokens: 5,
+          image_tokens: 3,
+          cached_tokens: 3,
+          cached_tokens_details: { text_tokens: 2, image_tokens: 1, audio_tokens: 0 },
+        },
+        output_tokens_details: { image_tokens: 12 },
+      },
+    }),
+  );
+
+  await clientWith(fake.fetch).images.generate({ model: "gpt-image-1", prompt: "an otter" });
+
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.operation.name"]).toBe("generate_content");
+  expect(span.attributes["gen_ai.output.type"]).toBe("image");
+  expect(span.attributes["gen_ai.usage.text.input_tokens"]).toBe(5);
+  expect(span.attributes["gen_ai.usage.image.input_tokens"]).toBe(3);
+  expect(span.attributes["gen_ai.usage.cache_read.input_tokens"]).toBe(3);
+  expect(span.attributes["gen_ai.usage.text.cache_read.input_tokens"]).toBe(2);
+  expect(span.attributes["gen_ai.usage.image.cache_read.input_tokens"]).toBe(1);
+  expect(span.attributes["gen_ai.usage.audio.cache_read.input_tokens"]).toBe(0);
+  expect(span.attributes["gen_ai.usage.image.output_tokens"]).toBe(12);
+  expect(String(span.attributes["gen_ai.output.messages"])).not.toContain("secret-image-bytes");
+});
+
+test("endpoint modality fills aggregate image and transcription output usage", async () => {
+  const spans = setupSpans();
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+    images: {
+      generate: async (_params: unknown) => ({
+        data: [],
+        usage: { output_tokens: 9, output_tokens_details: { text_tokens: 2 } },
+      }),
+    },
+    audio: {
+      transcriptions: {
+        create: async (_params: unknown) => ({
+          text: "hello",
+          usage: { output_tokens: 7, output_tokens_details: {} },
+        }),
+      },
+    },
+  });
+
+  await client.images!.generate({ model: "gpt-image-1", prompt: "otter" });
+  await client.audio!.transcriptions!.create({ model: "gpt-4o-transcribe" });
+
+  const [image, transcription] = await finishedSpans(spans, 2);
+  expect(image?.attributes["gen_ai.usage.image.output_tokens"]).toBe(9);
+  expect(image?.attributes["gen_ai.usage.text.output_tokens"]).toBe(2);
+  expect(transcription?.attributes["gen_ai.usage.text.output_tokens"]).toBe(7);
+  expect(transcription?.attributes["gen_ai.usage.image.output_tokens"]).toBeUndefined();
+});
+
+test("streaming transcription bounds captured output while yielding every event", async () => {
+  const spans = setupSpans();
+  const delta = "\\".repeat(70_000);
+
+  const events = [
+    { type: "transcript.text.delta", delta },
+    { type: "transcript.text.done", text: delta, usage: { output_tokens: 5 } },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+    audio: { transcriptions: { create: async (_params: unknown) => source } },
+  });
+
+  const stream = await client.audio!.transcriptions!.create({
+    model: "gpt-4o-transcribe",
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  const output = String(span.attributes["gen_ai.output.messages"]);
+  expect(output.length).toBeLessThanOrEqual(65_536);
+  expect(output).toBe("\\".repeat(32_767));
+  expect(output).not.toContain("...[truncated]");
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(span.attributes["gen_ai.usage.text.output_tokens"]).toBe(5);
+});
+
+test("streaming transcription bounds escaped Unicode at a code point boundary", async () => {
+  const spans = setupSpans();
+  const prefix = "😀\n\ud800";
+  const delta = `${prefix}${"\\".repeat(40_000)}`;
+  const events = [{ type: "transcript.text.delta", delta }];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+    audio: { transcriptions: { create: async (_params: unknown) => source } },
+  });
+
+  const stream = await client.audio!.transcriptions!.create({
+    model: "gpt-4o-transcribe",
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  const output = String(span.attributes["gen_ai.output.messages"]);
+  expect(output.startsWith(prefix)).toBe(true);
+  expect(JSON.stringify(output).length).toBeLessThanOrEqual(65_536);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("streaming transcription replaces truncated deltas with complete terminal text", async () => {
+  const spans = setupSpans();
+
+  const events = [
+    { type: "transcript.text.delta", delta: "x".repeat(70_000) },
+    { type: "transcript.text.done", text: "complete transcript" },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+    audio: { transcriptions: { create: async (_params: unknown) => source } },
+  });
+
+  const stream = await client.audio!.transcriptions!.create({
+    model: "gpt-4o-transcribe",
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBe("complete transcript");
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test("streaming transcription captures many small deltas in linear work", async () => {
+  const spans = setupSpans();
+
+  const events = Array.from({ length: 70_000 }, () => ({
+    type: "transcript.text.delta",
+    delta: "x",
+  }));
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+    audio: { transcriptions: { create: async (_params: unknown) => source } },
+  });
+
+  const stream = await client.audio!.transcriptions!.create({
+    model: "gpt-4o-transcribe",
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toHaveLength(events.length);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBe("x".repeat(65_534));
+});
+
+test.each([
+  ["enabled", true, "hello"],
+  ["disabled", false, undefined],
+])(
+  "streaming transcription segment records output before an error with capture %s",
+  async (_, captureOutput, expectedOutput) => {
+    const spans = setupSpans(undefined, { captureOutput });
+
+    const source = new Stream(async function* () {
+      yield { type: "transcript.text.segment", text: "hello" };
+      throw new Error("stream failed");
+    }, new AbortController());
+
+    const client = wrapOpenAI({
+      chat: { completions: { create() {} } },
+      responses: { create() {} },
+      embeddings: { create() {} },
+      audio: { transcriptions: { create: async (_params: unknown) => source } },
+    });
+
+    const stream = await client.audio!.transcriptions!.create({
+      model: "gpt-4o-transcribe",
+      stream: true,
+    });
+
+    await expect(collectStream(stream)).rejects.toThrow("stream failed");
+    const span = await exportedSpan(spans);
+    expect(span.status.code).toBe(SPAN_STATUS_ERROR);
+    expect(span.attributes["gen_ai.output.messages"]).toBe(expectedOutput);
+    expect(span.attributes["gen_ai.response.time_to_first_chunk"]).toEqual(expect.any(Number));
+  },
+);
+
+test.each([
+  ["wrapped", false],
+  ["prototype", true],
+])("batch lifecycle maps create and %s request identities", async (_case, prototype) => {
+  const spans = setupSpans();
+
+  const batch = {
+    id: "batch_123",
+    object: "batch",
+    endpoint: "/v1/responses",
+    input_file_id: "file_123",
+    completion_window: "24h",
+    status: "in_progress",
+    request_counts: { total: 2, completed: 0, failed: 0 },
+    usage: {
+      input_tokens: 10,
+      output_tokens: 5,
+      total_tokens: 15,
+      input_tokens_details: { cached_tokens: 0 },
+      output_tokens_details: { reasoning_tokens: 0 },
+    },
+  };
+
+  const fake = createFakeFetch(jsonResponse(batch), jsonResponse(batch), jsonResponse(batch));
+
+  if (prototype) instrumentOpenAI();
+  const client = new OpenAI({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 });
+  const instrumented = prototype ? client : wrapOpenAI(client);
+
+  await instrumented.batches.create({
+    endpoint: "/v1/responses",
+    input_file_id: "file_123",
+    completion_window: "24h",
+  });
+  await instrumented.batches.retrieve("batch_123");
+  await instrumented.batches.cancel("batch_123");
+
+  const finished = await finishedSpans(spans, 3);
+
+  const inputs = Object.fromEntries(
+    finished.map((span) => [
+      span.attributes["gen_ai.operation.name"],
+      jsonAttr<{ batch_id?: string; input_file_id?: string }>(span, "gen_ai.input.messages"),
+    ]),
+  );
+
+  expect(inputs["openai.batch.create"]).toMatchObject({ input_file_id: "file_123" });
+  expect(inputs["openai.batch.create"]).not.toHaveProperty("batch_id");
+  expect(inputs["openai.batch.retrieve"]).toMatchObject({ batch_id: "batch_123" });
+  expect(inputs["openai.batch.retrieve"]).not.toHaveProperty("input_file_id");
+  expect(inputs["openai.batch.cancel"]).toMatchObject({ batch_id: "batch_123" });
+  expect(inputs["openai.batch.cancel"]).not.toHaveProperty("input_file_id");
+  for (const span of finished) {
+    expect(Object.keys(span.attributes).filter((key) => key.startsWith("gen_ai.usage."))).toEqual(
+      [],
+    );
+    expect(span.attributes["openai.batch.id"]).toBe("batch_123");
+    expect(span.attributes["openai.batch.status"]).toBe("in_progress");
+  }
+});
+
+test("realtime wrapper traces response lifecycle, modality usage, and is idempotent", async () => {
+  const spans = setupSpans();
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+
+  const connection = {
+    send: vi.fn(),
+    close: vi.fn(),
+    on(event: string, listener: (...args: unknown[]) => void) {
+      listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+    },
+    off(event: string, listener: (...args: unknown[]) => void) {
+      listeners.set(
+        event,
+        (listeners.get(event) ?? []).filter((candidate) => candidate !== listener),
+      );
+    },
+  };
+
+  const originalSend = connection.send;
+  const wrapped = wrapOpenAIRealtime(wrapOpenAIRealtime(connection, { model: "gpt-realtime" }));
+
+  const emit = (event: string, value: unknown) => {
+    for (const listener of listeners.get(event) ?? []) listener(value);
+  };
+
+  wrapped.send({ type: "response.create", response: { instructions: "be brief" } });
+  const [sentEvent] = originalSend.mock.calls[0]!;
+  const sentResponse = (sentEvent as { response?: object }).response;
+  emit("event", { type: "response.created", response: { id: "resp_rt", ...sentResponse } });
+  emit("event", { type: "response.output_text.delta", response_id: "resp_rt", delta: "hi" });
+  emit("event", {
+    type: "response.done",
+    response: {
+      id: "resp_rt",
+      model: "gpt-realtime-1",
+      status: "completed",
+      output: [
+        { type: "message", content: [{ type: "output_text", text: "hi" }] },
+        { type: "output_audio", data: "REALTIME_AUDIO", transcript: "spoken" },
+      ],
+      usage: {
+        input_tokens: 7,
+        output_tokens: 3,
+        total_tokens: 10,
+        input_token_details: { text_tokens: 2, audio_tokens: 5 },
+        output_token_details: { text_tokens: 3 },
+      },
+    },
+  });
+
+  const span = await exportedSpan(spans);
+  expect(originalSend).toHaveBeenCalledTimes(1);
+  expect(listeners.get("event")).toHaveLength(1);
+  expect(span.attributes["gen_ai.response.id"]).toBe("resp_rt");
+  expect(span.attributes["gen_ai.usage.audio.input_tokens"]).toBe(5);
+  expect(span.attributes["gen_ai.usage.text.output_tokens"]).toBe(3);
+  expect(span.attributes["gen_ai.response.time_to_first_chunk"]).toEqual(expect.any(Number));
+  expect(String(span.attributes["gen_ai.output.messages"])).not.toContain("REALTIME_AUDIO");
+  expect(String(span.attributes["gen_ai.output.messages"])).toContain("spoken");
+});
+
+test("realtime retains bounded completed snapshots when a connection closes before response.done", async () => {
+  const spans = setupSpans();
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const sent: Array<{ response?: object }> = [];
+
+  const connection = {
+    send(event: unknown) {
+      sent.push(event as { response?: object });
+    },
+    close() {},
+    on(event: string, listener: (...args: unknown[]) => void) {
+      listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+    },
+    off() {},
+  };
+
+  const wrapped = wrapOpenAIRealtime(connection);
+  const emit = (value: unknown) => listeners.get("event")?.forEach((listener) => listener(value));
+
+  wrapped.send({ type: "response.create" });
+  emit({ type: "response.created", response: { id: "partial", ...sent[0]?.response } });
+  emit({
+    type: "response.output_item.added",
+    response_id: "partial",
+    output_index: 0,
+    item: { id: "message", type: "message", role: "assistant", content: [] },
+  });
+  emit({
+    type: "response.content_part.added",
+    response_id: "partial",
+    output_index: 0,
+    item_id: "message",
+    content_index: 0,
+    part: { type: "text", text: "draft" },
+  });
+  emit({
+    type: "response.output_text.delta",
+    response_id: "partial",
+    output_index: 0,
+    item_id: "message",
+    content_index: 0,
+    delta: " ignored",
+  });
+  emit({
+    type: "response.output_text.done",
+    response_id: "partial",
+    output_index: 0,
+    item_id: "message",
+    content_index: 0,
+    text: "hello",
+  });
+  emit({
+    type: "response.content_part.done",
+    response_id: "partial",
+    output_index: 0,
+    item_id: "message",
+    content_index: 0,
+    part: { type: "text", text: "hello from part" },
+  });
+  emit({
+    type: "response.output_item.done",
+    response_id: "partial",
+    output_index: 0,
+    item: {
+      id: "message",
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text: "hello final" }],
+    },
+  });
+  emit({
+    type: "response.output_item.added",
+    response_id: "partial",
+    output_index: 1,
+    item: { id: "audio", type: "message", role: "assistant", content: [] },
+  });
+  emit({
+    type: "response.content_part.added",
+    response_id: "partial",
+    output_index: 1,
+    item_id: "audio",
+    content_index: 0,
+    part: { type: "audio", audio: "SECRET_AUDIO", transcript: "draft" },
+  });
+  emit({
+    type: "response.output_audio_transcript.delta",
+    response_id: "partial",
+    output_index: 1,
+    item_id: "audio",
+    content_index: 0,
+    delta: "spoken",
+  });
+  emit({
+    type: "response.output_audio_transcript.done",
+    response_id: "partial",
+    output_index: 1,
+    item_id: "audio",
+    content_index: 0,
+    transcript: "spoken final",
+  });
+  emit({
+    type: "response.output_item.added",
+    response_id: "partial",
+    output_index: 2,
+    item: {
+      id: "function",
+      type: "function_call",
+      call_id: "call_1",
+      name: "lookup",
+      arguments: "",
+    },
+  });
+  emit({
+    type: "response.function_call_arguments.delta",
+    response_id: "partial",
+    output_index: 2,
+    item_id: "function",
+    call_id: "call_1",
+    delta: '{"q":',
+  });
+  emit({
+    type: "response.function_call_arguments.done",
+    response_id: "partial",
+    output_index: 2,
+    item_id: "function",
+    call_id: "call_1",
+    name: "lookup",
+    arguments: '{"q":"weather"}',
+  });
+  emit({
+    type: "response.output_item.added",
+    response_id: "partial",
+    output_index: 3,
+    item: {
+      id: "mcp",
+      type: "mcp_call",
+      name: "search",
+      server_label: "docs",
+      arguments: "",
+    },
+  });
+  emit({
+    type: "response.mcp_call_arguments.delta",
+    response_id: "partial",
+    output_index: 3,
+    item_id: "mcp",
+    delta: '{"term":',
+  });
+  emit({
+    type: "response.mcp_call_arguments.done",
+    response_id: "partial",
+    output_index: 3,
+    item_id: "mcp",
+    arguments: '{"term":"telemetry"}',
+  });
+  wrapped.close();
+
+  const span = await exportedSpan(spans);
+
+  const output = jsonAttr<
+    Array<{
+      type: string;
+      arguments?: string;
+      content?: Array<{ audio?: string; text?: string; transcript?: string }>;
+    }>
+  >(span, "gen_ai.output.messages");
+
+  expect(span.status.code).toBe(SPAN_STATUS_ERROR);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(span.attributes["gen_ai.response.time_to_first_chunk"]).toEqual(expect.any(Number));
+  expect(output[0]?.content?.[0]?.text).toBe("hello final");
+  expect(output[1]?.content?.[0]).toMatchObject({ transcript: "spoken final" });
+  expect(output[1]?.content?.[0]?.audio).toBeUndefined();
+  expect(output[2]).toMatchObject({ type: "function_call", arguments: '{"q":"weather"}' });
+  expect(output[3]).toMatchObject({ type: "mcp_call", arguments: '{"term":"telemetry"}' });
+  expect(String(span.attributes["gen_ai.output.messages"])).not.toContain("SECRET_AUDIO");
+});
+
+test("realtime caps reconstructed output before a trace timeout", async () => {
+  const spans = setupSpans();
+  vi.useFakeTimers();
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const sent: Array<{ response?: object }> = [];
+
+  const connection = {
+    send(event: unknown) {
+      sent.push(event as { response?: object });
+    },
+    close() {},
+    on(event: string, listener: (...args: unknown[]) => void) {
+      listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+    },
+    off() {},
+  };
+
+  const wrapped = wrapOpenAIRealtime(connection, { traceTimeoutMs: 100 });
+  const emit = (value: unknown) => listeners.get("event")?.forEach((listener) => listener(value));
+
+  wrapped.send({ type: "response.create" });
+  emit({ type: "response.created", response: { id: "bounded", ...sent[0]?.response } });
+  emit({
+    type: "response.output_item.added",
+    response_id: "bounded",
+    output_index: 0,
+    item: { id: "first", type: "message", role: "assistant", content: [] },
+  });
+  emit({
+    type: "response.output_text.delta",
+    response_id: "bounded",
+    output_index: 1,
+    item_id: "second",
+    content_index: 0,
+    delta: "x".repeat(100_000),
+  });
+  emit({
+    type: "response.content_part.added",
+    response_id: "bounded",
+    output_index: 0,
+    item_id: "first",
+    content_index: 999,
+    part: { type: "output_text", text: "must not be retained" },
+  });
+  vi.advanceTimersByTime(100);
+  vi.useRealTimers();
+
+  const span = spans.getFinishedSpans()[0]!;
+  const output = jsonAttr<Array<{ content?: unknown[] }>>(span, "gen_ai.output.messages");
+  expect(span.status.code).toBe(SPAN_STATUS_ERROR);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(String(span.attributes["gen_ai.output.messages"]).length).toBeLessThanOrEqual(65_536);
+  expect(output[0]?.content).toEqual([]);
+  wrapped.close();
+});
+
+test("realtime terminal output supersedes truncated deltas", async () => {
+  const spans = setupSpans();
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const sent: Array<{ response?: object }> = [];
+
+  const connection = {
+    send(event: unknown) {
+      sent.push(event as { response?: object });
+    },
+    close() {},
+    on(event: string, listener: (...args: unknown[]) => void) {
+      listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+    },
+    off() {},
+  };
+
+  const wrapped = wrapOpenAIRealtime(connection);
+  const emit = (value: unknown) => listeners.get("event")?.forEach((listener) => listener(value));
+
+  wrapped.send({ type: "response.create" });
+  emit({ type: "response.created", response: { id: "terminal", ...sent[0]?.response } });
+  emit({
+    type: "response.output_text.delta",
+    response_id: "terminal",
+    output_index: 0,
+    item_id: "message",
+    content_index: 0,
+    delta: "x".repeat(100_000),
+  });
+  emit({
+    type: "response.done",
+    response: {
+      id: "terminal",
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "final" }],
+        },
+      ],
+    },
+  });
+
+  const span = await exportedSpan(spans);
+
+  const output = jsonAttr<Array<{ content?: Array<{ text?: string }> }>>(
+    span,
+    "gen_ai.output.messages",
+  );
+
+  expect(output[0]?.content?.[0]?.text).toBe("final");
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  wrapped.close();
+});
+
+test("realtime wrapper correlates reversed manual responses and ignores automatic responses", async () => {
+  const spans = setupSpans();
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+
+  interface RealtimeCreateEvent {
+    response?: { metadata?: Record<string, string> };
+  }
+
+  const sent: RealtimeCreateEvent[] = [];
+
+  const connection = {
+    send(event: unknown) {
+      const typed = event as RealtimeCreateEvent;
+
+      sent.push(typed);
+    },
+    close() {},
+    on(event: string, listener: (...args: unknown[]) => void) {
+      listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+    },
+    off(event: string, listener: (...args: unknown[]) => void) {
+      listeners.set(
+        event,
+        (listeners.get(event) ?? []).filter((candidate) => candidate !== listener),
+      );
+    },
+  };
+
+  const emit = (value: unknown) => {
+    for (const listener of listeners.get("event") ?? []) listener(value);
+  };
+
+  const wrapped = wrapOpenAIRealtime(connection);
+
+  wrapped.send({
+    type: "response.create",
+    response: {
+      model: "model-a",
+      instructions: "first",
+      metadata: { caller: "kept-a", __telemetry_dev_response_id: "caller-owned" },
+    },
+  });
+  wrapped.send({
+    type: "response.create",
+    response: {
+      model: "model-b",
+      instructions: "second",
+      metadata: { caller: "kept-b", __telemetry_dev_response_id: "caller-owned-b" },
+    },
+  });
+  expect(sent[0]?.response?.metadata?.caller).toBe("kept-a");
+  expect(sent[0]?.response?.metadata?.__telemetry_dev_response_id).toBe("caller-owned");
+  expect(Object.keys(sent[0]?.response?.metadata ?? {})).toHaveLength(3);
+  expect(sent[1]?.response?.metadata?.caller).toBe("kept-b");
+  expect(Object.keys(sent[1]?.response?.metadata ?? {})).toHaveLength(3);
+  const secondCorrelation = sent[1]?.response?.metadata?.__telemetry_dev_response_id_1;
+  expect(secondCorrelation).toEqual(expect.any(String));
+  emit({ type: "response.created", response: { id: "automatic" } });
+  emit({
+    type: "response.created",
+    response: {
+      id: "response-a",
+      ...sent[0]?.response,
+      metadata: {
+        ...sent[0]?.response?.metadata,
+        __telemetry_dev_response_id: secondCorrelation,
+      },
+    },
+  });
+  emit({ type: "response.created", response: { id: "response-b", ...sent[1]?.response } });
+  emit({
+    type: "response.done",
+    response: {
+      id: "automatic",
+      model: "automatic-model",
+      status: "completed",
+      output: ["automatic"],
+      usage: { output_tokens: 99 },
+    },
+  });
+  emit({
+    type: "response.done",
+    response: {
+      id: "response-b",
+      model: "result-b",
+      status: "completed",
+      output: ["output-b"],
+      usage: { output_tokens: 2, output_token_details: { text_tokens: 2 } },
+    },
+  });
+  emit({
+    type: "response.done",
+    response: {
+      id: "response-a",
+      model: "result-a",
+      status: "completed",
+      output: ["output-a"],
+      usage: { output_tokens: 1, output_token_details: { text_tokens: 1 } },
+    },
+  });
+
+  const finished = await finishedSpans(spans, 2);
+
+  const byInput = Object.fromEntries(
+    finished.map((span) => [String(span.attributes["gen_ai.input.messages"]), span]),
+  );
+
+  expect(byInput.first?.attributes["gen_ai.response.model"]).toBe("result-a");
+  expect(jsonAttr(byInput.first!, "gen_ai.output.messages")).toEqual(["output-a"]);
+  expect(byInput.first?.attributes["gen_ai.usage.output_tokens"]).toBe(1);
+  expect(byInput.second?.attributes["gen_ai.response.model"]).toBe("result-b");
+  expect(jsonAttr(byInput.second!, "gen_ai.output.messages")).toEqual(["output-b"]);
+  expect(byInput.second?.attributes["gen_ai.usage.output_tokens"]).toBe(2);
+
+  const fullMetadata = Object.fromEntries(
+    Array.from({ length: 16 }, (_, index) => [`caller_${index}`, `value_${index}`]),
+  );
+
+  wrapped.send({ type: "response.create", response: { metadata: fullMetadata } });
+  expect(sent[2]?.response?.metadata).toEqual(fullMetadata);
+  const withMetadataFailure = await finishedSpans(spans, 3);
+  expect(withMetadataFailure).toHaveLength(3);
+  expect(withMetadataFailure.find((span) => span.status.code === SPAN_STATUS_ERROR)).toBeDefined();
+});
+
+test("realtime wrapper ends active spans on transport errors and close", async () => {
+  const spans = setupSpans();
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+
+  const connection = {
+    send(_event?: unknown) {},
+    close() {},
+    on(event: string, listener: (...args: unknown[]) => void) {
+      listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+    },
+    off(event: string, listener: (...args: unknown[]) => void) {
+      listeners.set(
+        event,
+        (listeners.get(event) ?? []).filter((candidate) => candidate !== listener),
+      );
+    },
+  };
+
+  const wrapped = wrapOpenAIRealtime(connection);
+
+  const emit = (event: string, value: unknown) => {
+    for (const listener of listeners.get(event) ?? []) listener(value);
+  };
+
+  wrapped.send({ type: "response.create" });
+  emit("error", "socket failed");
+  wrapped.send({ type: "response.create" });
+  wrapped.close();
+  wrapped.send({ type: "response.create" });
+
+  const finished = await finishedSpans(spans, 2);
+  expect(finished.every((span) => span.status.code === SPAN_STATUS_ERROR)).toBe(true);
+  expect(spans.getFinishedSpans()).toHaveLength(2);
+});
+
+test("realtime wrapper preserves EventEmitter unhandled errors while finishing telemetry", async () => {
+  const spans = setupSpans();
+
+  const connection = Object.assign(new EventEmitter(), {
+    socket: new EventEmitter(),
+    send(_event?: unknown) {},
+    close() {},
+  });
+
+  const wrapped = wrapOpenAIRealtime(connection);
+  const transportError = new Error("socket failed");
+
+  wrapped.send({ type: "response.create" });
+  expect(() => connection.socket.emit("error", transportError)).toThrow(transportError);
+  expect(() => connection.emit("error", transportError)).toThrow(transportError);
+
+  const span = await exportedSpan(spans);
+  expect(span.status.code).toBe(SPAN_STATUS_ERROR);
+  expect(connection.listenerCount("error")).toBe(0);
+
+  wrapped.close();
+  expect(connection.socket.listenerCount("error")).toBe(0);
+});
+
+test("realtime wrapper keeps recoverable API errors scoped and handles remote close", async () => {
+  const spans = setupSpans();
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const socketListeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const sent: unknown[] = [];
+
+  const add = (
+    target: Map<string, Array<(...args: unknown[]) => void>>,
+    event: string,
+    listener: (...args: unknown[]) => void,
+  ) => target.set(event, [...(target.get(event) ?? []), listener]);
+
+  const remove = (
+    target: Map<string, Array<(...args: unknown[]) => void>>,
+    event: string,
+    listener: (...args: unknown[]) => void,
+  ) =>
+    target.set(
+      event,
+      (target.get(event) ?? []).filter((candidate) => candidate !== listener),
+    );
+
+  const connection = {
+    send(event?: unknown) {
+      sent.push(event);
+    },
+    close() {},
+    on(event: string, listener: (...args: unknown[]) => void) {
+      add(listeners, event, listener);
+    },
+    off(event: string, listener: (...args: unknown[]) => void) {
+      remove(listeners, event, listener);
+    },
+    socket: {
+      on(event: string, listener: (...args: unknown[]) => void) {
+        add(socketListeners, event, listener);
+      },
+      off(event: string, listener: (...args: unknown[]) => void) {
+        remove(socketListeners, event, listener);
+      },
+    },
+  };
+
+  const wrapped = wrapOpenAIRealtime(wrapOpenAIRealtime(connection));
+
+  const emit = (event: string, value: unknown) => {
+    for (const listener of listeners.get(event) ?? []) listener(value);
+  };
+
+  wrapped.send({ type: "response.create", event_id: "create_1" });
+  emit("event", {
+    type: "response.created",
+    response: { id: "resp_1", ...(sent.at(-1) as { response?: object }).response },
+  });
+  emit("event", {
+    type: "error",
+    error: {
+      type: "invalid_request_error",
+      code: "bad_session_update",
+      message: "unrelated update rejected",
+      event_id: "session_update_1",
+    },
+  });
+  emit("error", { error: { event_id: "session_update_1" } });
+  emit("event", {
+    type: "response.done",
+    response: { id: "resp_1", status: "completed", output: [], usage: {} },
+  });
+
+  const [completed] = await finishedSpans(spans, 1);
+  expect(completed?.status.code).toBe(SPAN_STATUS_UNSET);
+
+  wrapped.send({ type: "response.create", event_id: "create_2" });
+  emit("event", {
+    type: "error",
+    error: {
+      type: "invalid_request_error",
+      code: "invalid_response",
+      message: "response rejected",
+      event_id: "create_2",
+    },
+  });
+  emit("error", { error: { event_id: "create_2" } });
+
+  const failed = await finishedSpans(spans, 2);
+  expect(failed[1]?.status.code).toBe(SPAN_STATUS_ERROR);
+
+  wrapped.send({ type: "response.create" });
+  const sentEvent = sent.at(-1) as { event_id?: unknown } | undefined;
+  const generatedEventId = typeof sentEvent?.event_id === "string" ? sentEvent.event_id : "";
+  expect(generatedEventId).toMatch(/^event_telemetry_/);
+  emit("event", {
+    type: "error",
+    error: {
+      type: "invalid_request_error",
+      code: "invalid_response",
+      message: "unkeyed response rejected",
+      event_id: generatedEventId,
+    },
+  });
+  emit("error", { error: { event_id: generatedEventId } });
+
+  const unkeyedFailed = await finishedSpans(spans, 3);
+  expect(unkeyedFailed[2]?.status.code).toBe(SPAN_STATUS_ERROR);
+
+  wrapped.send({ type: "response.create", event_id: "create_3" });
+  emit("event", {
+    type: "response.created",
+    response: { id: "resp_3", ...(sent.at(-1) as { response?: object }).response },
+  });
+  emit("event", {
+    type: "response.done",
+    response: { id: "resp_3", status: "completed", output: [], usage: {} },
+  });
+
+  const subsequent = await finishedSpans(spans, 4);
+  expect(subsequent[3]?.status.code).toBe(SPAN_STATUS_UNSET);
+
+  wrapped.send({ type: "response.create", event_id: "create_4" });
+  emit("event", {
+    type: "response.created",
+    response: { id: "resp_4", ...(sent.at(-1) as { response?: object }).response },
+  });
+  wrapped.send({ type: "session.update", session: { instructions: 7 } });
+  emit("event", {
+    type: "error",
+    error: {
+      type: "invalid_request_error",
+      code: "bad_session_update",
+      message: "unkeyed unrelated update rejected",
+    },
+  });
+  emit("event", {
+    type: "response.done",
+    response: { id: "resp_4", status: "completed", output: [], usage: {} },
+  });
+
+  const afterUncorrelated = await finishedSpans(spans, 5);
+  expect(afterUncorrelated[4]?.status.code).toBe(SPAN_STATUS_UNSET);
+
+  wrapped.send({ type: "response.create", event_id: "create_5" });
+  wrapped.send({ type: "response.create", event_id: "create_6" });
+
+  for (const listener of socketListeners.get("close") ?? []) listener();
+
+  const finished = await finishedSpans(spans, 7);
+  expect(finished[6]?.status.code).toBe(SPAN_STATUS_ERROR);
+  expect(listeners.get("event")).toHaveLength(0);
+  expect(socketListeners.get("close")).toHaveLength(0);
+  expect(socketListeners.get("error")).toHaveLength(0);
+});
+
+test("responses bounds cyclic, deep, oversized, binary, and shared capture without changing results", async () => {
+  const spans = setupSpans();
+  const shared = { text: "shared" };
+
+  interface CaptureFixture {
+    items?: Array<{ text: string }>;
+    binary?: { type: string; data: string };
+    self?: CaptureFixture;
+    next?: CaptureFixture;
+  }
+
+  const input: CaptureFixture = {
+    items: Array.from({ length: 2_000 }, () => shared),
+    binary: { type: "input_audio", data: "SECRET_BINARY" },
+  };
+
+  input.self = input;
+  let deep = input;
+
+  for (let index = 0; index < 100; index += 1) {
+    const next: CaptureFixture = {};
+    deep.next = next;
+    deep = next;
+  }
+
+  const output = { id: "resp_bounded", status: "completed", output: input };
+  const create = vi.fn((_params: unknown) => output);
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create },
+    embeddings: { create() {} },
+  });
+
+  await expect(client.responses.create({ model: "model", input } as never)).resolves.toBe(output);
+  expect(create).toHaveBeenCalledOnce();
+  const span = await exportedSpan(spans);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(String(span.attributes["gen_ai.input.messages"])).not.toContain("SECRET_BINARY");
+  expect(String(span.attributes["gen_ai.input.messages"]).length).toBeLessThan(65_536);
+});
+
+test("realtime expires pending and active traces, enforces cap, and ignores late events", () => {
+  const spans = setupSpans();
+  vi.useFakeTimers();
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const sent: Array<{ response?: object }> = [];
+
+  const connection = {
+    send(event: unknown) {
+      sent.push(event as { response?: object });
+    },
+    close() {},
+    on(event: string, listener: (...args: unknown[]) => void) {
+      listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+    },
+    off() {},
+  };
+
+  const wrapped = wrapOpenAIRealtime(connection, { traceTimeoutMs: 1_000, maxInFlight: 2 });
+  const emit = (value: unknown) => listeners.get("event")?.forEach((listener) => listener(value));
+
+  wrapped.send({ type: "response.create", response: { instructions: "pending-expiry" } });
+  vi.advanceTimersByTime(1_000);
+  wrapped.send({ type: "response.create", response: { instructions: "active-expiry" } });
+  emit({ type: "response.created", response: { id: "active", ...sent.at(-1)?.response } });
+  vi.advanceTimersByTime(1_000);
+  emit({ type: "response.done", response: { id: "active", status: "completed", output: [] } });
+
+  wrapped.send({ type: "response.create", response: { instructions: "evicted" } });
+  wrapped.send({ type: "response.create", response: { instructions: "kept-1" } });
+  wrapped.send({ type: "response.create", response: { instructions: "kept-2" } });
+  vi.useRealTimers();
+  const finished = spans.getFinishedSpans();
+  expect(finished).toHaveLength(3);
+  expect(finished.every((span) => span.status.code === SPAN_STATUS_ERROR)).toBe(true);
+  emit({ type: "response.created", response: { id: "late", ...sent[0]?.response } });
+  emit({ type: "response.done", response: { id: "late", status: "completed", output: [] } });
+  expect(spans.getFinishedSpans()).toHaveLength(3);
+  wrapped.close();
+});
+
+test.each([0, -1, 1.5, Number.NaN])("realtime rejects invalid maxInFlight %s", (maxInFlight) => {
+  const connection = {
+    send() {},
+    close() {},
+    on() {},
+    off() {},
+  };
+
+  expect(() => wrapOpenAIRealtime(connection, { maxInFlight })).toThrow(
+    "maxInFlight must be a positive integer",
+  );
+});
+
+test.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])(
+  "realtime rejects invalid traceTimeoutMs %s",
+  (traceTimeoutMs) => {
+    const connection = {
+      send() {},
+      close() {},
+      on() {},
+      off() {},
+    };
+
+    expect(() => wrapOpenAIRealtime(connection, { traceTimeoutMs })).toThrow(
+      "traceTimeoutMs must be a positive finite number",
+    );
+  },
+);
+
+test("realtime in-flight eviction selects the oldest trace across active and pending", async () => {
+  const spans = setupSpans();
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const sent: Array<{ response?: object }> = [];
+
+  const connection = {
+    send(event: unknown) {
+      sent.push(event as { response?: object });
+    },
+    close() {},
+    on(event: string, listener: (...args: unknown[]) => void) {
+      listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+    },
+    off() {},
+  };
+
+  const wrapped = wrapOpenAIRealtime(connection, { maxInFlight: 2 });
+  const emit = (value: unknown) => listeners.get("event")?.forEach((listener) => listener(value));
+
+  wrapped.send({ type: "response.create", response: { instructions: "A" } });
+  emit({ type: "response.created", response: { id: "response-a", ...sent[0]?.response } });
+  emit({
+    type: "response.output_text.delta",
+    response_id: "response-a",
+    output_index: 0,
+    item_id: "message-a",
+    content_index: 0,
+    delta: "partial A",
+  });
+  wrapped.send({ type: "response.create", response: { instructions: "B" } });
+  wrapped.send({ type: "response.create", response: { instructions: "C" } });
+  emit({ type: "response.created", response: { id: "response-b", ...sent[1]?.response } });
+  emit({ type: "response.done", response: { id: "response-b", status: "completed", output: [] } });
+
+  const finished = await finishedSpans(spans, 2);
+
+  expect(finished.map((span) => span.status.code)).toEqual([SPAN_STATUS_ERROR, SPAN_STATUS_UNSET]);
+  expect(
+    jsonAttr<Array<{ content: Array<{ text: string }> }>>(finished[0]!, "gen_ai.output.messages"),
+  ).toEqual([
+    {
+      type: "message",
+      role: "assistant",
+      id: "message-a",
+      content: [{ type: "output_text", text: "partial A" }],
+    },
+  ]);
+  expect(finished[0]?.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  wrapped.close();
+});
+
+test("realtime assigns unique in-flight event ids before binding API errors", async () => {
+  const spans = setupSpans();
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const sent: Array<{ event_id?: unknown; response?: object }> = [];
+
+  const connection = {
+    send(event: unknown) {
+      sent.push(event as { event_id?: unknown; response?: object });
+    },
+    close() {},
+    on(event: string, listener: (...args: unknown[]) => void) {
+      listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+    },
+    off() {},
+  };
+
+  const wrapped = wrapOpenAIRealtime(connection);
+  const emit = (value: unknown) => listeners.get("event")?.forEach((listener) => listener(value));
+
+  wrapped.send({ type: "response.create", event_id: "duplicate" });
+  wrapped.send({ type: "response.create", event_id: "duplicate" });
+
+  expect(sent[0]?.event_id).toBe("duplicate");
+  expect(sent[1]?.event_id).not.toBe("duplicate");
+  emit({ type: "error", error: { event_id: "duplicate", message: "first failed" } });
+
+  const first = await exportedSpan(spans);
+  expect(first.status.code).toBe(SPAN_STATUS_ERROR);
+
+  emit({
+    type: "response.created",
+    response: { id: "second", ...(sent[1]?.response as object) },
+  });
+  emit({
+    type: "response.done",
+    response: { id: "second", status: "completed", output: [], usage: {} },
+  });
+
+  const finished = await finishedSpans(spans, 2);
+  expect(finished[1]?.status.code).toBe(SPAN_STATUS_UNSET);
+  wrapped.close();
+});
+
+test("realtime duplicate response ids finish the incoming trace without orphaning the active trace", async () => {
+  const spans = setupSpans();
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const sent: Array<{ response?: object }> = [];
+
+  const connection = {
+    send(event: unknown) {
+      sent.push(event as { response?: object });
+    },
+    close() {},
+    on(event: string, listener: (...args: unknown[]) => void) {
+      listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+    },
+    off() {},
+  };
+
+  const wrapped = wrapOpenAIRealtime(connection, { maxInFlight: 2 });
+  const emit = (value: unknown) => listeners.get("event")?.forEach((listener) => listener(value));
+
+  wrapped.send({ type: "response.create", response: { instructions: "A" } });
+  wrapped.send({ type: "response.create", response: { instructions: "B" } });
+  emit({ type: "response.created", response: { id: "same", ...sent[0]?.response } });
+  emit({ type: "response.created", response: { id: "same", ...sent[1]?.response } });
+
+  expect(spans.getFinishedSpans()).toHaveLength(1);
+  expect(spans.getFinishedSpans()[0]?.status.code).toBe(SPAN_STATUS_ERROR);
+  expect(
+    spans
+      .getFinishedSpans()[0]
+      ?.events.some((event) =>
+        String(event.attributes?.["exception.message"]).includes("duplicate response id same"),
+      ),
+  ).toBe(true);
+
+  wrapped.send({ type: "response.create", response: { instructions: "C" } });
+  expect(spans.getFinishedSpans()).toHaveLength(1);
+  emit({ type: "response.done", response: { id: "same", status: "completed", output: [] } });
+
+  const finished = await finishedSpans(spans, 2);
+  expect(finished.map((span) => span.status.code)).toEqual([SPAN_STATUS_ERROR, SPAN_STATUS_UNSET]);
+  wrapped.close();
+  expect(spans.getFinishedSpans()).toHaveLength(3);
+});
+
+test.each([
+  [new Error("bare socket error"), "bare socket error"],
+  [{ error: new Error("nested socket error") }, "nested socket error"],
+])("realtime socket errors finish all traces from %j", async (cause, message) => {
+  const spans = setupSpans();
+  const socketListeners = new Map<string, (...args: unknown[]) => void>();
+
+  const connection = {
+    send(_event: unknown) {},
+    close() {},
+    on() {},
+    off() {},
+    socket: {
+      addEventListener(event: string, listener: (...args: unknown[]) => void) {
+        socketListeners.set(event, listener);
+      },
+      removeEventListener() {},
+    },
+  };
+
+  const wrapped = wrapOpenAIRealtime(connection);
+  wrapped.send({ type: "response.create" });
+  socketListeners.get("error")?.(cause);
+  const span = await exportedSpan(spans);
+  expect(span.status.code).toBe(SPAN_STATUS_ERROR);
+  expect(span.events.some((event) => event.attributes?.["exception.message"] === message)).toBe(
+    true,
+  );
 });

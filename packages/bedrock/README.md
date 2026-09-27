@@ -13,6 +13,7 @@ This package instruments AWS SDK for JavaScript v3 clients for:
 - `@aws-sdk/client-bedrock-agent-runtime`
   - `InvokeAgent`
   - `InvokeInlineAgent`
+  - `Rerank`
   - `Retrieve`
   - `RetrieveAndGenerate`
   - `RetrieveAndGenerateStream`
@@ -113,6 +114,7 @@ All instrumented AWS responses/errors include `gen_ai.response.id` from the AWS 
 | `InvokeModelWithResponseStream`     | `generation` or `embedding` | `chat {modelId}` / `embeddings {modelId}`             | provider-native chunk text where known, optional final `amazon-bedrock-invocationMetrics` usage                                                                                                        |
 | `ApplyGuardrail`                    | `span`                      | `apply_guardrail {guardrailIdentifier}`               | guardrail input/output, action, action reason, request id                                                                                                                                              |
 | `InvokeAgent` / `InvokeInlineAgent` | `agent`                     | `invoke_agent {agentId}` / `invoke_agent {agentName}` | user input, streamed answer, session/memory ids, alias id, trace usage aggregation, trace event count, return-control output                                                                           |
+| `Rerank`                            | `span` (`rerank` operation) | `rerank {modelArn basename}`                          | queries, inline sources, model request fields, ranked results and scores, result counts, pagination metadata, request id                                                                               |
 | `Retrieve`                          | `span`                      | `retrieve {knowledgeBaseId}`                          | query, retrieval results, guardrail action, result count metadata                                                                                                                                      |
 | `RetrieveAndGenerate` / stream      | `generation`                | `retrieve_and_generate {modelArn basename}`           | input text, generated text, citations count, session id, guardrail action                                                                                                                              |
 | `InvokeFlow`                        | `agent`                     | `invoke_flow {flowIdentifier}`                        | inputs, flow output events, completion reason                                                                                                                                                          |
@@ -149,7 +151,6 @@ The following calls pass through unless a supported operation above is used:
 - `InvokeModelWithBidirectionalStream`
 - `StartAsyncInvoke`, `GetAsyncInvoke`, `ListAsyncInvokes`
 - Agent Runtime session CRUD
-- `Rerank`
 - `GenerateQuery`
 - `OptimizePrompt`
 - `AgenticRetrieveStream`

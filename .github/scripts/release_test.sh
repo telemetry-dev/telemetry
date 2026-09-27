@@ -4,6 +4,7 @@ set -euo pipefail
 root=$(git rev-parse --show-toplevel)
 source_script="$root/.github/scripts/release-source.sh"
 artifact_script="$root/.github/scripts/release-artifact.sh"
+dependency_script="$root/.github/scripts/verify-python-release-dependencies.sh"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 repo="$tmp/repo"
@@ -224,6 +225,64 @@ for field in dependencies peerDependencies; do
     exit 1
   fi
 done
+
+touch "$tmp/provider.whl"
+cat > "$tmp/bin/uv" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$*" == "pip install --dry-run --system --no-sources --no-build $EXPECTED_ARTIFACT" ]]
+printf 'attempt\n' >> "$ATTEMPTS"
+attempt=$(wc -l < "$ATTEMPTS")
+if [[ "${PERMANENT_ERROR:-false}" == true ]]; then
+  echo 'No solution found: package requires Python >=4' >&2
+  exit 1
+fi
+if ((attempt >= DEPENDENCY_AVAILABLE_AFTER)); then
+  exit 0
+fi
+echo 'Because there is no version of telemetry-dev==0.2.6' >&2
+exit 1
+SH
+chmod +x "$tmp/bin/uv"
+run_dependency_check() {
+  (
+    PATH="$tmp/bin:$PATH" ATTEMPTS="$tmp/dependency-attempts" \
+      EXPECTED_ARTIFACT="$tmp/provider.whl" \
+      DEPENDENCY_AVAILABLE_AFTER="$1" RELEASE_DEPENDENCY_ATTEMPTS="$2" \
+      PERMANENT_ERROR="${3:-false}" \
+      RELEASE_DEPENDENCY_DELAY_SECONDS=0 \
+      "$dependency_script" "$tmp/provider.whl"
+  )
+}
+run_dependency_check_with_settings() {
+  (
+    PATH="$tmp/bin:$PATH" ATTEMPTS="$tmp/dependency-attempts" \
+      EXPECTED_ARTIFACT="$tmp/provider.whl" DEPENDENCY_AVAILABLE_AFTER=1 \
+      RELEASE_DEPENDENCY_ATTEMPTS="$1" RELEASE_DEPENDENCY_DELAY_SECONDS="$2" \
+      "$dependency_script" "$tmp/provider.whl"
+  )
+}
+rm -f "$tmp/dependency-attempts"
+run_dependency_check 3 5
+[[ $(wc -l < "$tmp/dependency-attempts") -eq 3 ]]
+rm -f "$tmp/dependency-attempts"
+expect_failure "published dependencies did not become available" run_dependency_check 5 4
+[[ $(wc -l < "$tmp/dependency-attempts") -eq 4 ]]
+rm -f "$tmp/dependency-attempts"
+expect_failure "package requires Python >=4" run_dependency_check 5 4 true
+[[ $(wc -l < "$tmp/dependency-attempts") -eq 1 ]]
+expect_failure "RELEASE_DEPENDENCY_ATTEMPTS must be an integer from 1 to 60" \
+  run_dependency_check_with_settings nope 0
+expect_failure "RELEASE_DEPENDENCY_ATTEMPTS must be an integer from 1 to 60" \
+  run_dependency_check_with_settings 0 0
+expect_failure "RELEASE_DEPENDENCY_ATTEMPTS must be an integer from 1 to 60" \
+  run_dependency_check_with_settings 61 0
+expect_failure "RELEASE_DEPENDENCY_DELAY_SECONDS must be an integer from 0 to 60" \
+  run_dependency_check_with_settings 1 1.5
+expect_failure "RELEASE_DEPENDENCY_DELAY_SECONDS must be an integer from 0 to 60" \
+  run_dependency_check_with_settings 1 -1
+expect_failure "RELEASE_DEPENDENCY_DELAY_SECONDS must be an integer from 0 to 60" \
+  run_dependency_check_with_settings 1 61
 
 printf '{"sdks/python":"0.2.2"}\n' > "$repo/.release-please-manifest.json"
 printf '{"packages":{"sdks/python":{"component":"python","release-type":"python","package-name":"telemetry-dev"}}}\n' > "$repo/release-please-config.json"

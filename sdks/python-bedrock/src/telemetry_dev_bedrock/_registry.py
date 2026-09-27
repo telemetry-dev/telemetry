@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
+
+import telemetry_dev
 
 from ._fields import PROVIDER, clean, merge_fields, metadata_fields, usage_from_converse
 from ._invoke_model import is_embedding_model
@@ -225,6 +227,95 @@ def _retrieve_response(_params: dict[str, Any], response: dict[str, Any]) -> dic
     )
 
 
+def _rerank_configuration(
+    params: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    raw_configuration = params.get("rerankingConfiguration")
+    configuration = (
+        cast(dict[str, Any], raw_configuration) if isinstance(raw_configuration, dict) else {}
+    )
+    raw_bedrock = configuration.get("bedrockRerankingConfiguration")
+    bedrock = cast(dict[str, Any], raw_bedrock) if isinstance(raw_bedrock, dict) else {}
+    raw_model = bedrock.get("modelConfiguration")
+    model = cast(dict[str, Any], raw_model) if isinstance(raw_model, dict) else {}
+    return bedrock, model
+
+
+def _rerank_model(params: dict[str, Any]) -> str | None:
+    model_arn = _rerank_configuration(params)[1].get("modelArn")
+    return model_arn if isinstance(model_arn, str) else None
+
+
+def _rerank_name(params: dict[str, Any]) -> str:
+    model = _rerank_model(params)
+    return f"rerank {model.rsplit('/', 1)[-1] if model else 'unknown'}"
+
+
+def _bounded_capture(value: Any, capture: Literal["input", "output"]) -> tuple[Any, bool]:
+    client = telemetry_dev.get_client()
+    enabled = client is not None and (
+        client.capture_input if capture == "input" else client.capture_output
+    )
+    if not enabled:
+        return None, False
+    budget = telemetry_dev.CaptureBudget.from_client()
+    return (value if budget.accept(value) else None), budget.truncated
+
+
+def _rerank_request(params: dict[str, Any]) -> dict[str, Any]:
+    bedrock, model = _rerank_configuration(params)
+    model_arn = model.get("modelArn")
+    result_count = bedrock.get("numberOfResults")
+    input_value = clean(
+        {
+            "queries": params.get("queries"),
+            "sources": params.get("sources"),
+            "additionalModelRequestFields": model.get("additionalModelRequestFields"),
+            "nextToken": params.get("nextToken"),
+        }
+    )
+    captured_input, truncated = _bounded_capture(input_value, "input")
+    return clean(
+        {
+            "provider": PROVIDER,
+            "model": model_arn if isinstance(model_arn, str) else None,
+            "input": captured_input,
+            "attributes": {
+                "gen_ai.operation.name": "rerank",
+                **({"telemetry.dev.capture.truncated": True} if truncated else {}),
+            },
+            "metadata": clean(
+                {
+                    "requested_result_count": (
+                        str(result_count)
+                        if isinstance(result_count, int) and not isinstance(result_count, bool)
+                        else None
+                    )
+                }
+            )
+            or None,
+        }
+    )
+
+
+def _rerank_response(_params: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+    results = response.get("results") if isinstance(response.get("results"), list) else []
+    captured_results, truncated = _bounded_capture(results, "output")
+    return merge_fields(
+        metadata_fields(response),
+        {
+            "output": captured_results,
+            "attributes": {"telemetry.dev.capture.truncated": True} if truncated else None,
+            "metadata": clean(
+                {
+                    "result_count": len(results),
+                    "has_next_token": True if isinstance(response.get("nextToken"), str) else None,
+                }
+            ),
+        },
+    )
+
+
 def _rag_model(params: dict[str, Any]) -> str | None:
     config = params.get("retrieveAndGenerateConfiguration")
     if not isinstance(config, dict):
@@ -365,6 +456,12 @@ AGENT_OPERATIONS: dict[str, OperationSpec] = {
         response_fields=_agent_response,
         stream_key="completion",
         stream_state_factory=lambda capture: AgentStreamState(capture_trace=capture),
+    ),
+    "Rerank": OperationSpec(
+        span_name=_rerank_name,
+        span_type=lambda _params: "span",
+        request_fields=_rerank_request,
+        response_fields=_rerank_response,
     ),
     "Retrieve": OperationSpec(
         span_name=lambda params: f"retrieve {params.get('knowledgeBaseId') or 'unknown'}",
