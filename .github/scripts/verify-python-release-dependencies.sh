@@ -22,12 +22,17 @@ validate_retry_setting() {
 validate_retry_setting RELEASE_DEPENDENCY_ATTEMPTS "$attempts" 1 60
 validate_retry_setting RELEASE_DEPENDENCY_DELAY_SECONDS "$delay" 0 60
 
+venv=$(mktemp -d)
+trap 'rm -rf "$venv"' EXIT
+uv venv --quiet "$venv"
+
 for ((attempt = 1; attempt <= attempts; attempt += 1)); do
-  if dependency_error=$(uv pip install --dry-run --system --no-sources --no-build "$artifact" 2>&1); then
+  if dependency_error=$(uv pip install --dry-run --no-cache --python "$venv" --no-sources --no-build "$artifact" 2>&1); then
     exit 0
   fi
   if [[ "$dependency_error" != *"was not found in the package registry"* &&
-    "$dependency_error" != *"there is no version of "* ]]; then
+    "$dependency_error" != *"there is no version of "* &&
+    ! "$dependency_error" =~ Because\ only\ [^[:space:]]+\ is\ available ]]; then
     printf '%s\n' "$dependency_error" >&2
     exit 1
   fi
