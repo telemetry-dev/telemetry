@@ -455,13 +455,15 @@ function batchResponse<T>(response: T): SpanFields {
   const r = asRecord(response) ?? {};
   const id = readString(r.id);
   const status = readString(r.status);
+  const attributes: Record<string, string> = {};
+
+  if (id !== undefined) attributes["openai.batch.id"] = id;
+
+  if (status !== undefined) attributes["openai.batch.status"] = status;
 
   return {
     responseId: id,
-    attributes: {
-      ...(id === undefined ? {} : { "openai.batch.id": id }),
-      ...(status === undefined ? {} : { "openai.batch.status": status }),
-    },
+    attributes,
     output: {
       status: r.status,
       endpoint: r.endpoint,
