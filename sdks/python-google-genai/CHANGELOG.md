@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/telemetry-dev/telemetry/compare/python-google-genai-v0.1.2...python-google-genai-v0.1.3) (2026-09-27)
+
+
+### Features
+
+* **sdk:** trace media, realtime, rerank, and modality token usage ([#17](https://github.com/telemetry-dev/telemetry/issues/17)) ([c489503](https://github.com/telemetry-dev/telemetry/commit/c4895031a27a30004e21dc58f678d0f1ce19c072))
+
 ## [0.1.2](https://github.com/telemetry-dev/telemetry/compare/python-google-genai-v0.1.1...python-google-genai-v0.1.2) (2026-09-12)
 
 

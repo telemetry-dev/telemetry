@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.6](https://github.com/telemetry-dev/telemetry/compare/python-v0.2.5...python-v0.2.6) (2026-09-27)
+
+
+### Features
+
+* **sdk:** trace media, realtime, rerank, and modality token usage ([#17](https://github.com/telemetry-dev/telemetry/issues/17)) ([c489503](https://github.com/telemetry-dev/telemetry/commit/c4895031a27a30004e21dc58f678d0f1ce19c072))
+
 ## [0.2.5](https://github.com/telemetry-dev/telemetry/compare/python-v0.2.4...python-v0.2.5) (2026-09-12)
 
 

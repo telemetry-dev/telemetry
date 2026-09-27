@@ -1,6 +1,6 @@
 [project]
 name = "telemetry-dev-bedrock"
-version = "0.1.2"
+version = "0.1.3"
 description = "AWS Bedrock integration for telemetry.dev Python SDK"
 readme = "README.md"
 license = "MIT"
