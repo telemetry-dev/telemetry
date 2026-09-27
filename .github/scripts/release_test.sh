@@ -230,7 +230,12 @@ touch "$tmp/provider.whl"
 cat > "$tmp/bin/uv" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ "$*" == "pip install --dry-run --system --no-sources --no-build $EXPECTED_ARTIFACT" ]]
+if [[ "$1" == venv ]]; then
+  [[ "$#" -eq 3 && "$2" == --quiet && -d "$3" ]]
+  printf '%s\n' "$3" > "$ATTEMPTS.venv"
+  exit 0
+fi
+[[ "$*" == "pip install --dry-run --no-cache --python $(cat "$ATTEMPTS.venv") --no-sources --no-build $EXPECTED_ARTIFACT" ]]
 printf 'attempt\n' >> "$ATTEMPTS"
 attempt=$(wc -l < "$ATTEMPTS")
 if [[ "${PERMANENT_ERROR:-false}" == true ]]; then
@@ -240,7 +245,11 @@ fi
 if ((attempt >= DEPENDENCY_AVAILABLE_AFTER)); then
   exit 0
 fi
-echo 'Because there is no version of telemetry-dev==0.2.6' >&2
+if [[ "${ONLY_OLDER_AVAILABLE:-false}" == true ]]; then
+  echo '  ╰─▶ Because only telemetry-dev<=0.2.5 is available and' >&2
+else
+  echo 'Because there is no version of telemetry-dev==0.2.6' >&2
+fi
 exit 1
 SH
 chmod +x "$tmp/bin/uv"
@@ -264,6 +273,9 @@ run_dependency_check_with_settings() {
 }
 rm -f "$tmp/dependency-attempts"
 run_dependency_check 3 5
+[[ $(wc -l < "$tmp/dependency-attempts") -eq 3 ]]
+rm -f "$tmp/dependency-attempts"
+ONLY_OLDER_AVAILABLE=true run_dependency_check 3 5
 [[ $(wc -l < "$tmp/dependency-attempts") -eq 3 ]]
 rm -f "$tmp/dependency-attempts"
 expect_failure "published dependencies did not become available" run_dependency_check 5 4
