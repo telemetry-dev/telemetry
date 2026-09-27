@@ -1328,21 +1328,62 @@ def streamed_beta_span(events: list[dict[str, Any]], memory: SimpleNamespace) ->
     return attrs(only_span(memory))
 
 
-def test_beta_stream_records_model_that_served_a_fallback(memory: SimpleNamespace) -> None:
-    fallback = {
-        "type": "fallback",
-        "from": {"model": "claude-opus-5"},
-        "to": {"model": "claude-opus-4-8"},
-    }
-    a = streamed_beta_span(
+FALLBACK_BLOCK: dict[str, Any] = {
+    "type": "fallback",
+    "from": {"model": "claude-opus-5"},
+    "to": {"model": "claude-opus-4-8"},
+}
+DECLINED_ITERATION: dict[str, Any] = {
+    "type": "message",
+    "model": "claude-opus-5",
+    "input_tokens": 5,
+    "output_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+}
+SERVED_ITERATION: dict[str, Any] = {
+    **DECLINED_ITERATION,
+    "type": "fallback_message",
+    "model": "claude-opus-4-8",
+    "output_tokens": 2,
+}
+
+
+def with_iterations(
+    events: list[dict[str, Any]], iterations: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    # A fallback block marks the switch point; only a fallback_message iteration in the
+    # terminal usage proves the fallback model served the response.
+    for event in events:
+        if event["type"] == "message_delta":
+            event["usage"] = {"output_tokens": 2, "iterations": iterations}
+    return events
+
+
+def fallback_stream(iterations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return with_iterations(
         beta_stream_events(
-            (fallback, []),
+            (FALLBACK_BLOCK, []),
             ({"type": "text", "text": ""}, [{"type": "text_delta", "text": "Hi"}]),
         ),
-        memory,
+        iterations,
     )
 
+
+def test_beta_stream_records_fallback_model_that_served_the_response(
+    memory: SimpleNamespace,
+) -> None:
+    a = streamed_beta_span(fallback_stream([DECLINED_ITERATION, SERVED_ITERATION]), memory)
+
     assert a["gen_ai.response.model"] == "claude-opus-4-8"
+
+
+def test_beta_stream_keeps_requested_model_when_fallback_request_failed(
+    memory: SimpleNamespace,
+) -> None:
+    a = streamed_beta_span(fallback_stream([DECLINED_ITERATION]), memory)
+
+    assert a["gen_ai.response.model"] == "claude-opus-5"
 
 
 def test_beta_stream_records_compaction_content(memory: SimpleNamespace) -> None:
@@ -1399,14 +1440,12 @@ def test_beta_stream_records_mcp_tool_use_input(memory: SimpleNamespace) -> None
 
 def test_beta_stream_records_fallback_model_after_capture_budget_is_exhausted(make: Any) -> None:
     memory = make(max_attribute_length=64)
-    fallback = {
-        "type": "fallback",
-        "from": {"model": "claude-opus-5"},
-        "to": {"model": "claude-opus-4-8"},
-    }
-    events = beta_stream_events(
-        ({"type": "text", "text": ""}, [{"type": "text_delta", "text": "x" * 60}]),
-        (fallback, []),
+    events = with_iterations(
+        beta_stream_events(
+            ({"type": "text", "text": ""}, [{"type": "text_delta", "text": "x" * 60}]),
+            (FALLBACK_BLOCK, []),
+        ),
+        [DECLINED_ITERATION, SERVED_ITERATION],
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1752,6 +1791,34 @@ def test_replacement_budget_invariants_hold_for_random_streams(make: Any) -> Non
                 continue
             fits = measure(candidate) <= state.budget.max_bytes - others
             assert (state.blocks.get(index) == candidate) == fits
+            assert (index in state.superseded) != fits
+            output = telemetry_dev_anthropic._stream_output(state)  # pyright: ignore[reportPrivateUsage]
+            emitted: list[Any] = output[0]["content"] if output else []
+            assert len(emitted) == len(set(state.blocks) - state.superseded)
             if not fits:
                 assert (dict(state.blocks.get(index, {})), state.budget.bytes_used) == before
                 assert state.budget.truncated is False
+                assert index in state.superseded
+
+
+def test_stream_omits_compaction_superseded_by_a_rejected_final_replacement(make: Any) -> None:
+    # 400 bytes fits the text block with the "ok" compaction (344 bytes), not the oversized
+    # replacement (742 bytes), so "ok" is accepted and then superseded.
+    memory = make(max_attribute_length=400)
+    a = streamed_beta_span(
+        beta_stream_events(
+            ({"type": "text", "text": ""}, [{"type": "text_delta", "text": "Hi"}]),
+            (
+                {"type": "compaction", "content": None},
+                [
+                    {"type": "compaction_delta", "content": "ok"},
+                    {"type": "compaction_delta", "content": "x" * 400},
+                ],
+            ),
+        ),
+        memory,
+    )
+
+    assert json.loads(str(a["gen_ai.output.messages"])) == [
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]}
+    ]

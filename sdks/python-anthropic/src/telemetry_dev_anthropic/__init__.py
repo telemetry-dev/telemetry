@@ -243,6 +243,9 @@ class _StreamState:
         self.budget = telemetry_dev.CaptureBudget.from_client()
         # Budget bytes and items each block holds: its start plus every accepted delta.
         self.block_reservations: dict[int, tuple[int, int]] = {}
+        # Blocks whose latest replacement was rejected: their retained value is stale, so they
+        # are left out of the output until a later replacement is accepted.
+        self.superseded: set[int] = set()
 
 
 def _reserve(index: int, value: Any, state: _StreamState) -> bool:
@@ -285,14 +288,16 @@ def _finalize_block(index: int, block: Mapping[str, Any], state: _StreamState) -
 
 
 def _stream_output(state: _StreamState) -> list[dict[str, Any]] | None:
-    if not state.blocks:
+    blocks = {
+        index: block for index, block in state.blocks.items() if index not in state.superseded
+    }
+    if not blocks:
         return None
     return [
         {
             "role": "assistant",
             "content": [
-                _finalize_block(index, block, state)
-                for index, block in sorted(state.blocks.items())
+                _finalize_block(index, block, state) for index, block in sorted(blocks.items())
             ],
         }
     ]
@@ -332,12 +337,6 @@ def _record_content_block_start(event: Any, state: _StreamState) -> None:
     block_index = index if isinstance(index, int) else len(state.blocks)
     content_block = _native(_field(event, "content_block"))
     block_type = _string(_field(content_block, "type"))
-    if block_type == "fallback":
-        # The final fallback block names the model that served the response. Read it before
-        # the capture budget check: it is span metadata, not retained output.
-        state.response_model = (
-            _string(_field(_field(content_block, "to"), "model")) or state.response_model
-        )
     if not _reserve(block_index, content_block, state):
         return
     if block_type == "text":
@@ -434,8 +433,13 @@ def _record_content_block_delta(event: Any, state: _StreamState) -> None:
     delta_type = _string(_field(delta, "type"))
     if delta_type in _REPLACEMENT_DELTAS:
         replaced = _replaced_block(block_index, delta, state)
-        if replaced is not None and _reserve_replacement(block_index, replaced, state):
+        if replaced is None:
+            return
+        if _reserve_replacement(block_index, replaced, state):
             state.blocks[block_index] = replaced
+            state.superseded.discard(block_index)
+        else:
+            state.superseded.add(block_index)
         return
     if not _reserve(block_index, delta, state):
         return
@@ -450,6 +454,20 @@ def _record_content_block_delta(event: Any, state: _StreamState) -> None:
         _append_item(block, "citations", _field(delta, "citation"))
     elif delta_type == "thinking_delta":
         _append_string(block, "thinking", _field(delta, "thinking"))
+
+
+def _fallback_serving_model(usage: Any) -> str | None:
+    """Model named by the fallback_message entry in the terminal usage iterations.
+
+    A fallback block only marks where a fallback was attempted; the fallback_message
+    iteration is what shows a fallback model actually served the response.
+    """
+    served = [
+        entry
+        for entry in _sequence_items(_field(usage, "iterations"))
+        if _string(_field(entry, "type")) == "fallback_message"
+    ]
+    return _string(_field(served[-1], "model")) if served else None
 
 
 def _record_stream_event(event: Any, state: _StreamState) -> dict[str, Any]:
@@ -468,6 +486,9 @@ def _record_stream_event(event: Any, state: _StreamState) -> dict[str, Any]:
         delta = _field(event, "delta")
         state.finish_reason = _string(_field(delta, "stop_reason")) or state.finish_reason
         state.usage = _merge_usage(state.usage, _messages_usage(_field(event, "usage")))
+        state.response_model = (
+            _fallback_serving_model(_field(event, "usage")) or state.response_model
+        )
     return update
 
 

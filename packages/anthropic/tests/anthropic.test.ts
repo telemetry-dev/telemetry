@@ -1050,21 +1050,54 @@ async function streamedBetaSpan(
   return exportedSpan(spans);
 }
 
-test("beta streams record the model that served a fallback", async () => {
-  const fallback = {
-    type: "fallback",
-    from: { model: "claude-opus-5" },
-    to: { model: "claude-opus-4-8" },
-  };
+const fallbackBlock = {
+  type: "fallback",
+  from: { model: "claude-opus-5" },
+  to: { model: "claude-opus-4-8" },
+};
 
+// A fallback block marks the switch point; only a fallback_message iteration in the terminal
+// usage proves the fallback model served the response.
+function fallbackStream(iterations: JsonRecord[]): JsonRecord[] {
+  const events = betaStreamEvents(
+    [fallbackBlock, []],
+    [{ type: "text", text: "" }, [{ type: "text_delta", text: "Hi" }]],
+  );
+  const messageDelta = events.find((event) => event.type === "message_delta")!;
+  messageDelta.usage = { output_tokens: 2, iterations };
+
+  return events;
+}
+
+const declinedIteration = {
+  type: "message",
+  model: "claude-opus-5",
+  input_tokens: 5,
+  output_tokens: 0,
+  cache_creation_input_tokens: 0,
+  cache_read_input_tokens: 0,
+};
+
+test("beta streams record the fallback model when a fallback_message iteration served it", async () => {
   const span = await streamedBetaSpan(
-    betaStreamEvents(
-      [fallback, []],
-      [{ type: "text", text: "" }, [{ type: "text_delta", text: "Hi" }]],
-    ),
+    fallbackStream([
+      declinedIteration,
+      {
+        ...declinedIteration,
+        type: "fallback_message",
+        model: "claude-opus-4-8",
+        output_tokens: 2,
+      },
+    ]),
   );
 
   expect(span.attributes["gen_ai.response.model"]).toBe("claude-opus-4-8");
+});
+
+test("beta streams keep the requested model when the fallback request failed", async () => {
+  const span = await streamedBetaSpan(fallbackStream([declinedIteration]));
+
+  expect(span.attributes["gen_ai.response.model"]).toBe("claude-opus-5");
 });
 
 const compactionStream = (...deltas: JsonRecord[]) =>

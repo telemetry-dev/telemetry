@@ -412,10 +412,6 @@ function recordContentBlockStart(event: ValueRecord, state: StreamState): void {
   const contentBlock: ValueRecord = asRecord(event.content_block) ?? {};
   const type = readString(contentBlock.type);
 
-  // The final fallback block names the model that served the response.
-  if (type === "fallback")
-    state.responseModel = readString(asRecord(contentBlock.to)?.model) ?? state.responseModel;
-
   if (type === "text") {
     state.blocks.set(index, { type, text: readString(contentBlock.text) ?? "" });
 
@@ -511,6 +507,17 @@ function recordContentBlockDelta(event: ValueRecord, state: StreamState): void {
   }
 }
 
+// A fallback block only marks where a fallback was attempted. The model that served the
+// response is the one on the fallback_message entry in the terminal usage.iterations.
+function fallbackServingModel<T>(usage: T): string | undefined {
+  const iterations = asRecord(usage)?.iterations;
+
+  if (!Array.isArray(iterations)) return undefined;
+  const served = iterations.map(asRecord).findLast((entry) => entry?.type === "fallback_message");
+
+  return readString(served?.model);
+}
+
 function recordStreamEvent<T>(event: T, state: StreamState): SpanFields {
   const record: ValueRecord = asRecord(event) ?? {};
   const type = readString(record.type);
@@ -531,6 +538,7 @@ function recordStreamEvent<T>(event: T, state: StreamState): SpanFields {
     const delta = asRecord(record.delta) ?? {};
     state.finishReason = readString(delta.stop_reason) ?? state.finishReason;
     state.usage = mergeUsage(state.usage, messagesUsage(record.usage));
+    state.responseModel = fallbackServingModel(record.usage) ?? state.responseModel;
   }
 
   return fields;
