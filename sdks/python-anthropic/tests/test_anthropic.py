@@ -1790,15 +1790,21 @@ def test_replacement_budget_invariants_hold_for_random_streams(make: Any) -> Non
             if not replacing or was_truncated or candidate is None:
                 continue
             fits = measure(candidate) <= state.budget.max_bytes - others
+            compaction = delta["type"] == "compaction_delta"
             assert (state.blocks.get(index) == candidate) == fits
-            assert (index in state.superseded) != fits
+            assert (index in state.superseded) == (compaction and not fits)
             output = telemetry_dev_anthropic._stream_output(state)  # pyright: ignore[reportPrivateUsage]
             emitted: list[Any] = output[0]["content"] if output else []
             assert len(emitted) == len(set(state.blocks) - state.superseded)
-            if not fits:
+            if fits:
+                continue
+            assert state.budget.truncated is False
+            if compaction:
                 assert (dict(state.blocks.get(index, {})), state.budget.bytes_used) == before
-                assert state.budget.truncated is False
-                assert index in state.superseded
+            else:
+                # A rejected signature keeps the thinking block without the stale signature.
+                kept = {key: value for key, value in before[0].items() if key != "signature"}
+                assert state.blocks.get(index) == kept
 
 
 def test_stream_omits_compaction_superseded_by_a_rejected_final_replacement(make: Any) -> None:
@@ -1821,4 +1827,34 @@ def test_stream_omits_compaction_superseded_by_a_rejected_final_replacement(make
 
     assert json.loads(str(a["gen_ai.output.messages"])) == [
         {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]}
+    ]
+
+
+def test_rejected_signature_keeps_thinking_and_drops_the_stale_signature(make: Any) -> None:
+    # 800 bytes fits the thinking text (698 bytes) and the block with the short signature
+    # (636 bytes), but not the block with the oversized signature (1233 bytes).
+    memory = make(max_attribute_length=800)
+    a = streamed_beta_span(
+        beta_stream_events(
+            ({"type": "text", "text": ""}, [{"type": "text_delta", "text": "Hi"}]),
+            (
+                {"type": "thinking", "thinking": ""},
+                [
+                    {"type": "thinking_delta", "thinking": "t" * 300},
+                    {"type": "signature_delta", "signature": "sig"},
+                    {"type": "signature_delta", "signature": "s" * 600},
+                ],
+            ),
+        ),
+        memory,
+    )
+
+    assert json.loads(str(a["gen_ai.output.messages"])) == [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Hi"},
+                {"type": "thinking", "thinking": "t" * 300},
+            ],
+        }
     ]

@@ -243,8 +243,8 @@ class _StreamState:
         self.budget = telemetry_dev.CaptureBudget.from_client()
         # Budget bytes and items each block holds: its start plus every accepted delta.
         self.block_reservations: dict[int, tuple[int, int]] = {}
-        # Blocks whose latest replacement was rejected: their retained value is stale, so they
-        # are left out of the output until a later replacement is accepted.
+        # Compaction blocks whose latest replacement was rejected: the retained summary is
+        # stale, so they are left out of the output until a later replacement is accepted.
         self.superseded: set[int] = set()
 
 
@@ -426,6 +426,21 @@ def _reserve_replacement(index: int, block: dict[str, Any], state: _StreamState)
     return False
 
 
+def _drop_stale_signature(index: int, state: _StreamState) -> None:
+    """Keep a thinking block whose newer signature was rejected, without the stale signature.
+
+    The reasoning text is still valid; only the earlier signature no longer matches. The
+    block is re-reserved without it when the budget allows, so the dropped bytes are freed.
+    """
+    block = state.blocks.get(index)
+    if block is None or "signature" not in block:
+        return
+    stripped = {key: value for key, value in block.items() if key != "signature"}
+    state.blocks[index] = stripped
+    if not state.budget.truncated:
+        _reserve_replacement(index, stripped, state)
+
+
 def _record_content_block_delta(event: Any, state: _StreamState) -> None:
     index = _field(event, "index")
     block_index = index if isinstance(index, int) else 0
@@ -438,8 +453,10 @@ def _record_content_block_delta(event: Any, state: _StreamState) -> None:
         if _reserve_replacement(block_index, replaced, state):
             state.blocks[block_index] = replaced
             state.superseded.discard(block_index)
-        else:
+        elif delta_type == "compaction_delta":
             state.superseded.add(block_index)
+        else:
+            _drop_stale_signature(block_index, state)
         return
     if not _reserve(block_index, delta, state):
         return
