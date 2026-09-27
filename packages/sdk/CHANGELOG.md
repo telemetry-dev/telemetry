@@ -2,11 +2,10 @@
 
 ## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.1.5...sdk-v0.1.6) (2026-09-27)
 
-
 ### Features
 
-* **sdk:** add evaluation telemetry ([#14](https://github.com/telemetry-dev/telemetry/issues/14)) ([b1b5218](https://github.com/telemetry-dev/telemetry/commit/b1b521866763b4f090b083530671714823a2384f))
-* **sdk:** trace media, realtime, rerank, and modality token usage ([#17](https://github.com/telemetry-dev/telemetry/issues/17)) ([c489503](https://github.com/telemetry-dev/telemetry/commit/c4895031a27a30004e21dc58f678d0f1ce19c072))
+- **sdk:** add evaluation telemetry ([#14](https://github.com/telemetry-dev/telemetry/issues/14)) ([b1b5218](https://github.com/telemetry-dev/telemetry/commit/b1b521866763b4f090b083530671714823a2384f))
+- **sdk:** trace media, realtime, rerank, and modality token usage ([#17](https://github.com/telemetry-dev/telemetry/issues/17)) ([c489503](https://github.com/telemetry-dev/telemetry/commit/c4895031a27a30004e21dc58f678d0f1ce19c072))
 
 ## [0.1.5](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.1.4...sdk-v0.1.5) (2026-09-12)
 
