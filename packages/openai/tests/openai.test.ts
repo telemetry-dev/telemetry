@@ -2667,6 +2667,7 @@ test.each([
   expect(inputs["openai.batch.retrieve"]).not.toHaveProperty("input_file_id");
   expect(inputs["openai.batch.cancel"]).toMatchObject({ batch_id: "batch_123" });
   expect(inputs["openai.batch.cancel"]).not.toHaveProperty("input_file_id");
+
   for (const span of finished) {
     expect(Object.keys(span.attributes).filter((key) => key.startsWith("gen_ai.usage."))).toEqual(
       [],
