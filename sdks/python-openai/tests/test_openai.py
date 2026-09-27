@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
+import openai
 import pytest
 import telemetry_dev
 from openai import AsyncOpenAI, OpenAI
@@ -18,6 +19,7 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import StatusCode
 from pydantic import BaseModel
 
+import telemetry_dev_openai
 from telemetry_dev_openai import instrument_openai, uninstrument_openai, wrap_openai
 
 SyncHandler = Callable[[httpx.Request], httpx.Response]
@@ -79,6 +81,11 @@ class FailingAsyncByteStream(httpx.AsyncByteStream):
         raise httpx.ReadError(self._message)
 
 
+class UnencodableText(str):
+    def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+        raise AssertionError("capture must not encode the complete transcript")
+
+
 def failing_sync_sse_response(event: Mapping[str, Any], message: str) -> httpx.Response:
     first_chunk = f"data: {json.dumps(event)}\n\n".encode()
     return httpx.Response(
@@ -136,8 +143,19 @@ def chat_completion(
             "prompt_tokens": 11,
             "completion_tokens": 7,
             "total_tokens": 18,
-            "prompt_tokens_details": {"cached_tokens": 3},
-            "completion_tokens_details": {"reasoning_tokens": 2},
+            "prompt_tokens_details": {
+                "cached_tokens": 6,
+                "cached_tokens_details": {
+                    "text_tokens": 1,
+                    "image_tokens": 2,
+                    "audio_tokens": 3,
+                },
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": 2,
+                "text_tokens": 5,
+                "audio_tokens": 2,
+            },
         },
     }
 
@@ -234,7 +252,14 @@ def response_payload(*, response_id: str = "resp_123", text: str = "No jokes.") 
             "input_tokens": 13,
             "output_tokens": 4,
             "total_tokens": 17,
-            "input_tokens_details": {"cached_tokens": 2},
+            "input_tokens_details": {
+                "cached_tokens": 6,
+                "cached_tokens_details": {
+                    "text_tokens": 1,
+                    "image_tokens": 2,
+                    "audio_tokens": 3,
+                },
+            },
             "output_tokens_details": {"reasoning_tokens": 1},
         },
     }
@@ -251,6 +276,551 @@ def embeddings_payload() -> dict[str, Any]:
 
 class ParsedAnswer(BaseModel):
     answer: str
+
+
+def test_image_generation_is_media_span_without_binary_capture(memory: SimpleNamespace) -> None:
+    client = wrap_openai(
+        sync_client(lambda _request: json_response({"created": 1, "data": [{"b64_json": "AAAA"}]}))
+    )
+
+    response = client.images.generate(model="gpt-image-1", prompt="A telemetry graph")
+
+    assert response.data
+    a = attrs(only_span(memory))
+    assert a["gen_ai.operation.name"] == "generate_content"
+    assert a["gen_ai.output.type"] == "image"
+    assert a["gen_ai.request.model"] == "gpt-image-1"
+    assert "AAAA" not in json.dumps(a)
+
+
+def test_responses_capture_recursively_omits_binary_media(memory: SimpleNamespace) -> None:
+    responses_request = vars(telemetry_dev_openai)["_responses_request"]
+    responses_response = vars(telemetry_dev_openai)["_responses_response"]
+    _, request = responses_request(
+        {
+            "model": "gpt-4.1",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": "INPUT_AUDIO", "format": "wav"},
+                        },
+                        {"type": "input_image", "image_url": "data:image/png;base64,INPUT_IMAGE"},
+                        {"type": "input_image", "image_url": "https://example.com/image.png"},
+                        {"type": "input_file", "file_data": "INPUT_FILE", "filename": "report.pdf"},
+                    ],
+                }
+            ],
+        }
+    )
+    response = responses_response(
+        {
+            "status": "completed",
+            "output": [
+                {"type": "output_audio", "data": "OUTPUT_AUDIO", "transcript": "hello"},
+                {"type": "image_generation_call", "result": "IMAGE_RESULT", "status": "completed"},
+            ],
+        }
+    )
+
+    captured = json.dumps({"request": request, "response": response})
+    assert "INPUT_AUDIO" not in captured
+    assert "INPUT_IMAGE" not in captured
+    assert "INPUT_FILE" not in captured
+    assert "OUTPUT_AUDIO" not in captured
+    assert "IMAGE_RESULT" not in captured
+    assert "https://example.com/image.png" in captured
+    assert "hello" in captured
+
+
+def test_chat_capture_recursively_omits_binary_media(memory: SimpleNamespace) -> None:
+    chat_request = vars(telemetry_dev_openai)["_chat_request"]
+    chat_response = vars(telemetry_dev_openai)["_chat_response"]
+    _, request = chat_request(
+        {
+            "model": "gpt-4o-audio-preview",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": "INPUT_AUDIO", "format": "wav"},
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,INPUT_IMAGE"},
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/image.png"},
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    response = chat_response(
+        {
+            "id": "chatcmpl_media",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "spoken reply",
+                        "audio": {
+                            "id": "audio_1",
+                            "data": "OUTPUT_AUDIO",
+                            "transcript": "spoken reply",
+                        },
+                    },
+                }
+            ],
+        }
+    )
+
+    captured = json.dumps({"request": request, "response": response})
+    assert "INPUT_AUDIO" not in captured
+    assert "INPUT_IMAGE" not in captured
+    assert "OUTPUT_AUDIO" not in captured
+    assert "https://example.com/image.png" in captured
+    assert "spoken reply" in captured
+
+
+def test_disabled_responses_capture_does_not_convert_hostile_values(make: Any) -> None:
+    class Hostile:
+        def model_dump(self, **_kwargs: Any) -> Any:
+            raise AssertionError("capture-disabled payload was traversed")
+
+    make(capture_input=False, capture_output=False)
+    responses_request = vars(telemetry_dev_openai)["_responses_request"]
+    responses_response = vars(telemetry_dev_openai)["_responses_response"]
+
+    _, request = responses_request({"model": "gpt-4.1", "input": Hostile()})
+    response = responses_response({"status": "completed", "output": Hostile()})
+
+    assert request["input"] is None
+    assert response["output"] is None
+
+
+def test_streamed_image_edit_maps_aggregate_output_tokens_to_image(memory: SimpleNamespace) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return sse_response(
+            [
+                {
+                    "type": "image_edit.completed",
+                    "usage": {"input_tokens": 4, "output_tokens": 9, "total_tokens": 13},
+                }
+            ]
+        )
+
+    client = wrap_openai(sync_client(handler))
+    stream = cast(Any, client.images.edit)(
+        image=b"image",
+        prompt="Add telemetry",
+        model="gpt-image-1",
+        stream=True,
+    )
+
+    assert [event.type for event in stream] == ["image_edit.completed"]
+    assert attrs(only_span(memory))["gen_ai.usage.image.output_tokens"] == 9
+
+
+def test_media_stream_preserves_sync_context_manager_cleanup(memory: SimpleNamespace) -> None:
+    client = wrap_openai(
+        sync_client(
+            lambda _request: sse_response(
+                [
+                    {
+                        "type": "image_edit.completed",
+                        "usage": {"input_tokens": 4, "output_tokens": 9, "total_tokens": 13},
+                    }
+                ]
+            )
+        )
+    )
+
+    with cast(Any, client.images.edit)(
+        image=b"image",
+        prompt="Add telemetry",
+        model="gpt-image-1",
+        stream=True,
+    ) as stream:
+        assert next(stream).type == "image_edit.completed"
+
+    assert len(memory.span_exporter.get_finished_spans()) == 1
+
+
+async def test_media_stream_preserves_async_context_manager_cleanup(
+    memory: SimpleNamespace,
+) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return sse_response(
+            [
+                {
+                    "type": "image_edit.completed",
+                    "usage": {"input_tokens": 4, "output_tokens": 9, "total_tokens": 13},
+                }
+            ]
+        )
+
+    client = wrap_openai(async_client(handler))
+    async with await cast(Any, client.images.edit)(
+        image=b"image",
+        prompt="Add telemetry",
+        model="gpt-image-1",
+        stream=True,
+    ) as stream:
+        assert (await stream.__anext__()).type == "image_edit.completed"
+    await client.close()
+
+    assert len(memory.span_exporter.get_finished_spans()) == 1
+
+
+def test_streaming_transcription_records_terminal_text_and_usage(memory: SimpleNamespace) -> None:
+    events = [
+        {"type": "transcript.text.delta", "delta": "partial"},
+        {
+            "type": "transcript.text.done",
+            "text": "complete transcript",
+            "usage": {"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},
+        },
+    ]
+    client = wrap_openai(sync_client(lambda _request: sse_response(events)))
+
+    stream = cast(Any, client.audio.transcriptions.create)(
+        model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
+    )
+
+    assert [event.type for event in stream] == [event["type"] for event in events]
+    a = attrs(only_span(memory))
+    assert a["gen_ai.output.messages"] == "complete transcript"
+    assert a["gen_ai.usage.text.output_tokens"] == 3
+
+
+def test_unpaired_surrogate_does_not_replace_unary_result(memory: SimpleNamespace) -> None:
+    text = "before\ud800after"
+    client = wrap_openai(
+        sync_client(
+            lambda _request: httpx.Response(
+                200,
+                content=json.dumps({"text": text}),
+                headers={"Content-Type": "application/json"},
+            )
+        )
+    )
+
+    response = cast(Any, client.audio.transcriptions.create)(
+        model="gpt-4o-transcribe", file=("audio.wav", b"audio")
+    )
+
+    assert response.text == text
+    assert attrs(only_span(memory))["gen_ai.output.messages"] == text
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_unpaired_surrogate_streams_preserve_events_and_cleanup(
+    memory: SimpleNamespace, async_mode: bool
+) -> None:
+    text = "before\ud800after"
+    events = [
+        {"type": "transcript.text.delta", "delta": text},
+        {"type": "transcript.text.done", "text": text},
+    ]
+
+    if async_mode:
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return sse_response(events)
+
+        client = wrap_openai(async_client(handler))
+        stream = await cast(Any, client.audio.transcriptions.create)(
+            model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
+        )
+        received = [event async for event in stream]
+        assert stream.response.is_closed
+        await client.close()
+    else:
+        client = wrap_openai(sync_client(lambda _request: sse_response(events)))
+        stream = cast(Any, client.audio.transcriptions.create)(
+            model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
+        )
+        received = list(stream)
+        assert stream.response.is_closed
+        client.close()
+
+    assert [event.type for event in received] == [event["type"] for event in events]
+    assert received[-1].text == text
+    assert attrs(only_span(memory))["gen_ai.output.messages"] == text
+
+
+def test_streaming_transcription_terminal_text_replaces_truncated_deltas(
+    memory: SimpleNamespace,
+) -> None:
+    events = [
+        {"type": "transcript.text.delta", "delta": "x" * 70_000},
+        {"type": "transcript.text.done", "text": "complete transcript"},
+    ]
+    client = wrap_openai(sync_client(lambda _request: sse_response(events)))
+
+    stream = cast(Any, client.audio.transcriptions.create)(
+        model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
+    )
+    assert [event.type for event in stream] == [event["type"] for event in events]
+
+    a = attrs(only_span(memory))
+    assert a["gen_ai.output.messages"] == "complete transcript"
+    assert "telemetry.dev.capture.truncated" not in a
+
+
+async def test_async_streaming_transcription_records_terminal_text_and_usage(
+    memory: SimpleNamespace,
+) -> None:
+    events = [
+        {
+            "type": "transcript.text.segment",
+            "id": "segment-1",
+            "start": 0,
+            "end": 1,
+            "speaker": "A",
+            "text": "partial",
+        },
+        {
+            "type": "transcript.text.done",
+            "text": "complete transcript",
+            "usage": {"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},
+        },
+    ]
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    client = wrap_openai(async_client(handler))
+    stream = await cast(Any, client.audio.transcriptions.create)(
+        model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
+    )
+    assert [event.type async for event in stream] == [event["type"] for event in events]
+    await client.close()
+
+    a = attrs(only_span(memory))
+    assert a["gen_ai.output.messages"] == "complete transcript"
+    assert a["gen_ai.usage.text.output_tokens"] == 3
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_interrupted_transcription_stream_records_bounded_partial_text(
+    memory: SimpleNamespace, async_mode: bool
+) -> None:
+    event = {"type": "transcript.text.delta", "delta": "x" * 70_000}
+    if async_mode:
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return failing_async_sse_response(event, "interrupted")
+
+        client = wrap_openai(async_client(handler))
+        stream = await cast(Any, client.audio.transcriptions.create)(
+            model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
+        )
+        with pytest.raises(httpx.ReadError, match="interrupted"):
+            _ = [item async for item in stream]
+        await client.close()
+    else:
+        client = wrap_openai(
+            sync_client(lambda _request: failing_sync_sse_response(event, "interrupted"))
+        )
+        stream = cast(Any, client.audio.transcriptions.create)(
+            model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
+        )
+        with pytest.raises(httpx.ReadError, match="interrupted"):
+            list(stream)
+
+    span = only_span(memory)
+    output = str(attrs(span)["gen_ai.output.messages"])
+    assert output == "x" * 65_536
+    assert attrs(span)["telemetry.dev.capture.truncated"] is True
+
+
+def test_terminal_transcription_capture_is_incrementally_bounded(make: Any) -> None:
+    make(max_attribute_length=5)
+    mapper = vars(telemetry_dev_openai)["_media_stream_event_fields"]
+
+    fields = mapper(
+        SimpleNamespace(type="transcript.text.done", text=UnencodableText("ééé")),
+        vars(telemetry_dev_openai)["_text_media_response"],
+        True,
+    )
+
+    assert fields["output"] == "éé"
+    assert fields["attributes"]["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_transcription_delta_capture_is_incrementally_bounded(
+    make: Any, async_mode: bool
+) -> None:
+    make(max_attribute_length=5)
+    ended: list[dict[str, Any]] = []
+    event = SimpleNamespace(type="transcript.text.delta", delta=UnencodableText("ééé"))
+
+    class Handle:
+        def end(self, **fields: Any) -> None:
+            ended.append(fields)
+
+    if async_mode:
+
+        class Inner:
+            def __init__(self) -> None:
+                self._remaining = True
+
+            def __aiter__(self) -> Inner:
+                return self
+
+            async def __anext__(self) -> Any:
+                if not self._remaining:
+                    raise StopAsyncIteration
+                self._remaining = False
+                return event
+
+        stream_type = vars(telemetry_dev_openai)["_InstrumentedAsyncMediaStream"]
+        stream = stream_type(
+            Inner(), cast(Any, Handle()), vars(telemetry_dev_openai)["_text_media_response"]
+        )
+        assert await stream.__anext__() is event
+        await stream.close()
+    else:
+        stream_type = vars(telemetry_dev_openai)["_InstrumentedMediaStream"]
+        stream = stream_type(
+            iter([event]), cast(Any, Handle()), vars(telemetry_dev_openai)["_text_media_response"]
+        )
+        assert next(stream) is event
+        stream.close()
+
+    assert ended[-1]["output"] == "éé"
+    assert ended[-1]["attributes"]["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_failed_media_stream_events_record_errors(
+    memory: SimpleNamespace, async_mode: bool
+) -> None:
+    event = SimpleNamespace(
+        type="image_generation.failed",
+        error=SimpleNamespace(code="provider_error", message="provider failed"),
+    )
+    handle = telemetry_dev.start_span("image failed", type="generation")
+
+    if async_mode:
+
+        class Inner:
+            def __init__(self) -> None:
+                self._remaining = True
+
+            def __aiter__(self) -> Inner:
+                return self
+
+            async def __anext__(self) -> Any:
+                if not self._remaining:
+                    raise StopAsyncIteration
+                self._remaining = False
+                return event
+
+        stream_type = vars(telemetry_dev_openai)["_InstrumentedAsyncMediaStream"]
+        stream = stream_type(Inner(), handle, vars(telemetry_dev_openai)["_media_response"])
+        assert await stream.__anext__() is event
+    else:
+        stream_type = vars(telemetry_dev_openai)["_InstrumentedMediaStream"]
+        stream = stream_type(iter([event]), handle, vars(telemetry_dev_openai)["_media_response"])
+        assert next(stream) is event
+
+    span = only_span(memory)
+    assert span.status.status_code == StatusCode.ERROR
+    assert attrs(span)["error.type"] == "RuntimeError"
+    assert dict(span.events[0].attributes or {})["exception.message"] == (
+        "provider_error: provider failed"
+    )
+
+
+def test_disabled_transcription_stream_capture_does_not_read_text(make: Any) -> None:
+    class Event:
+        type = "transcript.text.done"
+        usage = SimpleNamespace(output_tokens=2)
+
+        @property
+        def text(self) -> str:
+            raise AssertionError("capture-disabled output was read")
+
+    class Handle:
+        def end(self, **_fields: Any) -> None:
+            pass
+
+    make(capture_output=False)
+    stream_type = vars(telemetry_dev_openai)["_InstrumentedMediaStream"]
+    stream = stream_type(
+        iter([Event()]), cast(Any, Handle()), vars(telemetry_dev_openai)["_text_media_response"]
+    )
+
+    assert next(stream).type == "transcript.text.done"
+
+
+@pytest.mark.parametrize("delegated", [False, True])
+def test_media_stream_context_exit_records_body_and_delegated_errors(delegated: bool) -> None:
+    errors: list[BaseException] = []
+
+    class Handle:
+        def end(self, **fields: Any) -> None:
+            errors.append(fields["error"])
+
+    class Inner:
+        def __exit__(self, _type: Any, _exc: Any, _tb: Any) -> bool:
+            if delegated:
+                raise RuntimeError("exit failed")
+            return False
+
+    stream_type = vars(telemetry_dev_openai)["_InstrumentedMediaStream"]
+    stream = stream_type(
+        Inner(), cast(Any, Handle()), vars(telemetry_dev_openai)["_media_response"]
+    )
+    body_error = ValueError("body failed")
+    if delegated:
+        with pytest.raises(RuntimeError, match="exit failed"):
+            stream.__exit__(None, None, None)
+        assert str(errors[0]) == "exit failed"
+    else:
+        assert stream.__exit__(ValueError, body_error, None) is False
+        assert errors == [body_error]
+
+
+@pytest.mark.parametrize("delegated", [False, True])
+async def test_async_media_stream_context_exit_records_body_and_delegated_errors(
+    delegated: bool,
+) -> None:
+    errors: list[BaseException] = []
+
+    class Handle:
+        def end(self, **fields: Any) -> None:
+            errors.append(fields["error"])
+
+    class Inner:
+        async def __aexit__(self, _type: Any, _exc: Any, _tb: Any) -> bool:
+            if delegated:
+                raise RuntimeError("exit failed")
+            return False
+
+    stream_type = vars(telemetry_dev_openai)["_InstrumentedAsyncMediaStream"]
+    stream = stream_type(
+        Inner(), cast(Any, Handle()), vars(telemetry_dev_openai)["_media_response"]
+    )
+    body_error = ValueError("body failed")
+    if delegated:
+        with pytest.raises(RuntimeError, match="exit failed"):
+            await stream.__aexit__(None, None, None)
+        assert str(errors[0]) == "exit failed"
+    else:
+        assert await stream.__aexit__(ValueError, body_error, None) is False
+        assert errors == [body_error]
 
 
 def test_chat_completion_maps_native_messages_usage_finish_provider_and_sampling(
@@ -296,8 +866,13 @@ def test_chat_completion_maps_native_messages_usage_finish_provider_and_sampling
     assert a["gen_ai.usage.input_tokens"] == 11
     assert a["gen_ai.usage.output_tokens"] == 7
     assert a["gen_ai.usage.total_tokens"] == 18
-    assert a["gen_ai.usage.cache_read.input_tokens"] == 3
+    assert a["gen_ai.usage.cache_read.input_tokens"] == 6
     assert a["gen_ai.usage.reasoning.output_tokens"] == 2
+    assert a["gen_ai.usage.text.cache_read.input_tokens"] == 1
+    assert a["gen_ai.usage.image.cache_read.input_tokens"] == 2
+    assert a["gen_ai.usage.audio.cache_read.input_tokens"] == 3
+    assert a["gen_ai.usage.text.output_tokens"] == 5
+    assert a["gen_ai.usage.audio.output_tokens"] == 2
     assert json.loads(str(a["gen_ai.input.messages"])) == CHAT_MESSAGES
     assert json.loads(str(a["gen_ai.output.messages"])) == [
         {"role": "assistant", "content": "Telemetry works."}
@@ -312,6 +887,16 @@ def test_chat_completion_maps_native_messages_usage_finish_provider_and_sampling
         ("https://openrouter.ai./api/v1", "openrouter"),
         ("https://api.openrouter.ai./api/v1", "openrouter"),
         ("https://openrouter.ai.example.com/api/v1", "openai"),
+        ("https://api.groq.com/openai/v1", "groq"),
+        ("https://api.x.ai/v1", "x_ai"),
+        ("https://api.deepseek.com/v1", "deepseek"),
+        ("https://api.together.xyz/v1", "together_ai"),
+        ("https://api.fireworks.ai/inference/v1", "fireworks_ai"),
+        ("https://groq.com.example.org/v1", "openai"),
+        ("https://notx.ai.example.org/v1", "openai"),
+        ("https://deepseek.com.evil.test/v1", "openai"),
+        ("https://together.xyz.invalid/v1", "openai"),
+        ("https://fireworks.ai.example.com/v1", "openai"),
     ],
 )
 def test_openrouter_base_url_reports_expected_provider(
@@ -908,7 +1493,7 @@ def test_responses_create_and_stream_map_instructions_and_completed_event(
         {"role": "user", "content": "Tell me a joke"}
     ]
     assert json.loads(str(first_attrs["gen_ai.output.messages"])) == response_payload()["output"]
-    assert first_attrs["gen_ai.usage.cache_read.input_tokens"] == 2
+    assert first_attrs["gen_ai.usage.cache_read.input_tokens"] == 6
     assert first_attrs["gen_ai.usage.reasoning.output_tokens"] == 1
     assert list(cast(Any, first_attrs["gen_ai.response.finish_reasons"])) == ["stop"]
     stream_attrs = attrs(stream_span)
@@ -1013,6 +1598,79 @@ def test_responses_stream_bounds_output_without_dropping_terminal_metadata(
             "content": [{"type": "output_text", "text": "prefix", "annotations": []}],
         }
     ]
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def empty_created_then_oversized_terminal() -> list[tuple[str, dict[str, Any]]]:
+    created = response_payload(text="")
+    created["status"] = "in_progress"
+    created["output"] = []
+    completed = response_payload(text="x" * 70_000)
+    completed["output"] = [
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "lookup",
+            "arguments": '{"q":"a"}',
+            "status": "completed",
+        },
+        *completed["output"],
+    ]
+    return [
+        ("response.created", {"type": "response.created", "response": created}),
+        ("response.completed", {"type": "response.completed", "response": completed}),
+    ]
+
+
+def assert_empty_created_output_not_reported(memory: SimpleNamespace) -> None:
+    a = attrs(only_span(memory))
+    assert "gen_ai.output.messages" not in a
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def test_responses_stream_does_not_report_empty_created_output_for_truncated_terminal(
+    memory: SimpleNamespace,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return named_sse_response(empty_created_then_oversized_terminal())
+
+    list(
+        cast(Any, wrap_openai(sync_client(handler)).responses.create)(
+            model="gpt-4o-mini", input="x", stream=True
+        )
+    )
+    assert_empty_created_output_not_reported(memory)
+
+
+def test_responses_stream_fitting_terminal_clears_prior_truncation(memory: SimpleNamespace) -> None:
+    retained = response_payload(text="partial")
+    retained["status"] = "in_progress"
+    oversized = response_payload(text="x" * 70_000)
+    oversized["status"] = "in_progress"
+    completed = response_payload(text="final")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return named_sse_response(
+            [
+                ("response.created", {"type": "response.created", "response": retained}),
+                (
+                    "response.in_progress",
+                    {"type": "response.in_progress", "response": oversized},
+                ),
+                ("response.completed", {"type": "response.completed", "response": completed}),
+            ]
+        )
+
+    list(
+        cast(Any, wrap_openai(sync_client(handler)).responses.create)(
+            model="gpt-4o-mini", input="x", stream=True
+        )
+    )
+
+    a = attrs(only_span(memory))
+    assert json.loads(str(a["gen_ai.output.messages"]))[0]["content"][0]["text"] == "final"
+    assert "telemetry.dev.capture.truncated" not in a
 
 
 def test_embeddings_map_usage_without_output(memory: SimpleNamespace) -> None:
@@ -1167,6 +1825,10 @@ async def test_async_responses_create_and_embeddings_map_usage_like_sync(
     assert response_attrs["gen_ai.usage.input_tokens"] == 13
     assert response_attrs["gen_ai.usage.output_tokens"] == 4
     assert response_attrs["gen_ai.usage.total_tokens"] == 17
+    assert response_attrs["gen_ai.usage.cache_read.input_tokens"] == 6
+    assert response_attrs["gen_ai.usage.text.cache_read.input_tokens"] == 1
+    assert response_attrs["gen_ai.usage.image.cache_read.input_tokens"] == 2
+    assert response_attrs["gen_ai.usage.audio.cache_read.input_tokens"] == 3
     embedding_attrs = attrs(embedding_span)
     assert embedding_span.name == "embeddings text-embedding-3-small"
     assert embedding_attrs["gen_ai.operation.name"] == "embeddings"
@@ -1174,6 +1836,53 @@ async def test_async_responses_create_and_embeddings_map_usage_like_sync(
     assert embedding_attrs["gen_ai.response.model"] == "text-embedding-3-small"
     assert embedding_attrs["gen_ai.usage.input_tokens"] == 6
     assert embedding_attrs["gen_ai.usage.total_tokens"] == 6
+
+
+@pytest.mark.parametrize("method", ["retrieve", "cancel"])
+def test_batch_positional_id_is_recorded_when_sync_request_errors(
+    memory: SimpleNamespace, method: str
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": {"message": "batch failed"}})
+
+    client = wrap_openai(sync_client(handler))
+
+    with pytest.raises(openai.APIStatusError):
+        getattr(client.batches, method)("batch_positional")
+
+    span = only_span(memory)
+    assert span.status.status_code == StatusCode.ERROR
+    assert attrs(span)["openai.batch.id"] == "batch_positional"
+
+
+@pytest.mark.parametrize("method", ["retrieve", "cancel"])
+async def test_batch_positional_id_is_recorded_when_async_request_errors(
+    memory: SimpleNamespace, method: str
+) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": {"message": "batch failed"}})
+
+    client = wrap_openai(async_client(handler))
+
+    with pytest.raises(openai.APIStatusError):
+        await getattr(client.batches, method)("batch_positional")
+    await client.close()
+
+    span = only_span(memory)
+    assert span.status.status_code == StatusCode.ERROR
+    assert attrs(span)["openai.batch.id"] == "batch_positional"
+
+
+async def test_async_batch_list_remains_directly_async_iterable(memory: SimpleNamespace) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return json_response({"object": "list", "data": [], "has_more": False})
+
+    client = wrap_openai(async_client(handler))
+    batches = [batch async for batch in client.batches.list()]
+    await client.close()
+
+    assert batches == []
+    assert memory.span_exporter.get_finished_spans() == ()
 
 
 async def test_async_chat_stream_iteration_error_records_one_error_span(
@@ -1398,6 +2107,20 @@ def test_double_instrument_is_idempotent_and_uninstrument_restores_once(
     uninstrumented = sync_client(handler)
     cast(Any, uninstrumented.chat.completions.create)(model="gpt-4o-mini", messages=CHAT_MESSAGES)
     assert len(memory.span_exporter.get_finished_spans()) == 1
+
+
+def test_uninstrument_preserves_a_later_class_owner() -> None:
+    original = Completions.create
+
+    def later_owner(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return original(self, *args, **kwargs)
+
+    instrument_openai()
+    Completions.create = later_owner
+    uninstrument_openai()
+
+    assert Completions.create is later_owner
+    Completions.create = original
 
 
 def test_wrap_openai_is_idempotent(memory: SimpleNamespace) -> None:
@@ -1760,6 +2483,51 @@ async def test_async_responses_stream_bounds_output_without_dropping_terminal_me
             "content": [{"type": "output_text", "text": "prefix", "annotations": []}],
         }
     ]
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+async def test_async_responses_stream_does_not_report_empty_created_output_for_truncated_terminal(
+    memory: SimpleNamespace,
+) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return named_sse_response(empty_created_then_oversized_terminal())
+
+    client = wrap_openai(async_client(handler))
+    stream = await cast(Any, client.responses.create)(model="gpt-4o-mini", input="x", stream=True)
+    [event async for event in stream]
+    await client.close()
+    assert_empty_created_output_not_reported(memory)
+
+
+async def test_async_responses_stream_fitting_terminal_clears_prior_truncation(
+    memory: SimpleNamespace,
+) -> None:
+    retained = response_payload(text="partial")
+    retained["status"] = "in_progress"
+    oversized = response_payload(text="x" * 70_000)
+    oversized["status"] = "in_progress"
+    completed = response_payload(text="final")
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return named_sse_response(
+            [
+                ("response.created", {"type": "response.created", "response": retained}),
+                (
+                    "response.in_progress",
+                    {"type": "response.in_progress", "response": oversized},
+                ),
+                ("response.completed", {"type": "response.completed", "response": completed}),
+            ]
+        )
+
+    client = wrap_openai(async_client(handler))
+    stream = await cast(Any, client.responses.create)(model="gpt-4o-mini", input="x", stream=True)
+    assert len([event async for event in stream]) == 3
+    await client.close()
+
+    a = attrs(only_span(memory))
+    assert json.loads(str(a["gen_ai.output.messages"]))[0]["content"][0]["text"] == "final"
+    assert "telemetry.dev.capture.truncated" not in a
 
 
 async def test_async_responses_stream_existing_response_is_instrumented(
@@ -1919,3 +2687,128 @@ def test_chat_stream_manager_context_exit_closes_response_and_ends_span_once(
     assert json.loads(str(attrs(spans[0])["gen_ai.output.messages"])) == [
         {"role": "assistant", "content": "Hello"}
     ]
+
+
+def test_text_media_response_captures_text_and_falls_back_text_tokens(
+    memory: SimpleNamespace,
+) -> None:
+    mapper = vars(telemetry_dev_openai)["_text_media_response"]
+    fields = mapper(
+        SimpleNamespace(text="transcript", usage=SimpleNamespace(output_tokens=7, total_tokens=7))
+    )
+    assert fields["output"] == "transcript"
+    assert fields["usage"]["text_output_tokens"] == 7
+
+
+def test_text_media_response_capture_is_incrementally_bounded(make: Any) -> None:
+    make(max_attribute_length=5)
+    mapper = vars(telemetry_dev_openai)["_text_media_response"]
+
+    fields = mapper(SimpleNamespace(text=UnencodableText("ééé")))
+
+    assert fields["output"] == "éé"
+    assert fields["attributes"]["telemetry.dev.capture.truncated"] is True
+
+
+def test_bounded_responses_conversion_does_not_model_dump(memory: SimpleNamespace) -> None:
+    class Bomb:
+        def __init__(self) -> None:
+            self.output = [{"type": "output_text", "text": "x" * 100_000}]
+            self.status = "completed"
+
+        def model_dump(self, **kwargs: Any) -> Any:
+            raise AssertionError("model_dump must not run")
+
+    fields = vars(telemetry_dev_openai)["_responses_response"](Bomb())
+    assert fields["output"] is None
+    assert fields["attributes"]["telemetry.dev.capture.truncated"] is True
+
+
+def test_bounded_responses_capture_repeats_shared_acyclic_values(
+    memory: SimpleNamespace,
+) -> None:
+    shared = {"text": "same"}
+
+    captured, truncated = vars(telemetry_dev_openai)["_bounded_responses_capture"]([shared, shared])
+
+    assert captured == [{"text": "same"}, {"text": "same"}]
+    assert truncated is False
+
+
+def test_bounded_responses_capture_normalizes_opaque_values(memory: SimpleNamespace) -> None:
+    class Opaque:
+        __slots__ = ()
+
+    captured, truncated = vars(telemetry_dev_openai)["_bounded_responses_capture"](
+        {"opaque": Opaque()}
+    )
+
+    assert captured == {"opaque": None}
+    assert json.dumps(captured) == '{"opaque": null}'
+    assert truncated is False
+
+
+def test_bounded_responses_capture_propagates_process_control_exceptions(
+    memory: SimpleNamespace,
+) -> None:
+    class InterruptingMapping(dict[str, Any]):
+        def items(self) -> Any:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        vars(telemetry_dev_openai)["_bounded_responses_capture"](
+            InterruptingMapping(value="unread")
+        )
+
+
+@pytest.mark.parametrize("kind", ["oversized", "deep", "cyclic", "hostile"])
+def test_responses_input_capture_failure_never_blocks_provider(
+    memory: SimpleNamespace, kind: str
+) -> None:
+    class HostileMapping(dict[str, Any]):
+        def items(self) -> Any:
+            raise RuntimeError("hostile mapping")
+
+    if kind == "oversized":
+        value: Any = {"text": "x" * 70_000}
+    elif kind == "deep":
+        value = {}
+        cursor = value
+        for _ in range(40):
+            child: dict[str, Any] = {}
+            cursor["child"] = child
+            cursor = child
+    elif kind == "cyclic":
+        value = {}
+        value["self"] = value
+    else:
+        value = HostileMapping(value="x")
+    called = False
+
+    def provider(**_kwargs: Any) -> SimpleNamespace:
+        nonlocal called
+        called = True
+        return SimpleNamespace()
+
+    def response_mapper(_response: Any) -> dict[str, Any]:
+        return {}
+
+    def provider_resolver(_resource: object | None) -> str:
+        return "openai"
+
+    wrapper = vars(telemetry_dev_openai)["_wrap_sync"](
+        provider,
+        "responses",
+        vars(telemetry_dev_openai)["_responses_request"],
+        response_mapper,
+        provider_resolver,
+        False,
+    )
+
+    wrapper(model="gpt-4.1", input=value)
+    assert called
+
+    if kind == "oversized":
+        span = memory.span_exporter.get_finished_spans()[-1]
+        assert "gen_ai.input.messages" not in attrs(span)
+        assert attrs(span)["telemetry.dev.capture.truncated"] is True

@@ -1,6 +1,6 @@
 # telemetry-dev-litellm
 
-LiteLLM integration for the telemetry.dev Python SDK. It instruments `litellm.completion`, `litellm.acompletion`, `litellm.embedding`, `litellm.aembedding`, streaming `CustomStreamWrapper` responses, and `litellm.Router` calls by emitting spans through the public `telemetry_dev.start_span` API.
+LiteLLM integration for the telemetry.dev Python SDK. It instruments LiteLLM completion, Responses, embedding, and rerank APIs, including their async and streaming variants, and `litellm.Router` methods when available.
 
 ## Install
 
@@ -37,7 +37,7 @@ response = completion(
 )
 ```
 
-Available drop-ins: `completion`, `acompletion`, `embedding`, `aembedding`. Each resolves the current `litellm.<function>` at call time. If global instrumentation is already active, it delegates to the globally wrapped function so the call produces exactly one span.
+Available drop-ins: `completion`, `acompletion`, `responses`, `aresponses`, `embedding`, `aembedding`, `rerank`, `arerank`. Each resolves the current `litellm.<function>` at call time. If global instrumentation is already active, it delegates to the globally wrapped function so the call produces exactly one span.
 
 ## Global instrumentation
 
@@ -50,12 +50,16 @@ response = litellm.completion(model="gpt-4o-mini", messages=[...])
 uninstrument_litellm()
 ```
 
-`instrument_litellm()` patches exactly four package attributes:
+`instrument_litellm()` patches these package attributes when LiteLLM provides them:
 
 - `litellm.completion`
 - `litellm.acompletion`
 - `litellm.embedding`
 - `litellm.aembedding`
+- `litellm.rerank`
+- `litellm.arerank`
+- `litellm.responses`
+- `litellm.aresponses`
 
 It is thread-safe and idempotent. `uninstrument_litellm()` restores the original objects and is also idempotent.
 
@@ -105,7 +109,14 @@ Embedding spans use `type="embedding"` and emit `gen_ai.operation.name="embeddin
 - response model, usage, cost when available
 - no embedding vectors as output
 
-Usage keys follow the core SDK contract: `input_tokens`, `output_tokens`, `total_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, and `reasoning_output_tokens`.
+Rerank spans emit `gen_ai.operation.name="rerank"`:
+
+- request model, provider, query, documents, ranking options, and metadata
+- response id, ranked results and scores, result count, provider search units, token usage, and cost when available
+
+Responses spans emit `gen_ai.operation.name="chat"` and capture request input, instructions, sampling options, metadata, response output/status/id, usage, cost, and provider. Streaming Responses events are handled separately from chat chunks; terminal failure and error events mark the span as failed, and early close records the partial output collected so far.
+
+Aggregate usage keys are `input_tokens`, `output_tokens`, `total_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, and `reasoning_output_tokens`. The core contract also includes modality fields; Responses usage emits text, image, and audio input/output token details when LiteLLM exposes them.
 
 ## Streaming
 
@@ -142,7 +153,7 @@ LiteLLM's synchronous response metadata is used when available: `_hidden_params.
 
 ## Limitations
 
-- Instrumented surfaces are limited to `completion`, `acompletion`, `embedding`, `aembedding`, and the same four methods on `Router` via `wrap_router`. `text_completion`, `litellm.responses`, image/audio/rerank/batch APIs, and provider-specific APIs are out of scope for this package version.
+- Instrumented surfaces are limited to `completion`, `acompletion`, `responses`, `aresponses`, `embedding`, `aembedding`, `rerank`, `arerank`, and the corresponding methods available on `Router` via `wrap_router`. `text_completion`, image/audio/batch APIs, and provider-specific APIs are out of scope for this package version.
 - References imported from LiteLLM before `instrument_litellm()` are not patched.
 - Internal `num_retries` retries are not separate spans; Router deployment attempts are.
 - OTel's built-in-tools scenario is not portable across LiteLLM providers and is not covered by the examples.

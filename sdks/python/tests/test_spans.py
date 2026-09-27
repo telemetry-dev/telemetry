@@ -115,6 +115,15 @@ def test_full_field_mapping(memory: SimpleNamespace) -> None:
             "cache_read_input_tokens": 2,
             "cache_creation_input_tokens": 1,
             "reasoning_output_tokens": 3,
+            "text_input_tokens": 6,
+            "text_output_tokens": 2,
+            "text_cache_read_input_tokens": 1,
+            "image_input_tokens": 4,
+            "image_output_tokens": 7,
+            "image_cache_read_input_tokens": 1,
+            "audio_input_tokens": 1,
+            "audio_output_tokens": 5,
+            "audio_cache_read_input_tokens": 0,
         },
         cost_usd=0.0123,
         time_to_first_chunk_ms=250,
@@ -134,6 +143,15 @@ def test_full_field_mapping(memory: SimpleNamespace) -> None:
     assert a["gen_ai.usage.cache_read.input_tokens"] == 2
     assert a["gen_ai.usage.cache_creation.input_tokens"] == 1
     assert a["gen_ai.usage.reasoning.output_tokens"] == 3
+    assert a["gen_ai.usage.text.input_tokens"] == 6
+    assert a["gen_ai.usage.text.output_tokens"] == 2
+    assert a["gen_ai.usage.text.cache_read.input_tokens"] == 1
+    assert a["gen_ai.usage.image.input_tokens"] == 4
+    assert a["gen_ai.usage.image.output_tokens"] == 7
+    assert a["gen_ai.usage.image.cache_read.input_tokens"] == 1
+    assert a["gen_ai.usage.audio.input_tokens"] == 1
+    assert a["gen_ai.usage.audio.output_tokens"] == 5
+    assert a["gen_ai.usage.audio.cache_read.input_tokens"] == 0
     assert a["gen_ai.usage.cost"] == 0.0123
     assert a["gen_ai.request.temperature"] == 0.2
     assert a["gen_ai.request.top_p"] == 0.9

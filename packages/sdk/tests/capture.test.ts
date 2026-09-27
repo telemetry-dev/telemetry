@@ -1,6 +1,6 @@
-import { afterEach, expect, test } from "vitest";
+import { afterEach, describe, expect, test } from "vitest";
 
-import { TRUNCATION_MARKER } from "../src/capture.ts";
+import { boundedCapture, boundedCaptureDetails, TRUNCATION_MARKER } from "../src/capture.ts";
 import { flush, observe, shutdown, startSpan } from "../src/index.ts";
 import { setup } from "./helpers.ts";
 
@@ -8,118 +8,224 @@ afterEach(async () => {
   await shutdown();
 });
 
-test("mask receives the structured value and the attribute key before stringification", async () => {
-  const calls: Array<{ key: string; value: unknown }> = [];
+describe("boundedCapture", () => {
+  test("captures repeated acyclic references independently", () => {
+    const shared = { text: "same" };
 
-  const { spans } = setup({
-    mask: (value, ctx) => {
-      calls.push({ key: ctx.key, value });
-
-      if (ctx.key === "gen_ai.input.messages") return { redacted: true };
-
-      return value;
-    },
+    expect(boundedCapture([shared, shared])).toEqual({
+      value: [{ text: "same" }, { text: "same" }],
+      truncated: false,
+    });
   });
 
-  startSpan("masked", {
-    type: "generation",
-    input: { prompt: "secret", ssn: "123-45-6789" },
-    output: "visible",
-  }).end();
-  await flush();
-  const inputCall = calls.find((c) => c.key === "gen_ai.input.messages")!;
-  // Structured object, not a JSON string.
-  expect(inputCall.value).toEqual({ prompt: "secret", ssn: "123-45-6789" });
-  const span = spans.getFinishedSpans()[0]!;
-  expect(span.attributes["gen_ai.input.messages"]).toBe(JSON.stringify({ redacted: true }));
-  expect(span.attributes["gen_ai.output.messages"]).toBe("visible");
-});
-
-test("mask returning undefined drops the content attribute", async () => {
-  const { spans } = setup({ mask: () => undefined });
-  startSpan("dropped", { type: "generation", input: "secret" }).end();
-  await flush();
-  expect(spans.getFinishedSpans()[0]!.attributes["gen_ai.input.messages"]).toBeUndefined();
-});
-
-test("a throwing mask drops content but never the span", async () => {
-  const { spans } = setup({
-    mask: () => {
-      throw new Error("mask broke");
-    },
-    onError: () => {},
+  test("reports the retained JSON size without changing the public result", () => {
+    expect(boundedCaptureDetails({ text: "same" })).toEqual({
+      value: { text: "same" },
+      truncated: false,
+      bytes: 15,
+      items: 2,
+    });
   });
 
-  startSpan("survives", { input: "content" }).end();
-  await flush();
-  const span = spans.getFinishedSpans()[0]!;
-  expect(span.attributes["gen_ai.input.messages"]).toBeUndefined();
-  expect(span.name).toBe("survives");
+  test("restores tentative object and array charges after rejecting a value", () => {
+    expect(boundedCapture({ a: "oversized", b: 0 }, { maxBytes: 7 })).toEqual({
+      value: { b: 0 },
+      truncated: true,
+    });
+    expect(boundedCapture(["oversized", 0], { maxBytes: 3 })).toEqual({
+      value: [0],
+      truncated: true,
+    });
+  });
+
+  test("caps traversal attempts when rejected values retain no bytes", () => {
+    const input = Array.from({ length: 1_100 }, () => "oversized");
+    input.push("kept");
+
+    expect(boundedCapture(input, { maxBytes: 10 })).toEqual({
+      value: [],
+      truncated: true,
+    });
+
+    const skipped = Object.fromEntries(
+      Array.from({ length: 1_100 }, (_, index) => [`skip${index}`, index]),
+    );
+
+    skipped.kept = 1;
+
+    expect(boundedCapture(skipped, { skip: (key) => key.startsWith("skip") })).toEqual({
+      value: {},
+      truncated: true,
+    });
+  });
+
+  test("counts inherited enumerable properties toward the traversal cap", () => {
+    const prototype = Object.fromEntries(
+      Array.from({ length: 1_100 }, (_, index) => [`inherited${index}`, index]),
+    );
+
+    const input: object = Object.create(prototype);
+
+    expect(boundedCapture(input, { maxItems: 10 })).toEqual({
+      value: {},
+      truncated: true,
+    });
+  });
+
+  test.each([
+    ["maxBytes", Number.NaN],
+    ["maxBytes", Number.POSITIVE_INFINITY],
+    ["maxDepth", -1],
+    ["maxDepth", 1.5],
+    ["maxItems", Number.NaN],
+    ["maxItems", Number.MAX_VALUE],
+  ] as const)("rejects unsafe %s limit %s", (name, value) => {
+    expect(() => boundedCapture({ value: "kept" }, { [name]: value })).toThrow(RangeError);
+  });
+
+  test("measures escaped and non-BMP strings by their JSON UTF-8 size", () => {
+    expect(boundedCapture("😀", { maxBytes: 6 })).toEqual({ value: "😀", truncated: false });
+    expect(boundedCapture("😀", { maxBytes: 5 })).toEqual({
+      value: undefined,
+      truncated: true,
+    });
+    expect(boundedCapture("\n", { maxBytes: 4 })).toEqual({ value: "\n", truncated: false });
+    expect(boundedCapture("\n", { maxBytes: 3 })).toEqual({
+      value: undefined,
+      truncated: true,
+    });
+  });
 });
 
-test("content is truncated to the cap with the marker, marker surviving the span limit", async () => {
-  const { spans } = setup();
-  startSpan("big", { input: "x".repeat(70000) }).end();
-  await flush();
-  const value = String(spans.getFinishedSpans()[0]!.attributes["gen_ai.input.messages"]);
-  expect(value.length).toBe(65536);
-  expect(value.endsWith(TRUNCATION_MARKER)).toBe(true);
-});
+describe("capture integration", () => {
+  test("passes structured values and attribute keys to the mask", async () => {
+    const calls: Array<{ key: string; value: unknown }> = [];
 
-test("truncation counts UTF-16 code units, matching the Python SDK on astral-plane content", async () => {
-  const { spans } = setup();
-  startSpan("emoji", { input: "🤖".repeat(40000) }).end();
-  await flush();
-  const value = String(spans.getFinishedSpans()[0]!.attributes["gen_ai.input.messages"]);
-  expect(value.length).toBe(65536);
-  expect(value).toBe("🤖".repeat(32761) + TRUNCATION_MARKER);
-});
+    const { spans } = setup({
+      mask: (value, ctx) => {
+        calls.push({ key: ctx.key, value });
 
-test("custom maxAttributeLength applies", async () => {
-  const { spans } = setup({ maxAttributeLength: 100 });
-  startSpan("small-cap", { input: "y".repeat(500) }).end();
-  await flush();
-  const value = String(spans.getFinishedSpans()[0]!.attributes["gen_ai.input.messages"]);
-  expect(value.length).toBe(100);
-  expect(value.endsWith(TRUNCATION_MARKER)).toBe(true);
-});
+        if (ctx.key === "gen_ai.input.messages") return { redacted: true };
 
-test("global captureInput:false drops inputs everywhere; per-call override re-enables", async () => {
-  const { spans } = setup({ captureInput: false });
-  startSpan("default-off", { input: "hidden" }).end();
-  startSpan("explicit-on", { input: "shown", captureInput: true }).end();
-  await flush();
-  const exported = spans.getFinishedSpans();
-  expect(
-    exported.find((s) => s.name === "default-off")!.attributes["gen_ai.input.messages"],
-  ).toBeUndefined();
-  expect(exported.find((s) => s.name === "explicit-on")!.attributes["gen_ai.input.messages"]).toBe(
-    "shown",
-  );
-});
+        return value;
+      },
+    });
 
-test("global captureOutput:false drops outputs including observe results", async () => {
-  const { spans } = setup({ captureOutput: false });
-  startSpan("no-output", { output: "hidden" }).end();
-  const observed = observe(() => "also hidden", { name: "observed-no-output" });
-  expect(observed()).toBe("also hidden");
-  await flush();
-  const exported = spans.getFinishedSpans();
-  expect(
-    exported.find((span) => span.name === "no-output")!.attributes["gen_ai.output.messages"],
-  ).toBeUndefined();
-  expect(
-    exported.find((span) => span.name === "observed-no-output")!.attributes[
-      "gen_ai.output.messages"
-    ],
-  ).toBeUndefined();
-});
+    startSpan("masked", {
+      type: "generation",
+      input: { prompt: "secret", ssn: "123-45-6789" },
+      output: "visible",
+    }).end();
+    await flush();
 
-test("metadata values flow through truncation", async () => {
-  const { spans } = setup({ maxAttributeLength: 50 });
-  startSpan("meta", { metadata: { blob: "z".repeat(200) } }).end();
-  await flush();
-  const value = String(spans.getFinishedSpans()[0]!.attributes["td.metadata.blob"]);
-  expect(value.length).toBe(50);
-  expect(value.endsWith(TRUNCATION_MARKER)).toBe(true);
+    const inputCall = calls.find((call) => call.key === "gen_ai.input.messages")!;
+    expect(inputCall.value).toEqual({ prompt: "secret", ssn: "123-45-6789" });
+    const span = spans.getFinishedSpans()[0]!;
+    expect(span.attributes["gen_ai.input.messages"]).toBe(JSON.stringify({ redacted: true }));
+    expect(span.attributes["gen_ai.output.messages"]).toBe("visible");
+  });
+
+  test("fails closed when the mask returns undefined or throws", async () => {
+    const dropped = setup({ mask: () => undefined });
+    startSpan("dropped", { type: "generation", input: "secret" }).end();
+    await flush();
+    expect(
+      dropped.spans.getFinishedSpans()[0]!.attributes["gen_ai.input.messages"],
+    ).toBeUndefined();
+
+    await shutdown();
+
+    const throwing = setup({
+      mask: () => {
+        throw new Error("mask broke");
+      },
+      onError: () => {},
+    });
+
+    startSpan("survives", { input: "content" }).end();
+    await flush();
+
+    const span = throwing.spans.getFinishedSpans()[0]!;
+    expect(span.attributes["gen_ai.input.messages"]).toBeUndefined();
+    expect(span.name).toBe("survives");
+  });
+
+  test("preserves truncation markers at default and custom span limits", async () => {
+    const defaults = setup();
+    startSpan("big", { input: "x".repeat(70_000) }).end();
+    await flush();
+
+    const defaultValue = String(
+      defaults.spans.getFinishedSpans()[0]!.attributes["gen_ai.input.messages"],
+    );
+
+    expect(defaultValue.length).toBe(65_536);
+    expect(defaultValue.endsWith(TRUNCATION_MARKER)).toBe(true);
+
+    await shutdown();
+
+    const custom = setup({ maxAttributeLength: 100 });
+    startSpan("small-cap", { input: "y".repeat(500) }).end();
+    await flush();
+
+    const customValue = String(
+      custom.spans.getFinishedSpans()[0]!.attributes["gen_ai.input.messages"],
+    );
+
+    expect(customValue.length).toBe(100);
+    expect(customValue.endsWith(TRUNCATION_MARKER)).toBe(true);
+  });
+
+  test("counts non-BMP content in UTF-16 code units", async () => {
+    const { spans } = setup();
+    startSpan("emoji", { input: "🤖".repeat(40_000) }).end();
+    await flush();
+
+    const value = String(spans.getFinishedSpans()[0]!.attributes["gen_ai.input.messages"]);
+    expect(value.length).toBe(65_536);
+    expect(value).toBe("🤖".repeat(32_761) + TRUNCATION_MARKER);
+  });
+
+  test("honors global input and output capture controls", async () => {
+    const inputCapture = setup({ captureInput: false });
+    startSpan("default-off", { input: "hidden" }).end();
+    startSpan("explicit-on", { input: "shown", captureInput: true }).end();
+    await flush();
+
+    const inputSpans = inputCapture.spans.getFinishedSpans();
+    expect(
+      inputSpans.find((span) => span.name === "default-off")!.attributes["gen_ai.input.messages"],
+    ).toBeUndefined();
+    expect(
+      inputSpans.find((span) => span.name === "explicit-on")!.attributes["gen_ai.input.messages"],
+    ).toBe("shown");
+
+    await shutdown();
+
+    const outputCapture = setup({ captureOutput: false });
+    startSpan("no-output", { output: "hidden" }).end();
+    const observed = observe(() => "also hidden", { name: "observed-no-output" });
+    expect(observed()).toBe("also hidden");
+    await flush();
+
+    const outputSpans = outputCapture.spans.getFinishedSpans();
+    expect(
+      outputSpans.find((span) => span.name === "no-output")!.attributes["gen_ai.output.messages"],
+    ).toBeUndefined();
+    expect(
+      outputSpans.find((span) => span.name === "observed-no-output")!.attributes[
+        "gen_ai.output.messages"
+      ],
+    ).toBeUndefined();
+  });
+
+  test("applies the attribute limit to metadata", async () => {
+    const { spans } = setup({ maxAttributeLength: 50 });
+    startSpan("meta", { metadata: { blob: "z".repeat(200) } }).end();
+    await flush();
+
+    const value = String(spans.getFinishedSpans()[0]!.attributes["td.metadata.blob"]);
+    expect(value.length).toBe(50);
+    expect(value.endsWith(TRUNCATION_MARKER)).toBe(true);
+  });
 });

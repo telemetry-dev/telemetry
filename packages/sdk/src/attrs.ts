@@ -32,6 +32,15 @@ export interface TokenUsage {
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
   reasoningOutputTokens?: number;
+  textInputTokens?: number;
+  textOutputTokens?: number;
+  textCacheReadInputTokens?: number;
+  imageInputTokens?: number;
+  imageOutputTokens?: number;
+  imageCacheReadInputTokens?: number;
+  audioInputTokens?: number;
+  audioOutputTokens?: number;
+  audioCacheReadInputTokens?: number;
 }
 
 export interface GenerationFields {
@@ -103,6 +112,15 @@ export function fieldsToAttributes(
     "gen_ai.usage.cache_read.input_tokens": fields.usage?.cacheReadInputTokens,
     "gen_ai.usage.cache_creation.input_tokens": fields.usage?.cacheCreationInputTokens,
     "gen_ai.usage.reasoning.output_tokens": fields.usage?.reasoningOutputTokens,
+    "gen_ai.usage.text.input_tokens": fields.usage?.textInputTokens,
+    "gen_ai.usage.text.output_tokens": fields.usage?.textOutputTokens,
+    "gen_ai.usage.text.cache_read.input_tokens": fields.usage?.textCacheReadInputTokens,
+    "gen_ai.usage.image.input_tokens": fields.usage?.imageInputTokens,
+    "gen_ai.usage.image.output_tokens": fields.usage?.imageOutputTokens,
+    "gen_ai.usage.image.cache_read.input_tokens": fields.usage?.imageCacheReadInputTokens,
+    "gen_ai.usage.audio.input_tokens": fields.usage?.audioInputTokens,
+    "gen_ai.usage.audio.output_tokens": fields.usage?.audioOutputTokens,
+    "gen_ai.usage.audio.cache_read.input_tokens": fields.usage?.audioCacheReadInputTokens,
     "gen_ai.usage.cost": fields.costUsd,
     "gen_ai.response.finish_reasons": fields.finishReason ? [fields.finishReason] : undefined,
     "gen_ai.output.type": fields.outputType,

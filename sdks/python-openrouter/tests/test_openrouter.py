@@ -94,8 +94,12 @@ def chat_payload(*, usage: dict[str, Any] | None = None) -> dict[str, Any]:
             "prompt_tokens": 11,
             "completion_tokens": 7,
             "total_tokens": 18,
-            "prompt_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 6},
-            "completion_tokens_details": {"reasoning_tokens": 2},
+            "prompt_tokens_details": {
+                "cached_tokens": 3,
+                "cache_write_tokens": 6,
+                "audio_tokens": 1,
+            },
+            "completion_tokens_details": {"reasoning_tokens": 2, "audio_tokens": 4},
             "cost": 0.0012,
         },
     }
@@ -197,7 +201,12 @@ def embeddings_payload() -> dict[str, Any]:
         "object": "list",
         "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}],
         "model": "openai/text-embedding-3-small",
-        "usage": {"prompt_tokens": 6, "total_tokens": 6, "cost": 0.0001},
+        "usage": {
+            "prompt_tokens": 6,
+            "total_tokens": 6,
+            "prompt_tokens_details": {"text_tokens": 1, "image_tokens": 2, "audio_tokens": 3},
+            "cost": 0.0001,
+        },
     }
 
 
@@ -244,6 +253,8 @@ def test_chat_send_maps_messages_usage_cost_and_sampling(memory: SimpleNamespace
     assert a["gen_ai.usage.cache_read.input_tokens"] == 3
     assert a["gen_ai.usage.cache_creation.input_tokens"] == 6
     assert a["gen_ai.usage.reasoning.output_tokens"] == 2
+    assert a["gen_ai.usage.audio.input_tokens"] == 1
+    assert a["gen_ai.usage.audio.output_tokens"] == 4
     assert a["gen_ai.usage.cost"] == 0.0012
     assert json.loads(str(a["gen_ai.input.messages"])) == CHAT_MESSAGES
     assert json.loads(str(a["gen_ai.output.messages"])) == [
@@ -2044,6 +2055,9 @@ def test_embeddings_generate_maps_usage_without_output(memory: SimpleNamespace) 
     assert a["gen_ai.input.messages"] == "embed me"
     assert a["gen_ai.usage.input_tokens"] == 6
     assert a["gen_ai.usage.total_tokens"] == 6
+    assert a["gen_ai.usage.text.input_tokens"] == 1
+    assert a["gen_ai.usage.image.input_tokens"] == 2
+    assert a["gen_ai.usage.audio.input_tokens"] == 3
     assert a["gen_ai.usage.cost"] == 0.0001
     assert "gen_ai.output.messages" not in a
 

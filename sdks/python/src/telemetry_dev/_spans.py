@@ -72,7 +72,7 @@ NOT_GIVEN: Any = _NotGiven()
 
 
 class Usage(TypedDict, total=False):
-    """Token usage — exactly these six fields are emitted; unknown keys are dropped."""
+    """Token usage; unknown keys are dropped."""
 
     input_tokens: int
     output_tokens: int
@@ -80,6 +80,15 @@ class Usage(TypedDict, total=False):
     cache_read_input_tokens: int
     cache_creation_input_tokens: int
     reasoning_output_tokens: int
+    text_input_tokens: int
+    text_output_tokens: int
+    text_cache_read_input_tokens: int
+    image_input_tokens: int
+    image_output_tokens: int
+    image_cache_read_input_tokens: int
+    audio_input_tokens: int
+    audio_output_tokens: int
+    audio_cache_read_input_tokens: int
 
 
 ParentType = str | Context | SpanContext | None

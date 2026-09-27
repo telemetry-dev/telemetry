@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import Iterator, Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -693,6 +695,1569 @@ async def test_embedding_and_aembedding_map_usage_without_output(memory: SimpleN
         assert "gen_ai.output.messages" not in a
 
 
+async def test_rerank_and_arerank_capture_rankings_usage_and_provider(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    results = [
+        {"index": 1, "relevance_score": 0.93, "document": {"text": "second"}},
+        {"index": 0, "relevance_score": 0.14, "document": {"text": "first"}},
+    ]
+
+    def response(response_id: str, provider: str, search_units: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=response_id,
+            results=results,
+            meta={
+                "billed_units": {"search_units": search_units, "total_tokens": 17},
+                "tokens": {"input_tokens": 15, "output_tokens": 2},
+            },
+            _hidden_params={"custom_llm_provider": provider, "response_cost": 0.004},
+        )
+
+    def fake_rerank(
+        model: str,
+        query: str,
+        documents: list[str | dict[str, Any]],
+        **kwargs: Any,
+    ) -> SimpleNamespace:
+        return response("rerank-sync", "cohere", 1)
+
+    async def fake_arerank(
+        model: str,
+        query: str,
+        documents: list[str | dict[str, Any]],
+        **kwargs: Any,
+    ) -> SimpleNamespace:
+        return response("rerank-async", "voyage", 2)
+
+    monkeypatch.setattr(litellm, "rerank", fake_rerank)
+    monkeypatch.setattr(litellm, "arerank", fake_arerank)
+    documents: list[str | dict[str, Any]] = ["first", {"text": "second", "source": "kb"}]
+
+    sync_response = telemetry_dev_litellm.rerank(
+        "cohere/rerank-v3.5",
+        "best result",
+        documents,
+        top_n=2,
+        rank_fields=["text"],
+        return_documents=True,
+        max_tokens_per_doc=256,
+        metadata={"tenant": "acme"},
+    )
+    instrument_litellm()
+    async_response = await llm.arerank(
+        "voyage/rerank-2.5",
+        "best async result",
+        documents,
+        top_n=1,
+        max_chunks_per_doc=3,
+    )
+
+    assert sync_response.id == "rerank-sync"
+    assert async_response.id == "rerank-async"
+    sync_span, async_span = finished_spans(memory)
+
+    for span, expected_model, expected_provider, expected_id, expected_units in (
+        (sync_span, "rerank-v3.5", "cohere", "rerank-sync", 1),
+        (async_span, "rerank-2.5", "voyage", "rerank-async", 2),
+    ):
+        a = attrs(span)
+        assert span.name == f"rerank {expected_model}"
+        assert a["gen_ai.operation.name"] == "rerank"
+        assert a["gen_ai.request.model"] == expected_model
+        assert a["gen_ai.provider.name"] == expected_provider
+        assert a["gen_ai.response.id"] == expected_id
+        assert a["gen_ai.usage.input_tokens"] == 15
+        assert a["gen_ai.usage.output_tokens"] == 2
+        assert a["gen_ai.usage.total_tokens"] == 17
+        assert a["gen_ai.usage.cost"] == 0.004
+        assert a["td.metadata.result_count"] == 2
+        assert a["td.metadata.search_units"] == expected_units
+        assert json_attr(a["gen_ai.output.messages"]) == results
+
+    assert attrs(sync_span)["td.metadata.tenant"] == "acme"
+    assert json_attr(attrs(sync_span)["gen_ai.input.messages"]) == {
+        "query": "best result",
+        "documents": documents,
+        "top_n": 2,
+        "rank_fields": ["text"],
+        "return_documents": True,
+        "max_tokens_per_doc": 256,
+    }
+    assert json_attr(attrs(async_span)["gen_ai.input.messages"]) == {
+        "query": "best async result",
+        "documents": documents,
+        "top_n": 1,
+        "max_chunks_per_doc": 3,
+    }
+
+
+def test_rerank_bounds_large_results_and_preserves_total_count(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    results = [
+        {"index": index, "relevance_score": 0.5, "document": {"text": "x" * 1_000}}
+        for index in range(2_000)
+    ]
+
+    def fake_rerank(**_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(id="rerank-large", results=results, meta={})
+
+    monkeypatch.setattr(litellm, "rerank", fake_rerank)
+    instrument_litellm()
+
+    llm.rerank(model="cohere/rerank-v3.5", query="best", documents=["document"])
+
+    a = attrs(only_span(memory))
+    assert a["td.metadata.result_count"] == 2_000
+    assert a["telemetry.dev.capture.truncated"] is True
+    assert "gen_ai.output.messages" not in a
+
+
+def test_rerank_bounds_large_inputs_without_changing_provider_documents(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    documents = [{"text": "x" * 1_000, "index": index} for index in range(2_000)]
+    received: list[Any] = []
+
+    def fake_rerank(**kwargs: Any) -> SimpleNamespace:
+        received.append(kwargs["documents"])
+        return SimpleNamespace(id="rerank-large-input", results=[], meta={})
+
+    monkeypatch.setattr(litellm, "rerank", fake_rerank)
+    instrument_litellm()
+
+    llm.rerank(model="cohere/rerank-v3.5", query="best", documents=documents)
+
+    assert received == [documents]
+    a = attrs(only_span(memory))
+    assert a["telemetry.dev.capture.truncated"] is True
+    assert "gen_ai.input.messages" not in a
+
+
+def test_rerank_capture_disabled_counts_results_without_iterating(
+    make: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class CountOnlyResults(Sequence[Any]):
+        def __len__(self) -> int:
+            return 250
+
+        def __getitem__(self, index: int | slice) -> Any:
+            raise AssertionError(f"read result {index}")
+
+    env = make(capture_output=False)
+
+    def fake_rerank(**_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(id="rerank-count", results=CountOnlyResults(), meta={})
+
+    monkeypatch.setattr(litellm, "rerank", fake_rerank)
+    instrument_litellm()
+
+    llm.rerank(model="cohere/rerank-v3.5", query="best", documents=["document"])
+
+    a = attrs(only_span(env))
+    assert a["td.metadata.result_count"] == 250
+    assert "gen_ai.output.messages" not in a
+
+
+def responses_result(status: str = "completed") -> SimpleNamespace:
+    return SimpleNamespace(
+        id="resp_123",
+        model="gpt-4.1-mini",
+        status=status,
+        output=[
+            {
+                "id": "msg_123",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hello"}],
+            }
+        ],
+        usage=SimpleNamespace(
+            input_tokens=12,
+            output_tokens=5,
+            total_tokens=17,
+            input_tokens_details=SimpleNamespace(
+                cached_tokens=2, text_tokens=7, image_tokens=3, audio_tokens=2
+            ),
+            output_tokens_details=SimpleNamespace(
+                reasoning_tokens=1, text_tokens=4, image_tokens=1, audio_tokens=0
+            ),
+        ),
+        error={"message": "provider rejected response"} if status == "failed" else None,
+        _hidden_params={"custom_llm_provider": "openai", "response_cost": 0.002},
+    )
+
+
+async def test_responses_and_aresponses_map_response_shape_and_modalities(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_responses(input: Any, model: str, **kwargs: Any) -> SimpleNamespace:
+        return responses_result()
+
+    async def fake_aresponses(input: Any, model: str, **kwargs: Any) -> SimpleNamespace:
+        return responses_result()
+
+    monkeypatch.setattr(litellm, "responses", fake_responses)
+    monkeypatch.setattr(litellm, "aresponses", fake_aresponses)
+
+    telemetry_dev_litellm.responses(
+        "Describe this",
+        "openai/gpt-4.1-mini",
+        instructions="Be brief",
+        temperature=0.2,
+        top_p=0.8,
+        max_output_tokens=64,
+        metadata={"tenant": "acme"},
+    )
+    instrument_litellm()
+    await llm.aresponses(input=[{"role": "user", "content": "Async"}], model="gpt-4.1-mini")
+
+    sync_span, async_span = finished_spans(memory)
+    sync_attrs = attrs(sync_span)
+    assert sync_span.name == "chat gpt-4.1-mini"
+    assert sync_attrs["gen_ai.operation.name"] == "chat"
+    assert sync_attrs["gen_ai.system_instructions"] == "Be brief"
+    assert sync_attrs["gen_ai.request.temperature"] == 0.2
+    assert sync_attrs["gen_ai.request.top_p"] == 0.8
+    assert sync_attrs["gen_ai.request.max_tokens"] == 64
+    assert sync_attrs["td.metadata.tenant"] == "acme"
+    assert sync_attrs["gen_ai.response.id"] == "resp_123"
+    assert sync_attrs["gen_ai.response.status"] == "completed"
+    assert json_attr(sync_attrs["gen_ai.output.messages"])[0]["type"] == "message"
+    assert sync_attrs["gen_ai.usage.text.input_tokens"] == 7
+    assert sync_attrs["gen_ai.usage.image.input_tokens"] == 3
+    assert sync_attrs["gen_ai.usage.audio.input_tokens"] == 2
+    assert sync_attrs["gen_ai.usage.text.output_tokens"] == 4
+    assert sync_attrs["gen_ai.usage.image.output_tokens"] == 1
+    assert sync_attrs["gen_ai.usage.audio.output_tokens"] == 0
+    assert attrs(async_span)["gen_ai.response.id"] == "resp_123"
+
+
+class ResponsesStream:
+    def __init__(self, events: list[SimpleNamespace]) -> None:
+        self._events = iter(events)
+        self.closed = False
+
+    def __iter__(self) -> ResponsesStream:
+        return self
+
+    def __next__(self) -> SimpleNamespace:
+        return next(self._events)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class AsyncResponsesStream:
+    def __init__(self, events: list[SimpleNamespace]) -> None:
+        self._events = iter(events)
+        self.closed = False
+
+    def __aiter__(self) -> AsyncResponsesStream:
+        return self
+
+    async def __anext__(self) -> SimpleNamespace:
+        try:
+            return next(self._events)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class ResponsesTransport:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class AsyncResponsesTransport:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class RealShapedResponsesStream:
+    def __init__(self, events: list[SimpleNamespace], response: Any) -> None:
+        self._events = iter(events)
+        self.response = response
+
+    def __iter__(self) -> RealShapedResponsesStream:
+        return self
+
+    def __next__(self) -> SimpleNamespace:
+        return next(self._events)
+
+    def __aiter__(self) -> RealShapedResponsesStream:
+        return self
+
+    async def __anext__(self) -> SimpleNamespace:
+        try:
+            return next(self._events)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+
+class FailingResponsesStream:
+    def __init__(self, failure: BaseException, response: Any) -> None:
+        self.failure = failure
+        self.response = response
+
+    def __iter__(self) -> FailingResponsesStream:
+        return self
+
+    def __next__(self) -> SimpleNamespace:
+        raise self.failure
+
+
+class CancellingResponsesStream:
+    def __init__(self, failure: asyncio.CancelledError, response: Any) -> None:
+        self.failure = failure
+        self.response = response
+
+    def __aiter__(self) -> CancellingResponsesStream:
+        return self
+
+    async def __anext__(self) -> SimpleNamespace:
+        raise self.failure
+
+
+def fake_responses_stream(events: list[SimpleNamespace]) -> Any:
+    def fake_responses(*args: Any, **kwargs: Any) -> ResponsesStream:
+        return ResponsesStream(events)
+
+    return fake_responses
+
+
+def test_responses_input_strips_binary_media_and_keeps_remote_references(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream([]))
+    instrument_litellm()
+
+    list(
+        llm.responses(
+            input=[
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "SECRET_AUDIO", "format": "wav"},
+                },
+                {"type": "input_image", "image_url": "https://example.com/image.png"},
+            ],
+            model="gpt-4.1-mini",
+            stream=True,
+        )
+    )
+
+    captured = str(attrs(only_span(memory))["gen_ai.input.messages"])
+    assert "SECRET_AUDIO" not in captured
+    assert "https://example.com/image.png" in captured
+
+
+def test_responses_input_capture_disabled_does_not_traverse_input(
+    make: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class UnreadableInput(Mapping[str, Any]):
+        def __getitem__(self, key: str) -> Any:
+            raise AssertionError(f"read input key {key}")
+
+        def __iter__(self) -> Iterator[str]:
+            raise AssertionError("iterated input")
+
+        def __len__(self) -> int:
+            raise AssertionError("measured input")
+
+    env = make(capture_input=False)
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream([]))
+    instrument_litellm()
+
+    list(llm.responses(input=UnreadableInput(), model="gpt-4.1-mini", stream=True))
+
+    assert "gen_ai.input.messages" not in attrs(only_span(env))
+
+
+async def test_responses_streams_use_events_and_close_early(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    completed = SimpleNamespace(type="response.completed", response=responses_result())
+    sync_inner = ResponsesStream(
+        [
+            SimpleNamespace(type="response.created", response=responses_result()),
+            SimpleNamespace(type="response.output_text.delta", delta="Hel"),
+            SimpleNamespace(type="response.output_text.delta", delta="lo"),
+            completed,
+        ]
+    )
+    async_inner = AsyncResponsesStream(
+        [
+            SimpleNamespace(type="response.output_text.delta", delta="partial"),
+            completed,
+        ]
+    )
+
+    def fake_responses(input: Any, model: str, stream: bool = False, **kwargs: Any) -> Any:
+        return sync_inner
+
+    async def fake_aresponses(input: Any, model: str, stream: bool = False, **kwargs: Any) -> Any:
+        return async_inner
+
+    monkeypatch.setattr(litellm, "responses", fake_responses)
+    monkeypatch.setattr(litellm, "aresponses", fake_aresponses)
+    instrument_litellm()
+
+    stream = llm.responses(input="hi", model="gpt-4.1-mini", stream=True)
+    events = list(stream)
+    assert [event.type for event in events][-1] == "response.completed"
+    assert sync_inner.closed
+
+    async_stream = await llm.aresponses(input="hi", model="gpt-4.1-mini", stream=True)
+    event = await async_stream.__anext__()
+    assert event.delta == "partial"
+    await async_stream.aclose()
+    await async_stream.aclose()
+    assert async_inner.closed
+
+    completed_span, partial_span = finished_spans(memory)
+    assert json_attr(attrs(completed_span)["gen_ai.output.messages"])[0]["type"] == "message"
+    assert isinstance(attrs(completed_span)["gen_ai.response.time_to_first_chunk"], float)
+    assert json_attr(attrs(partial_span)["gen_ai.output.messages"]) == [
+        {"type": "output_text", "text": "partial"}
+    ]
+
+
+def test_responses_stream_capture_disabled_does_not_read_terminal_output(
+    make: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class TerminalResponse:
+        id = "resp_disabled"
+        model = "gpt-4.1-mini"
+        status = "completed"
+        usage = None
+        error = None
+        _hidden_params = None
+
+        @property
+        def output(self) -> object:
+            raise AssertionError("capture-disabled output was read")
+
+    env = make(capture_output=False)
+    events = [SimpleNamespace(type="response.completed", response=TerminalResponse())]
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    list(llm.responses(input="hi", model="gpt-4.1-mini", stream=True))
+
+    assert "gen_ai.output.messages" not in attrs(only_span(env))
+
+
+def test_responses_stream_retains_added_items_and_sanitized_distinct_partial_shapes(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = [
+        SimpleNamespace(
+            type="response.output_item.added",
+            output_index=0,
+            item={"id": "reason_1", "type": "reasoning", "summary": [{"text": "why"}]},
+        ),
+        SimpleNamespace(
+            type="response.output_item.added",
+            output_index=1,
+            item={
+                "id": "mcp_1",
+                "type": "mcp_call",
+                "name": "lookup",
+                "server_label": "docs",
+            },
+        ),
+        SimpleNamespace(
+            type="response.mcp_call_arguments.delta",
+            output_index=1,
+            item_id="mcp_1",
+            delta='{"query":"telemetry"}',
+        ),
+        SimpleNamespace(
+            type="response.content_part.added",
+            output_index=2,
+            content_index=0,
+            part={"type": "output_audio", "data": "SECRET_AUDIO", "transcript": "hello"},
+        ),
+        SimpleNamespace(
+            type="response.output_item.added",
+            output_index=3,
+            item={"id": "shell_1", "type": "shell_call", "command": "pwd"},
+        ),
+    ]
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    stream = llm.responses(input="hi", model="gpt-4.1-mini", stream=True)
+    next(stream)
+    next(stream)
+    next(stream)
+    next(stream)
+    next(stream)
+    stream.close()
+
+    output = json_attr(attrs(only_span(memory))["gen_ai.output.messages"])
+    captured = json.dumps(output)
+    assert "why" in captured
+    assert '"arguments": "{\\"query\\":\\"telemetry\\"}"' in captured
+    assert "lookup" in captured and "docs" in captured
+    assert "hello" in captured and "SECRET_AUDIO" not in captured
+    assert "shell_call" in captured and "pwd" in captured
+
+
+async def test_responses_streams_close_inner_http_response(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class AsyncClosingStream(RealShapedResponsesStream):
+        def __init__(self, events: list[SimpleNamespace], response: Any) -> None:
+            super().__init__(events, response)
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    sync_transport = ResponsesTransport()
+    async_transport = AsyncResponsesTransport()
+    async_inner = AsyncClosingStream([], async_transport)
+    streams = iter(
+        [
+            RealShapedResponsesStream([], sync_transport),
+            async_inner,
+        ]
+    )
+
+    def fake_responses(input: Any, model: str, stream: bool = False, **kwargs: Any) -> Any:
+        return next(streams)
+
+    async def fake_aresponses(input: Any, model: str, stream: bool = False, **kwargs: Any) -> Any:
+        return next(streams)
+
+    monkeypatch.setattr(litellm, "responses", fake_responses)
+    monkeypatch.setattr(litellm, "aresponses", fake_aresponses)
+    instrument_litellm()
+
+    llm.responses(input="sync", model="gpt-4.1-mini", stream=True).close()
+    async_stream = await llm.aresponses(input="async", model="gpt-4.1-mini", stream=True)
+    await async_stream.aclose()
+
+    assert sync_transport.closed
+    assert async_inner.closed
+    assert async_transport.closed
+    assert len(finished_spans(memory)) == 2
+
+
+async def test_responses_stream_cleanup_always_closes_nested_transport(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync_transport = ResponsesTransport()
+    async_transport = AsyncResponsesTransport()
+    sync_cleanup_error = RuntimeError("sync iterator cleanup failed")
+    async_cleanup_error = RuntimeError("async iterator cleanup failed")
+
+    class SyncStream(RealShapedResponsesStream):
+        def close(self) -> None:
+            raise sync_cleanup_error
+
+    class AsyncStream(RealShapedResponsesStream):
+        async def aclose(self) -> None:
+            raise async_cleanup_error
+
+    def fake_responses(input: Any, model: str, stream: bool = False, **kwargs: Any) -> Any:
+        return SyncStream([], sync_transport)
+
+    async def fake_aresponses(input: Any, model: str, stream: bool = False, **kwargs: Any) -> Any:
+        return AsyncStream([], async_transport)
+
+    monkeypatch.setattr(litellm, "responses", fake_responses)
+    monkeypatch.setattr(litellm, "aresponses", fake_aresponses)
+    instrument_litellm()
+
+    sync_stream = llm.responses(input="sync", model="gpt-4.1-mini", stream=True)
+    with pytest.raises(RuntimeError) as sync_error:
+        sync_stream.close()
+    assert sync_error.value is sync_cleanup_error
+    assert sync_transport.closed
+
+    async_stream = await llm.aresponses(input="async", model="gpt-4.1-mini", stream=True)
+    with pytest.raises(RuntimeError) as async_error:
+        await async_stream.aclose()
+    assert async_error.value is async_cleanup_error
+    assert async_transport.closed
+    assert len(finished_spans(memory)) == 2
+
+
+async def test_responses_stream_failures_close_inner_http_response(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FailingCloseTransport(ResponsesTransport):
+        def close(self) -> None:
+            super().close()
+            raise RuntimeError("sync cleanup failed")
+
+    class FailingAsyncCloseTransport(AsyncResponsesTransport):
+        async def aclose(self) -> None:
+            await super().aclose()
+            raise RuntimeError("async cleanup failed")
+
+    read_failure = RuntimeError("response read failed")
+    cancellation = asyncio.CancelledError()
+    sync_transport = FailingCloseTransport()
+    async_transport = FailingAsyncCloseTransport()
+
+    def fake_responses(input: Any, model: str, stream: bool = False, **kwargs: Any) -> Any:
+        return FailingResponsesStream(read_failure, sync_transport)
+
+    async def fake_aresponses(input: Any, model: str, stream: bool = False, **kwargs: Any) -> Any:
+        return CancellingResponsesStream(cancellation, async_transport)
+
+    monkeypatch.setattr(litellm, "responses", fake_responses)
+    monkeypatch.setattr(litellm, "aresponses", fake_aresponses)
+    instrument_litellm()
+
+    sync_stream = llm.responses(input="sync", model="gpt-4.1-mini", stream=True)
+    with pytest.raises(RuntimeError) as sync_error:
+        next(sync_stream)
+    assert sync_error.value is read_failure
+    assert sync_transport.closed
+
+    async_stream = await llm.aresponses(input="async", model="gpt-4.1-mini", stream=True)
+    with pytest.raises(asyncio.CancelledError) as async_error:
+        await async_stream.__anext__()
+    assert async_error.value is cancellation
+    assert async_transport.closed
+
+    sync_span, async_span = finished_spans(memory)
+    assert sync_span.status.status_code is StatusCode.ERROR
+    assert async_span.status.status_code is StatusCode.ERROR
+
+
+def test_responses_stream_only_buffers_bounded_output_text(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chunk_times: list[float | None] = []
+    original = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        chunk_times.append(timestamp_ms)
+        return original(handle, timestamp_ms)
+
+    events = [
+        SimpleNamespace(type="response.function_call_arguments.delta", delta='{"city":"SF"}'),
+        SimpleNamespace(type="response.reasoning_summary_text.delta", delta="private reasoning"),
+        SimpleNamespace(type="response.output_text.delta", delta="x" * 100_000),
+    ]
+
+    def fake_responses(input: Any, model: str, stream: bool = False, **kwargs: Any) -> Any:
+        return ResponsesStream(events)
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
+    monkeypatch.setattr(litellm, "responses", fake_responses)
+    instrument_litellm()
+
+    list(llm.responses(input="bounded", model="gpt-4.1-mini", stream=True))
+
+    assert len(chunk_times) == 3
+    a = attrs(only_span(memory))
+    assert json_attr(a["gen_ai.output.messages"]) == [
+        {"type": "function_call", "arguments": '{"city":"SF"}'},
+        {"type": "summary_text", "text": "private reasoning"},
+    ]
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def test_responses_stream_accounts_for_small_deltas_incrementally(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    accepted_text_lengths: list[int] = []
+    original_accept = telemetry_dev.CaptureBudget.accept
+
+    def accept(budget: telemetry_dev.CaptureBudget, value: object) -> bool:
+        if isinstance(value, str):
+            accepted_text_lengths.append(len(value))
+        elif isinstance(value, Mapping):
+            accepted_text_lengths.extend(
+                len(item)
+                for item in cast(Mapping[object, object], value).values()
+                if isinstance(item, str)
+            )
+        return original_accept(budget, cast(object, value))
+
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=0,
+            content_index=0,
+            delta="x",
+        )
+        for _ in range(1_000)
+    ]
+    monkeypatch.setattr(telemetry_dev.CaptureBudget, "accept", accept)
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    list(llm.responses(input="incremental", model="gpt-4.1-mini", stream=True))
+
+    assert sum(accepted_text_lengths) <= 2_000
+    assert max(accepted_text_lengths) < 100
+    assert json_attr(attrs(only_span(memory))["gen_ai.output.messages"]) == [
+        {"type": "output_text", "text": "x" * 1_000}
+    ]
+
+
+def test_responses_stream_accounts_for_annotations_without_remeasuring_text(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    accepted_text_lengths: list[int] = []
+    original_accept = telemetry_dev.CaptureBudget.accept
+
+    def accept(budget: telemetry_dev.CaptureBudget, value: object) -> bool:
+        if isinstance(value, Mapping):
+            accepted_text_lengths.extend(
+                len(item)
+                for item in cast(Mapping[object, object], value).values()
+                if isinstance(item, str)
+            )
+        return original_accept(budget, cast(object, value))
+
+    text = "x" * 59_000
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=0,
+            content_index=0,
+            delta=text,
+        ),
+        *[
+            SimpleNamespace(
+                type="response.output_text.annotation.added",
+                output_index=0,
+                content_index=0,
+                annotation_index=index,
+                annotation={"type": "url_citation", "url": f"https://example.com/{index}"},
+            )
+            for index in range(20)
+        ],
+    ]
+    monkeypatch.setattr(telemetry_dev.CaptureBudget, "accept", accept)
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    stream = llm.responses(input="citation", model="gpt-4.1-mini", stream=True)
+    next(stream)
+    accepted_text_lengths.clear()
+    list(stream)
+
+    assert max(accepted_text_lengths) < 100
+    output = json_attr(attrs(only_span(memory))["gen_ai.output.messages"])
+    assert output[0]["text"] == text
+    assert len(output[0]["annotations"]) == 20
+
+
+def test_responses_stream_rejected_annotation_preserves_text_and_marks_truncated(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = "x" * 59_000
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=0,
+            content_index=0,
+            delta=text,
+        ),
+        SimpleNamespace(
+            type="response.output_text.annotation.added",
+            output_index=0,
+            content_index=0,
+            annotation_index=0,
+            annotation={"type": "url_citation", "url": "https://example.com/" + "c" * 7_000},
+        ),
+    ]
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    list(llm.responses(input="citation", model="gpt-4.1-mini", stream=True))
+
+    a = attrs(only_span(memory))
+    assert json_attr(a["gen_ai.output.messages"]) == [{"type": "output_text", "text": text}]
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def test_responses_stream_rejects_sparse_annotation_indexes(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=0,
+            content_index=0,
+            delta="answer",
+        ),
+        SimpleNamespace(
+            type="response.output_text.annotation.added",
+            output_index=0,
+            content_index=0,
+            annotation_index=1_000_000_000,
+            annotation={"type": "url_citation", "url": "https://example.com"},
+        ),
+    ]
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    list(llm.responses(input="citation", model="gpt-4.1-mini", stream=True))
+
+    a = attrs(only_span(memory))
+    assert json_attr(a["gen_ai.output.messages"]) == [{"type": "output_text", "text": "answer"}]
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def test_responses_stream_merges_seeded_textual_event_families(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = [
+        SimpleNamespace(
+            type="response.output_item.added",
+            output_index=0,
+            item={"id": "reason", "type": "reasoning", "summary": []},
+        ),
+        SimpleNamespace(
+            type="response.reasoning_summary_part.added",
+            output_index=0,
+            summary_index=0,
+            part={"type": "summary_text", "text": ""},
+        ),
+        SimpleNamespace(
+            type="response.reasoning_summary_text.delta",
+            output_index=0,
+            summary_index=0,
+            delta="summary",
+        ),
+        SimpleNamespace(
+            type="response.reasoning_text.delta",
+            output_index=0,
+            content_index=0,
+            delta="reasoning",
+        ),
+        SimpleNamespace(
+            type="response.output_item.added",
+            output_index=1,
+            item={"id": "message", "type": "message", "content": []},
+        ),
+        SimpleNamespace(
+            type="response.content_part.added",
+            output_index=1,
+            content_index=0,
+            part={"type": "output_text", "text": "", "annotations": []},
+        ),
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=1,
+            content_index=0,
+            delta="answer",
+        ),
+        SimpleNamespace(
+            type="response.output_text.annotation.added",
+            output_index=1,
+            content_index=0,
+            annotation_index=0,
+            annotation={"type": "url_citation", "url": "https://example.com"},
+        ),
+        SimpleNamespace(
+            type="response.audio.transcript.delta",
+            output_index=1,
+            content_index=1,
+            delta="spoken",
+        ),
+        SimpleNamespace(
+            type="response.output_item.added",
+            output_index=2,
+            item={"id": "code", "type": "code_interpreter_call"},
+        ),
+        SimpleNamespace(
+            type="response.code_interpreter_call_code.delta",
+            output_index=2,
+            delta="print(1)",
+        ),
+    ]
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    stream = llm.responses(input="hi", model="gpt-4.1-mini", stream=True)
+    for _ in events:
+        next(stream)
+    stream.close()
+
+    output = json_attr(attrs(only_span(memory))["gen_ai.output.messages"])
+    assert output[0]["summary"] == [{"type": "summary_text", "text": "summary"}]
+    assert output[0]["content"] == [{"type": "reasoning_text", "text": "reasoning"}]
+    assert output[1]["content"][0]["text"] == "answer"
+    assert output[1]["content"][0]["annotations"][0]["url"] == "https://example.com"
+    assert output[1]["content"][1]["transcript"] == "spoken"
+    assert output[2]["code"] == "print(1)"
+
+
+def test_bounded_responses_conversion_stops_without_model_dump(memory: SimpleNamespace) -> None:
+    class Bomb:
+        def __init__(self) -> None:
+            self.output = [{"type": "output_text", "text": "x" * 100_000}]
+            self.status = "completed"
+
+        def model_dump(self, **kwargs: Any) -> Any:
+            raise AssertionError("model_dump must not run")
+
+    fields = vars(telemetry_dev_litellm)["_responses_response"](Bomb())
+    assert fields["output"] is None
+    assert fields["attributes"]["telemetry.dev.capture.truncated"] is True
+
+
+def test_bounded_responses_conversion_repeats_shared_acyclic_values(
+    memory: SimpleNamespace,
+) -> None:
+    shared = {"text": "same"}
+
+    captured, budget = vars(telemetry_dev_litellm)["_bounded_responses_native"]([shared, shared])
+
+    assert captured == [{"text": "same"}, {"text": "same"}]
+    assert budget.truncated is False
+
+
+def test_bounded_responses_conversion_normalizes_opaque_values(memory: SimpleNamespace) -> None:
+    class Opaque:
+        __slots__ = ()
+
+    captured, budget = vars(telemetry_dev_litellm)["_bounded_responses_native"](
+        {"opaque": Opaque()}
+    )
+
+    assert captured == {"opaque": None}
+    assert json.dumps(captured) == '{"opaque": null}'
+    assert budget.truncated is False
+
+
+def test_responses_stream_terminal_item_preserves_truncation_overflow(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    oversized = "x" * 70_000
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=0,
+            content_index=index,
+            delta=oversized,
+        )
+        for index in range(1_025)
+    ]
+    events.extend(
+        [
+            SimpleNamespace(
+                type="response.output_item.done",
+                output_index=0,
+                item={"id": "msg_done", "type": "message", "content": []},
+            ),
+            SimpleNamespace(
+                type="response.output_text.delta",
+                output_index=1,
+                content_index=0,
+                delta="fits",
+            ),
+        ]
+    )
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    list(llm.responses(input="hi", model="gpt-4.1-mini", stream=True))
+
+    a = attrs(only_span(memory))
+    assert json_attr(a["gen_ai.output.messages"]) == [
+        {"id": "msg_done", "type": "message", "content": []},
+        {"type": "output_text", "text": "fits"},
+    ]
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+async def test_responses_stream_terminal_items_do_not_erase_untracked_overflow(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_budget = telemetry_dev.CaptureBudget.from_client
+
+    def limited_budget() -> telemetry_dev.CaptureBudget:
+        budget = original_budget()
+        budget.max_items = 8
+        return budget
+
+    def events() -> list[SimpleNamespace]:
+        return [
+            *[
+                SimpleNamespace(
+                    type="response.output_text.delta",
+                    output_index=index,
+                    content_index=0,
+                    delta="x" * 70_000,
+                )
+                for index in range(9)
+            ],
+            *[
+                SimpleNamespace(
+                    type="response.output_item.done",
+                    output_index=index,
+                    item=True,
+                )
+                for index in range(8)
+            ],
+        ]
+
+    sync_inner = ResponsesStream(events())
+    async_inner = AsyncResponsesStream(events())
+
+    def fake_responses(*args: Any, **kwargs: Any) -> ResponsesStream:
+        return sync_inner
+
+    async def fake_aresponses(*args: Any, **kwargs: Any) -> AsyncResponsesStream:
+        return async_inner
+
+    monkeypatch.setattr(
+        telemetry_dev.CaptureBudget,
+        "from_client",
+        staticmethod(limited_budget),
+    )
+    monkeypatch.setattr(litellm, "responses", fake_responses)
+    monkeypatch.setattr(litellm, "aresponses", fake_aresponses)
+    instrument_litellm()
+
+    list(llm.responses(input="sync", model="gpt-4.1-mini", stream=True))
+    async_stream = await llm.aresponses(input="async", model="gpt-4.1-mini", stream=True)
+    _ = [event async for event in async_stream]
+
+    sync_span, async_span = finished_spans(memory)
+    for span in (sync_span, async_span):
+        a = attrs(span)
+        assert json_attr(a["gen_ai.output.messages"]) == [True] * 8
+        assert a["telemetry.dev.capture.truncated"] is True
+
+
+def test_responses_stream_terminal_items_clear_multi_owner_truncation(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    oversized = "x" * 70_000
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=output_index,
+            content_index=0,
+            delta=oversized,
+        )
+        for output_index in (0, 1)
+    ]
+    events.extend(
+        [
+            SimpleNamespace(
+                type="response.output_item.done",
+                output_index=0,
+                item={"id": "msg_0", "type": "message", "content": []},
+            ),
+            SimpleNamespace(
+                type="response.output_item.done",
+                output_index=1,
+                item={"id": "msg_1", "type": "message", "content": []},
+            ),
+            SimpleNamespace(
+                type="response.output_text.delta",
+                output_index=2,
+                content_index=0,
+                delta="fits",
+            ),
+        ]
+    )
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    list(llm.responses(input="hi", model="gpt-4.1-mini", stream=True))
+
+    a = attrs(only_span(memory))
+    assert json_attr(a["gen_ai.output.messages"]) == [
+        {"id": "msg_0", "type": "message", "content": []},
+        {"id": "msg_1", "type": "message", "content": []},
+        {"type": "output_text", "text": "fits"},
+    ]
+    assert "telemetry.dev.capture.truncated" not in a
+
+
+def test_responses_stream_evaluates_later_items_after_rejected_delta(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=0,
+            content_index=0,
+            delta="x" * 70_000,
+        ),
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=1,
+            content_index=0,
+            delta="fits",
+        ),
+    ]
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    list(llm.responses(input="hi", model="gpt-4.1-mini", stream=True))
+
+    a = attrs(only_span(memory))
+    assert json_attr(a["gen_ai.output.messages"]) == [{"type": "output_text", "text": "fits"}]
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def test_responses_stream_bounds_auxiliary_index_state(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=index,
+            content_index=0,
+            delta="x",
+        )
+        for index in range(2_000)
+    ]
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    stream = llm.responses(input="bounded indexes", model="gpt-4.1-mini", stream=True)
+    list(stream)
+
+    retained = (
+        len(stream._partial_content)
+        + len(stream._partial_calls)
+        + len(stream._completed_items)
+        + len(stream._truncated_items)
+    )
+    assert retained <= stream._budget.max_items
+    assert stream._retained_item_count == retained
+    assert stream._truncated_key_count == sum(
+        len(values) for values in stream._truncated_item_keys.values()
+    )
+    assert len(stream._item_indexes) <= stream._budget.max_items
+    assert stream._truncation_overflow is True
+    assert attrs(only_span(memory))["telemetry.dev.capture.truncated"] is True
+
+
+def test_responses_stream_bounds_rejected_content_keys_for_one_owner(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=0,
+            content_index=index,
+            delta="x" * 70_000,
+        )
+        for index in range(2_000)
+    ]
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    stream = llm.responses(input="bounded keys", model="gpt-4.1-mini", stream=True)
+    list(stream)
+
+    owner = ("index", 0)
+    assert owner in stream._truncated_items
+    assert len(stream._truncated_item_keys[owner]) <= stream._budget.max_items
+    assert stream._truncated_key_count == len(stream._truncated_item_keys[owner])
+    assert stream._truncation_overflow is True
+    assert attrs(only_span(memory))["telemetry.dev.capture.truncated"] is True
+
+
+def test_responses_stream_charges_one_character_fragments_against_item_budget(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=0,
+            content_index=0,
+            delta="x",
+        )
+        for _ in range(2_000)
+    ]
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    stream = llm.responses(input="bounded fragments", model="gpt-4.1-mini", stream=True)
+    assert list(stream) == events
+
+    fragments = stream._partial_content[("index", 0)][("index", 0)]["_fragments"]
+    assert len(fragments) <= stream._budget.max_items
+    assert stream._budget.items_used <= stream._budget.max_items
+    assert attrs(only_span(memory))["telemetry.dev.capture.truncated"] is True
+
+
+async def test_responses_stream_surrogate_deltas_fail_closed_and_finish(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync_event = SimpleNamespace(type="response.output_text.delta", delta="\ud800")
+    async_event = SimpleNamespace(type="response.output_text.delta", delta="\udfff")
+    sync_inner = ResponsesStream([sync_event])
+    async_inner = AsyncResponsesStream([async_event])
+
+    def fake_responses(*args: Any, **kwargs: Any) -> ResponsesStream:
+        return sync_inner
+
+    async def fake_aresponses(*args: Any, **kwargs: Any) -> AsyncResponsesStream:
+        return async_inner
+
+    monkeypatch.setattr(litellm, "responses", fake_responses)
+    monkeypatch.setattr(litellm, "aresponses", fake_aresponses)
+    instrument_litellm()
+
+    assert list(llm.responses(input="sync", model="gpt-4.1-mini", stream=True)) == [sync_event]
+    async_stream = await llm.aresponses(input="async", model="gpt-4.1-mini", stream=True)
+    assert [event async for event in async_stream] == [async_event]
+
+    assert sync_inner.closed
+    assert async_inner.closed
+    sync_span, async_span = finished_spans(memory)
+    for span in (sync_span, async_span):
+        assert span.status.status_code is not StatusCode.ERROR
+        assert attrs(span)["telemetry.dev.capture.truncated"] is True
+        assert "gen_ai.output.messages" not in attrs(span)
+
+
+def test_responses_stream_content_done_replaces_matching_text_deltas(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=4,
+            content_index=7,
+            delta="Hel",
+        ),
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=4,
+            content_index=7,
+            delta="lo",
+        ),
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=4,
+            content_index=7,
+            delta="x" * 100_000,
+        ),
+        SimpleNamespace(
+            type="response.content_part.done",
+            output_index=4,
+            content_index=7,
+            part={"type": "output_text", "text": "Hello"},
+        ),
+    ]
+
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    list(llm.responses(input="hi", model="gpt-4.1-mini", stream=True))
+
+    a = attrs(only_span(memory))
+    assert json_attr(a["gen_ai.output.messages"]) == [{"type": "output_text", "text": "Hello"}]
+    assert "telemetry.dev.capture.truncated" not in a
+
+
+def test_responses_stream_content_done_resolves_each_rejected_part(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_budget = telemetry_dev.CaptureBudget.from_client
+
+    def limited_budget() -> telemetry_dev.CaptureBudget:
+        budget = original_budget()
+        budget.max_bytes = 500
+        return budget
+
+    monkeypatch.setattr(
+        telemetry_dev.CaptureBudget,
+        "from_client",
+        staticmethod(limited_budget),
+    )
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=4,
+            content_index=index,
+            delta="x" * 1_000,
+        )
+        for index in range(2)
+    ] + [
+        SimpleNamespace(
+            type="response.content_part.done",
+            output_index=4,
+            content_index=index,
+            part={"type": "output_text", "text": text},
+        )
+        for index, text in enumerate(("A", "B"))
+    ]
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    list(llm.responses(input="hi", model="gpt-4.1-mini", stream=True))
+
+    a = attrs(only_span(memory))
+    assert json_attr(a["gen_ai.output.messages"]) == [
+        {"type": "output_text", "text": "A"},
+        {"type": "output_text", "text": "B"},
+    ]
+    assert "telemetry.dev.capture.truncated" not in a
+
+
+def test_responses_stream_many_completed_items_materialize_output_once(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = [
+        SimpleNamespace(
+            type="response.output_item.done",
+            output_index=index,
+            item={"id": f"msg_{index}", "type": "message", "content": []},
+        )
+        for index in range(100)
+    ]
+    materializations = 0
+
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+    stream = llm.responses(input="many", model="gpt-4.1-mini", stream=True)
+    stream_type = cast(type[Any], type(stream))
+    original = stream_type._partial_output
+
+    def counted(stream: Any) -> list[Any]:
+        nonlocal materializations
+        materializations += 1
+        return original(stream)
+
+    monkeypatch.setattr(stream_type, "_partial_output", counted)
+
+    list(stream)
+
+    assert materializations == 1
+    assert len(json_attr(attrs(only_span(memory))["gen_ai.output.messages"])) == 100
+
+
+def test_responses_stream_reconstructs_refusal_and_function_arguments(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = [
+        SimpleNamespace(
+            type="response.function_call_arguments.delta",
+            output_index=8,
+            item_id="call_asymmetric",
+            delta='{"city":',
+        ),
+        SimpleNamespace(
+            type="response.refusal.delta",
+            output_index=3,
+            content_index=9,
+            delta="I cannot",
+        ),
+        SimpleNamespace(
+            type="response.function_call_arguments.delta",
+            output_index=8,
+            item_id="call_asymmetric",
+            delta='"SF"}',
+        ),
+    ]
+
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    list(llm.responses(input="hi", model="gpt-4.1-mini", stream=True))
+
+    assert json_attr(attrs(only_span(memory))["gen_ai.output.messages"]) == [
+        {"type": "refusal", "refusal": "I cannot"},
+        {
+            "type": "function_call",
+            "id": "call_asymmetric",
+            "arguments": '{"city":"SF"}',
+        },
+    ]
+
+
+@pytest.mark.parametrize("replacement", ["item", "terminal"])
+def test_responses_stream_replacement_resets_exhausted_partial_budget(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    original_budget = telemetry_dev.CaptureBudget.from_client
+
+    def limited_budget() -> telemetry_dev.CaptureBudget:
+        budget = original_budget()
+        budget.max_bytes = 500
+        return budget
+
+    monkeypatch.setattr(
+        telemetry_dev.CaptureBudget,
+        "from_client",
+        staticmethod(limited_budget),
+    )
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=6,
+            content_index=2,
+            delta="partial",
+        ),
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=6,
+            content_index=2,
+            delta="x" * 1_000,
+        ),
+    ]
+    expected: list[dict[str, Any]]
+    if replacement == "item":
+        expected = [{"id": "msg_done", "type": "message", "content": []}]
+        events.append(
+            SimpleNamespace(
+                type="response.output_item.done",
+                output_index=6,
+                item={"id": "msg_done", "type": "message", "content": []},
+            )
+        )
+    else:
+        expected = [{"type": "output_text", "text": "terminal"}]
+        terminal = responses_result()
+        terminal.output = expected
+        events.append(SimpleNamespace(type="response.completed", response=terminal))
+
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    list(llm.responses(input="hi", model="gpt-4.1-mini", stream=True))
+
+    a = attrs(only_span(memory))
+    assert json_attr(a["gen_ai.output.messages"]) == expected
+    assert "telemetry.dev.capture.truncated" not in a
+
+
+def test_responses_stream_oversized_terminal_retains_bounded_partial(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_budget = telemetry_dev.CaptureBudget.from_client
+
+    def limited_budget() -> telemetry_dev.CaptureBudget:
+        budget = original_budget()
+        budget.max_bytes = 500
+        return budget
+
+    monkeypatch.setattr(
+        telemetry_dev.CaptureBudget,
+        "from_client",
+        staticmethod(limited_budget),
+    )
+    terminal = responses_result()
+    terminal.output = [{"type": "output_text", "text": "x" * 1_000}]
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta",
+            output_index=5,
+            content_index=1,
+            delta="bounded partial",
+        ),
+        SimpleNamespace(type="response.completed", response=terminal),
+    ]
+
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    list(llm.responses(input="hi", model="gpt-4.1-mini", stream=True))
+
+    a = attrs(only_span(memory))
+    assert json_attr(a["gen_ai.output.messages"]) == [
+        {"type": "output_text", "text": "bounded partial"}
+    ]
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def test_responses_stream_keeps_a_prefix_after_a_rejected_delta(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_budget = telemetry_dev.CaptureBudget.from_client
+
+    def limited_budget() -> telemetry_dev.CaptureBudget:
+        budget = original_budget()
+        budget.max_bytes = 500
+        return budget
+
+    monkeypatch.setattr(
+        telemetry_dev.CaptureBudget,
+        "from_client",
+        staticmethod(limited_budget),
+    )
+    terminal = responses_result()
+    terminal.output = [{"type": "output_text", "text": "x" * 1_000}]
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta", output_index=0, content_index=0, delta=delta
+        )
+        for delta in ("Hello ", "x" * 1_000, " end.")
+    ]
+    events.append(SimpleNamespace(type="response.completed", response=terminal))
+
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    list(llm.responses(input="hi", model="gpt-4.1-mini", stream=True))
+
+    a = attrs(only_span(memory))
+    assert json_attr(a["gen_ai.output.messages"]) == [{"type": "output_text", "text": "Hello "}]
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def test_responses_failed_event_marks_span_error(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failed = responses_result("failed")
+    streams = iter(
+        [
+            ResponsesStream([SimpleNamespace(type="response.failed", response=failed)]),
+            ResponsesStream(
+                [
+                    SimpleNamespace(
+                        type="error",
+                        error=SimpleNamespace(
+                            message="stream disconnected", code="transport_error"
+                        ),
+                    )
+                ]
+            ),
+        ]
+    )
+
+    def fake_responses(input: Any, model: str, stream: bool = False, **kwargs: Any) -> Any:
+        return next(streams)
+
+    monkeypatch.setattr(litellm, "responses", fake_responses)
+    instrument_litellm()
+    list(llm.responses(input="fail", model="gpt-4.1-mini", stream=True))
+    list(llm.responses(input="error", model="gpt-4.1-mini", stream=True))
+
+    failed_span, error_span = finished_spans(memory)
+    assert failed_span.status.status_code is StatusCode.ERROR
+    assert attrs(failed_span)["error.type"] == "RuntimeError"
+    assert attrs(failed_span)["gen_ai.response.status"] == "failed"
+    assert error_span.status.status_code is StatusCode.ERROR
+    assert attrs(error_span)["error.type"] == "RuntimeError"
+    exception = next(event for event in error_span.events if event.name == "exception")
+    assert exception.attributes is not None
+    assert exception.attributes["exception.message"] == "stream disconnected (transport_error)"
+
+
 def test_router_completion_traced(memory: SimpleNamespace) -> None:
     instrument_litellm()
     router = llm.Router(
@@ -785,10 +2350,28 @@ async def test_wrap_router_acompletion_positional_stream_is_instrumented(
 
 
 def test_instrument_uninstrument_idempotent_and_restores(memory: SimpleNamespace) -> None:
-    originals = (llm.completion, llm.acompletion, llm.embedding, llm.aembedding)
+    originals = (
+        llm.completion,
+        llm.acompletion,
+        llm.embedding,
+        llm.aembedding,
+        llm.rerank,
+        llm.arerank,
+        llm.responses,
+        llm.aresponses,
+    )
 
     instrument_litellm()
-    instrumented = (llm.completion, llm.acompletion, llm.embedding, llm.aembedding)
+    instrumented = (
+        llm.completion,
+        llm.acompletion,
+        llm.embedding,
+        llm.aembedding,
+        llm.rerank,
+        llm.arerank,
+        llm.responses,
+        llm.aresponses,
+    )
     assert instrumented != originals
     instrument_litellm()
     assert (
@@ -796,6 +2379,10 @@ def test_instrument_uninstrument_idempotent_and_restores(memory: SimpleNamespace
         llm.acompletion,
         llm.embedding,
         llm.aembedding,
+        llm.rerank,
+        llm.arerank,
+        llm.responses,
+        llm.aresponses,
     ) == instrumented
     llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, mock_response="one")
     assert len(finished_spans(memory)) == 1
@@ -806,6 +2393,10 @@ def test_instrument_uninstrument_idempotent_and_restores(memory: SimpleNamespace
         llm.acompletion,
         llm.embedding,
         llm.aembedding,
+        llm.rerank,
+        llm.arerank,
+        llm.responses,
+        llm.aresponses,
     ) == originals
     llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, mock_response="two")
     assert len(finished_spans(memory)) == 1

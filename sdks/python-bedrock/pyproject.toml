@@ -19,7 +19,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "telemetry-dev>=0.2.0",
+  "telemetry-dev>=0.2.6",
   "boto3>=1.36",
 ]
 

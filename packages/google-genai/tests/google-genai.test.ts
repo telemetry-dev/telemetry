@@ -102,7 +102,13 @@ function createFakeFetch(...responses: Response[]) {
   return { fetch: fetchImpl, requests };
 }
 
-function setupSpans(): InMemorySpanExporter {
+function setupSpans(
+  options: {
+    captureInput?: boolean;
+    captureOutput?: boolean;
+    mask?: (value: unknown, context: { key: string }) => unknown;
+  } = {},
+): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
   init(
     {
@@ -112,6 +118,7 @@ function setupSpans(): InMemorySpanExporter {
       exportMode: "immediate",
       logLevel: "silent",
       fetch: async () => new Response(null, { status: 200 }),
+      ...options,
     },
     { spanExporter },
   );
@@ -303,7 +310,12 @@ test("generateContent normalizes part-array input before recording", async () =>
   await client.models.generateContent({ model: "gemini-2.5-flash", contents });
 
   const span = await exportedSpan(spans);
-  expect(messagesAttr(span, "gen_ai.input.messages")).toEqual([{ role: "user", parts: contents }]);
+  expect(messagesAttr(span, "gen_ai.input.messages")).toEqual([
+    {
+      role: "user",
+      parts: [{ text: "Describe this image" }, { inlineData: { mimeType: "image/png" } }],
+    },
+  ]);
 });
 
 test("structured output records json output type", async () => {
@@ -699,6 +711,386 @@ test("streaming automatic function calls keep tool turns out of final output", a
   expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(14);
   expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(5);
   expect(span.attributes["gen_ai.usage.total_tokens"]).toBe(19);
+});
+
+test("streaming AFC input does not consume the resumed output budget", async () => {
+  const spans = setupSpans();
+  const functionArgument = "x".repeat(47_000);
+  const finalText = "y".repeat(3_000);
+
+  const chunks = [
+    {
+      responseId: "afc_large_1",
+      candidates: [
+        {
+          content: {
+            role: "model",
+            parts: [{ functionCall: { name: "lookup", args: { value: functionArgument } } }],
+          },
+        },
+      ],
+    },
+    {
+      candidates: [
+        {
+          content: {
+            role: "user",
+            parts: [{ functionResponse: { name: "lookup", response: { ok: true } } }],
+          },
+        },
+      ],
+    },
+    {
+      responseId: "afc_large_2",
+      candidates: [{ content: { role: "model", parts: [{ text: finalText }] } }],
+    },
+  ];
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield* chunks;
+      },
+    },
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: "go" }),
+  );
+
+  for await (const _chunk of stream) {
+  }
+
+  const span = await exportedSpan(spans);
+  expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "model", parts: [{ text: finalText }] },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test("streaming AFC applies one cumulative input budget", async () => {
+  const spans = setupSpans();
+  const requestText = "r".repeat(40_000);
+  const functionArgument = "a".repeat(40_000);
+  const finalText = "final";
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield {
+          responseId: "afc_bounded_1",
+          candidates: [
+            {
+              content: {
+                role: "model",
+                parts: [{ functionCall: { name: "lookup", args: { value: functionArgument } } }],
+              },
+            },
+          ],
+        };
+        yield {
+          candidates: [
+            {
+              content: {
+                role: "user",
+                parts: [{ functionResponse: { name: "lookup", response: { ok: true } } }],
+              },
+            },
+          ],
+        };
+        yield {
+          responseId: "afc_bounded_2",
+          candidates: [{ content: { role: "model", parts: [{ text: finalText }] } }],
+        };
+      },
+    },
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: requestText }),
+  );
+
+  for await (const _chunk of stream) {
+  }
+
+  const span = await exportedSpan(spans);
+  const input = String(span.attributes["gen_ai.input.messages"]);
+  expect(new TextEncoder().encode(input).byteLength).toBeLessThanOrEqual(48 * 1024);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "model", parts: [{ text: finalText }] },
+  ]);
+});
+
+test("authoritative AFC history clears truncation from superseded synthetic turns", async () => {
+  const spans = setupSpans();
+
+  const authoritativeHistory = [
+    { role: "user", parts: [{ text: "run lookup" }] },
+    { role: "model", parts: [{ functionCall: { name: "lookup", args: {} } }] },
+    {
+      role: "user",
+      parts: [{ functionResponse: { name: "lookup", response: { ok: true } } }],
+    },
+  ];
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        for (let index = 0; index < 1_001; index += 1) {
+          yield { candidates: [{ content: { role: "model", parts: [{ text: "x" }] } }] };
+        }
+
+        yield {
+          candidates: [
+            {
+              content: {
+                role: "user",
+                parts: [{ functionResponse: { name: "lookup", response: { ok: true } } }],
+              },
+            },
+          ],
+        };
+        yield {
+          automaticFunctionCallingHistory: authoritativeHistory,
+          candidates: [{ content: { role: "model", parts: [{ text: "done" }] } }],
+        };
+      },
+    },
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: "run lookup" }),
+  );
+
+  for await (const _chunk of stream) {
+  }
+
+  const span = await exportedSpan(spans);
+  expect(messagesAttr(span, "gen_ai.input.messages")).toEqual(authoritativeHistory);
+  expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "model", parts: [{ text: "done" }] },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test("streaming output applies its cumulative limit in UTF-8 bytes", async () => {
+  const spans = setupSpans();
+  const text = "界".repeat(10_000);
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield { candidates: [{ content: { role: "model", parts: [{ text }] } }] };
+        yield { candidates: [{ content: { role: "model", parts: [{ text }] } }] };
+      },
+    },
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: "go" }),
+  );
+
+  for await (const _chunk of stream) {
+  }
+
+  const span = await exportedSpan(spans);
+  const output = String(span.attributes["gen_ai.output.messages"]);
+  expect(new TextEncoder().encode(output).byteLength).toBeLessThanOrEqual(48 * 1024);
+  expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "model", parts: [{ text }] },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("streaming capture ignores unretained candidate metadata", async () => {
+  const spans = setupSpans();
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield {
+          candidates: [
+            {
+              content: { role: "model", parts: [{ text: "kept" }] },
+              unusedMetadata: "x".repeat(70_000),
+            },
+          ],
+        };
+      },
+    },
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: "go" }),
+  );
+
+  for await (const _chunk of stream) {
+  }
+
+  const span = await exportedSpan(spans);
+  expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "model", parts: [{ text: "kept" }] },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test("streaming capture resumes after rejecting an oversized output delta", async () => {
+  const spans = setupSpans();
+  const retained = "a".repeat(40_000);
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield { candidates: [{ content: { role: "model", parts: [{ text: retained }] } }] };
+        yield {
+          candidates: [{ content: { role: "model", parts: [{ text: "b".repeat(10_000) }] } }],
+        };
+        yield {
+          candidates: [
+            { content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" },
+          ],
+        };
+      },
+    },
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: "go" }),
+  );
+
+  for await (const _chunk of stream) {
+  }
+
+  const span = await exportedSpan(spans);
+  expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "model", parts: [{ text: `${retained}ok` }] },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("streaming records terminal metadata when the terminal candidate is truncated", async () => {
+  const spans = setupSpans();
+  const retained = "a".repeat(40_000);
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield {
+          candidates: [{ index: 1, content: { role: "model", parts: [{ text: retained }] } }],
+        };
+        yield {
+          candidates: [
+            {
+              index: 1,
+              content: { role: "model", parts: [{ text: "b".repeat(50_000) }] },
+              finishReason: "MAX_TOKENS",
+            },
+          ],
+        };
+      },
+    },
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: "go" }),
+  );
+
+  for await (const _chunk of stream) {
+  }
+
+  const span = await exportedSpan(spans);
+
+  const output = messagesAttr(span, "gen_ai.output.messages") as Array<{
+    role: string;
+    parts: Array<{ text?: string }>;
+  }>;
+
+  expect(output[0]?.parts[0]?.text).toBe(retained);
+  expect(new TextEncoder().encode(JSON.stringify(output)).byteLength).toBeLessThanOrEqual(
+    48 * 1024,
+  );
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["MAX_TOKENS"]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("streaming AFC capture accepts fitting entries after a rejected turn", async () => {
+  const spans = setupSpans();
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield {
+          candidates: [
+            {
+              content: {
+                role: "model",
+                parts: [{ functionCall: { name: "lookup", args: { value: "x".repeat(10_000) } } }],
+              },
+            },
+          ],
+        };
+        yield {
+          candidates: [
+            {
+              content: {
+                role: "user",
+                parts: [{ functionResponse: { name: "lookup", response: { ok: true } } }],
+              },
+            },
+          ],
+        };
+        yield { candidates: [{ content: { role: "model", parts: [{ text: "done" }] } }] };
+      },
+    },
+  });
+
+  const prompt = "p".repeat(40_000);
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: prompt }),
+  );
+
+  for await (const _chunk of stream) {
+  }
+
+  const span = await exportedSpan(spans);
+
+  const input = messagesAttr(span, "gen_ai.input.messages") as Array<{
+    role: string;
+    parts: unknown[];
+  }>;
+
+  expect(input).toHaveLength(2);
+  expect(input[0]).toEqual({ role: "user", parts: [{ text: prompt }] });
+  expect(input[1]).toEqual({
+    role: "user",
+    parts: [{ functionResponse: { name: "lookup", response: { ok: true } } }],
+  });
+  expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "model", parts: [{ text: "done" }] },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("unary AFC replacement reports terminal input truncation", async () => {
+  const spans = setupSpans();
+
+  const response = {
+    candidates: [{ content: { role: "model", parts: [{ text: "done" }] } }],
+    automaticFunctionCallingHistory: [{ role: "user", parts: [{ text: "x".repeat(60_000) }] }],
+  };
+
+  const client = wrapGoogleGenAI({
+    models: { generateContent: (_params: unknown) => response },
+  });
+
+  expect(client.models.generateContent({ model: "gemini", contents: "go" })).toBe(response);
+
+  const span = await exportedSpan(spans);
+  const input = String(span.attributes["gen_ai.input.messages"]);
+  expect(new TextEncoder().encode(input).byteLength).toBeLessThanOrEqual(48 * 1024);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
 test("streaming automatic function history excludes prior synthetic output", async () => {
@@ -1561,4 +1953,461 @@ test("wrapped calls fail open when telemetry is not initialized", async () => {
   });
 
   expect(response.text).toBe("ok");
+});
+
+test("usage modality details map text, image, and audio without video attributes", async () => {
+  const spans = setupSpans();
+
+  const client = wrapGoogleGenAI({
+    models: {
+      generateContent(_params: unknown) {
+        return {
+          usageMetadata: {
+            promptTokensDetails: [
+              { modality: "TEXT", tokenCount: 2 },
+              { modality: "IMAGE", tokenCount: 3 },
+              { modality: "VIDEO", tokenCount: 99 },
+            ],
+            candidatesTokensDetails: [{ modality: "AUDIO", tokenCount: 4 }],
+            cacheTokensDetails: [
+              { modality: "TEXT", tokenCount: 5 },
+              { modality: "IMAGE", tokenCount: 6 },
+              { modality: "AUDIO", tokenCount: 7 },
+            ],
+          },
+        };
+      },
+    },
+  });
+
+  client.models.generateContent({ model: "gemini", contents: "hello" });
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.usage.text.input_tokens"]).toBe(2);
+  expect(span.attributes["gen_ai.usage.image.input_tokens"]).toBe(3);
+  expect(span.attributes["gen_ai.usage.audio.output_tokens"]).toBe(4);
+  expect(span.attributes["gen_ai.usage.text.cache_read.input_tokens"]).toBe(5);
+  expect(span.attributes["gen_ai.usage.image.cache_read.input_tokens"]).toBe(6);
+  expect(span.attributes["gen_ai.usage.audio.cache_read.input_tokens"]).toBe(7);
+  expect(
+    Object.keys(span.attributes).some((key) => key.includes("video") && key.includes("usage")),
+  ).toBe(false);
+});
+
+test.each(["generateImages", "editImage", "upscaleImage"] as const)(
+  "%s creates image generation spans without binary payloads",
+  async (method) => {
+    const spans = setupSpans();
+    const binary = "base64-secret-image";
+
+    const client = wrapGoogleGenAI({
+      vertexai: true,
+      models: {
+        [method](_params: unknown) {
+          return {
+            generatedImages: [{ image: { imageBytes: binary, gcsUri: "gs://bucket/output.png" } }],
+          };
+        },
+      },
+    });
+
+    client.models[method]({
+      model: "imagen-3",
+      prompt: "a lighthouse",
+      image: { imageBytes: binary, mimeType: "image/png" },
+      referenceImages: [{ referenceImage: { imageBytes: binary } }],
+      upscaleFactor: "x2",
+      config: { numberOfImages: 1, outputGcsUri: "gs://bucket", httpOptions: { headers: {} } },
+    });
+    const span = await exportedSpan(spans);
+    expect(span.attributes["gen_ai.operation.name"]).toBe("generate_content");
+    expect(span.attributes["gen_ai.output.type"]).toBe("image");
+    expect(span.attributes["gen_ai.provider.name"]).toBe("gcp.vertex_ai");
+    expect(span.attributes["google_genai.response.image_count"]).toBe(1);
+    expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+      { type: "image", uri: "gs://bucket/output.png" },
+    ]);
+    expect(span.attributes["google_genai.response.image_uris"]).toBeUndefined();
+    expect(JSON.stringify(span.attributes)).not.toContain(binary);
+  },
+);
+
+test.each([
+  { captureInput: false, captureOutput: false, expected: undefined },
+  {
+    mask: (_value: unknown, context: { key: string }) => `redacted:${context.key}`,
+    expected: "redacted",
+  },
+])("media content obeys capture privacy controls %#", async (options) => {
+  const spans = setupSpans(options);
+
+  const client = wrapGoogleGenAI({
+    models: {
+      generateImages(_params: unknown) {
+        return { generatedImages: [{ image: { gcsUri: "gs://secret/output.png" } }] };
+      },
+    },
+  });
+
+  client.models.generateImages({
+    model: "imagen-3",
+    prompt: "secret prompt",
+    image: { gcsUri: "gs://secret/input.png", mimeType: "image/png" },
+    config: {
+      negativePrompt: "secret negative prompt",
+      outputGcsUri: "gs://secret/output-prefix",
+      pubsubTopic: "projects/secret/topics/private",
+    },
+  });
+
+  const span = await exportedSpan(spans);
+  const serialized = JSON.stringify(span.attributes);
+
+  expect(serialized).not.toContain("secret prompt");
+  expect(serialized).not.toContain("gs://secret");
+  expect(serialized).not.toContain("projects/secret");
+  expect(span.attributes["google_genai.response.image_count"]).toBe(1);
+
+  if (options.expected) {
+    expect(span.attributes["gen_ai.input.messages"]).toContain(options.expected);
+    expect(span.attributes["gen_ai.output.messages"]).toContain(options.expected);
+  } else {
+    expect(span.attributes["gen_ai.input.messages"]).toBeUndefined();
+    expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  }
+});
+
+test("generateVideos traces submit and tracked polling idempotently", async () => {
+  const spans = setupSpans();
+  const operation = { name: "operations/video-1", done: false };
+
+  const models = {
+    generateVideos(_params: unknown) {
+      return Promise.resolve(operation);
+    },
+  };
+
+  const operations = {
+    get(_params: unknown) {
+      return Promise.resolve({
+        name: operation.name,
+        done: true,
+        response: { generatedVideos: [{ video: { uri: "gs://bucket/video.mp4" } }] },
+      });
+    },
+  };
+
+  const client = { models, operations };
+
+  expect(wrapGoogleGenAI(client)).toBe(client);
+  expect(wrapGoogleGenAI(client)).toBe(client);
+  const submitted = await client.models.generateVideos({ model: "veo", prompt: "ocean" });
+  const completed = await client.operations.get({ operation: submitted });
+  expect(completed.done).toBe(true);
+  const exported = await finishedSpans(spans, 2);
+  expect(exported[0]!.attributes["gen_ai.response.id"]).toBe(operation.name);
+  expect(messagesAttr(exported[1]!, "gen_ai.output.messages")).toEqual([
+    { type: "video", uri: "gs://bucket/video.mp4" },
+  ]);
+  expect(exported[1]!.attributes["google_genai.response.video_uris"]).toBeUndefined();
+  expect(exported.every((span) => span.attributes["gen_ai.output.type"] === "video")).toBe(true);
+});
+
+test("video operation tracking is identity-only and client-local", async () => {
+  const spans = setupSpans();
+  const operationName = "operations/shared";
+
+  const makeClient = () => ({
+    models: {
+      generateVideos(_params?: unknown) {
+        return { name: operationName, done: false };
+      },
+    },
+    operations: {
+      get(_params: unknown) {
+        return { name: operationName, done: true };
+      },
+    },
+  });
+
+  const first = wrapGoogleGenAI(makeClient());
+  const second = wrapGoogleGenAI(makeClient());
+
+  const submitted = first.models.generateVideos();
+  second.operations.get({ operation: { name: operationName } });
+  first.operations.get({ operation: submitted });
+  first.operations.get({ operation: { name: operationName } });
+
+  const exported = await finishedSpans(spans, 2);
+  expect(exported.map((span) => span.name)).toEqual([
+    "generate_content unknown",
+    "generate_content video operation",
+  ]);
+});
+
+test.each(["get", "getVideosOperation"] as const)(
+  "operations.%s tracks each successful non-terminal response for the next poll",
+  async (method) => {
+    const spans = setupSpans();
+    const submitted = { name: "operations/video-chain", done: false };
+    const pending = { name: submitted.name, done: false };
+    const completed = { name: submitted.name, done: true };
+
+    const operationMethods = {
+      [method]({ operation }: { operation: object }) {
+        return operation === submitted ? pending : completed;
+      },
+    };
+
+    const client = wrapGoogleGenAI({
+      models: { generateVideos: () => submitted },
+      operations: operationMethods,
+    });
+
+    client.models.generateVideos();
+    expect(client.operations[method]({ operation: submitted })).toBe(pending);
+    expect(client.operations[method]({ operation: pending })).toBe(completed);
+    client.operations[method]({ operation: { name: submitted.name } });
+
+    const exported = await finishedSpans(spans, 3);
+    expect(exported.map((span) => span.name)).toEqual([
+      "generate_content unknown",
+      "generate_content video operation",
+      "generate_content video operation",
+    ]);
+  },
+);
+
+test.each(["get", "getVideosOperation"] as const)(
+  "operations.%s tracks a non-terminal response when telemetry mapping fails",
+  async (method) => {
+    const spans = setupSpans();
+    const submitted = { name: "operations/video-mapping-failure", done: false };
+
+    const pending = Object.defineProperty({ name: submitted.name, done: false }, "response", {
+      get() {
+        throw new Error("telemetry response getter");
+      },
+    });
+
+    const completed = { name: submitted.name, done: true };
+
+    const client = wrapGoogleGenAI({
+      models: { generateVideos: () => submitted },
+      operations: {
+        [method]({ operation }: { operation: object }) {
+          return operation === submitted ? pending : completed;
+        },
+      },
+    });
+
+    client.models.generateVideos();
+    expect(client.operations[method]({ operation: submitted })).toBe(pending);
+    expect(client.operations[method]({ operation: pending })).toBe(completed);
+
+    const exported = await finishedSpans(spans, 3);
+    expect(exported.map((span) => span.name)).toEqual([
+      "generate_content unknown",
+      "generate_content video operation",
+      "generate_content video operation",
+    ]);
+  },
+);
+
+test("content telemetry strips binary media from unary, streaming, and AFC history", async () => {
+  const spans = setupSpans();
+  const binary = "binary-secret";
+
+  const content = {
+    role: "model",
+    parts: [
+      { text: "kept" },
+      { inlineData: { mimeType: "image/png", data: binary, displayName: "preview" } },
+      { inline_data: { mime_type: "image/jpeg", data: binary, display_name: "snake preview" } },
+      { image: { imageBytes: binary, mimeType: "image/png" } },
+      { video: { videoBytes: binary, uri: "gs://bucket/video.mp4" } },
+      {
+        functionResponse: {
+          name: "lookup",
+          response: {
+            data: "useful result",
+            mimeType: "application/json",
+            inlineData: { data: "nested tool result", mimeType: "application/json" },
+            image: { imageBytes: "nested image result" },
+            video: { videoBytes: "nested video result" },
+          },
+        },
+      },
+    ],
+  };
+
+  const unary = wrapGoogleGenAI({
+    models: {
+      generateContent(_params: unknown) {
+        return {
+          candidates: [{ content }],
+          automaticFunctionCallingHistory: [{ role: "user", parts: content.parts }],
+        };
+      },
+    },
+  });
+
+  const streaming = wrapGoogleGenAI({
+    models: {
+      async generateContentStream(_params: unknown) {
+        return (async function* () {
+          yield {
+            candidates: [{ content }],
+            automaticFunctionCallingHistory: [{ role: "user", parts: content.parts }],
+          };
+        })();
+      },
+    },
+  });
+
+  unary.models.generateContent({
+    contents: [{ role: "user", parts: content.parts }],
+    config: {
+      systemInstruction: {
+        parts: [
+          { text: "system kept" },
+          { inlineData: { mimeType: "image/png", data: binary, displayName: "system preview" } },
+        ],
+      },
+    },
+  });
+
+  const stream = await streaming.models.generateContentStream({
+    contents: content,
+  });
+
+  for await (const _chunk of stream) {
+  }
+
+  const exported = await finishedSpans(spans, 2);
+
+  for (const span of exported) {
+    const serialized = JSON.stringify(span.attributes);
+    expect(serialized).not.toContain(binary);
+    expect(serialized).toContain("kept");
+    expect(serialized).toContain("preview");
+    expect(serialized).toContain("snake preview");
+    expect(serialized).toContain("gs://bucket/video.mp4");
+    expect(serialized).toContain("useful result");
+    expect(serialized).toContain("application/json");
+    expect(serialized).toContain("nested tool result");
+    expect(serialized).toContain("nested image result");
+    expect(serialized).toContain("nested video result");
+  }
+
+  const unarySerialized = JSON.stringify(exported[0]!.attributes);
+  expect(unarySerialized).toContain("system kept");
+  expect(unarySerialized).toContain("system preview");
+});
+
+test.each(["get", "getVideosOperation"] as const)(
+  "operations.%s preserves throwing getters and successful responses",
+  async (method) => {
+    const spans = setupSpans();
+    const operation = { name: "operations/getters", done: false };
+
+    const response = Object.defineProperty({ name: operation.name }, "done", {
+      enumerable: true,
+      get() {
+        throw new Error("response getter");
+      },
+    });
+
+    let calls = 0;
+
+    const client = wrapGoogleGenAI({
+      models: { generateVideos: (_params: unknown) => operation },
+      operations: {
+        [method](_params: unknown) {
+          calls += 1;
+
+          return Promise.resolve(response);
+        },
+      },
+    });
+
+    client.models.generateVideos({ model: "veo" });
+
+    const request = Object.defineProperty({}, "operation", {
+      get() {
+        throw new Error("request getter");
+      },
+    });
+
+    await expect(client.operations[method](request)).resolves.toBe(response);
+    await expect(client.operations[method]({ operation })).resolves.toBe(response);
+    expect(calls).toBe(2);
+    await finishedSpans(spans, 2);
+  },
+);
+
+test("media methods preserve rejected and synchronously thrown failures", async () => {
+  const spans = setupSpans();
+  const rejected = new Error("image rejected");
+  const thrown = new Error("video threw");
+
+  const client = wrapGoogleGenAI({
+    models: {
+      generateImages(_params: unknown) {
+        return Promise.reject(rejected);
+      },
+      generateVideos(_params: unknown) {
+        throw thrown;
+      },
+    },
+  });
+
+  await expect(client.models.generateImages({ model: "imagen", prompt: "fail" })).rejects.toBe(
+    rejected,
+  );
+  expect(() => client.models.generateVideos({ model: "veo", prompt: "fail" })).toThrow(thrown);
+  const exported = await finishedSpans(spans, 2);
+  expect(exported.every((span) => span.status.code === SPAN_STATUS_ERROR)).toBe(true);
+});
+
+test("capture traversal is bounded, cycle-aware, binary-safe, and preserves provider outcomes", async () => {
+  const spans = setupSpans();
+  const shared = { text: "shared" };
+
+  interface CaptureFixture {
+    role?: string;
+    parts?: Array<{ text: string }>;
+    inlineData?: { mimeType: string; data: string };
+    self?: CaptureFixture;
+    next?: CaptureFixture;
+  }
+
+  const contents: CaptureFixture = {
+    role: "user",
+    parts: Array.from({ length: 2_000 }, () => shared),
+    inlineData: { mimeType: "image/png", data: "SECRET_BINARY" },
+  };
+
+  contents.self = contents;
+  let deep = contents;
+
+  for (let index = 0; index < 100; index += 1) {
+    const next: CaptureFixture = {};
+    deep.next = next;
+    deep = next;
+  }
+
+  const response = {
+    candidates: [{ content: { role: "model", parts: contents.parts } }],
+  };
+
+  const generateContent = vi.fn((_params: unknown) => response);
+  const client = wrapGoogleGenAI({ models: { generateContent } });
+
+  expect(client.models.generateContent({ model: "gemini", contents })).toBe(response);
+  expect(generateContent).toHaveBeenCalledOnce();
+  const span = await exportedSpan(spans);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(String(span.attributes["gen_ai.input.messages"])).not.toContain("SECRET_BINARY");
+  expect(String(span.attributes["gen_ai.input.messages"]).length).toBeLessThan(65_536);
+  expect(String(span.attributes["gen_ai.output.messages"]).length).toBeLessThan(65_536);
 });

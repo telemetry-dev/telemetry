@@ -75,6 +75,12 @@ export function currentClient(): ClientHandle {
   return activeClient ?? NOOP_CLIENT;
 }
 
+export function captureEnabled(kind: "input" | "output"): boolean {
+  const config = currentClient().core?.config;
+
+  return kind === "input" ? (config?.captureInput ?? false) : (config?.captureOutput ?? false);
+}
+
 export function flush(): Promise<void> {
   return currentClient().flush();
 }

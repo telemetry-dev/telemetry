@@ -70,6 +70,10 @@ Use this as the app-wide one-liner at startup when all OpenAI clients should be 
 - `client.responses.parse(...)` is covered by the OpenAI SDK because it routes through `create()`
 - `client.responses.stream({ input, model, ... })` is covered for new responses because it routes through `create({ stream: true })`
 - `client.embeddings.create(...)`
+- `client.images.generate(...)`, `edit(...)`, and `createVariation(...)`, including image streams
+- `client.audio.speech.create(...)`, `transcriptions.create(...)` (including streams), and `translations.create(...)`
+- `client.videos.create(...)` and `retrieve(...)` when exposed by the installed OpenAI SDK
+- `client.batches.create(...)`, `retrieve(...)`, and `cancel(...)`
 
 The integration maps native OpenAI request/response shapes directly into telemetry.dev fields. It does not normalize messages into another schema.
 
@@ -93,8 +97,27 @@ Embedding calls emit `gen_ai.operation.name = "embeddings"`, request model/input
 
 OpenAI clients configured with `https://openrouter.ai/api/v1` as their base URL record provider `openrouter`. The same detection applies to OpenRouter subdomains; unrelated hosts containing `openrouter.ai` are not matched.
 
+OpenAI-compatible URLs on Groq, xAI, DeepSeek, Together, and Fireworks domains (including their subdomains) record the corresponding provider. Other compatible endpoints retain the `openai` default.
+
+## Realtime WebSocket
+
+Realtime WebSocket emitters require explicit wrapping; global prototype instrumentation does not cover them:
+
+```ts
+import { OpenAIRealtimeWS } from "openai/realtime/ws";
+import { wrapOpenAIRealtime } from "@telemetry-dev/openai";
+
+const realtime = wrapOpenAIRealtime(new OpenAIRealtimeWS({ model: "gpt-realtime" }), {
+  model: "gpt-realtime",
+});
+```
+
+The wrapper creates one generation span for each `response.create`, finishes it on `response.done`, transport error, or early close, and records output timing and modality usage. To match responses that can complete out of order, it adds a private correlation field to `response.metadata` without replacing caller fields. OpenAI permits at most 16 metadata fields; when the caller already supplies 16, the request is sent unchanged and the wrapper emits an immediately failed span because response events cannot be correlated safely. By default, an unfinished span fails after five minutes, and the wrapper retains at most 100 in-flight spans per connection. A positive finite `traceTimeoutMs` and a positive-integer `maxInFlight` override those limits; exceeding the in-flight limit fails and removes the oldest span. Wrapping the same emitter more than once is safe.
+
+Image, audio, and video request/response bytes are never captured, including binary fields nested in Responses API input and output. Non-streaming image spans retain the prompt, image count, revised prompts, and token usage. Streamed image spans retain supported timing and usage only. Speech spans retain text input but not returned audio; transcription and translation spans retain returned text and token usage. Batch spans use the custom `openai.batch.create`, `openai.batch.retrieve`, and `openai.batch.cancel` operations because OpenTelemetry defines no standard GenAI batch lifecycle operation.
+
 ## Limitations
 
-- `responses.stream({ response_id: ... })` resumes an existing response through `retrieve()`, which is not instrumented in this version.
 - Wrapped calls preserve `withResponse()` and `asResponse()`, but the returned promise is not guaranteed to be `instanceof` the OpenAI SDK's internal `APIPromise` class.
 - Unawaited OpenAI calls keep the SDK's lazy behavior: no request is made and no span is finished until the returned promise/stream is consumed.
+- Realtime instrumentation is explicit through `wrapOpenAIRealtime`; `instrumentOpenAI()` does not automatically patch Realtime WebSocket prototypes.

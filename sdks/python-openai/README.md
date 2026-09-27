@@ -64,6 +64,9 @@ Sync and async variants are covered:
 - `client.responses.parse(...)`
 - `client.responses.stream(...)` when starting a new response
 - `client.embeddings.create(...)`
+- `client.images.generate(...)`, `edit(...)`, and `create_variation(...)`
+- `client.audio.speech.create(...)`, `transcriptions.create(...)`, and `translations.create(...)`
+- `client.batches.create(...)`, `retrieve(...)`, and `cancel(...)`
 
 The integration maps native OpenAI request/response shapes directly into telemetry.dev fields. It does not normalize messages into another schema.
 
@@ -75,7 +78,7 @@ Chat completion streams are traced. Requests are sent unchanged by default, so t
 client = wrap_openai(OpenAI(), inject_stream_usage=True)
 ```
 
-Responses API streams are traced through `responses.create(stream=True)`; terminal `response.completed`, `response.failed`, and `response.incomplete` events close the span.
+Responses API streams are traced through `responses.create(stream=True)` and `responses.stream(response_id=...)`; terminal `response.completed`, `response.failed`, and `response.incomplete` events close the span.
 
 ## Embeddings
 
@@ -87,8 +90,13 @@ Embedding calls emit `gen_ai.operation.name = "embeddings"`, request model/input
 
 OpenAI clients configured with `https://openrouter.ai/api/v1` as their base URL record provider `openrouter`. The same detection applies to OpenRouter subdomains; unrelated hosts containing `openrouter.ai` are not matched.
 
+OpenAI-compatible URLs on Groq, xAI, DeepSeek, Together, and Fireworks domains (including their subdomains) record the corresponding provider. Other compatible endpoints retain the `openai` default.
+
 ## Limitations
 
-- `with_raw_response` snapshots bound methods on first access in the OpenAI Python SDK. Call `wrap_openai()` or `instrument_openai()` before accessing `with_raw_response` if those methods need instrumentation.
-- `responses.stream(response_id=...)` resumes an existing response through `retrieve()`, which is not instrumented in this version.
+- `with_raw_response` and `with_streaming_response` snapshot bound methods on first access in the OpenAI Python SDK. Call `wrap_openai()` or `instrument_openai()` before accessing either helper if those methods need instrumentation.
 - Unconsumed streams end their spans only when the stream is exhausted, errors, or is closed.
+- Binary image and audio bodies are never captured, including binary fields nested in Responses API input and output. Speech download/streaming response spans cover request creation, not later byte consumption. Transcription stream spans remain open through stream consumption and record terminal or bounded partial transcript text and usage.
+- Realtime is not wrapped: OpenAI Python 2.x exposes an async WebSocket connection (`realtime.connect`), not an event emitter with a stable listener lifecycle, so an explicit event-emitter wrapper would be misleading.
+- Videos (`client.videos`) are not instrumented yet; video create and retrieve calls produce no spans. The TypeScript integration traces them.
+- Batch list pagination is not instrumented so the SDK's synchronous `AsyncPaginator` remains directly usable with `async for`.

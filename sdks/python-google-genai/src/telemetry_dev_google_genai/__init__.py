@@ -10,13 +10,17 @@ import contextvars
 import json
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from functools import wraps
 from typing import Any, TypeVar, cast
+from weakref import WeakKeyDictionary
 
 import telemetry_dev
 from google.genai import _extra_utils
+from google.genai.client import AsyncClient, Client
 from google.genai.models import AsyncModels, Models
+from google.genai.operations import AsyncOperations, Operations
 
 __version__ = "0.1.2"
 
@@ -33,6 +37,8 @@ _T = TypeVar("_T")
 _AFC_USAGE_STATE: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "telemetry_dev_google_genai_afc_usage_state", default=None
 )
+_MAX_PENDING_VIDEO_OPERATIONS = 1024
+_MAX_CAPTURE_DEPTH = 32
 
 _BUILTIN_TOOL_FIELDS = (
     ("google_search", "googleSearch"),
@@ -377,15 +383,149 @@ def _generate_usage(raw: Any, attrs: dict[str, Any]) -> dict[str, int | float] |
     tool_use = _number(_field(raw, "tool_use_prompt_token_count"))
     if tool_use is not None:
         attrs["google_genai.usage.tool_use_prompt_tokens"] = int(tool_use)
-    return _usage(
-        {
-            "input_tokens": _number(_field(raw, "prompt_token_count")),
-            "output_tokens": _number(_field(raw, "candidates_token_count")),
-            "total_tokens": _number(_field(raw, "total_token_count")),
-            "cache_read_input_tokens": _number(_field(raw, "cached_content_token_count")),
-            "reasoning_output_tokens": _number(_field(raw, "thoughts_token_count")),
+    fields: dict[str, int | float | None] = {
+        "input_tokens": _number(_field(raw, "prompt_token_count")),
+        "output_tokens": _number(_field(raw, "candidates_token_count")),
+        "total_tokens": _number(_field(raw, "total_token_count")),
+        "cache_read_input_tokens": _number(_field(raw, "cached_content_token_count")),
+        "reasoning_output_tokens": _number(_field(raw, "thoughts_token_count")),
+    }
+    for detail_field, suffix in (
+        ("prompt_tokens_details", "input_tokens"),
+        ("candidates_tokens_details", "output_tokens"),
+        ("cache_tokens_details", "cache_read_input_tokens"),
+    ):
+        for detail in _sequence_items(_field(raw, detail_field)):
+            modality = (_enum_value(_field(detail, "modality")) or "").lower()
+            count = _number(_field(detail, "token_count"))
+            if modality in {"text", "image", "audio"} and count is not None:
+                key = f"{modality}_{suffix}"
+                fields[key] = (fields.get(key) or 0) + count
+    return _usage(fields)
+
+
+def _media_request_fields(output_type: str | None) -> RequestMapper:
+    def mapper(model: Any, contents: Any, config: Any) -> tuple[str, dict[str, Any]]:
+        fields: dict[str, Any] = {
+            "type": "generation",
+            "model": _string(model),
+            "input": contents,
+            "output_type": output_type,
+            "attributes": {"gen_ai.operation.name": "generate_content"},
         }
-    )
+        return f"generate_content {_string(model) or 'unknown'}", fields
+
+    return mapper
+
+
+def _media_response_fields(response: Any, output_type: str | None = None) -> dict[str, Any]:
+    operation_name = _string(_field(response, "name"))
+    operation_error = _field(response, "error")
+    error_message = _string(_field(operation_error, "message"))
+    fields: dict[str, Any] = {
+        "response_id": _string(_field(response, "id")) or operation_name,
+        "error": RuntimeError(error_message or "video operation failed")
+        if operation_error
+        else None,
+    }
+    attrs: dict[str, Any] = {}
+    done = _field(response, "done")
+    if operation_name:
+        attrs["google_genai.response.operation_name"] = operation_name
+    if isinstance(done, bool):
+        attrs["google_genai.response.operation_done"] = done
+    if output_type:
+        payload = _field(response, "response") or _field(response, "result") or response
+        items = _sequence_items(_field(payload, f"generated_{output_type}s"))
+        attrs[f"google_genai.response.{output_type}_count"] = len(items)
+        uris = [
+            uri
+            for item in items
+            if (uri := _string(_field(_field(item, output_type), "gcs_uri")))
+            or (uri := _string(_field(_field(item, output_type), "uri")))
+        ]
+        if uris:
+            fields["output"] = [{"type": output_type, "uri": uri} for uri in uris]
+    if attrs:
+        fields["attributes"] = attrs
+    return fields
+
+
+class _VideoOperationTracker:
+    def __init__(self, scoped: bool = False) -> None:
+        self._scoped = scoped
+        self._pending: OrderedDict[tuple[object, str], tuple[str, Callable[..., None]]] = (
+            OrderedDict()
+        )
+        self._lock = threading.Lock()
+        self._closed = False
+        self._closed_scopes: WeakKeyDictionary[object, set[str]] = WeakKeyDictionary()
+
+    def _scope(self, resource: Any) -> object:
+        return _field(resource, "_api_client") if self._scoped else self
+
+    def add(self, resource: Any, name: str, transport: str, end: Callable[..., None]) -> None:
+        evicted: Callable[..., None] | None = None
+        closed_error: RuntimeError | None = None
+        scope = self._scope(resource)
+        with self._lock:
+            if self._closed:
+                closed_error = RuntimeError(
+                    "Google GenAI instrumentation removed during video operation"
+                )
+            elif transport in self._closed_scopes.get(scope, set()):
+                closed_error = RuntimeError("Google GenAI client closed during video operation")
+            else:
+                key = (scope, name)
+                previous = self._pending.pop(key, None)
+                self._pending[key] = (transport, end)
+                if previous is not None:
+                    _, evicted = previous
+                elif len(self._pending) > _MAX_PENDING_VIDEO_OPERATIONS:
+                    _, (_, evicted) = self._pending.popitem(last=False)
+        if closed_error is not None:
+            end(error=closed_error)
+        if evicted is not None:
+            evicted(error=RuntimeError("video operation tracking capacity exceeded"))
+
+    def take(self, resource: Any, name: str) -> Callable[..., None] | None:
+        with self._lock:
+            pending = self._pending.pop((self._scope(resource), name), None)
+        return pending[1] if pending is not None else None
+
+    def close_scope(self, resource: Any, transport: str) -> None:
+        scope = self._scope(resource)
+        with self._lock:
+            self._closed_scopes.setdefault(scope, set()).add(transport)
+            pending: list[Callable[..., None]] = []
+            for key, (pending_transport, end) in list(self._pending.items()):
+                if key[0] is scope and pending_transport == transport:
+                    self._pending.pop(key, None)
+                    pending.append(end)
+        for end in pending:
+            end(error=RuntimeError("Google GenAI client closed during video operation"))
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            pending = [end for _, end in self._pending.values()]
+            self._pending.clear()
+        for end in pending:
+            end(error=RuntimeError("Google GenAI instrumentation removed during video operation"))
+
+
+_global_video_tracker: _VideoOperationTracker | None = None
+
+
+def _video_operation_state(operation: Any) -> tuple[str | None, bool | None]:
+    try:
+        name = _string(_field(operation, "name"))
+        done = _field(operation, "done")
+        return name, done if isinstance(done, bool) else None
+    except Exception:
+        return None, None
 
 
 def _content_output(content: Any) -> dict[str, Any] | None:
@@ -1166,6 +1306,333 @@ def _wrap_async_embed(
     return wrapper
 
 
+def _media_reference(value: Any) -> dict[str, str] | None:
+    result: dict[str, str] = {}
+    for field in ("gcs_uri", "uri", "mime_type"):
+        item = _string(_field(value, field))
+        if item is not None:
+            result[field] = item
+    return result or None
+
+
+class _CaptureLimit(Exception):
+    pass
+
+
+def _bounded_native(
+    value: Any,
+    budget: telemetry_dev.CaptureBudget,
+    ancestors: set[int],
+    depth: int = 0,
+) -> Any:
+    if depth > _MAX_CAPTURE_DEPTH:
+        raise _CaptureLimit
+    if value is None or isinstance(value, str | bool | int | float):
+        if not budget.accept(value):
+            raise _CaptureLimit
+        return value
+
+    value_id = id(value)
+    if value_id in ancestors:
+        if not budget.accept(None):
+            raise _CaptureLimit
+        return None
+    ancestors.add(value_id)
+    try:
+        source: Mapping[Any, Any] | None = None
+        if isinstance(value, Mapping):
+            source = cast(Mapping[Any, Any], value)
+        else:
+            attributes = getattr(value, "__dict__", None)
+            if isinstance(attributes, Mapping):
+                source = cast(Mapping[Any, Any], attributes)
+        if source is not None:
+            if not budget.accept({}):
+                raise _CaptureLimit
+            result: dict[str, Any] = {}
+            for raw_key, item in source.items():
+                key = str(raw_key)
+                if not budget.accept(key):
+                    raise _CaptureLimit
+                result[key] = _bounded_native(item, budget, ancestors, depth + 1)
+            return result
+        if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+            if not budget.accept([]):
+                raise _CaptureLimit
+            return [
+                _bounded_native(item, budget, ancestors, depth + 1)
+                for item in cast(Sequence[Any], value)
+            ]
+        enum_value = getattr(value, "value", None)
+        if enum_value is not None:
+            return _bounded_native(enum_value, budget, ancestors, depth + 1)
+        if not budget.accept(None):
+            raise _CaptureLimit
+        return None
+    finally:
+        ancestors.remove(value_id)
+
+
+def _media_contents(kwargs: Mapping[str, Any]) -> tuple[Any, bool]:
+    client = telemetry_dev.get_client()
+    if client is None or not client.capture_input:
+        return None, False
+    budget = telemetry_dev.CaptureBudget.from_client()
+    try:
+        result: dict[str, Any] = {}
+        prompt = kwargs.get("prompt")
+        source = kwargs.get("source")
+        if not isinstance(prompt, str):
+            prompt = _string(_field(source, "prompt"))
+        if prompt:
+            if not budget.accept(prompt):
+                raise _CaptureLimit
+            result["prompt"] = prompt
+
+        media: list[dict[str, str]] = []
+        for value in (
+            kwargs.get("image"),
+            kwargs.get("video"),
+            _field(source, "image"),
+            _field(source, "video"),
+        ):
+            reference = _media_reference(value)
+            if reference is not None:
+                if not budget.accept(reference):
+                    raise _CaptureLimit
+                media.append(reference)
+        reference_images = kwargs.get("reference_images")
+        if isinstance(reference_images, Sequence) and not isinstance(
+            reference_images, str | bytes | bytearray
+        ):
+            for item in cast(Sequence[Any], reference_images):
+                if budget.items_used >= budget.max_items:
+                    raise _CaptureLimit
+                value = _field(item, "reference_image") or _field(item, "image") or item
+                reference = _media_reference(value)
+                if reference is not None:
+                    if not budget.accept(reference):
+                        raise _CaptureLimit
+                    media.append(reference)
+        if media:
+            result["media"] = media
+
+        config = kwargs.get("config")
+        negative_prompt = _string(_field(config, "negative_prompt"))
+        if negative_prompt:
+            if not budget.accept(negative_prompt):
+                raise _CaptureLimit
+            result["negative_prompt"] = negative_prompt
+        labels = _field(config, "labels")
+        if labels is not None:
+            result["labels"] = _bounded_native(labels, budget, set())
+        for field in ("output_gcs_uri", "pubsub_topic"):
+            value = _string(_field(config, field))
+            if value is not None:
+                if not budget.accept(value):
+                    raise _CaptureLimit
+                result[field] = value
+        return result or None, False
+    except Exception:
+        return None, True
+
+
+def _wrap_sync_media(
+    output_type: str | None,
+    tracker: _VideoOperationTracker | None = None,
+) -> Callable[[Callable[..., Any], ProviderResolver], Callable[..., Any]]:
+    mapper = _media_request_fields(output_type)
+
+    def factory(
+        original: Callable[..., Any], provider_resolver: ProviderResolver
+    ) -> Callable[..., Any]:
+        @wraps(original)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            resource = args[0] if args else None
+            contents, truncated = _media_contents(kwargs)
+            name, fields = mapper(kwargs.get("model"), contents, kwargs.get("config"))
+            if truncated:
+                fields["attributes"]["telemetry.dev.capture.truncated"] = True
+            handle = telemetry_dev.start_span(
+                name, provider=provider_resolver(resource), **_clean_fields(fields)
+            )
+            end = _end_once(handle)
+            try:
+                result = original(*args, **kwargs)
+            except BaseException as exc:
+                end(error=exc)
+                raise
+            operation_name, operation_done = _video_operation_state(result)
+            if tracker is not None and operation_name and operation_done is not True:
+                tracker.add(resource, operation_name, "sync", end)
+            else:
+                end(
+                    **_safe_fields(lambda value: _media_response_fields(value, output_type), result)
+                )
+            return result
+
+        setattr(wrapper, _WRAPPED_ATTR, True)
+        setattr(wrapper, _ORIGINAL_ATTR, original)
+        return wrapper
+
+    return factory
+
+
+def _wrap_async_media(
+    output_type: str | None,
+    tracker: _VideoOperationTracker | None = None,
+) -> Callable[[Callable[..., Any], ProviderResolver], Callable[..., Any]]:
+    mapper = _media_request_fields(output_type)
+
+    def factory(
+        original: Callable[..., Any], provider_resolver: ProviderResolver
+    ) -> Callable[..., Any]:
+        @wraps(original)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            resource = args[0] if args else None
+            contents, truncated = _media_contents(kwargs)
+            name, fields = mapper(kwargs.get("model"), contents, kwargs.get("config"))
+            if truncated:
+                fields["attributes"]["telemetry.dev.capture.truncated"] = True
+            handle = telemetry_dev.start_span(
+                name, provider=provider_resolver(resource), **_clean_fields(fields)
+            )
+            end = _end_once(handle)
+            try:
+                result = await original(*args, **kwargs)
+            except BaseException as exc:
+                end(error=exc)
+                raise
+            operation_name, operation_done = _video_operation_state(result)
+            if tracker is not None and operation_name and operation_done is not True:
+                tracker.add(resource, operation_name, "async", end)
+            else:
+                end(
+                    **_safe_fields(lambda value: _media_response_fields(value, output_type), result)
+                )
+            return result
+
+        setattr(wrapper, _WRAPPED_ATTR, True)
+        setattr(wrapper, _ORIGINAL_ATTR, original)
+        return wrapper
+
+    return factory
+
+
+def _operation_arg(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Any:
+    if "operation" in kwargs:
+        return kwargs["operation"]
+    return args[-1] if args else None
+
+
+def _wrap_sync_operation_get(
+    tracker: _VideoOperationTracker,
+) -> Callable[[Callable[..., Any], ProviderResolver], Callable[..., Any]]:
+    def factory(
+        original: Callable[..., Any], _provider_resolver: ProviderResolver
+    ) -> Callable[..., Any]:
+        @wraps(original)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            resource = args[0] if args else None
+            name, _done = _video_operation_state(_operation_arg(args, kwargs))
+            try:
+                result = original(*args, **kwargs)
+            except BaseException as exc:
+                end = tracker.take(resource, name) if name else None
+                if end is not None:
+                    end(error=exc)
+                raise
+            _result_name, result_done = _video_operation_state(result)
+            if name is not None and result_done is True:
+                end = tracker.take(resource, name)
+                if end is not None:
+                    end(
+                        **_safe_fields(lambda value: _media_response_fields(value, "video"), result)
+                    )
+            return result
+
+        setattr(wrapper, _WRAPPED_ATTR, True)
+        setattr(wrapper, _ORIGINAL_ATTR, original)
+        return wrapper
+
+    return factory
+
+
+def _wrap_async_operation_get(
+    tracker: _VideoOperationTracker,
+) -> Callable[[Callable[..., Any], ProviderResolver], Callable[..., Any]]:
+    def factory(
+        original: Callable[..., Any], _provider_resolver: ProviderResolver
+    ) -> Callable[..., Any]:
+        @wraps(original)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            resource = args[0] if args else None
+            name, _done = _video_operation_state(_operation_arg(args, kwargs))
+            try:
+                result = await original(*args, **kwargs)
+            except BaseException as exc:
+                end = tracker.take(resource, name) if name else None
+                if end is not None:
+                    end(error=exc)
+                raise
+            _result_name, result_done = _video_operation_state(result)
+            if name is not None and result_done is True:
+                end = tracker.take(resource, name)
+                if end is not None:
+                    end(
+                        **_safe_fields(lambda value: _media_response_fields(value, "video"), result)
+                    )
+            return result
+
+        setattr(wrapper, _WRAPPED_ATTR, True)
+        setattr(wrapper, _ORIGINAL_ATTR, original)
+        return wrapper
+
+    return factory
+
+
+def _wrap_sync_client_close(
+    tracker: _VideoOperationTracker, owner: object | None = None
+) -> Callable[[Callable[..., Any], ProviderResolver], Callable[..., Any]]:
+    def factory(
+        original: Callable[..., Any], _provider_resolver: ProviderResolver
+    ) -> Callable[..., Any]:
+        @wraps(original)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            resource = owner if owner is not None else (args[0] if args else None)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                tracker.close_scope(resource, "sync")
+
+        setattr(wrapper, _WRAPPED_ATTR, True)
+        setattr(wrapper, _ORIGINAL_ATTR, original)
+        return wrapper
+
+    return factory
+
+
+def _wrap_async_client_close(
+    tracker: _VideoOperationTracker, owner: object | None = None
+) -> Callable[[Callable[..., Any], ProviderResolver], Callable[..., Any]]:
+    def factory(
+        original: Callable[..., Any], _provider_resolver: ProviderResolver
+    ) -> Callable[..., Any]:
+        @wraps(original)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            resource = owner if owner is not None else (args[0] if args else None)
+            try:
+                return await original(*args, **kwargs)
+            finally:
+                tracker.close_scope(resource, "async")
+
+        setattr(wrapper, _WRAPPED_ATTR, True)
+        setattr(wrapper, _ORIGINAL_ATTR, original)
+        return wrapper
+
+    return factory
+
+
 def _patch_instance(
     resource: object,
     method: str,
@@ -1196,42 +1663,84 @@ def _patch_class(
     setattr(cls, method, wrapper_factory(original, _provider_for_resource))
 
 
-def _patch_models(resource: object, provider_name: str) -> None:
+def _patch_models(
+    resource: object, provider_name: str, video_tracker: _VideoOperationTracker
+) -> None:
     _patch_instance(resource, "_generate_content", _wrap_sync_collect_generate, provider_name)
     _patch_instance(resource, "_generate_content_stream", _wrap_sync_collect_stream, provider_name)
     _patch_instance(resource, "generate_content", _wrap_sync_generate, provider_name)
     _patch_instance(resource, "generate_content_stream", _wrap_sync_stream, provider_name)
     _patch_instance(resource, "embed_content", _wrap_sync_embed, provider_name)
+    for method, output_type in (
+        ("generate_images", "image"),
+        ("edit_image", "image"),
+        ("upscale_image", "image"),
+    ):
+        if hasattr(resource, method):
+            _patch_instance(resource, method, _wrap_sync_media(output_type), provider_name)
+    if hasattr(resource, "generate_videos"):
+        _patch_instance(
+            resource, "generate_videos", _wrap_sync_media("video", video_tracker), provider_name
+        )
 
 
-def _patch_async_models(resource: object, provider_name: str) -> None:
+def _patch_async_models(
+    resource: object, provider_name: str, video_tracker: _VideoOperationTracker
+) -> None:
     _patch_instance(resource, "_generate_content", _wrap_async_collect_generate, provider_name)
     _patch_instance(resource, "_generate_content_stream", _wrap_async_collect_stream, provider_name)
     _patch_instance(resource, "generate_content", _wrap_async_generate, provider_name)
     _patch_instance(resource, "generate_content_stream", _wrap_async_stream, provider_name)
     _patch_instance(resource, "embed_content", _wrap_async_embed, provider_name)
+    for method, output_type in (
+        ("generate_images", "image"),
+        ("edit_image", "image"),
+        ("upscale_image", "image"),
+    ):
+        if hasattr(resource, method):
+            _patch_instance(resource, method, _wrap_async_media(output_type), provider_name)
+    if hasattr(resource, "generate_videos"):
+        _patch_instance(
+            resource, "generate_videos", _wrap_async_media("video", video_tracker), provider_name
+        )
 
 
 def wrap_google_genai(client: _T) -> _T:
     if getattr(client, _WRAPPED_ATTR, False):
         return client
     provider_name = _provider_for_client(client)
+    video_tracker = _VideoOperationTracker()
     models = getattr(client, "models", None)
     if models is not None:
-        _patch_models(models, provider_name)
+        _patch_models(models, provider_name, video_tracker)
     aio = getattr(client, "aio", None)
     async_models = getattr(aio, "models", None) if aio is not None else None
     if async_models is not None:
-        _patch_async_models(async_models, provider_name)
+        _patch_async_models(async_models, provider_name, video_tracker)
+    operations = getattr(client, "operations", None)
+    if operations is not None and hasattr(operations, "get"):
+        _patch_instance(operations, "get", _wrap_sync_operation_get(video_tracker), provider_name)
+    async_operations = getattr(aio, "operations", None) if aio is not None else None
+    if async_operations is not None and hasattr(async_operations, "get"):
+        _patch_instance(
+            async_operations, "get", _wrap_async_operation_get(video_tracker), provider_name
+        )
+    if hasattr(client, "close"):
+        _patch_instance(
+            client, "close", _wrap_sync_client_close(video_tracker, client), provider_name
+        )
+    if aio is not None and hasattr(aio, "aclose"):
+        _patch_instance(aio, "aclose", _wrap_async_client_close(video_tracker, aio), provider_name)
     setattr(client, _WRAPPED_ATTR, True)
     return client
 
 
 def instrument_google_genai() -> None:
-    global _installed
+    global _global_video_tracker, _installed
     with _install_lock:
         if _installed:
             return
+        video_tracker = _VideoOperationTracker(scoped=True)
         for method, factory in (
             ("_generate_content", _wrap_sync_collect_generate),
             ("_generate_content_stream", _wrap_sync_collect_stream),
@@ -1240,6 +1749,15 @@ def instrument_google_genai() -> None:
             ("embed_content", _wrap_sync_embed),
         ):
             _patch_class(Models, method, factory)
+        for method, output_type in (
+            ("generate_images", "image"),
+            ("edit_image", "image"),
+            ("upscale_image", "image"),
+        ):
+            if hasattr(Models, method):
+                _patch_class(Models, method, _wrap_sync_media(output_type))
+        if hasattr(Models, "generate_videos"):
+            _patch_class(Models, "generate_videos", _wrap_sync_media("video", video_tracker))
         for method, factory in (
             ("_generate_content", _wrap_async_collect_generate),
             ("_generate_content_stream", _wrap_async_collect_stream),
@@ -1248,12 +1766,28 @@ def instrument_google_genai() -> None:
             ("embed_content", _wrap_async_embed),
         ):
             _patch_class(AsyncModels, method, factory)
+        for method, output_type in (
+            ("generate_images", "image"),
+            ("edit_image", "image"),
+            ("upscale_image", "image"),
+        ):
+            if hasattr(AsyncModels, method):
+                _patch_class(AsyncModels, method, _wrap_async_media(output_type))
+        if hasattr(AsyncModels, "generate_videos"):
+            _patch_class(AsyncModels, "generate_videos", _wrap_async_media("video", video_tracker))
+        _patch_class(Operations, "get", _wrap_sync_operation_get(video_tracker))
+        _patch_class(AsyncOperations, "get", _wrap_async_operation_get(video_tracker))
+        _patch_class(Client, "close", _wrap_sync_client_close(video_tracker))
+        _patch_class(AsyncClient, "aclose", _wrap_async_client_close(video_tracker))
+        _global_video_tracker = video_tracker
         _installed = True
 
 
 def uninstrument_google_genai() -> None:
-    global _installed
+    global _global_video_tracker, _installed
     with _install_lock:
+        video_tracker = _global_video_tracker
+        _global_video_tracker = None
         while _ORIGINALS:
             cls, method, original = _ORIGINALS.pop()
             current = getattr(cls, method, None)
@@ -1263,6 +1797,8 @@ def uninstrument_google_genai() -> None:
             ):
                 setattr(cls, method, original)
         _installed = False
+    if video_tracker is not None:
+        video_tracker.close()
 
 
 __all__ = [

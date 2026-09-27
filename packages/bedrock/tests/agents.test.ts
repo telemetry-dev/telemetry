@@ -2,9 +2,11 @@ import {
   BedrockAgentRuntimeClient,
   InvokeAgentCommand,
   InvokeFlowCommand,
+  RerankCommand,
   RetrieveAndGenerateCommand,
   RetrieveAndGenerateStreamCommand,
   RetrieveCommand,
+  type RerankCommandInput,
 } from "@aws-sdk/client-bedrock-agent-runtime";
 import { afterEach, expect, test } from "vitest";
 
@@ -85,6 +87,122 @@ test("InvokeAgent aggregates trace usage and return control", async () => {
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual({
     returnControl: { invocationId: "inv-1", invocationInputs: [{ function: "lookup" }] },
   });
+});
+
+test("Rerank captures queries, sources, model, ranking, and pagination metadata", async () => {
+  const spans = setup();
+  const modelArn = "arn:aws:bedrock:us-west-2::foundation-model/cohere.rerank-v3-5:0";
+
+  const request: RerankCommandInput = {
+    queries: [{ type: "TEXT", textQuery: { text: "best observability platform" } }],
+    sources: [
+      {
+        type: "INLINE",
+        inlineDocumentSource: { type: "TEXT", textDocument: { text: "Telemetry data" } },
+      },
+      {
+        type: "INLINE",
+        inlineDocumentSource: { type: "JSON", jsonDocument: { title: "Other result" } },
+      },
+    ],
+    rerankingConfiguration: {
+      type: "BEDROCK_RERANKING_MODEL",
+      bedrockRerankingConfiguration: {
+        numberOfResults: 2,
+        modelConfiguration: {
+          modelArn,
+          additionalModelRequestFields: { max_tokens_per_doc: 256 },
+        },
+      },
+    },
+  };
+
+  const requestSnapshot = structuredClone(request);
+
+  const results = [
+    {
+      index: 0,
+      relevanceScore: 0.91,
+      document: { type: "TEXT", textDocument: { text: "Telemetry data" } },
+    },
+    { index: 1, relevanceScore: 0.12 },
+  ];
+
+  const client = wrapBedrockAgents(
+    new FakeClient([
+      {
+        results,
+        nextToken: "page-2",
+        $metadata: { requestId: "rerank-1", httpStatusCode: 200 },
+      },
+    ]),
+  );
+
+  await client.send(new RerankCommand(request));
+
+  expect(request).toEqual(requestSnapshot);
+  expect(client.calls[0]).toEqual(requestSnapshot);
+  const [span] = spans.getFinishedSpans();
+  expect(span.name).toBe("rerank cohere.rerank-v3-5:0");
+  expect(span.attributes["gen_ai.operation.name"]).toBe("rerank");
+  expect(span.attributes["gen_ai.provider.name"]).toBe("amazon-bedrock");
+  expect(span.attributes["gen_ai.request.model"]).toBe(modelArn);
+  expect(span.attributes["gen_ai.response.id"]).toBe("rerank-1");
+  expect(span.attributes["td.metadata.requested_result_count"]).toBe("2");
+  expect(span.attributes["td.metadata.result_count"]).toBe("2");
+  expect(span.attributes["td.metadata.has_next_token"]).toBe("true");
+  expect(jsonAttr(span, "gen_ai.input.messages")).toEqual({
+    queries: request.queries,
+    sources: request.sources,
+    additionalModelRequestFields: { max_tokens_per_doc: 256 },
+  });
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual(results);
+});
+
+test("Rerank bounds large source and result captures while preserving counts", async () => {
+  const spans = setup();
+
+  const sources = Array.from({ length: 2_000 }, (_, index) => ({
+    type: "INLINE" as const,
+    inlineDocumentSource: {
+      type: "TEXT" as const,
+      textDocument: { text: `source-${index}:${"x".repeat(1_000)}` },
+    },
+  }));
+
+  const results = Array.from({ length: 2_000 }, (_, index) => ({
+    index,
+    relevanceScore: 1 / (index + 1),
+    document: { type: "TEXT", textDocument: { text: `result-${index}:${"y".repeat(1_000)}` } },
+  }));
+
+  const client = wrapBedrockAgents(new FakeClient([{ results }]));
+
+  await client.send(
+    new RerankCommand({
+      queries: [{ type: "TEXT", textQuery: { text: "observability" } }],
+      sources,
+      rerankingConfiguration: {
+        type: "BEDROCK_RERANKING_MODEL",
+        bedrockRerankingConfiguration: {
+          modelConfiguration: {
+            modelArn: "arn:aws:bedrock:us-west-2::foundation-model/cohere.rerank-v3-5:0",
+          },
+        },
+      },
+    }),
+  );
+
+  const [span] = spans.getFinishedSpans();
+  const input = jsonAttr(span, "gen_ai.input.messages");
+  const output = jsonAttr(span, "gen_ai.output.messages");
+
+  expect(input.sources.length).toBeLessThan(sources.length);
+  expect(output.length).toBeLessThan(results.length);
+  expect(JSON.stringify(input).length).toBeLessThanOrEqual(48 * 1_024);
+  expect(JSON.stringify(output).length).toBeLessThanOrEqual(48 * 1_024);
+  expect(span.attributes["td.metadata.result_count"]).toBe("2000");
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
 test("Retrieve and RetrieveAndGenerate capture outputs and citations", async () => {

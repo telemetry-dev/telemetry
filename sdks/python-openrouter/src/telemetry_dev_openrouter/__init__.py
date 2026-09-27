@@ -194,6 +194,8 @@ def _chat_usage(raw: Any) -> dict[str, int | float] | None:
             "cache_read_input_tokens": _number(_field(prompt_details, "cached_tokens")),
             "cache_creation_input_tokens": _number(_field(prompt_details, "cache_write_tokens")),
             "reasoning_output_tokens": _number(_field(completion_details, "reasoning_tokens")),
+            "audio_input_tokens": _number(_field(prompt_details, "audio_tokens")),
+            "audio_output_tokens": _number(_field(completion_details, "audio_tokens")),
         }
     )
 
@@ -336,6 +338,7 @@ def _embeddings_response(response: Any) -> dict[str, Any]:
     if isinstance(response, str) or _absent(response):
         return {}
     raw_usage = _field(response, "usage")
+    prompt_details = _field(raw_usage, "prompt_tokens_details")
     return {
         "response_model": _string(_field(response, "model")),
         "response_id": _string(_field(response, "id")),
@@ -343,6 +346,9 @@ def _embeddings_response(response: Any) -> dict[str, Any]:
             {
                 "input_tokens": _number(_field(raw_usage, "prompt_tokens")),
                 "total_tokens": _number(_field(raw_usage, "total_tokens")),
+                "text_input_tokens": _number(_field(prompt_details, "text_tokens")),
+                "image_input_tokens": _number(_field(prompt_details, "image_tokens")),
+                "audio_input_tokens": _number(_field(prompt_details, "audio_tokens")),
             }
         ),
         "cost_usd": _cost_usd(raw_usage),

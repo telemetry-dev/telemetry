@@ -380,6 +380,8 @@ function chatUsage<T>(usage: T): SpanFields["usage"] {
     cacheReadInputTokens: readNumber(promptDetails?.cachedTokens),
     cacheCreationInputTokens: readNumber(promptDetails?.cacheWriteTokens),
     reasoningOutputTokens: readNumber(completionDetails?.reasoningTokens),
+    audioInputTokens: readNumber(promptDetails?.audioTokens),
+    audioOutputTokens: readNumber(completionDetails?.audioTokens),
   });
 }
 
@@ -508,6 +510,7 @@ function embeddingsRequest(request: JsonRecord): RequestMapping {
 function embeddingsResponse<T>(response: T): SpanFields {
   const r = asRecord(response) ?? {};
   const usage = asRecord(r.usage);
+  const promptDetails = asRecord(usage?.promptTokensDetails);
 
   return {
     responseModel: readString(r.model),
@@ -515,6 +518,9 @@ function embeddingsResponse<T>(response: T): SpanFields {
     usage: compactUsage({
       inputTokens: readNumber(usage?.promptTokens),
       totalTokens: readNumber(usage?.totalTokens),
+      textInputTokens: readNumber(promptDetails?.textTokens),
+      imageInputTokens: readNumber(promptDetails?.imageTokens),
+      audioInputTokens: readNumber(promptDetails?.audioTokens),
     }),
     costUsd: usageCost(usage),
   };

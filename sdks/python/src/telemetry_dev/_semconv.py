@@ -91,6 +91,15 @@ USAGE_ATTRS: dict[str, str] = {
     "cache_read_input_tokens": "gen_ai.usage.cache_read.input_tokens",
     "cache_creation_input_tokens": "gen_ai.usage.cache_creation.input_tokens",
     "reasoning_output_tokens": "gen_ai.usage.reasoning.output_tokens",
+    "text_input_tokens": "gen_ai.usage.text.input_tokens",
+    "text_output_tokens": "gen_ai.usage.text.output_tokens",
+    "text_cache_read_input_tokens": "gen_ai.usage.text.cache_read.input_tokens",
+    "image_input_tokens": "gen_ai.usage.image.input_tokens",
+    "image_output_tokens": "gen_ai.usage.image.output_tokens",
+    "image_cache_read_input_tokens": "gen_ai.usage.image.cache_read.input_tokens",
+    "audio_input_tokens": "gen_ai.usage.audio.input_tokens",
+    "audio_output_tokens": "gen_ai.usage.audio.output_tokens",
+    "audio_cache_read_input_tokens": "gen_ai.usage.audio.cache_read.input_tokens",
 }
 
 SAMPLING_ATTRS: dict[str, str] = {

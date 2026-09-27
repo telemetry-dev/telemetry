@@ -63,8 +63,15 @@ Sync and async variants are covered:
 - `client.models.generate_content(...)` / `client.aio.models.generate_content(...)`
 - `client.models.generate_content_stream(...)` / `client.aio.models.generate_content_stream(...)`
 - `client.models.embed_content(...)` / `client.aio.models.embed_content(...)`
+- `generate_images(...)`, `edit_image(...)`, `upscale_image(...)`, and `generate_videos(...)` on sync and async models
 
 `client.chats.create(...).send_message(...)` and `send_message_stream(...)` are covered automatically because they call the wrapped `models` methods.
+
+When `generate_videos(...)` returns a nonterminal operation, its span completes only after
+`operations.get(...)` on the same wrapped client observes that operation in a terminal state. An
+operation polled by another client or process cannot complete the submission span. If the wrapped
+client closes, instrumentation is removed, or the bounded operation tracker evicts an uncompleted
+operation, the submission span ends with an error instead of remaining open.
 
 ## What gets captured
 
@@ -78,7 +85,7 @@ Sync and async variants are covered:
 | `config.candidate_count` | `gen_ai.request.choice.count` |
 | `config.tools` | `gen_ai.tool.definitions` |
 | `config.tool_config`, `safety_settings`, `thinking_config`, `labels`, `cached_content`, `response_modalities` | `google_genai.request.*` attributes |
-| response IDs, model version, finish reasons, output messages, usage tokens | mapped span fields |
+| response IDs, model version, finish reasons, output messages, usage tokens (including TEXT/IMAGE/AUDIO prompt, candidate, and cache details) | mapped span fields |
 | block/safety/grounding/url-context metadata | `google_genai.response.*` attributes |
 | AFC history on the final response | replaces span `input`; sets `google_genai.automatic_function_calling=true` |
 
@@ -107,6 +114,7 @@ Mapping code is defensive; wrapped calls return the SDK response unchanged and r
 
 ## Limitations
 
-- Not instrumented: `count_tokens`, `compute_tokens`, `generate_images`, `generate_videos`, `live`, `caches`, `files`, `tunings`, `batches`.
-- Deliberately not captured: logprobs, citation metadata, per-modality token detail arrays, `create_time`, `sdk_http_response`.
+- Not instrumented: `count_tokens`, `compute_tokens`, `live`, `caches`, `files`, `tunings`, `batches`.
+- Media operations capture text prompts, model/provider attribution, non-binary media references such as URIs and MIME types, and `gen_ai.operation.name=generate_content`. Image, video, and reference-image bytes are never captured. Image and video operations emit the corresponding `gen_ai.output.type`.
+- Deliberately not captured: logprobs, citation metadata, `create_time`, `sdk_http_response`.
 - Unconsumed streams end their spans only when the stream is exhausted, errors, or is closed.

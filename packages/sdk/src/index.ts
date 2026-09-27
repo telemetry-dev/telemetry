@@ -7,7 +7,14 @@ export type {
   ToolFields,
 } from "./attrs.ts";
 
-export { type ClientOverrides, flush, init, shutdown, type TelemetryClient } from "./client.ts";
+export {
+  captureEnabled,
+  type ClientOverrides,
+  flush,
+  init,
+  shutdown,
+  type TelemetryClient,
+} from "./client.ts";
 
 export type {
   BatchOptions,
@@ -17,6 +24,14 @@ export type {
   SdkLogLevel,
   TelemetryOptions,
 } from "./config.ts";
+
+export {
+  boundedCapture,
+  boundedCaptureDetails,
+  type BoundedCaptureDetails,
+  type BoundedCaptureOptions,
+  type BoundedCaptureResult,
+} from "./capture.ts";
 
 export {
   propagateAttributes,

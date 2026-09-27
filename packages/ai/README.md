@@ -39,6 +39,48 @@ npm install @telemetry-dev/ai-sdk ai
 Requires `ai >= 6.0.111 < 8` (import from the entry matching your major).
 Evaluation telemetry requires `ai >= 7.0.111`.
 
+## Media and batch wrappers
+
+AI SDK telemetry hooks do not cover media or batch APIs. Wrap the functions supplied by your
+installed `ai` version instead; this package does not import version-specific runtime exports:
+
+```ts
+import { generateImage, experimental_generateSpeech, experimental_transcribe } from "ai";
+import {
+  wrapGenerateImage,
+  wrapGenerateSpeech,
+  wrapTranscribe,
+  type TelemetryDevOptions,
+} from "@telemetry-dev/ai-sdk"; // use /v6 with ai@6
+
+const telemetryOptions = {
+  apiKey: process.env.TELEMETRY_DEV_API_KEY,
+} satisfies TelemetryDevOptions;
+const generateImageWithTelemetry = wrapGenerateImage(generateImage, telemetryOptions);
+const generateSpeechWithTelemetry = wrapGenerateSpeech(
+  experimental_generateSpeech,
+  telemetryOptions,
+);
+const transcribeWithTelemetry = wrapTranscribe(experimental_transcribe, telemetryOptions);
+```
+
+`wrapGenerateVideo` wraps the caller-provided `experimental_generateVideo` in the same way. Media
+spans use `generate_content` with output type `image`, `speech`, `text`, or `video`. They record
+model/provider metadata, image token usage when the SDK reports it, output image/video counts,
+transcription duration, and speech input character count. Binary inputs and outputs are never
+captured.
+
+Each wrapper resolves its own telemetry configuration. Options passed to `telemetryDev()` are not
+inherited; pass the same options as the wrapper's second argument, or configure the corresponding
+environment variables.
+
+The root entry also exports `wrapStartBatch`, `wrapGetBatchStatus`, `wrapCancelBatch`, and
+`wrapGetBatchResults`. These wrappers require `ai >= 7.0.55 < 8`, when the corresponding
+experimental batch functions became available. Each network operation gets its own bounded span;
+no span remains open for the asynchronous job lifetime. A results span remains open only while its
+returned `ReadableStream` or async iterable is consumed, so it can report the observed item count.
+If a results stream is never consumed or cancelled, that retrieval span cannot be completed.
+
 ## Environment
 
 | Variable                    | Required | Default                        | Notes                                                                   |

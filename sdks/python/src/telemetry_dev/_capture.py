@@ -122,31 +122,34 @@ class CaptureBudget:
         if value_id in seen:
             return byte_count, item_count
         seen.add(value_id)
-        mapping: dict[object, object] | None = None
-        children: Iterable[object] = ()
-        if isinstance(value, dict):
-            mapping = cast("dict[object, object]", value)
-        elif isinstance(value, list | tuple | set | frozenset):
-            children = cast("Iterable[object]", value)
-        else:
-            attributes = getattr(value, "__dict__", None)
-            if isinstance(attributes, dict):
-                mapping = cast("dict[object, object]", attributes)
+        try:
+            mapping: dict[object, object] | None = None
+            children: Iterable[object] = ()
+            if isinstance(value, dict):
+                mapping = cast("dict[object, object]", value)
+            elif isinstance(value, list | tuple | set | frozenset):
+                children = cast("Iterable[object]", value)
+            else:
+                attributes = getattr(value, "__dict__", None)
+                if isinstance(attributes, dict):
+                    mapping = cast("dict[object, object]", attributes)
 
-        if mapping is not None:
-            children = chain.from_iterable(mapping.items())
+            if mapping is not None:
+                children = chain.from_iterable(mapping.items())
 
-        for child in children:
-            measured = cls._measure(
-                child,
-                remaining_bytes=remaining_bytes - byte_count,
-                remaining_items=remaining_items - item_count,
-                depth=depth + 1,
-                seen=seen,
-            )
-            if measured is None:
-                return None
-            child_bytes, child_items = measured
-            byte_count += child_bytes
-            item_count += child_items
-        return byte_count, item_count
+            for child in children:
+                measured = cls._measure(
+                    child,
+                    remaining_bytes=remaining_bytes - byte_count,
+                    remaining_items=remaining_items - item_count,
+                    depth=depth + 1,
+                    seen=seen,
+                )
+                if measured is None:
+                    return None
+                child_bytes, child_items = measured
+                byte_count += child_bytes
+                item_count += child_items
+            return byte_count, item_count
+        finally:
+            seen.remove(value_id)

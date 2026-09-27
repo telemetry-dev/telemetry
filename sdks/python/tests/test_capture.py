@@ -55,6 +55,12 @@ def test_capture_budget_measures_nested_dict_values_without_skipping_subtrees() 
     assert long_budget.bytes_used - short_budget.bytes_used == 100 * 31
 
 
+def test_capture_budget_charges_repeated_aliases_for_each_serialized_occurrence() -> None:
+    shared = {"text": "x" * 1_000}
+
+    assert CaptureBudget().accept([shared] * 100) is False
+
+
 def test_capture_budget_measures_serialized_binary_footprint() -> None:
     assert CaptureBudget().accept({"data": b"x" * 30_000}) is True
     assert CaptureBudget().accept({"data": b"x" * 49_200}) is False
