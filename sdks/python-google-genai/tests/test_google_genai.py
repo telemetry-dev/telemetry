@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import gc
 import json
 import weakref
@@ -110,8 +111,8 @@ class FakeTransport:
         return async_generator()
 
 
-def client_with_transport(queue: list[Any]) -> tuple[Any, FakeTransport]:
-    client = genai.Client(api_key="test")
+def client_with_transport(queue: list[Any], *, vertexai: bool = False) -> tuple[Any, FakeTransport]:
+    client = genai.Client(api_key="test", vertexai=vertexai)
     transport = FakeTransport(queue)
     client._api_client.request = transport.request
     client._api_client.request_streamed = transport.request_streamed
@@ -202,17 +203,20 @@ def embed_payload() -> dict[str, Any]:
 
 
 def test_generate_images_is_media_span_without_binary_capture(memory: SimpleNamespace) -> None:
+    # google-genai 2.25 serves Imagen only through Vertex AI.
     client, _transport = client_with_transport(
-        [{"generatedImages": [{"image": {"imageBytes": "AAAA", "mimeType": "image/png"}}]}]
+        [{"predictions": [{"bytesBase64Encoded": "AAAA", "mimeType": "image/png"}]}],
+        vertexai=True,
     )
     wrapped = wrap_google_genai(client)
 
-    wrapped.models.generate_images(model="imagen-4.0-generate-001", prompt="A graph")
+    response = wrapped.models.generate_images(model="imagen-4.0-generate-001", prompt="A graph")
 
+    assert response.generated_images
     a = attrs(only_span(memory))
     assert a["gen_ai.operation.name"] == "generate_content"
     assert a["gen_ai.output.type"] == "image"
-    assert a["gen_ai.provider.name"] == "gcp.gemini"
+    assert a["gen_ai.provider.name"] == "gcp.vertex_ai"
     assert "AAAA" not in json.dumps(a)
 
 
@@ -2076,7 +2080,19 @@ def test_streaming_afc_accumulates_usage_and_records_history(
 
     assert calls == [{"location": "Paris"}]
     assert len(transport.calls) == 2
-    assert len(chunks) == 1
+    # The chunk sequence depends on the google-genai version (2.25 also yields the
+    # function-call turn), so compare against the same stream without instrumentation.
+    plain_client, _plain_transport = client_with_transport(copy.deepcopy([turn_one, turn_two]))
+    plain_chunks = list(
+        plain_client.models.generate_content_stream(
+            model="gemini-2.5-flash",
+            contents=[{"role": "user", "parts": [{"text": "weather?"}]}],
+            config=types.GenerateContentConfig(tools=[get_weather]),
+        )
+    )
+    assert [chunk.model_dump(mode="json") for chunk in chunks] == [
+        chunk.model_dump(mode="json") for chunk in plain_chunks
+    ]
     span = only_span(memory)
     a = attrs(span)
     assert a["gen_ai.usage.input_tokens"] == 30

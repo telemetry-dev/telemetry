@@ -160,8 +160,11 @@ pnpm run build
 pnpm run py:sync
 pnpm run py:check
 pnpm run py:test
+pnpm run py:test:bounds
 pnpm run py:build
 ```
+
+`py:test:bounds` runs each Python package's tests against the lowest and the highest third-party dependency versions its declared ranges allow. It always uses the local `telemetry-dev` checkout, not the lowest published `telemetry-dev` a provider package accepts.
 
 CI runs dependency, code, test, build, and release-safety checks for TypeScript and Python.
 The [SDK conformance guide](docs/sdk-conformance.md) defines the shared telemetry format and behavior.

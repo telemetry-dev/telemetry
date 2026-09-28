@@ -12,7 +12,6 @@ from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import (
     ExportMetricsServiceRequest,
 )
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
-from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import (
     AggregationTemporality,
     Histogram,
@@ -20,11 +19,16 @@ from opentelemetry.sdk.metrics.export import (
     Metric,
     PeriodicExportingMetricReader,
 )
+from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import telemetry_dev
-from telemetry_dev._metrics import GuardedOTLPMetricExporter, OutputChunkAggregation
+from telemetry_dev._metrics import (
+    GuardedOTLPMetricExporter,
+    OutputChunkAggregation,
+    sdk_meter_provider,
+)
 from tests.conftest import MakeClient
 from tests.otlp_capture import otlp_capture_server
 
@@ -385,13 +389,19 @@ def test_plain_span_records_nothing(memory: SimpleNamespace) -> None:
     assert "gen_ai.client.token.usage" not in metrics
 
 
-def test_quiet_interval_emits_zero_metric_posts() -> None:
-    # Empty-datapoint guard: collections with no data points are never POSTed.
-    # Same exporter + periodic reader wiring the client uses, against a real local server.
+@pytest.mark.parametrize("internal_metrics", [False, True])
+def test_quiet_interval_emits_zero_metric_posts(
+    monkeypatch: pytest.MonkeyPatch, internal_metrics: bool
+) -> None:
+    # Empty-datapoint guard: collections with no data points are never POSTed, even when
+    # OpenTelemetry records its own metric-reader metrics on the provider.
+    # Same exporter, reader, and provider wiring the client uses, against a real local server.
+    if internal_metrics:
+        monkeypatch.setenv("OTEL_PYTHON_SDK_INTERNAL_METRICS_ENABLED", "true")
     with otlp_capture_server() as server:
         exporter = GuardedOTLPMetricExporter(endpoint=f"{server.url}/v1/metrics")
         reader = PeriodicExportingMetricReader(exporter, export_interval_millis=50)
-        provider = MeterProvider(metric_readers=[reader], shutdown_on_exit=False)
+        provider = sdk_meter_provider(reader, Resource.create())
         meter = provider.get_meter("quiet")
         histogram = meter.create_histogram("gen_ai.client.operation.duration", unit="s")
 

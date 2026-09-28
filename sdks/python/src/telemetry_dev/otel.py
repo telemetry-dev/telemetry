@@ -22,7 +22,7 @@ from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
 from ._config import SDK_VERSION, logger, report_error, resolve_config
-from ._metrics import GuardedOTLPMetricExporter, MetricsRecorder
+from ._metrics import GuardedOTLPMetricExporter, MetricsRecorder, sdk_meter_provider
 from ._processor import ExportMode, StampingSpanProcessor
 from ._semconv import SCOPE_NAME
 
@@ -137,9 +137,7 @@ class TelemetrySpanProcessor(SpanProcessor):
                     else _DORMANT_METRIC_INTERVAL_MILLIS
                 ),
             )
-            self._meter_provider = MeterProvider(
-                metric_readers=[reader], resource=resource, shutdown_on_exit=False
-            )
+            self._meter_provider = sdk_meter_provider(reader, resource)
             meter = self._meter_provider.get_meter(SCOPE_NAME, SDK_VERSION)
             metrics_recorder = MetricsRecorder(meter, on_error=on_error)
 

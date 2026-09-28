@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import importlib
 import json
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mapping, Sequence
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
-import httpx
 import openai
 import pytest
 import telemetry_dev
@@ -22,8 +22,27 @@ from pydantic import BaseModel
 import telemetry_dev_openai
 from telemetry_dev_openai import instrument_openai, uninstrument_openai, wrap_openai
 
+if TYPE_CHECKING:
+    import httpx2 as httpx
+else:
+    # openai 3.x is built on httpx2 and rejects httpx clients; 2.x uses httpx.
+    _sdk_http = importlib.import_module("openai._base_client")
+    httpx = getattr(_sdk_http, "httpx2", None) or _sdk_http.httpx
+
 SyncHandler = Callable[[httpx.Request], httpx.Response]
 AsyncHandler = Callable[[httpx.Request], Coroutine[Any, Any, httpx.Response]]
+
+
+def assert_stream_transport_error(error: BaseException, message: str) -> None:
+    # openai 3.x wraps a mid-stream transport failure in APIConnectionError; 2.x re-raises it.
+    if openai.__version__.startswith("2."):
+        transport = error
+    else:
+        assert type(error) is openai.APIConnectionError
+        transport = error.__cause__
+    assert type(transport) is httpx.ReadError
+    assert str(transport) == message
+
 
 CHAT_MESSAGES: list[dict[str, str]] = [
     {"role": "system", "content": "You are helpful."},
@@ -624,8 +643,9 @@ async def test_interrupted_transcription_stream_records_bounded_partial_text(
         stream = await cast(Any, client.audio.transcriptions.create)(
             model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
         )
-        with pytest.raises(httpx.ReadError, match="interrupted"):
+        with pytest.raises(Exception) as exc_info:
             _ = [item async for item in stream]
+        assert_stream_transport_error(exc_info.value, "interrupted")
         await client.close()
     else:
         client = wrap_openai(
@@ -634,8 +654,9 @@ async def test_interrupted_transcription_stream_records_bounded_partial_text(
         stream = cast(Any, client.audio.transcriptions.create)(
             model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
         )
-        with pytest.raises(httpx.ReadError, match="interrupted"):
+        with pytest.raises(Exception) as exc_info:
             list(stream)
+        assert_stream_transport_error(exc_info.value, "interrupted")
 
     span = only_span(memory)
     output = str(attrs(span)["gen_ai.output.messages"])
@@ -1141,6 +1162,42 @@ async def test_chunk_timing_excludes_control_and_empty_deltas(
     assert len(received) == len(events)
     assert len(calls) == 6
     assert memory.metric_reader.get_metrics_data() is not None
+
+
+@pytest.mark.parametrize(
+    ("event_type", "chunks"),
+    [("response.shell_call_command.delta", 2), ("response.shell_call_output_content.delta", 0)],
+)
+def test_responses_chunk_timing_counts_model_generated_shell_commands(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, event_type: str, chunks: int
+) -> None:
+    calls: list[telemetry_dev.SpanHandle] = []
+    original = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        calls.append(handle)
+        return original(handle, timestamp_ms)
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
+    delta = {"item_id": "shell_1", "output_index": 0, "sequence_number": 0}
+    events: list[dict[str, Any]] = [
+        {"type": event_type, "delta": "ls", **delta},
+        {"type": event_type, "delta": "", **delta},
+        {"type": event_type, "delta": " -la", **delta},
+        {
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {"id": "resp_shell", "model": "gpt-5", "status": "completed", "output": []},
+        },
+    ]
+
+    stream = cast(Any, wrap_openai(sync_client(lambda _request: sse_response(events))).responses)
+    received = list(stream.create(model="gpt-5", input="List files", stream=True))
+
+    assert len(received) == len(events)
+    assert len(calls) == chunks
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
@@ -1902,7 +1959,7 @@ async def test_async_chat_stream_iteration_error_records_one_error_span(
         await stream.__anext__()
     await client.close()
 
-    assert "async stream broke" in str(exc_info.value)
+    assert_stream_transport_error(exc_info.value, "async stream broke")
     span = only_span(memory)
     assert span.status.status_code == StatusCode.ERROR
     a = attrs(span)
@@ -1952,7 +2009,7 @@ def test_chat_stream_iteration_error_records_one_error_span(memory: SimpleNamesp
     with pytest.raises(Exception) as exc_info:
         next(stream)
 
-    assert "sync stream broke" in str(exc_info.value)
+    assert_stream_transport_error(exc_info.value, "sync stream broke")
     span = only_span(memory)
     assert span.status.status_code == StatusCode.ERROR
     a = attrs(span)

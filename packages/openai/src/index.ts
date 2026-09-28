@@ -944,6 +944,7 @@ function responseEventHasOutput(event: JsonRecord): boolean {
       "response.custom_tool_call_input.delta",
       "response.code_interpreter_call_code.delta",
       "response.mcp_call_arguments.delta",
+      "response.shell_call_command.delta",
       "response.output_audio.delta",
       "response.audio.delta",
       "response.audio.transcript.delta",

@@ -41,7 +41,12 @@ from ._config import (
     resolve_config,
 )
 from ._context import SessionSampler
-from ._metrics import GuardedOTLPMetricExporter, MetricsRecorder, OutputChunkAggregation
+from ._metrics import (
+    GuardedOTLPMetricExporter,
+    MetricsRecorder,
+    OutputChunkAggregation,
+    sdk_meter_provider,
+)
 from ._processor import ExportMode, StampingSpanProcessor
 from ._semconv import SCOPE_NAME
 from ._serialize import Mask, serialize_content
@@ -207,9 +212,7 @@ class Client:
             )
         metrics_recorder: MetricsRecorder | None = None
         if metric_reader is not None:
-            self._meter_provider = MeterProvider(
-                metric_readers=[metric_reader], resource=resource, shutdown_on_exit=False
-            )
+            self._meter_provider = sdk_meter_provider(metric_reader, resource)
             meter = self._meter_provider.get_meter(SCOPE_NAME, SDK_VERSION)
             metrics_recorder = MetricsRecorder(
                 meter, on_error=on_error, output_chunks=self._output_chunks

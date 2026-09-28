@@ -20,7 +20,7 @@ classifiers = [
 ]
 dependencies = [
   "telemetry-dev>=0.2.6",
-  "openai>=2,<3",
+  "openai>=2,<4",
 ]
 
 [project.urls]

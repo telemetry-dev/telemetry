@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import inspect
 import json
 import random
 import sys
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mapping, Sequence
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import anthropic
-import httpx
 import pytest
 import telemetry_dev
 from anthropic import Anthropic, AsyncAnthropic
@@ -25,6 +26,15 @@ from opentelemetry.trace import StatusCode
 
 import telemetry_dev_anthropic
 from telemetry_dev_anthropic import instrument_anthropic, uninstrument_anthropic, wrap_anthropic
+
+if TYPE_CHECKING:
+    import httpx2 as httpx
+else:
+    # anthropic 1.x is built on httpx2 and rejects httpx clients; 0.x uses httpx.
+    _sdk_http = importlib.import_module("anthropic._base_client")
+    httpx = getattr(_sdk_http, "httpx2", None) or _sdk_http.httpx
+
+SAMPLING_KWARGS = anthropic.__version__.startswith("0.")
 
 SyncHandler = Callable[[httpx.Request], httpx.Response]
 AsyncHandler = Callable[[httpx.Request], Coroutine[Any, Any, httpx.Response]]
@@ -318,10 +328,8 @@ def test_create_maps_native_messages_system_params_usage_finish_and_provider(
         max_tokens=64,
         messages=MESSAGES,
         system="Be terse",
-        temperature=0.2,
-        top_p=0.9,
-        top_k=40,
         stop_sequences=["END"],
+        extra_body={"temperature": 0.2, "top_p": 0.9, "top_k": 40},
     )
 
     assert response.id == "msg_123"
@@ -351,6 +359,53 @@ def test_create_maps_native_messages_system_params_usage_finish_and_provider(
     assert json.loads(str(a["gen_ai.output.messages"])) == [
         {"role": "assistant", "content": [{"type": "text", "text": "Telemetry works."}]}
     ]
+
+
+def test_create_records_only_the_fields_the_request_sends(memory: SimpleNamespace) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request_json(request))
+        return json_response(message_payload())
+
+    wrapped_sync_client(handler).messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=64,
+        messages=MESSAGES,
+        system="Be terse",
+        stop_sequences=anthropic.omit,
+        extra_body={"max_tokens": anthropic.NOT_GIVEN, "system": anthropic.omit},
+    )
+
+    a = attrs(only_span(memory))
+    assert requests[0]["max_tokens"] == a["gen_ai.request.max_tokens"] == 64
+    assert "system" not in requests[0]
+    assert "gen_ai.system_instructions" not in a
+    assert "stop_sequences" not in requests[0]
+    assert "gen_ai.request.stop_sequences" not in a
+
+
+@pytest.mark.skipif(not SAMPLING_KWARGS, reason="anthropic 1.x removed sampling kwargs")
+def test_create_records_the_sampling_values_the_request_sends(memory: SimpleNamespace) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request_json(request))
+        return json_response(message_payload())
+
+    messages = wrapped_sync_client(handler).messages
+    messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=64,
+        messages=MESSAGES,
+        temperature=0.1,
+        top_p=0.9,
+        extra_body={"temperature": 0.2},
+    )
+
+    a = attrs(only_span(memory))
+    assert (requests[0]["temperature"], requests[0]["top_p"]) == (0.2, 0.9)
+    assert (a["gen_ai.request.temperature"], a["gen_ai.request.top_p"]) == (0.2, 0.9)
 
 
 def test_create_serializes_pydantic_request_content_blocks(memory: SimpleNamespace) -> None:
@@ -455,6 +510,33 @@ def test_tool_use_response_output_is_preserved(memory: SimpleNamespace) -> None:
     ]
     assert list(cast(Any, a["gen_ai.response.finish_reasons"])) == ["tool_use"]
     assert json.loads(str(a["gen_ai.input.messages"])) == {"messages": MESSAGES, "tools": [tool]}
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("anthropic.lib.tools._tool_params") is None,
+    reason="anthropic 0.x beta methods do not accept tool objects",
+)
+def test_beta_create_records_tool_objects_as_the_definitions_it_sends(
+    memory: SimpleNamespace,
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request_json(request))
+        return json_response(message_payload())
+
+    @anthropic.beta_tool
+    def get_weather(city: str) -> str:
+        """Look up the current weather for a city."""
+        return f"sunny in {city}"
+
+    wrapped_sync_client(handler).beta.messages.create(
+        model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES, tools=[get_weather]
+    )
+
+    captured = json.loads(str(attrs(only_span(memory))["gen_ai.input.messages"]))
+    assert captured["tools"] == requests[0]["tools"]
+    assert captured["tools"][0]["name"] == "get_weather"
 
 
 def test_create_streaming_preserves_events_and_records_aggregate(
