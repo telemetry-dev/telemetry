@@ -41,12 +41,15 @@ instrumentAnthropic();
 uninstrumentAnthropic();
 ```
 
-Global instrumentation patches `Messages.prototype.create`; call it once during process startup.
+Global instrumentation patches both the stable and beta `Messages.prototype.create`, so it covers `messages` and `beta.messages` on every client in the process. Call it once during process startup. `uninstrumentAnthropic()` restores both methods.
 
 ## Instrumented surfaces
 
 - `client.messages.create(...)`, including `stream: true` responses.
 - `client.messages.stream(...)` when the SDK helper is used.
+- `client.messages.parse(...)`, which routes through `create()`.
+- `client.beta.messages.create(...)`, `stream(...)`, and `parse(...)`.
+- `client.beta.messages.toolRunner(...)`: each model request in the tool loop records its own generation span.
 - Anthropic, Bedrock, and Vertex clients. Provider attributes are emitted as `anthropic`, `aws.bedrock`, or `gcp.vertex_ai`.
 
 Captured request fields include model, max tokens, temperature, top-p, stop sequences, system instructions, tools, and messages. Captured response fields include model, finish reason, content blocks, message id, and token usage including cache and thinking token details when Anthropic returns them.
@@ -57,6 +60,6 @@ Streaming spans start when the request is made and end when the stream is consum
 
 ## Limitations
 
-- `beta.messages`, `messages.countTokens`, and other non-Messages surfaces are not instrumented.
+- `messages.countTokens`, `beta.messages.countTokens`, batches, and other non-Messages surfaces are not instrumented.
 - `with_raw_response` and `with_streaming_response` helper namespaces are not patched directly.
 - If application code never consumes or closes a stream, the span cannot finish until the stream is finalized by the runtime.
