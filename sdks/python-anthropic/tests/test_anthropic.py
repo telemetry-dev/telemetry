@@ -1614,9 +1614,7 @@ def test_stream_keeps_short_compaction_replacement_within_budget(make: Any) -> N
     ]
 
 
-def test_oversized_compaction_replacement_keeps_previous_reservation_and_recovers(
-    make: Any,
-) -> None:
+def test_oversized_compaction_replacement_drops_stale_block_and_recovers(make: Any) -> None:
     make(max_attribute_length=300)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
@@ -1625,12 +1623,12 @@ def test_oversized_compaction_replacement_keeps_previous_reservation_and_recover
 
     record({"type": "content_block_start", "index": 0, "content_block": start}, state)
     record({"type": "content_block_delta", "index": 0, "delta": first}, state)
-    reserved = state.budget.bytes_used
     oversized = {"type": "compaction_delta", "content": "x" * 400}
     record({"type": "content_block_delta", "index": 0, "delta": oversized}, state)
 
-    assert state.budget.bytes_used == reserved
-    assert state.blocks[0]["content"] == "ok"
+    # The stale "ok" summary is dropped and its reservation released.
+    assert 0 not in state.blocks
+    assert state.budget.bytes_used == 0
 
     final = {"type": "compaction_delta", "content": "final"}
     record({"type": "content_block_delta", "index": 0, "delta": final}, state)
@@ -1643,7 +1641,7 @@ def test_oversized_compaction_replacement_keeps_previous_reservation_and_recover
     assert state.blocks[0]["content"] == "final"
 
 
-def test_replacement_after_other_block_truncation_stays_rejected(make: Any) -> None:
+def test_compaction_after_other_block_truncation_is_dropped(make: Any) -> None:
     make(max_attribute_length=300)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
@@ -1683,8 +1681,10 @@ def test_replacement_after_other_block_truncation_stays_rejected(make: Any) -> N
         state,
     )
 
+    # The rejected replacement still makes "ok" stale, so it is dropped; the truncation
+    # caused by the other block stays in effect.
     assert state.budget.truncated is True
-    assert state.blocks[0]["content"] == "ok"
+    assert 0 not in state.blocks
 
 
 def test_signature_replacement_releases_its_previous_budget_reservation(make: Any) -> None:
@@ -1792,24 +1792,26 @@ def test_replacement_budget_invariants_hold_for_random_streams(make: Any) -> Non
             fits = measure(candidate) <= state.budget.max_bytes - others
             compaction = delta["type"] == "compaction_delta"
             assert (state.blocks.get(index) == candidate) == fits
-            assert (index in state.superseded) == (compaction and not fits)
             output = telemetry_dev_anthropic._stream_output(state)  # pyright: ignore[reportPrivateUsage]
             emitted: list[Any] = output[0]["content"] if output else []
-            assert len(emitted) == len(set(state.blocks) - state.superseded)
+            assert len(emitted) == len(state.blocks)
             if fits:
                 continue
             assert state.budget.truncated is False
             if compaction:
-                assert (dict(state.blocks.get(index, {})), state.budget.bytes_used) == before
+                # A rejected summary drops the stale block and frees everything it held.
+                assert index not in state.blocks
+                assert index not in state.block_reservations
+                assert state.budget.bytes_used == others
             else:
                 # A rejected signature keeps the thinking block without the stale signature.
                 kept = {key: value for key, value in before[0].items() if key != "signature"}
                 assert state.blocks.get(index) == kept
 
 
-def test_stream_omits_compaction_superseded_by_a_rejected_final_replacement(make: Any) -> None:
+def test_stream_drops_compaction_superseded_by_a_rejected_final_replacement(make: Any) -> None:
     # 400 bytes fits the text block with the "ok" compaction (344 bytes), not the oversized
-    # replacement (742 bytes), so "ok" is accepted and then superseded.
+    # replacement (742 bytes), so "ok" is accepted and then made stale.
     memory = make(max_attribute_length=400)
     a = streamed_beta_span(
         beta_stream_events(
@@ -1858,3 +1860,49 @@ def test_rejected_signature_keeps_thinking_and_drops_the_stale_signature(make: A
             ],
         }
     ]
+
+
+def test_rejected_compaction_releases_budget_for_later_blocks(make: Any) -> None:
+    # The 150-character summary block holds 300 bytes and the text block needs 390, so the
+    # text only fits in 400 bytes once the stale summary's reservation is released.
+    memory = make(max_attribute_length=400)
+    a = streamed_beta_span(
+        beta_stream_events(
+            (
+                {"type": "compaction", "content": None},
+                [
+                    {"type": "compaction_delta", "content": "x" * 150},
+                    {"type": "compaction_delta", "content": "x" * 400},
+                ],
+            ),
+            ({"type": "text", "text": ""}, [{"type": "text_delta", "text": "y" * 200}]),
+        ),
+        memory,
+    )
+
+    assert json.loads(str(a["gen_ai.output.messages"])) == [
+        {"role": "assistant", "content": [{"type": "text", "text": "y" * 200}]}
+    ]
+
+
+def test_rejected_compactions_after_truncation_leave_no_state(make: Any) -> None:
+    make(max_attribute_length=300)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+    record({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}, state)
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "z" * 500},
+        },
+        state,
+    )
+    assert state.budget.truncated is True
+    retained = (dict(state.blocks), dict(state.block_reservations), state.budget.bytes_used)
+
+    for index in range(1, 2001):
+        delta = {"type": "compaction_delta", "content": "c"}
+        record({"type": "content_block_delta", "index": index, "delta": delta}, state)
+
+    assert (state.blocks, state.block_reservations, state.budget.bytes_used) == retained

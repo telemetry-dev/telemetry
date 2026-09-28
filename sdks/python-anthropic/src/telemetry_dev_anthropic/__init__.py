@@ -243,9 +243,6 @@ class _StreamState:
         self.budget = telemetry_dev.CaptureBudget.from_client()
         # Budget bytes and items each block holds: its start plus every accepted delta.
         self.block_reservations: dict[int, tuple[int, int]] = {}
-        # Compaction blocks whose latest replacement was rejected: the retained summary is
-        # stale, so they are left out of the output until a later replacement is accepted.
-        self.superseded: set[int] = set()
 
 
 def _reserve(index: int, value: Any, state: _StreamState) -> bool:
@@ -288,16 +285,14 @@ def _finalize_block(index: int, block: Mapping[str, Any], state: _StreamState) -
 
 
 def _stream_output(state: _StreamState) -> list[dict[str, Any]] | None:
-    blocks = {
-        index: block for index, block in state.blocks.items() if index not in state.superseded
-    }
-    if not blocks:
+    if not state.blocks:
         return None
     return [
         {
             "role": "assistant",
             "content": [
-                _finalize_block(index, block, state) for index, block in sorted(blocks.items())
+                _finalize_block(index, block, state)
+                for index, block in sorted(state.blocks.items())
             ],
         }
     ]
@@ -437,8 +432,19 @@ def _drop_stale_signature(index: int, state: _StreamState) -> None:
         return
     stripped = {key: value for key, value in block.items() if key != "signature"}
     state.blocks[index] = stripped
-    if not state.budget.truncated:
-        _reserve_replacement(index, stripped, state)
+    _reserve_replacement(index, stripped, state)
+
+
+def _drop_stale_compaction(index: int, state: _StreamState) -> None:
+    """Drop a compaction block whose newer summary was rejected, and free its reservation.
+
+    The retained summary is stale, so it is never emitted. Releasing its bytes lets later
+    blocks use them, and a later replacement that fits reserves from what is left.
+    """
+    state.blocks.pop(index, None)
+    released_bytes, released_items = state.block_reservations.pop(index, (0, 0))
+    state.budget.bytes_used -= released_bytes
+    state.budget.items_used -= released_items
 
 
 def _record_content_block_delta(event: Any, state: _StreamState) -> None:
@@ -452,9 +458,8 @@ def _record_content_block_delta(event: Any, state: _StreamState) -> None:
             return
         if _reserve_replacement(block_index, replaced, state):
             state.blocks[block_index] = replaced
-            state.superseded.discard(block_index)
         elif delta_type == "compaction_delta":
-            state.superseded.add(block_index)
+            _drop_stale_compaction(block_index, state)
         else:
             _drop_stale_signature(block_index, state)
         return
