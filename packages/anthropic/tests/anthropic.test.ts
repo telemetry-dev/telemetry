@@ -1078,18 +1078,15 @@ const declinedIteration = {
   cache_read_input_tokens: 0,
 };
 
+const servedIteration = {
+  ...declinedIteration,
+  type: "fallback_message",
+  model: "claude-opus-4-8",
+  output_tokens: 2,
+};
+
 test("beta streams record the fallback model when a fallback_message iteration served it", async () => {
-  const span = await streamedBetaSpan(
-    fallbackStream([
-      declinedIteration,
-      {
-        ...declinedIteration,
-        type: "fallback_message",
-        model: "claude-opus-4-8",
-        output_tokens: 2,
-      },
-    ]),
-  );
+  const span = await streamedBetaSpan(fallbackStream([declinedIteration, servedIteration]));
 
   expect(span.attributes["gen_ai.response.model"]).toBe("claude-opus-4-8");
 });
@@ -1099,6 +1096,41 @@ test("beta streams keep the requested model when the fallback request failed", a
 
   expect(span.attributes["gen_ai.response.model"]).toBe("claude-opus-5");
 });
+
+const advisorIteration = {
+  ...declinedIteration,
+  type: "advisor_message",
+  model: "claude-haiku-4-5",
+};
+
+test.each<{ name: string; iterations: JsonRecord[]; expected: string }>([
+  {
+    name: "advisor without fallback",
+    iterations: [declinedIteration, advisorIteration],
+    expected: "claude-opus-5",
+  },
+  {
+    name: "advisor after fallback",
+    iterations: [declinedIteration, servedIteration, advisorIteration],
+    expected: "claude-opus-4-8",
+  },
+  {
+    name: "last fallback wins",
+    iterations: [
+      servedIteration,
+      { ...servedIteration, model: "claude-sonnet-5" },
+      advisorIteration,
+    ],
+    expected: "claude-sonnet-5",
+  },
+])(
+  "beta streams ignore advisor iterations for the served model: $name",
+  async ({ iterations, expected }) => {
+    const span = await streamedBetaSpan(fallbackStream(iterations));
+
+    expect(span.attributes["gen_ai.response.model"]).toBe(expected);
+  },
+);
 
 const compactionStream = (...deltas: JsonRecord[]) =>
   betaStreamEvents([

@@ -1386,6 +1386,33 @@ def test_beta_stream_keeps_requested_model_when_fallback_request_failed(
     assert a["gen_ai.response.model"] == "claude-opus-5"
 
 
+ADVISOR_ITERATION: dict[str, Any] = {
+    **DECLINED_ITERATION,
+    "type": "advisor_message",
+    "model": "claude-haiku-4-5",
+}
+
+
+@pytest.mark.parametrize(
+    ("iterations", "expected"),
+    [
+        ([DECLINED_ITERATION, ADVISOR_ITERATION], "claude-opus-5"),
+        ([DECLINED_ITERATION, SERVED_ITERATION, ADVISOR_ITERATION], "claude-opus-4-8"),
+        (
+            [SERVED_ITERATION, {**SERVED_ITERATION, "model": "claude-sonnet-5"}, ADVISOR_ITERATION],
+            "claude-sonnet-5",
+        ),
+    ],
+    ids=["advisor_without_fallback", "advisor_after_fallback", "last_fallback_wins"],
+)
+def test_beta_stream_ignores_advisor_iterations_for_the_served_model(
+    memory: SimpleNamespace, iterations: list[dict[str, Any]], expected: str
+) -> None:
+    a = streamed_beta_span(fallback_stream(iterations), memory)
+
+    assert a["gen_ai.response.model"] == expected
+
+
 def test_beta_stream_records_compaction_content(memory: SimpleNamespace) -> None:
     a = streamed_beta_span(
         beta_stream_events(
@@ -1906,3 +1933,149 @@ def test_rejected_compactions_after_truncation_leave_no_state(make: Any) -> None
         record({"type": "content_block_delta", "index": index, "delta": delta}, state)
 
     assert (state.blocks, state.block_reservations, state.budget.bytes_used) == retained
+
+
+@pytest.mark.parametrize("signature", ["sig", "s" * 200])
+def test_signature_at_a_tool_index_reserves_the_raw_tool_input_it_keeps(
+    make: Any, signature: str
+) -> None:
+    make(max_attribute_length=600)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+    start: dict[str, Any] = {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}
+    partial_json = json.dumps({"query": "q" * 200})
+
+    record({"type": "content_block_start", "index": 0, "content_block": start}, state)
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": partial_json},
+        },
+        state,
+    )
+    held = state.budget.bytes_used
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": signature},
+        },
+        state,
+    )
+
+    # The signed block is measured with the raw input it keeps; one that does not fit leaves
+    # the unsigned block and its input on their existing reservation.
+    signed = {**start, "signature": signature}
+    expected = telemetry_dev.CaptureBudget(max_bytes=600)
+    fits = expected.accept((signed, partial_json))
+    assert fits == (signature == "sig")
+    retained = signed if fits else start
+    assert state.budget.bytes_used == (expected.bytes_used if fits else held)
+    assert state.budget.truncated is False
+    assert telemetry_dev_anthropic._stream_output(state) == [  # pyright: ignore[reportPrivateUsage]
+        {"role": "assistant", "content": [{**retained, "input": {"query": "q" * 200}}]}
+    ]
+
+
+def test_dropped_compaction_at_a_tool_index_leaves_no_tool_input_for_later_blocks(
+    make: Any,
+) -> None:
+    make(max_attribute_length=300)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"a": 1}'},
+        },
+        state,
+    )
+    oversized = {"type": "compaction_delta", "content": "x" * 400}
+    record({"type": "content_block_delta", "index": 0, "delta": oversized}, state)
+    record(
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hi"}},
+        state,
+    )
+
+    assert telemetry_dev_anthropic._stream_output(state) == [  # pyright: ignore[reportPrivateUsage]
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]}
+    ]
+
+
+def test_signature_after_truncation_keeps_every_reservation(make: Any) -> None:
+    make(max_attribute_length=300)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+    thinking = {"type": "thinking", "thinking": ""}
+
+    record({"type": "content_block_start", "index": 0, "content_block": thinking}, state)
+    for delta in (
+        {"type": "thinking_delta", "thinking": "t" * 20},
+        {"type": "signature_delta", "signature": "sig"},
+    ):
+        record({"type": "content_block_delta", "index": 0, "delta": delta}, state)
+    record({"type": "content_block_start", "index": 1, "content_block": {"type": "text"}}, state)
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "text_delta", "text": "z" * 500},
+        },
+        state,
+    )
+    assert state.budget.truncated is True
+    retained = (dict(state.block_reservations), state.budget.bytes_used)
+
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "new"},
+        },
+        state,
+    )
+
+    # The newer signature makes "sig" stale, but no budget is released or re-reserved while
+    # truncated, so the stripped block stays paid for by its existing reservation.
+    assert (state.block_reservations, state.budget.bytes_used) == retained
+    assert state.blocks[0] == {"type": "thinking", "thinking": "t" * 20}
+
+
+@pytest.mark.parametrize("spare_items", [0, -1])
+def test_compaction_replacement_respects_the_item_limit(make: Any, spare_items: int) -> None:
+    make()
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+    sibling = {"type": "text", "text": "hi"}
+    replaced = {"type": "compaction", "content": "ok", "encrypted_content": None}
+
+    def items(value: object) -> int:
+        budget = telemetry_dev.CaptureBudget()
+        assert budget.accept(value)
+        return budget.items_used
+
+    # Exactly enough items for the sibling and the completed block, so the replacement only
+    # fits once the start shell's items are released.
+    state.budget = telemetry_dev.CaptureBudget(
+        max_items=items(sibling) + items(replaced) + spare_items
+    )
+    record({"type": "content_block_start", "index": 0, "content_block": sibling}, state)
+    record(
+        {"type": "content_block_start", "index": 1, "content_block": {"type": "compaction"}},
+        state,
+    )
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "compaction_delta", "content": "ok"},
+        },
+        state,
+    )
+
+    assert state.budget.truncated is False
+    assert state.budget.items_used == sum(held for _, held in state.block_reservations.values())
+    assert state.blocks.get(1) == (replaced if spare_items == 0 else None)
