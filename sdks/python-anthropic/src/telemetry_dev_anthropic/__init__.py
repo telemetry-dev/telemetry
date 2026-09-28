@@ -200,15 +200,20 @@ def _is_anthropic_class(client: object | None, name: str) -> bool:
     return isinstance(cls, type) and isinstance(client, cls)
 
 
+_CLIENT_PROVIDERS = (
+    ("AnthropicBedrock", "aws.bedrock"),
+    ("AsyncAnthropicBedrock", "aws.bedrock"),
+    ("AnthropicBedrockMantle", "aws.bedrock"),
+    ("AsyncAnthropicBedrockMantle", "aws.bedrock"),
+    ("AnthropicVertex", "gcp.vertex_ai"),
+    ("AsyncAnthropicVertex", "gcp.vertex_ai"),
+)
+
+
 def _provider_for_client(client: object | None) -> str:
-    if _is_anthropic_class(client, "AnthropicBedrock") or _is_anthropic_class(
-        client, "AsyncAnthropicBedrock"
-    ):
-        return "aws.bedrock"
-    if _is_anthropic_class(client, "AnthropicVertex") or _is_anthropic_class(
-        client, "AsyncAnthropicVertex"
-    ):
-        return "gcp.vertex_ai"
+    for name, provider in _CLIENT_PROVIDERS:
+        if _is_anthropic_class(client, name):
+            return provider
     return "anthropic"
 
 

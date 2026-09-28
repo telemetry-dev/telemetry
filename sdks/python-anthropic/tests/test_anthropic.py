@@ -981,6 +981,38 @@ def test_wrap_anthropic_keeps_client_wrapped_after_global_uninstrument(
     assert len(memory.span_exporter.get_finished_spans()) == 1
 
 
+@pytest.mark.parametrize(
+    ("client_class", "subclass", "expected"),
+    [
+        ("AnthropicBedrockMantle", False, "aws.bedrock"),
+        ("AsyncAnthropicBedrockMantle", False, "aws.bedrock"),
+        ("AnthropicBedrockMantle", True, "aws.bedrock"),
+        ("AnthropicFoundry", False, "anthropic"),
+        ("AnthropicAWS", False, "anthropic"),
+    ],
+)
+def test_provider_mapping_for_other_client_classes(
+    memory: SimpleNamespace, client_class: str, subclass: bool, expected: str
+) -> None:
+    base: type[Any] = getattr(anthropic, client_class)
+    cls: type[Any] = type("CustomClient", (base,), {}) if subclass else base
+    client = object.__new__(cls)
+
+    def create(**_kwargs: Any) -> dict[str, Any]:
+        return message_payload(id="msg_provider")
+
+    def stream_stub(**_kwargs: Any) -> None:
+        return None
+
+    client.messages = SimpleNamespace(create=create, stream=stream_stub)
+
+    wrap_anthropic(client).messages.create(
+        model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES
+    )
+
+    assert attrs(only_span(memory))["gen_ai.provider.name"] == expected
+
+
 def test_provider_mapping_for_bedrock_vertex_and_plain_client(memory: SimpleNamespace) -> None:
     anthropic_any: Any = anthropic
     bedrock = object.__new__(anthropic_any.AnthropicBedrock)

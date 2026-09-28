@@ -827,6 +827,41 @@ test("instrumentAnthropic and wrapAnthropic together record one span per call", 
   expect(allSpans[1]!.attributes["gen_ai.request.model"]).toBe("claude-sonnet-4-6");
 });
 
+const providerClients = {
+  AnthropicBedrock: class AnthropicBedrock {},
+  AnthropicBedrockMantle: class AnthropicBedrockMantle {},
+  AnthropicVertex: class AnthropicVertex {},
+  AnthropicFoundry: class AnthropicFoundry {},
+  AnthropicAws: class AnthropicAws {},
+};
+
+test.each<{ client: keyof typeof providerClients; subclass: boolean; expected: string }>([
+  { client: "AnthropicBedrockMantle", subclass: false, expected: "aws.bedrock" },
+  { client: "AnthropicBedrock", subclass: true, expected: "aws.bedrock" },
+  { client: "AnthropicVertex", subclass: true, expected: "gcp.vertex_ai" },
+  { client: "AnthropicFoundry", subclass: false, expected: "anthropic" },
+  { client: "AnthropicAws", subclass: false, expected: "anthropic" },
+])(
+  "wrapAnthropic maps $client (subclass: $subclass) to $expected",
+  async ({ client, subclass, expected }) => {
+    const spans = setupSpans();
+    const Base = providerClients[client];
+    const Client = subclass ? class CustomClient extends Base {} : Base;
+    const instance = Object.assign(new Client(), {
+      messages: { create: async (_params: JsonValue) => messagePayload({ id: "msg_provider" }) },
+    });
+
+    await wrapAnthropic(instance).messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 64,
+      messages: [{ role: "user", content: "Hi" }],
+    });
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["gen_ai.provider.name"]).toBe(expected);
+  },
+);
+
 test("wrapAnthropic records Bedrock provider names from client constructor names", async () => {
   const spans = setupSpans();
 
