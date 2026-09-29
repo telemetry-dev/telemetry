@@ -197,6 +197,23 @@ def _stop_sequences(value: Any) -> list[str] | None:
     return strings or None
 
 
+def _sent_params(params: Mapping[str, Any]) -> dict[str, Any]:
+    sent = dict(params)
+    extra_body = params.get("extra_body")
+    if isinstance(extra_body, Mapping):
+        overrides = cast(Mapping[str, Any], extra_body)
+        sent.update(
+            (key, value)
+            for key, value in overrides.items()
+            if not isinstance(value, openai.NotGiven)
+        )
+    return {
+        key: value
+        for key, value in sent.items()
+        if key != "extra_body" and not isinstance(value, (openai.NotGiven, openai.Omit))
+    }
+
+
 def _capture_text(value: str, budget: telemetry_dev.CaptureBudget) -> str:
     if not value or budget.truncated:
         return ""
@@ -353,14 +370,14 @@ def _responses_usage(raw: Any) -> dict[str, int | float] | None:
     )
 
 
-def _media_request(output_type: str) -> RequestMapper:
+def _media_request(endpoint: str, output_type: str) -> RequestMapper:
     def mapper(params: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
         model = _string(params.get("model"))
         input_value = params.get("prompt") or params.get("input")
         if not isinstance(input_value, str):
             input_value = None
         return (
-            f"generate_content {model or output_type}",
+            f"{endpoint} {model or 'unknown'}",
             {
                 "type": "generation",
                 "model": model,
@@ -1467,7 +1484,7 @@ def _inject_chat_usage(kwargs: Mapping[str, Any]) -> tuple[dict[str, Any], bool]
 def _start_span(
     params: Mapping[str, Any], mapper: RequestMapper, provider: str
 ) -> tuple[telemetry_dev.SpanHandle, Callable[..., None], float]:
-    name, fields = mapper(params)
+    name, fields = mapper(_sent_params(params))
     handle = telemetry_dev.start_span(name, provider=provider, **_clean_fields(fields))
     return handle, _end_once(handle), time.perf_counter()
 
@@ -1808,7 +1825,7 @@ def wrap_openai(client: _T, *, inject_stream_usage: bool = False) -> _T:
             method,
             wrapper_factory,
             "media",
-            _media_request("image"),
+            _media_request("image", "image"),
             _media_response,
             False,
         )  # type: ignore[attr-defined]
@@ -1817,17 +1834,20 @@ def wrap_openai(client: _T, *, inject_stream_usage: bool = False) -> _T:
         "create",
         wrapper_factory,
         "media",
-        _media_request("speech"),
+        _media_request("speech", "speech"),
         _media_response,
         False,
     )  # type: ignore[attr-defined]
-    for resource in (dynamic_client.audio.transcriptions, dynamic_client.audio.translations):
+    for resource, endpoint in (
+        (dynamic_client.audio.transcriptions, "transcription"),
+        (dynamic_client.audio.translations, "translation"),
+    ):
         _patch_instance(
             resource,
             "create",
             wrapper_factory,
             "media",
-            _media_request("text"),
+            _media_request(endpoint, "text"),
             _text_media_response,
             False,
         )
@@ -1903,24 +1923,24 @@ def instrument_openai(*, inject_stream_usage: bool = False) -> None:
                     method,
                     wrapper_factory,
                     "media",
-                    _media_request("image"),
+                    _media_request("image", "image"),
                     _media_response,
                     False,
                 )
-        for cls, wrapper_factory, output_type in (
-            (Speech, _wrap_sync, "speech"),
-            (AsyncSpeech, _wrap_async, "speech"),
-            (Transcriptions, _wrap_sync, "text"),
-            (AsyncTranscriptions, _wrap_async, "text"),
-            (Translations, _wrap_sync, "text"),
-            (AsyncTranslations, _wrap_async, "text"),
+        for cls, wrapper_factory, endpoint, output_type in (
+            (Speech, _wrap_sync, "speech", "speech"),
+            (AsyncSpeech, _wrap_async, "speech", "speech"),
+            (Transcriptions, _wrap_sync, "transcription", "text"),
+            (AsyncTranscriptions, _wrap_async, "transcription", "text"),
+            (Translations, _wrap_sync, "translation", "text"),
+            (AsyncTranslations, _wrap_async, "translation", "text"),
         ):
             _patch_class(
                 cls,
                 "create",
                 wrapper_factory,
                 "media",
-                _media_request(output_type),
+                _media_request(endpoint, output_type),
                 _text_media_response if output_type == "text" else _media_response,
                 False,
             )

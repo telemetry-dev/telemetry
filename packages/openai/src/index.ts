@@ -6,7 +6,7 @@ import {
   type SpanHandle,
   type StartSpanOptions,
 } from "@telemetry-dev/sdk";
-import OpenAI, { AzureOpenAI } from "openai";
+import OpenAI from "openai";
 import { Stream } from "openai/core/streaming";
 import { Speech } from "openai/resources/audio/speech";
 import { Transcriptions } from "openai/resources/audio/transcriptions";
@@ -485,8 +485,10 @@ function baseURLHost<T>(baseURL: T): string | undefined {
 }
 
 function providerForClient<T>(client: T): string {
-  if (client instanceof AzureOpenAI) return "azure.ai.openai";
-  const host = baseURLHost(asRecord(client)?.baseURL)?.replace(/\.$/, "");
+  const clientRecord = asRecord(client);
+
+  if (readString(clientRecord?.apiVersion) !== undefined) return "azure.ai.openai";
+  const host = baseURLHost(clientRecord?.baseURL)?.replace(/\.$/, "");
 
   if (host === "openrouter.ai" || host?.endsWith(".openrouter.ai")) return "openrouter";
 
@@ -1093,19 +1095,35 @@ function wrapStream<T>(
   startedAt: number,
   injectedUsage: boolean,
 ): T | Stream<JsonValue> {
-  if (!(value instanceof Stream)) return value;
+  const candidate = asRecord(value);
+
+  if (
+    !(candidate?.iterator instanceof Function) ||
+    !(candidate?.controller instanceof AbortController) ||
+    !(candidate?.tee instanceof Function) ||
+    !(candidate?.toReadableStream instanceof Function)
+  ) {
+    return value;
+  }
   const end = endOnce(span);
   const source = value as Stream<JsonValue>;
+  let observed: Stream<JsonValue>;
 
   if (operation === "chat") {
-    return createObservedChatStream(source, span, startedAt, end, injectedUsage);
+    observed = createObservedChatStream(source, span, startedAt, end, injectedUsage);
+  } else if (operation === "images" || operation === "transcriptions") {
+    observed = createObservedMediaStream(source, operation, span, startedAt, end);
+  } else {
+    observed = createObservedResponsesStream(source, span, startedAt, end);
   }
 
-  if (operation === "images" || operation === "transcriptions") {
-    return createObservedMediaStream(source, operation, span, startedAt, end);
-  }
+  const StreamConstructor = source.constructor as new (
+    iterator: () => AsyncIterator<JsonValue>,
+    controller: AbortController,
+  ) => Stream<JsonValue>;
+  const iterator = asRecord(observed)?.iterator as unknown as () => AsyncIterator<JsonValue>;
 
-  return createObservedResponsesStream(source, span, startedAt, end);
+  return new StreamConstructor(iterator, source.controller);
 }
 
 function withChatUsageInjection(body: JsonRecord) {

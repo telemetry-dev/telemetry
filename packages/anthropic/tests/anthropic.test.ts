@@ -5,7 +5,9 @@ import {
 } from "@opentelemetry/sdk-metrics";
 import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import { flush, init, shutdown } from "@telemetry-dev/sdk";
+import * as telemetrySdk from "@telemetry-dev/sdk";
 import Anthropic from "@anthropic-ai/sdk";
+import { createRequire } from "node:module";
 import { afterEach, expect, test, vi } from "vitest";
 
 import { instrumentAnthropic, uninstrumentAnthropic, wrapAnthropic } from "../src/index.ts";
@@ -154,7 +156,10 @@ function createFakeFetch(...responses: Response[]): FakeFetch {
   return { fetch: fetchImpl, requests };
 }
 
-function setupSpans(metricExporter?: PushMetricExporter): InMemorySpanExporter {
+function setupSpans(
+  metricExporter?: PushMetricExporter,
+  captureOutput = true,
+): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
   init(
     {
@@ -163,6 +168,7 @@ function setupSpans(metricExporter?: PushMetricExporter): InMemorySpanExporter {
       environment: "test",
       exportMode: "immediate",
       logLevel: "silent",
+      captureOutput,
       fetch: async () => new Response(null, { status: 200 }),
     },
     { spanExporter, metricExporter },
@@ -329,6 +335,27 @@ test("messages.create preserves the Anthropic promise API", async () => {
   await finishedSpans(spans, 1);
 });
 
+test("messages.parse sends the stable request and records its response", async () => {
+  const spans = setupSpans();
+  const fake = createFakeFetch(jsonResponse(messagePayload({ id: "msg_stable_parse" })));
+  const client = clientWith(fake.fetch);
+
+  const parsed = await client.messages.parse({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Parse this" }],
+  });
+
+  expect(parsed.id).toBe("msg_stable_parse");
+  expect(fake.requests).toEqual([
+    expect.objectContaining({
+      path: "/v1/messages",
+      body: expect.objectContaining({ messages: [{ role: "user", content: "Parse this" }] }),
+    }),
+  ]);
+  expect((await exportedSpan(spans)).attributes["gen_ai.response.id"]).toBe("msg_stable_parse");
+});
+
 test("messages.create records one error span when the Anthropic API returns 4xx", async () => {
   const spans = setupSpans();
   const fake = createFakeFetch(jsonErrorResponse(400, "bad model"));
@@ -485,6 +512,86 @@ test("messages.create streaming preserves events and records aggregated text usa
     Number(span.attributes["gen_ai.response.time_to_first_chunk"]) ===
       span.attributes["gen_ai.response.time_to_first_chunk"],
   ).toBe(true);
+});
+
+test("stream capture is bounded without changing delivered events", async () => {
+  const spans = setupSpans();
+  const events: JsonRecord[] = [
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    ...Array.from({ length: 80 }, () => ({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "x".repeat(1024) },
+    })),
+    { type: "message_stop" },
+  ];
+  const fake = createFakeFetch(namedSseResponse(events));
+  const stream = await clientWith(fake.fetch).messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  const output = jsonAttr<Array<{ content: Array<{ text: string }> }>>(
+    span,
+    "gen_ai.output.messages",
+  );
+  expect(output[0]!.content[0]!.text.length).toBeLessThan(48 * 1024);
+});
+
+test("stream capture retains no output when output capture is disabled", async () => {
+  const spans = setupSpans(undefined, false);
+  const capture = vi.spyOn(telemetrySdk, "boundedCaptureDetails");
+  const startSpan = telemetrySdk.startSpan;
+  const endedFields: unknown[] = [];
+  vi.spyOn(telemetrySdk, "startSpan").mockImplementation((...args) => {
+    const span = startSpan(...args);
+    const end = span.end.bind(span);
+    vi.spyOn(span, "end").mockImplementation((fields) => {
+      endedFields.push(fields);
+      return end(fields);
+    });
+    return span;
+  });
+  const fake = createFakeFetch(namedSseResponse(streamEvents()));
+  const stream = await clientWith(fake.fetch).messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(streamEvents());
+  expect(capture).not.toHaveBeenCalled();
+  expect(endedFields).toHaveLength(1);
+  expect(endedFields[0]).toHaveProperty("output", undefined);
+  expect((await exportedSpan(spans)).attributes["gen_ai.output.messages"]).toBeUndefined();
+});
+
+test("wrapAnthropic observes a CommonJS client subclass stream", async () => {
+  const spans = setupSpans();
+  const fake = createFakeFetch(namedSseResponse(streamEvents()));
+  const require = createRequire(import.meta.url);
+  const CommonJsAnthropic = require("@anthropic-ai/sdk").default as typeof Anthropic;
+  class CustomAnthropic extends CommonJsAnthropic {}
+  const client = wrapAnthropic(
+    new CustomAnthropic({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 }),
+  );
+  const stream = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toHaveLength(streamEvents().length);
+  expect(jsonAttr(await exportedSpan(spans), "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ type: "text", text: "Hello world" }] },
+  ]);
 });
 
 test("messages.create streaming observes duck-typed stream responses", async () => {
@@ -1282,6 +1389,191 @@ test("beta streams record output chunk timing for compaction content", async () 
 
   expect(histogram?.dataPoints).toEqual([
     expect.objectContaining({ value: expect.objectContaining({ count: 1 }) }),
+  ]);
+});
+
+test("beta stream replacement recovery clears capture truncation", async () => {
+  const span = await streamedBetaSpan(
+    compactionStream(
+      { content: "x".repeat(60 * 1024) },
+      { content: "recovered", encrypted_content: "e" },
+    ),
+  );
+
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: [{ type: "compaction", content: "recovered", encrypted_content: "e" }],
+    },
+  ]);
+});
+
+test("beta stream recovers after repeated rejected compaction replacements", async () => {
+  const span = await streamedBetaSpan(
+    compactionStream(
+      { content: "x".repeat(60 * 1024) },
+      { content: "y".repeat(60 * 1024) },
+      { content: "recovered" },
+    ),
+  );
+
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ type: "compaction", content: "recovered" }] },
+  ]);
+});
+
+test("beta stream keeps rejected inherited encrypted content unresolved until explicit replacement", async () => {
+  const unresolved = await streamedBetaSpan(
+    compactionStream(
+      { content: "ok", encrypted_content: "enc" },
+      { content: "x".repeat(60 * 1024) },
+      { content: "recovered" },
+    ),
+  );
+
+  expect(unresolved.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(jsonAttr(unresolved, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ type: "compaction", content: "recovered" }] },
+  ]);
+
+  const resolved = await streamedBetaSpan(
+    compactionStream(
+      { content: "ok", encrypted_content: "enc" },
+      { content: "x".repeat(60 * 1024) },
+      { content: "recovered" },
+      { content: "resolved", encrypted_content: "enc-2" },
+    ),
+  );
+
+  expect(resolved.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  expect(jsonAttr(resolved, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: [{ type: "compaction", content: "resolved", encrypted_content: "enc-2" }],
+    },
+  ]);
+});
+
+test("beta stream rejected final replacement marks capture incomplete", async () => {
+  const span = await streamedBetaSpan(compactionStream({ content: "x".repeat(60 * 1024) }));
+
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+});
+
+test("beta stream rejected signature stays incomplete until a later signature fits", async () => {
+  const events = betaStreamEvents([
+    { type: "thinking", thinking: "" },
+    [
+      { type: "signature_delta", signature: "sig" },
+      { type: "signature_delta", signature: "x".repeat(60 * 1024) },
+    ],
+  ]);
+  const rejected = await streamedBetaSpan(events);
+
+  expect(rejected.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(jsonAttr(rejected, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ type: "thinking", thinking: "" }] },
+  ]);
+
+  events.splice(-2, 0, {
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "signature_delta", signature: "recovered" },
+  });
+  const recovered = await streamedBetaSpan(events);
+
+  expect(recovered.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  expect(jsonAttr(recovered, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: [{ type: "thinking", thinking: "", signature: "recovered" }],
+    },
+  ]);
+});
+
+test("beta stream releases a rejected signature before retaining a sibling", async () => {
+  const events = betaStreamEvents(
+    [
+      { type: "thinking", thinking: "" },
+      [
+        { type: "signature_delta", signature: "s".repeat(40 * 1024) },
+        { type: "signature_delta", signature: "x".repeat(60 * 1024) },
+      ],
+    ],
+    [{ type: "text", text: "" }, [{ type: "text_delta", text: "t".repeat(10 * 1024) }]],
+  );
+  events.splice(-2, 0, {
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "signature_delta", signature: "recovered" },
+  });
+  const span = await streamedBetaSpan(events);
+
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "", signature: "recovered" },
+        { type: "text", text: "t".repeat(10 * 1024) },
+      ],
+    },
+  ]);
+});
+
+test("beta stream does not retain rejected signatures for unseen indexes", async () => {
+  const events = betaStreamEvents();
+  for (let index = 0; index < 2_000; index += 1) {
+    events.splice(-2, 0, {
+      type: "content_block_delta",
+      index,
+      delta: { type: "signature_delta", signature: "x".repeat(60 * 1024) },
+    });
+  }
+
+  const additions = vi.spyOn(Set.prototype, "add");
+  const span = await streamedBetaSpan(events);
+  const retainedIndexes = additions.mock.calls.filter(([value]) => typeof value === "number");
+  additions.mockRestore();
+
+  expect(retainedIndexes).toEqual([]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+});
+
+test("beta stream replacement budget retains raw tool JSON bytes", async () => {
+  const signatures = Array.from({ length: 20 }, (_, index) => ({
+    type: "signature_delta",
+    signature: `sig-${index}`,
+  }));
+  const span = await streamedBetaSpan(
+    betaStreamEvents([
+      { type: "tool_use", id: "toolu_1", name: "lookup", input: {} },
+      [
+        { type: "input_json_delta", partial_json: `{}${" ".repeat(40 * 1024)}` },
+        ...signatures,
+        { type: "input_json_delta", partial_json: `${" ".repeat(10 * 1024)}x` },
+      ],
+    ]),
+  );
+
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_1",
+          name: "lookup",
+          input: {},
+          signature: "sig-19",
+        },
+      ],
+    },
   ]);
 });
 

@@ -7,6 +7,7 @@ import {
 import { flush, init, shutdown } from "@telemetry-dev/sdk";
 import * as sdk from "@telemetry-dev/sdk";
 import { EventEmitter } from "node:events";
+import { createRequire } from "node:module";
 import OpenAI, { AzureOpenAI } from "openai";
 import { Stream } from "openai/core/streaming";
 import { Completions } from "openai/resources/chat/completions/completions";
@@ -2080,6 +2081,78 @@ test("AzureOpenAI clients report Azure provider for wrapped and global instrumen
   expect(global?.attributes["gen_ai.provider.name"]).toBe("azure.ai.openai");
 });
 
+test("wrapOpenAI supports require-created streams and Azure clients", async () => {
+  const spans = setupSpans();
+  const require = createRequire(import.meta.url);
+  const packageName = process.env.OPENAI_SDK_VERSION === "6" ? "openai-v6" : "openai";
+  const required = require(packageName) as typeof import("openai");
+  const RequiredOpenAI = required.default;
+  const RequiredAzureOpenAI = required.AzureOpenAI;
+  const fake = createFakeFetch(
+    sseResponse([
+      {
+        id: "chatcmpl_cjs_stream",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-4o",
+        choices: [{ index: 0, delta: { role: "assistant", content: "CJS" } }],
+      },
+      {
+        id: "chatcmpl_cjs_stream",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-4o",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      },
+    ]),
+    jsonResponse({
+      id: "chatcmpl_cjs_azure",
+      object: "chat.completion",
+      created: 1,
+      model: "gpt-4o",
+      choices: [{ index: 0, message: { role: "assistant", content: "Azure" } }],
+    }),
+  );
+  const streamClient = wrapOpenAI(
+    new RequiredOpenAI({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 }),
+  );
+  const stream = await streamClient.chat.completions.create({
+    model: "gpt-4o",
+    messages: [{ role: "user", content: "CJS" }],
+    stream: true,
+  });
+
+  expect(stream).not.toBeInstanceOf(Stream);
+  expect("tee" in stream).toBe(true);
+  expect("toReadableStream" in stream).toBe(true);
+  const [left, right] = stream.tee();
+  expect(left.controller).toBe(stream.controller);
+  const [leftEvents, rightEvents] = await Promise.all([collectStream(left), collectStream(right)]);
+  expect(leftEvents).toHaveLength(2);
+  expect(rightEvents).toHaveLength(2);
+  stream.controller.abort();
+  expect(stream.controller.signal.aborted).toBe(true);
+
+  await wrapOpenAI(
+    new RequiredAzureOpenAI({
+      apiKey: "test",
+      apiVersion: "2024-10-21",
+      endpoint: "https://example.azure.com",
+      fetch: fake.fetch,
+      maxRetries: 0,
+    }),
+  ).chat.completions.create({
+    model: "gpt-4o",
+    messages: [{ role: "user", content: "Azure" }],
+  });
+
+  const finished = await finishedSpans(spans, 2);
+  expect(finished.map((span) => span.attributes["gen_ai.provider.name"])).toEqual([
+    "openai",
+    "azure.ai.openai",
+  ]);
+});
+
 test("clients with an OpenRouter base URL report the openrouter provider", async () => {
   const spans = setupSpans();
 
@@ -2414,6 +2487,7 @@ test("images generate maps modality usage without capturing image bytes", async 
   await clientWith(fake.fetch).images.generate({ model: "gpt-image-1", prompt: "an otter" });
 
   const span = await exportedSpan(spans);
+  expect(span.name).toBe("image gpt-image-1");
   expect(span.attributes["gen_ai.operation.name"]).toBe("generate_content");
   expect(span.attributes["gen_ai.output.type"]).toBe("image");
   expect(span.attributes["gen_ai.usage.text.input_tokens"]).toBe(5);
@@ -2453,6 +2527,8 @@ test("endpoint modality fills aggregate image and transcription output usage", a
   await client.audio!.transcriptions!.create({ model: "gpt-4o-transcribe" });
 
   const [image, transcription] = await finishedSpans(spans, 2);
+  expect(image?.name).toBe("image gpt-image-1");
+  expect(transcription?.name).toBe("transcription gpt-4o-transcribe");
   expect(image?.attributes["gen_ai.usage.image.output_tokens"]).toBe(9);
   expect(image?.attributes["gen_ai.usage.text.output_tokens"]).toBe(2);
   expect(transcription?.attributes["gen_ai.usage.text.output_tokens"]).toBe(7);

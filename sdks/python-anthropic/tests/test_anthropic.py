@@ -756,6 +756,7 @@ def test_sync_stream_bounds_retained_events_without_dropping_chunks(
     assert state.budget.truncated is True
     assert state.budget.bytes_used <= state.budget.max_bytes
     assert len(state.blocks[0]["text"]) < 64 * 1024
+    assert attrs(only_span(memory))["telemetry.dev.capture.truncated"] is True
 
 
 def test_stream_rejects_normalized_tool_block_over_budget_but_keeps_metadata(
@@ -1347,6 +1348,53 @@ def test_beta_tool_runner_records_one_generation_span_per_turn(memory: SimpleNam
     ]
 
 
+async def test_async_beta_tool_runner_records_one_generation_span_per_turn(
+    memory: SimpleNamespace,
+) -> None:
+    responses = [
+        json_response(
+            message_payload(
+                id="msg_async_tool_turn",
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "weather",
+                        "input": {"city": "Accra"},
+                    }
+                ],
+                stop_reason="tool_use",
+            )
+        ),
+        json_response(message_payload(id="msg_async_final_turn")),
+    ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    calls: list[str] = []
+
+    @anthropic.beta_async_tool
+    async def weather(city: str) -> str:
+        calls.append(city)
+        return "sunny"
+
+    client = wrapped_async_client(handler)
+    final = await client.beta.messages.tool_runner(
+        model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES, tools=[weather]
+    ).until_done()
+    await client.close()
+
+    assert final.id == "msg_async_final_turn"
+    assert calls == ["Accra"]
+    assert [
+        attrs(span)["gen_ai.response.id"] for span in memory.span_exporter.get_finished_spans()
+    ] == [
+        "msg_async_tool_turn",
+        "msg_async_final_turn",
+    ]
+
+
 def test_global_instrumentation_covers_beta_and_parse_and_restores(
     memory: SimpleNamespace,
 ) -> None:
@@ -1849,6 +1897,54 @@ def test_oversized_compaction_replacement_drops_stale_block_and_recovers(make: A
     assert state.budget.truncated is False
     assert state.budget.bytes_used == expected.bytes_used
     assert state.blocks[0]["content"] == "final"
+    partial = telemetry_dev_anthropic._stream_partial(state)  # pyright: ignore[reportPrivateUsage]
+    assert "attributes" not in partial
+
+
+def test_multiple_rejected_compaction_replacements_still_recover(make: Any) -> None:
+    make(max_attribute_length=300)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+    record(
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "compaction"}},
+        state,
+    )
+    for content in ("x" * 400, "y" * 400, "recovered"):
+        record(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "compaction_delta", "content": content},
+            },
+            state,
+        )
+
+    assert state.budget.truncated is False
+    assert state.unresolved_replacements == set()
+    assert state.blocks[0]["content"] == "recovered"
+
+
+def test_rejected_final_compaction_marks_capture_incomplete(make: Any) -> None:
+    make(max_attribute_length=300)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+
+    record(
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "compaction"}},
+        state,
+    )
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "compaction_delta", "content": "x" * 400},
+        },
+        state,
+    )
+
+    partial = telemetry_dev_anthropic._stream_partial(state)  # pyright: ignore[reportPrivateUsage]
+    assert partial["attributes"] == {"telemetry.dev.capture.truncated": True}
+    assert state.budget.truncated is False
 
 
 def test_compaction_after_other_block_truncation_is_dropped(make: Any) -> None:
@@ -2007,6 +2103,9 @@ def test_replacement_budget_invariants_hold_for_random_streams(make: Any) -> Non
             assert len(emitted) == len(state.blocks)
             if fits:
                 continue
+            if not before[0] and index not in state.unresolved_replacements:
+                assert state.budget.truncated is True
+                continue
             assert state.budget.truncated is False
             if compaction:
                 # A rejected summary drops the stale block and frees everything it held.
@@ -2070,6 +2169,137 @@ def test_rejected_signature_keeps_thinking_and_drops_the_stale_signature(make: A
             ],
         }
     ]
+
+
+def test_rejected_signature_stays_unresolved_until_a_replacement_is_accepted(make: Any) -> None:
+    make(max_attribute_length=300)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+    record(
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}},
+        state,
+    )
+    for signature in ("sig", "x" * 400):
+        record(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": signature},
+            },
+            state,
+        )
+
+    assert state.unresolved_replacements == {0}
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "recovered"},
+        },
+        state,
+    )
+    assert state.unresolved_replacements == set()
+    assert state.blocks[0]["signature"] == "recovered"
+
+
+def test_rejected_signature_releases_budget_for_sibling_and_recovers(make: Any) -> None:
+    make(max_attribute_length=50 * 1024)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+    record(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""},
+        },
+        state,
+    )
+    for signature in ("s" * (40 * 1024), "x" * (60 * 1024)):
+        record(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": signature},
+            },
+            state,
+        )
+    record(
+        {"type": "content_block_start", "index": 1, "content_block": {"type": "text"}},
+        state,
+    )
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "text_delta", "text": "t" * (10 * 1024)},
+        },
+        state,
+    )
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "recovered"},
+        },
+        state,
+    )
+
+    assert state.budget.truncated is False
+    assert state.unresolved_replacements == set()
+    assert state.blocks[0]["signature"] == "recovered"
+    assert state.blocks[1]["text"] == "t" * (10 * 1024)
+    assert state.budget.bytes_used == sum(
+        held_bytes for held_bytes, _ in state.block_reservations.values()
+    )
+
+
+def test_rejected_unseen_replacements_use_sticky_bounded_truncation(make: Any) -> None:
+    make(max_attribute_length=100)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+
+    for index in range(2000):
+        record(
+            {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "signature_delta", "signature": "x" * 200},
+            },
+            state,
+        )
+
+    assert state.budget.truncated is True
+    assert state.unresolved_replacements == set()
+    assert state.blocks == {}
+
+
+def test_rejected_compaction_indexes_are_bounded_before_sticky_truncation(make: Any) -> None:
+    make(max_attribute_length=100)
+    state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
+    record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
+
+    for index in range(1100):
+        record(
+            {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {"type": "compaction"},
+            },
+            state,
+        )
+        record(
+            {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "compaction_delta", "content": "x" * 200},
+            },
+            state,
+        )
+
+    assert state.budget.truncated is True
+    assert len(state.unresolved_replacements) <= 1024
+    assert len(state.blocks) <= 1024
+    assert len(state.block_reservations) <= 1024
 
 
 def test_rejected_compaction_releases_budget_for_later_blocks(make: Any) -> None:
@@ -2188,7 +2418,7 @@ def test_dropped_compaction_at_a_tool_index_leaves_no_tool_input_for_later_block
     ]
 
 
-def test_signature_after_truncation_keeps_every_reservation(make: Any) -> None:
+def test_signature_after_truncation_remeasures_the_stripped_block(make: Any) -> None:
     make(max_attribute_length=300)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
@@ -2210,7 +2440,7 @@ def test_signature_after_truncation_keeps_every_reservation(make: Any) -> None:
         state,
     )
     assert state.budget.truncated is True
-    retained = (dict(state.block_reservations), state.budget.bytes_used)
+    retained_bytes = state.budget.bytes_used
 
     record(
         {
@@ -2221,9 +2451,11 @@ def test_signature_after_truncation_keeps_every_reservation(make: Any) -> None:
         state,
     )
 
-    # The newer signature makes "sig" stale, but no budget is released or re-reserved while
-    # truncated, so the stripped block stays paid for by its existing reservation.
-    assert (state.block_reservations, state.budget.bytes_used) == retained
+    assert state.budget.bytes_used < retained_bytes
+    assert state.budget.bytes_used == sum(
+        held_bytes for held_bytes, _ in state.block_reservations.values()
+    )
+    assert state.unresolved_replacements == {0}
     assert state.blocks[0] == {"type": "thinking", "thinking": "t" * 20}
 
 

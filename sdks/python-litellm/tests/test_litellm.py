@@ -2258,6 +2258,47 @@ def test_responses_failed_event_marks_span_error(
     assert exception.attributes["exception.message"] == "stream disconnected (transport_error)"
 
 
+@pytest.mark.parametrize("method", ["arerank", "responses", "aresponses"])
+async def test_router_rerank_and_responses_traced(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    rerank = method in ("rerank", "arerank")
+    response = (
+        SimpleNamespace(
+            id="rerank-router",
+            results=[{"index": 0, "relevance_score": 0.9}],
+            meta={"tokens": {"input_tokens": 15, "output_tokens": 2}},
+            _hidden_params={"custom_llm_provider": "cohere"},
+        )
+        if rerank
+        else responses_result()
+    )
+
+    def sync_call(**kwargs: Any) -> Any:
+        return response
+
+    async def async_call(**kwargs: Any) -> Any:
+        return response
+
+    router = llm.Router(model_list=[])
+    monkeypatch.setattr(router, method, async_call if method.startswith("a") else sync_call)
+    wrap_router(router)
+    params = (
+        {"model": "cohere/rerank-v3.5", "query": "best", "documents": ["first"]}
+        if rerank
+        else {"model": "openai/gpt-4.1-mini", "input": "hello"}
+    )
+    result = getattr(router, method)(**params)
+    if method.startswith("a"):
+        result = await result
+
+    assert result is response
+    span = only_span(memory)
+    assert attrs(span)["gen_ai.operation.name"] == ("rerank" if rerank else "chat")
+    assert attrs(span)["gen_ai.response.id"] == ("rerank-router" if rerank else "resp_123")
+    assert attrs(span)["gen_ai.usage.input_tokens"] == (15 if rerank else 12)
+
+
 def test_router_completion_traced(memory: SimpleNamespace) -> None:
     instrument_litellm()
     router = llm.Router(
