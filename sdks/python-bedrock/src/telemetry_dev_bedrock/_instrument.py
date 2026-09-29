@@ -333,17 +333,20 @@ class _InstrumentedStreamingBody(StreamingBody):
             self._finish(complete=True)
         return chunk
 
-    def readinto(self, b: Any) -> int:
-        try:
-            amount_read = super().readinto(b)
-        except BaseException as exc:
-            self._finish(complete=False, error=exc)
-            raise
-        if amount_read > 0:
-            self._capture(memoryview(b)[:amount_read])
-        if (amount_read == 0 and len(b) > 0) or self._content_length_reached():
-            self._finish(complete=True)
-        return amount_read
+    # botocore added StreamingBody.readinto in 1.39; only offer it when the wrapped body can.
+    if hasattr(StreamingBody, "readinto"):
+
+        def readinto(self, b: Any) -> int:
+            try:
+                amount_read = super().readinto(b)
+            except BaseException as exc:
+                self._finish(complete=False, error=exc)
+                raise
+            if amount_read > 0:
+                self._capture(memoryview(b)[:amount_read])
+            if (amount_read == 0 and len(b) > 0) or self._content_length_reached():
+                self._finish(complete=True)
+            return amount_read
 
     def readlines(self) -> list[bytes]:
         try:

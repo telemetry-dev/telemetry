@@ -141,12 +141,43 @@ def _stop_sequences(value: Any) -> list[str] | None:
     return strings or None
 
 
+def _sent_params(params: Mapping[str, Any]) -> dict[str, Any]:
+    # Mirrors the SDK: extra_body overrides kwargs (anthropic 1.x accepts sampling parameters
+    # only there), a NotGiven override is ignored, and Omit or NotGiven leaves a field unsent.
+    sent = dict(params)
+    extra_body = params.get("extra_body")
+    if isinstance(extra_body, Mapping):
+        overrides = cast(Mapping[str, Any], extra_body)
+        sent.update(
+            (key, value)
+            for key, value in overrides.items()
+            if not isinstance(value, anthropic.NotGiven)
+        )
+    return {
+        key: value
+        for key, value in sent.items()
+        if not isinstance(value, (anthropic.NotGiven, anthropic.Omit))
+    }
+
+
+def _tool_definitions(value: Any) -> Any:
+    # anthropic 1.x beta methods send a tool object's to_dict() in place of the object.
+    tools = _sequence_items(value)
+    if not tools:
+        return _native(value)
+    return [
+        _native(tool.to_dict()) if callable(getattr(tool, "to_dict", None)) else _native(tool)
+        for tool in tools
+    ]
+
+
 def _messages_request(params: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    params = _sent_params(params)
     model = _string(params.get("model"))
     input_value: Any
     if "tools" in params or "tool_choice" in params:
         input_value = {"messages": _native(params.get("messages"))}
-        tools = _native(params.get("tools"))
+        tools = _tool_definitions(params.get("tools"))
         tool_choice = _native(params.get("tool_choice"))
         if tools is not None:
             input_value["tools"] = tools

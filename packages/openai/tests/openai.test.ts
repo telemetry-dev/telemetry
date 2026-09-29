@@ -1358,6 +1358,7 @@ test.each([
   "response.custom_tool_call_input",
   "response.code_interpreter_call_code",
   "response.mcp_call_arguments",
+  "response.shell_call_command",
   "response.audio.transcript",
 ])("%s deltas retain timing after completion and interruption", async (eventType) => {
   const metricExporter = new InMemoryMetricExporter(AggregationTemporality.DELTA);

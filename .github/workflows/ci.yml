@@ -56,3 +56,23 @@ jobs:
       - run: pnpm run py:check
       - run: pnpm run py:test
       - run: pnpm run py:build
+
+  python-dependency-bounds:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - sdks/python
+          - sdks/python-anthropic
+          - sdks/python-bedrock
+          - sdks/python-google-genai
+          - sdks/python-litellm
+          - sdks/python-openai
+          - sdks/python-openrouter
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: bash .github/scripts/python_dependency_bounds.sh "${{ matrix.package }}"

@@ -9,16 +9,20 @@ from typing import Any
 
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.metrics import Meter
+from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import (
     AggregationTemporality,
     Histogram,
     HistogramDataPoint,
     Metric,
     MetricExportResult,
+    MetricReader,
     MetricsData,
     ResourceMetrics,
     ScopeMetrics,
 )
+from opentelemetry.sdk.metrics.view import DropAggregation, View
+from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import INVALID_SPAN_CONTEXT, NonRecordingSpan, set_span_in_context
 
@@ -39,6 +43,23 @@ _INPUT_TOKENS_ATTR = USAGE_ATTRS["input_tokens"]
 _OUTPUT_TOKENS_ATTR = USAGE_ATTRS["output_tokens"]
 _MAX_CHUNK_ATTRIBUTE_SETS = 2000
 _CHUNK_METRIC_NAME = "gen_ai.client.operation.time_per_output_chunk"
+
+
+def sdk_meter_provider(reader: MetricReader, resource: Resource) -> MeterProvider:
+    return MeterProvider(
+        metric_readers=[reader],
+        resource=resource,
+        shutdown_on_exit=False,
+        # OpenTelemetry records metric-reader metrics on the reader's own provider (always in
+        # 1.41, opt-in from 1.42); they must not be exported to telemetry.dev.
+        views=[
+            View(
+                meter_name="opentelemetry-sdk",
+                instrument_name="otel.sdk.*",
+                aggregation=DropAggregation(),
+            )
+        ],
+    )
 
 
 @dataclass

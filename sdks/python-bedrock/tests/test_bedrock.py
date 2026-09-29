@@ -936,6 +936,31 @@ def test_invoke_model_context_readinto_writes_pending_and_delegated_bytes(
     assert _json_attr(span, "gen_ai.output.messages")["completion"] == "answer"
 
 
+def test_invoke_model_streaming_body_offers_readinto_only_when_botocore_does(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _client("bedrock-runtime")
+    raw = _body({"completion": "answer"})
+    _stub_api_call(
+        client,
+        [{"body": StreamingBody(io.BytesIO(raw), len(raw)), "contentType": "application/json"}],
+        monkeypatch,
+    )
+    wrap_bedrock(client)
+
+    body = client.invoke_model(  # type: ignore[attr-defined]
+        modelId="anthropic.claude-3-haiku",
+        contentType="application/json",
+        body=_body({"messages": [], "max_tokens": 10}),
+    )["body"]
+
+    assert hasattr(body, "readinto") == hasattr(StreamingBody, "readinto")
+    assert body.read() == raw
+
+
+@pytest.mark.skipif(
+    not hasattr(StreamingBody, "readinto"), reason="botocore added readinto in 1.39"
+)
 def test_invoke_model_streaming_body_bounds_capture_and_preserves_readinto(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:

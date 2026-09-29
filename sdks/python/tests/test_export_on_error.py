@@ -58,6 +58,9 @@ class FakeLogExporter(LogRecordExporter):
             raise self._outcome
         return self._outcome
 
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return True
+
     def shutdown(self) -> None:
         pass
 
