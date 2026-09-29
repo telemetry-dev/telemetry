@@ -395,30 +395,35 @@ def _replaced_block(index: int, delta: Any, state: _StreamState) -> dict[str, An
     return block
 
 
+def _release(index: int, state: _StreamState) -> None:
+    """Hand back everything a block holds: its start and every accepted delta."""
+    held_bytes, held_items = state.block_reservations.pop(index, (0, 0))
+    state.budget.bytes_used -= held_bytes
+    state.budget.items_used -= held_items
+
+
 def _reserve_replacement(index: int, block: dict[str, Any], state: _StreamState) -> bool:
     """Reserve the block that a replacement delta produces in place of what the block held.
 
-    Everything the block held (its start and earlier deltas) is handed back first, then the
-    resulting block is reserved. Other blocks keep their reservations.
-
-    A replacement that does not fit is rejected on its own: the previous block keeps its
-    reservation and the budget stays usable for a later replacement that does fit.
-    Truncation caused by another block still applies.
+    The replacement, with any raw tool input the block keeps, is measured as if the block's
+    current reservation were already released. Only a replacement that fits releases it; one
+    that does not fit changes nothing, so the budget stays usable for a later replacement that
+    does fit. Other blocks keep their reservations, and truncation caused by another block
+    still applies.
     """
     budget = state.budget
     if budget.truncated:
         return False
-    released_bytes, released_items = state.block_reservations.pop(index, (0, 0))
-    budget.bytes_used -= released_bytes
-    budget.items_used -= released_items
-    if _reserve(index, block, state):
-        return True
-    budget.bytes_used += released_bytes
-    budget.items_used += released_items
-    budget.truncated = False
-    if released_bytes or released_items:
-        state.block_reservations[index] = (released_bytes, released_items)
-    return False
+    raw_input = state.tool_json.get(index)
+    retained = block if raw_input is None else (block, raw_input)
+    held_bytes, held_items = state.block_reservations.get(index, (0, 0))
+    candidate = telemetry_dev.CaptureBudget(budget.max_bytes, budget.max_items)
+    candidate.bytes_used = budget.bytes_used - held_bytes
+    candidate.items_used = budget.items_used - held_items
+    if not candidate.accept(retained):
+        return False
+    _release(index, state)
+    return _reserve(index, retained, state)
 
 
 def _drop_stale_signature(index: int, state: _StreamState) -> None:
@@ -442,9 +447,8 @@ def _drop_stale_compaction(index: int, state: _StreamState) -> None:
     blocks use them, and a later replacement that fits reserves from what is left.
     """
     state.blocks.pop(index, None)
-    released_bytes, released_items = state.block_reservations.pop(index, (0, 0))
-    state.budget.bytes_used -= released_bytes
-    state.budget.items_used -= released_items
+    state.tool_json.pop(index, None)
+    _release(index, state)
 
 
 def _record_content_block_delta(event: Any, state: _StreamState) -> None:
