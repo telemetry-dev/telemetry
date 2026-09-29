@@ -291,8 +291,11 @@ class _StreamState:
         self.finish_reason: str | None = None
         self.response_model: str | None = None
         self.budget = telemetry_dev.CaptureBudget.from_client()
-        # Budget bytes and items each block holds: its start plus every accepted delta.
         self.block_reservations: dict[int, tuple[int, int]] = {}
+        self.unresolved_replacements: set[int] = set()
+
+
+_MAX_UNRESOLVED_REPLACEMENTS = 1024
 
 
 def _reserve(index: int, value: Any, state: _StreamState) -> bool:
@@ -349,12 +352,15 @@ def _stream_output(state: _StreamState) -> list[dict[str, Any]] | None:
 
 
 def _stream_partial(state: _StreamState) -> dict[str, Any]:
-    return {
+    fields: dict[str, Any] = {
         "output": _stream_output(state),
         "usage": _cache_inclusive_usage(state.usage),
         "finish_reason": state.finish_reason,
         "response_model": state.response_model,
     }
+    if state.budget.truncated or state.unresolved_replacements:
+        fields["attributes"] = {"telemetry.dev.capture.truncated": True}
+    return fields
 
 
 def _append_string(target: dict[str, Any], key: str, value: Any) -> None:
@@ -427,7 +433,6 @@ def _block_for_delta(index: int, delta_type: str | None, state: _StreamState) ->
     return state.blocks[index]
 
 
-# Deltas whose value replaces the block's previous value instead of appending to it.
 _REPLACEMENT_DELTAS = frozenset({"compaction_delta", "signature_delta"})
 
 
@@ -453,14 +458,6 @@ def _release(index: int, state: _StreamState) -> None:
 
 
 def _reserve_replacement(index: int, block: dict[str, Any], state: _StreamState) -> bool:
-    """Reserve the block that a replacement delta produces in place of what the block held.
-
-    The replacement, with any raw tool input the block keeps, is measured as if the block's
-    current reservation were already released. Only a replacement that fits releases it; one
-    that does not fit changes nothing, so the budget stays usable for a later replacement that
-    does fit. Other blocks keep their reservations, and truncation caused by another block
-    still applies.
-    """
     budget = state.budget
     if budget.truncated:
         return False
@@ -471,31 +468,48 @@ def _reserve_replacement(index: int, block: dict[str, Any], state: _StreamState)
     candidate.bytes_used = budget.bytes_used - held_bytes
     candidate.items_used = budget.items_used - held_items
     if not candidate.accept(retained):
+        if index in state.blocks or index in state.unresolved_replacements:
+            if (
+                index not in state.unresolved_replacements
+                and len(state.unresolved_replacements) >= _MAX_UNRESOLVED_REPLACEMENTS
+            ):
+                budget.truncated = True
+            else:
+                state.unresolved_replacements.add(index)
+        else:
+            budget.truncated = True
         return False
     _release(index, state)
-    return _reserve(index, retained, state)
+    reserved = _reserve(index, retained, state)
+    if reserved:
+        state.unresolved_replacements.discard(index)
+    return reserved
 
 
 def _drop_stale_signature(index: int, state: _StreamState) -> None:
-    """Keep a thinking block whose newer signature was rejected, without the stale signature.
-
-    The reasoning text is still valid; only the earlier signature no longer matches. The
-    block is re-reserved without it when the budget allows, so the dropped bytes are freed.
-    """
     block = state.blocks.get(index)
     if block is None or "signature" not in block:
         return
     stripped = {key: value for key, value in block.items() if key != "signature"}
+    raw_input = state.tool_json.get(index)
+    retained = stripped if raw_input is None else (stripped, raw_input)
+    held_bytes, held_items = state.block_reservations.get(index, (0, 0))
+    candidate = telemetry_dev.CaptureBudget(state.budget.max_bytes, state.budget.max_items)
+    candidate.bytes_used = state.budget.bytes_used - held_bytes
+    candidate.items_used = state.budget.items_used - held_items
+    if candidate.accept(retained):
+        base_bytes = state.budget.bytes_used - held_bytes
+        base_items = state.budget.items_used - held_items
+        measured_bytes = candidate.bytes_used - base_bytes
+        measured_items = candidate.items_used - base_items
+        state.budget.bytes_used = base_bytes + measured_bytes
+        state.budget.items_used = base_items + measured_items
+        state.block_reservations[index] = (measured_bytes, measured_items)
     state.blocks[index] = stripped
-    _reserve_replacement(index, stripped, state)
+    state.unresolved_replacements.add(index)
 
 
 def _drop_stale_compaction(index: int, state: _StreamState) -> None:
-    """Drop a compaction block whose newer summary was rejected, and free its reservation.
-
-    The retained summary is stale, so it is never emitted. Releasing its bytes lets later
-    blocks use them, and a later replacement that fits reserves from what is left.
-    """
     state.blocks.pop(index, None)
     state.tool_json.pop(index, None)
     _release(index, state)

@@ -445,7 +445,9 @@ def test_streamed_image_edit_maps_aggregate_output_tokens_to_image(memory: Simpl
     )
 
     assert [event.type for event in stream] == ["image_edit.completed"]
-    assert attrs(only_span(memory))["gen_ai.usage.image.output_tokens"] == 9
+    span = only_span(memory)
+    assert span.name == "image gpt-image-1"
+    assert attrs(span)["gen_ai.usage.image.output_tokens"] == 9
 
 
 def test_media_stream_preserves_sync_context_manager_cleanup(memory: SimpleNamespace) -> None:
@@ -515,7 +517,9 @@ def test_streaming_transcription_records_terminal_text_and_usage(memory: SimpleN
     )
 
     assert [event.type for event in stream] == [event["type"] for event in events]
-    a = attrs(only_span(memory))
+    span = only_span(memory)
+    assert span.name == "transcription gpt-4o-transcribe"
+    a = attrs(span)
     assert a["gen_ai.output.messages"] == "complete transcript"
     assert a["gen_ai.usage.text.output_tokens"] == 3
 
@@ -898,6 +902,34 @@ def test_chat_completion_maps_native_messages_usage_finish_provider_and_sampling
     assert json.loads(str(a["gen_ai.output.messages"])) == [
         {"role": "assistant", "content": "Telemetry works."}
     ]
+
+
+def test_chat_completion_records_the_body_values_the_sdk_sends(memory: SimpleNamespace) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request_json(request))
+        return json_response(chat_completion())
+
+    client = wrap_openai(sync_client(handler))
+    cast(Any, client.chat.completions.create)(
+        model="gpt-4o-mini",
+        messages=CHAT_MESSAGES,
+        temperature=openai.omit,
+        extra_body={
+            "model": openai.NOT_GIVEN,
+            "temperature": 0.2,
+            "top_p": openai.omit,
+            "max_completion_tokens": 32,
+        },
+    )
+
+    a = attrs(only_span(memory))
+    assert requests[0]["model"] == a["gen_ai.request.model"] == "gpt-4o-mini"
+    assert requests[0]["temperature"] == a["gen_ai.request.temperature"] == 0.2
+    assert requests[0]["max_completion_tokens"] == a["gen_ai.request.max_tokens"] == 32
+    assert "top_p" not in requests[0]
+    assert "gen_ai.request.top_p" not in a
 
 
 @pytest.mark.parametrize(

@@ -228,6 +228,7 @@ On `ai@7` (root entry):
   `status: "error"` and an `exception` event.
 - `generateObject` / `streamObject` / `embed` / `embedMany` / `rerank` are covered.
 - `experimental_evaluate` telemetry is covered with `ai >= 7.0.111`.
+- Experimental realtime APIs are not instrumented.
 
 On `ai@6` (`/v6` entry) all three remain limitations:
 

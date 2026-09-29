@@ -38,7 +38,8 @@ await openai.chat.completions.create({
 });
 ```
 
-Use this when you want explicit control over which clients are instrumented.
+Use this when you want explicit control over which clients are instrumented. It also works when
+your application creates the OpenAI client with CommonJS `require()`.
 
 ## Global instrumentation
 
@@ -59,7 +60,9 @@ try {
 }
 ```
 
-Use this as the app-wide one-liner at startup when all OpenAI clients should be instrumented.
+Use this as the app-wide one-liner at startup when all OpenAI clients should be instrumented. Global
+instrumentation patches the ESM build imported by this package, so it does not instrument clients
+created from the OpenAI SDK's CommonJS build. Use `wrapOpenAI()` for CommonJS clients.
 
 ## Instrumented surfaces
 
@@ -93,7 +96,9 @@ Embedding calls emit `gen_ai.operation.name = "embeddings"`, request model/input
 
 ## Provider detection
 
-`wrapOpenAI(new AzureOpenAI(...))` records provider `azure.ai.openai`. Global prototype instrumentation defaults to provider detection from the resource's client when available.
+`wrapOpenAI(new AzureOpenAI(...))` records provider `azure.ai.openai`, including clients created with
+CommonJS `require()`. Global prototype instrumentation detects Azure clients from the ESM resource's
+client.
 
 OpenAI clients configured with `https://openrouter.ai/api/v1` as their base URL record provider `openrouter`. The same detection applies to OpenRouter subdomains; unrelated hosts containing `openrouter.ai` are not matched.
 
