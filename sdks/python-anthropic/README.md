@@ -33,7 +33,7 @@ message = client.messages.create(
 )
 ```
 
-`wrap_anthropic` also supports `AsyncAnthropic`, `AnthropicBedrock`, `AsyncAnthropicBedrock`, `AnthropicVertex`, and `AsyncAnthropicVertex` clients.
+`wrap_anthropic` also supports `AsyncAnthropic` and the provider clients `AnthropicBedrock`, `AnthropicBedrockMantle`, `AnthropicVertex`, `AnthropicAWS`, and `AnthropicFoundry`, with their `Async` variants.
 
 ## Global instrumentation
 
@@ -70,9 +70,9 @@ Native Anthropic stream events pass through unmodified. The span records time to
 
 `messages.stream()` starts the span when the context manager is entered, because that is when the Anthropic SDK opens the HTTP stream.
 
-## Bedrock and Vertex
+## Provider clients
 
-Class instrumentation covers Bedrock and Vertex clients. Their `messages` resources reuse the stable `Messages` and `AsyncMessages` classes. Their `beta.messages` resources are separate provider classes, which are patched too: Bedrock exposes `create()` and Vertex exposes `create()` and `stream()`. Provider attribution is recorded as `aws.bedrock` or `gcp.vertex_ai` when the client class identifies those runtimes.
+Class instrumentation covers the provider clients. Their `messages` resources reuse the stable `Messages` and `AsyncMessages` classes. The Bedrock and Vertex `beta.messages` resources are separate provider classes, which are patched too: Bedrock exposes `create()` and Vertex exposes `create()` and `stream()`. Provider attribution comes from the client class, including subclasses: `aws.bedrock` for `AnthropicBedrock` and `AnthropicBedrockMantle`, and `gcp.vertex_ai` for `AnthropicVertex`. `AnthropicAWS` (Claude Platform on AWS) and `AnthropicFoundry` (Microsoft Foundry) serve the Anthropic API, so they are recorded as `anthropic`.
 
 ## Limitations
 

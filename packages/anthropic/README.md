@@ -41,7 +41,7 @@ instrumentAnthropic();
 uninstrumentAnthropic();
 ```
 
-Global instrumentation patches both the stable and beta `Messages.prototype.create`, so it covers `messages` and `beta.messages` on every client in the process. Call it once during process startup. `uninstrumentAnthropic()` restores both methods.
+Global instrumentation patches both the stable and beta `Messages.prototype.create`, so it covers `messages` and `beta.messages` on every client that loads the same copy of `@anthropic-ai/sdk` through `import` (see Limitations). Call it once during process startup. `uninstrumentAnthropic()` restores both methods.
 
 ## Instrumented surfaces
 
@@ -50,7 +50,7 @@ Global instrumentation patches both the stable and beta `Messages.prototype.crea
 - `client.messages.parse(...)`, which routes through `create()`.
 - `client.beta.messages.create(...)`, `stream(...)`, and `parse(...)`.
 - `client.beta.messages.toolRunner(...)`: each model request in the tool loop records its own generation span.
-- Anthropic, Bedrock, and Vertex clients. Provider attributes are emitted as `anthropic`, `aws.bedrock`, or `gcp.vertex_ai`.
+- Anthropic, Bedrock, Bedrock Mantle, and Vertex clients, including subclasses. Provider attributes are emitted as `anthropic`, `aws.bedrock` (Bedrock and Bedrock Mantle), or `gcp.vertex_ai`. `AnthropicAws` (Claude Platform on AWS) and `AnthropicFoundry` (Microsoft Foundry) serve the Anthropic API, so they are recorded as `anthropic`.
 
 Captured request fields include model, max tokens, temperature, top-p, stop sequences, system instructions, tools, and messages. Captured response fields include model, finish reason, content blocks, message id, and token usage including cache and thinking token details when Anthropic returns them.
 
@@ -63,3 +63,4 @@ Streaming spans start when the request is made and end when the stream is consum
 - `messages.countTokens`, `beta.messages.countTokens`, batches, and other non-Messages surfaces are not instrumented.
 - `with_raw_response` and `with_streaming_response` helper namespaces are not patched directly.
 - If application code never consumes or closes a stream, the span cannot finish until the stream is finalized by the runtime.
+- Global instrumentation patches the ES module build of the `@anthropic-ai/sdk` copy this package resolves. Clients loaded through `require()` use the package's CommonJS build, which has separate classes. The Bedrock, Vertex, AWS, and Foundry client packages depend on `@anthropic-ai/sdk` 0.115.1 or newer, so a package manager can also install them a separate copy. Wrap those clients with `wrapAnthropic()`.

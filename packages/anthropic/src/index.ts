@@ -180,17 +180,25 @@ function constructorName<T>(value: T): string | undefined {
   return ctor instanceof Function ? ctor.name : undefined;
 }
 
+const clientProviders = new Map([
+  ["AnthropicBedrock", "aws.bedrock"],
+  ["AnthropicBedrockMantle", "aws.bedrock"],
+  ["AnthropicVertex", "gcp.vertex_ai"],
+]);
+
+// Walks the prototype chain so subclasses of a provider client keep its provider.
 function providerForClient<T>(client: T): string {
-  switch (constructorName(client)) {
-    case "AnthropicBedrock":
-    case "AsyncAnthropicBedrock":
-      return "aws.bedrock";
-    case "AnthropicVertex":
-    case "AsyncAnthropicVertex":
-      return "gcp.vertex_ai";
-    default:
-      return "anthropic";
+  let prototype =
+    client === null || client === undefined ? null : Object.getPrototypeOf(Object(client));
+
+  while (prototype !== null && prototype !== Object.prototype) {
+    const provider = clientProviders.get(constructorName(prototype) ?? "");
+
+    if (provider) return provider;
+    prototype = Object.getPrototypeOf(prototype);
   }
+
+  return "anthropic";
 }
 
 function providerForResource<T>(resource: T): string {
