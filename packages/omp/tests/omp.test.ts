@@ -340,7 +340,7 @@ test("assistant message_end produces a chat span with usage, timing, and parenti
     "gen_ai.response.time_to_first_chunk": 0.25,
     "gen_ai.usage.cache_creation.input_tokens": 25,
     "gen_ai.usage.cache_read.input_tokens": 300,
-    "gen_ai.usage.input_tokens": 120,
+    "gen_ai.usage.input_tokens": 120 + 300 + 25,
     "gen_ai.usage.output_tokens": 40,
     "gen_ai.usage.reasoning.output_tokens": 10,
     "gen_ai.usage.total_tokens": 485,

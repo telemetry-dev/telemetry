@@ -313,6 +313,75 @@ def citation_stream_events() -> list[dict[str, Any]]:
     ]
 
 
+@pytest.mark.parametrize(
+    ("start", "delta", "expected_input"),
+    [
+        (
+            {
+                "input_tokens": 40,
+                "cache_read_input_tokens": 1000,
+                "cache_creation_input_tokens": 200,
+            },
+            {"output_tokens": 12},
+            40 + 1000 + 200,
+        ),
+        (
+            {
+                "input_tokens": 40,
+                "cache_read_input_tokens": 1000,
+                "cache_creation_input_tokens": 200,
+            },
+            {
+                "input_tokens": 40,
+                "cache_read_input_tokens": 1000,
+                "cache_creation_input_tokens": 200,
+                "output_tokens": 12,
+            },
+            40 + 1000 + 200,
+        ),
+        (
+            {
+                "input_tokens": 40,
+                "cache_read_input_tokens": 1000,
+                "cache_creation_input_tokens": 200,
+            },
+            {"input_tokens": 40, "output_tokens": 12},
+            40 + 1000 + 200,
+        ),
+        ({"cache_read_input_tokens": 1000}, {"output_tokens": 12}, None),
+    ],
+    ids=[
+        "cache_on_message_start",
+        "delta_repeats_cumulative_counts",
+        "delta_repeats_input_only",
+        "no_input_count",
+    ],
+)
+def test_streamed_input_tokens_include_cache_reads_and_writes(
+    memory: SimpleNamespace,
+    start: dict[str, Any],
+    delta: dict[str, Any],
+    expected_input: int | None,
+) -> None:
+    events = stream_events()
+    events[0]["message"]["usage"] = start
+    events[-2]["usage"] = delta
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(events)
+
+    stream = wrapped_sync_client(handler).messages.create(
+        model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES, stream=True
+    )
+    for _event in stream:
+        pass
+
+    a = attrs(only_span(memory))
+    assert a.get("gen_ai.usage.input_tokens") == expected_input
+    assert a["gen_ai.usage.output_tokens"] == 12
+    assert a["gen_ai.usage.cache_read.input_tokens"] == 1000
+
+
 def test_create_maps_native_messages_system_params_usage_finish_and_provider(
     memory: SimpleNamespace,
 ) -> None:
@@ -348,7 +417,7 @@ def test_create_maps_native_messages_system_params_usage_finish_and_provider(
     assert a["gen_ai.request.top_k"] == 40
     assert a["gen_ai.request.max_tokens"] == 64
     assert list(cast(Any, a["gen_ai.request.stop_sequences"])) == ["END"]
-    assert a["gen_ai.usage.input_tokens"] == 11
+    assert a["gen_ai.usage.input_tokens"] == 11 + 3 + 2
     assert a["gen_ai.usage.output_tokens"] == 7
     assert a["gen_ai.usage.cache_creation.input_tokens"] == 2
     assert a["gen_ai.usage.cache_read.input_tokens"] == 3
@@ -1150,7 +1219,7 @@ def test_beta_create_records_generation_span(memory: SimpleNamespace) -> None:
     assert a["gen_ai.operation.name"] == "chat"
     assert a["gen_ai.provider.name"] == "anthropic"
     assert a["gen_ai.response.id"] == "msg_beta"
-    assert a["gen_ai.usage.input_tokens"] == 11
+    assert a["gen_ai.usage.input_tokens"] == 11 + 3 + 2
     assert a["gen_ai.response.finish_reasons"] == ("end_turn",)
 
 

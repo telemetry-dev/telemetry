@@ -129,12 +129,17 @@ function usageFields(message: JsonRecord): TokenUsage | undefined {
 
   if (!usage) return undefined;
 
+  const input = numberField(usage, "input");
+  const cacheRead = numberField(usage, "cacheRead");
+  const cacheWrite = numberField(usage, "cacheWrite");
+
   return {
-    inputTokens: numberField(usage, "input"),
+    // omp reports input without cache reads and writes; span input tokens include them.
+    inputTokens: input === undefined ? undefined : input + (cacheRead ?? 0) + (cacheWrite ?? 0),
     outputTokens: numberField(usage, "output"),
     totalTokens: numberField(usage, "totalTokens"),
-    cacheReadInputTokens: numberField(usage, "cacheRead"),
-    cacheCreationInputTokens: numberField(usage, "cacheWrite"),
+    cacheReadInputTokens: cacheRead,
+    cacheCreationInputTokens: cacheWrite,
     reasoningOutputTokens: numberField(usage, "reasoningTokens"),
   };
 }

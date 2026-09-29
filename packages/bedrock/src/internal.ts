@@ -145,9 +145,24 @@ export function safe<T>(fn: () => T): T | undefined {
   }
 }
 
+// Bedrock reports input tokens without cache reads and writes; span input tokens include them.
+function withCacheInclusiveInput(fields: SpanFields | undefined): SpanFields | undefined {
+  const usage = fields?.usage;
+
+  if (usage?.inputTokens === undefined) return fields;
+  const inputTokens =
+    usage.inputTokens + (usage.cacheReadInputTokens ?? 0) + (usage.cacheCreationInputTokens ?? 0);
+  const totalTokens =
+    usage.totalTokens !== undefined && usage.outputTokens !== undefined
+      ? inputTokens + usage.outputTokens
+      : usage.totalTokens;
+
+  return { ...fields, usage: { ...usage, inputTokens, totalTokens } };
+}
+
 export function endSpan(span: SpanHandle, fields?: SpanFields): void {
   try {
-    span.end(fields);
+    span.end(withCacheInclusiveInput(fields));
   } catch {
     // Instrumentation must never throw into caller code.
   }

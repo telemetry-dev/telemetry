@@ -31,6 +31,7 @@ import {
 
 import { resolveConfig, type TelemetryDevOptions } from "./config.ts";
 import { errorDetails } from "./errors.ts";
+import { inputTokens } from "./usage.ts";
 
 type JsonValue =
   | string
@@ -189,7 +190,7 @@ export function chatTelemetryDev(
         "gen_ai.response.finish_reasons": iteration.finishReason
           ? [iteration.finishReason]
           : undefined,
-        "gen_ai.usage.input_tokens": usage?.promptTokens,
+        "gen_ai.usage.input_tokens": inputTokens(state.provider, usage),
         "gen_ai.usage.output_tokens": usage?.completionTokens,
         "gen_ai.usage.cache_read.input_tokens": usage?.promptTokensDetails?.cachedTokens,
         "gen_ai.usage.cache_creation.input_tokens": usage?.promptTokensDetails?.cacheWriteTokens,
@@ -203,7 +204,7 @@ export function chatTelemetryDev(
     state.childSpans.push(iteration.span);
     state.iterationMetrics.push({
       durationSec: Math.max(endedAt.getTime() - iteration.startedAt.getTime(), 0) / 1000,
-      inputTokens: usage?.promptTokens ?? null,
+      inputTokens: inputTokens(state.provider, usage) ?? null,
       outputTokens: usage?.completionTokens ?? null,
     });
 

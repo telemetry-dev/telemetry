@@ -219,6 +219,40 @@ test.each([true, false])(
   },
 );
 
+test.each([
+  { provider: "anthropic", input: 10 + 3 + 2 },
+  { provider: "bedrock-converse", input: 10 + 3 + 2 },
+  { provider: "openrouter", input: 10 },
+])(
+  "$provider input tokens include cache reads and writes exactly once",
+  async ({ provider, input }) => {
+    const { spanBatches, metrics, overrides } = makeCapture();
+    const mw = middleware(overrides);
+    const ctx = makeCtx({ provider });
+
+    await mw.onStart?.(ctx);
+    await mw.onConfig?.(ctx, chatConfig());
+    await mw.onUsage?.(ctx, {
+      promptTokens: 10,
+      completionTokens: 5,
+      totalTokens: 15,
+      promptTokensDetails: { cachedTokens: 3, cacheWriteTokens: 2 },
+    } as never);
+    await mw.onFinish?.(ctx, { finishReason: "stop", duration: 120, content: "hi" } as never);
+
+    const spans = spanBatches[0]!;
+    const root = spans.find((s) => s.kind === SpanKind.INTERNAL)!;
+    const iteration = spans.find((s) => s.kind === SpanKind.CLIENT)!;
+    expect(iteration.attributes["gen_ai.usage.input_tokens"]).toBe(input);
+    expect(metrics.find((m) => m.metric === "tokens" && m.tokenType === "input")?.value).toBe(
+      input,
+    );
+    expect(event(root, "generation.summary")?.attributes?.["gen_ai.usage.input_tokens"]).toBe(
+      input,
+    );
+  },
+);
+
 test("bigint metadata IDs populate user and conversation attributes", async () => {
   const { spanBatches, overrides } = makeCapture();
   const mw = middleware(overrides);
