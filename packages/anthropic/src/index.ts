@@ -160,6 +160,17 @@ function mergeUsage(
   });
 }
 
+// Anthropic's input_tokens leaves out cache reads and writes; span input tokens include them.
+function cacheInclusiveUsage(usage: SpanFields["usage"]): SpanFields["usage"] {
+  if (usage?.inputTokens === undefined) return usage;
+
+  return {
+    ...usage,
+    inputTokens:
+      usage.inputTokens + (usage.cacheReadInputTokens ?? 0) + (usage.cacheCreationInputTokens ?? 0),
+  };
+}
+
 function messagesResponse<T>(response: T): SpanFields {
   const record: ValueRecord = asRecord(response) ?? {};
   const role = readString(record.role) ?? "assistant";
@@ -169,7 +180,7 @@ function messagesResponse<T>(response: T): SpanFields {
     responseId: readString(record.id),
     finishReason: readString(record.stop_reason),
     output: record.content !== undefined ? [{ role, content: record.content }] : undefined,
-    usage: messagesUsage(record.usage),
+    usage: cacheInclusiveUsage(messagesUsage(record.usage)),
   };
 }
 
@@ -398,7 +409,7 @@ function streamOutput(state: StreamState): ValueRecord[] | undefined {
 function streamPartialFields(state: StreamState): SpanFields {
   const fields: SpanFields = {
     output: streamOutput(state),
-    usage: state.usage,
+    usage: cacheInclusiveUsage(state.usage),
     finishReason: state.finishReason,
   };
 

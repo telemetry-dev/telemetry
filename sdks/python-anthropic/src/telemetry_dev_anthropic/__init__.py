@@ -170,6 +170,20 @@ def _messages_request(params: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     )
 
 
+def _cache_inclusive_usage(
+    usage: dict[str, int | float] | None,
+) -> dict[str, int | float] | None:
+    # Anthropic's input_tokens leaves out cache reads and writes; span input tokens include them.
+    if usage is None or "input_tokens" not in usage:
+        return usage
+    return {
+        **usage,
+        "input_tokens": usage["input_tokens"]
+        + usage.get("cache_read_input_tokens", 0)
+        + usage.get("cache_creation_input_tokens", 0),
+    }
+
+
 def _messages_usage(raw: Any) -> dict[str, int | float] | None:
     output_details = _field(raw, "output_tokens_details")
     return _usage(
@@ -191,7 +205,7 @@ def _messages_response(response: Any) -> dict[str, Any]:
         "response_id": _string(_field(response, "id")),
         "finish_reason": _string(_field(response, "stop_reason")),
         "output": [{"role": role, "content": _native(content)}] if content is not None else None,
-        "usage": _messages_usage(_field(response, "usage")),
+        "usage": _cache_inclusive_usage(_messages_usage(_field(response, "usage"))),
     }
 
 
@@ -301,7 +315,7 @@ def _stream_output(state: _StreamState) -> list[dict[str, Any]] | None:
 def _stream_partial(state: _StreamState) -> dict[str, Any]:
     return {
         "output": _stream_output(state),
-        "usage": state.usage,
+        "usage": _cache_inclusive_usage(state.usage),
         "finish_reason": state.finish_reason,
         "response_model": state.response_model,
     }

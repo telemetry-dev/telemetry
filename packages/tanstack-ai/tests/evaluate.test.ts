@@ -87,6 +87,31 @@ test("decide emits isolated evaluation spans and one set of usage metrics for co
 });
 
 test.each([
+  { provider: "anthropic", input: 10 + 3 + 2 },
+  { provider: "openrouter", input: 10 },
+])(
+  "decide from $provider records input tokens with cache reads and writes once",
+  async ({ provider, input }) => {
+    const { middleware, metrics, spanBatches } = capture();
+    const judge = adapter(provider, async () => ({
+      ...answer("judge-model", 10, 2),
+      usage: {
+        promptTokens: 10,
+        completionTokens: 2,
+        totalTokens: 12,
+        promptTokensDetails: { cachedTokens: 3, cacheWriteTokens: 2 },
+      },
+    }));
+
+    await decide({ adapter: judge, state: "one", questions, middleware: [middleware] });
+
+    const [span] = spanBatches.flat();
+    expect(span?.attributes["gen_ai.usage.input_tokens"]).toBe(input);
+    expect(metrics.find((metric) => metric.type === "input")?.value).toBe(input);
+  },
+);
+
+test.each([
   { error: new TypeError("provider failed"), type: "TypeError", message: "provider failed" },
   {
     error: Object.assign(Object.create(null), { message: "provider failed" }),

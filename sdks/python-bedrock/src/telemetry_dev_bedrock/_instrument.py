@@ -446,6 +446,23 @@ def _safe_start_fields(spec: OperationSpec, params: dict[str, Any]) -> tuple[str
     return name, fields
 
 
+def _with_cache_inclusive_input(fields: dict[str, Any]) -> dict[str, Any]:
+    # Bedrock reports input tokens without cache reads and writes; span input tokens include them.
+    usage = fields.get("usage")
+    if not isinstance(usage, dict) or "input_tokens" not in usage:
+        return fields
+    usage = cast(dict[str, Any], usage)
+    input_tokens = (
+        usage["input_tokens"]
+        + usage.get("cache_read_input_tokens", 0)
+        + usage.get("cache_creation_input_tokens", 0)
+    )
+    inclusive = {**usage, "input_tokens": input_tokens}
+    if "total_tokens" in usage and "output_tokens" in usage:
+        inclusive["total_tokens"] = input_tokens + usage["output_tokens"]
+    return {**fields, "usage": inclusive}
+
+
 def _end_once(handle: telemetry_dev.SpanHandle) -> Callable[..., None]:
     ended = False
 
@@ -455,7 +472,7 @@ def _end_once(handle: telemetry_dev.SpanHandle) -> Callable[..., None]:
             return
         ended = True
         try:
-            handle.end(**fields)
+            handle.end(**_with_cache_inclusive_input(fields))
         except Exception:
             pass
 

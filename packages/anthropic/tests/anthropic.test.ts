@@ -295,7 +295,7 @@ test("messages.create maps request, response, usage, finish reason, provider, an
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
     { role: "assistant", content: [{ type: "text", text: "Hello." }] },
   ]);
-  expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(10);
+  expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(10 + 3 + 2);
   expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(5);
   expect(span.attributes["gen_ai.usage.cache_read.input_tokens"]).toBe(3);
   expect(span.attributes["gen_ai.usage.cache_creation.input_tokens"]).toBe(2);
@@ -397,6 +397,63 @@ test("messages.create preserves request tools and tool-use blocks in output", as
     tools: [tool],
   });
 });
+
+test.each<{ name: string; start: JsonRecord; delta: JsonRecord; input: number | undefined }>([
+  {
+    name: "cache counts only on message_start",
+    start: { input_tokens: 40, cache_read_input_tokens: 1000, cache_creation_input_tokens: 200 },
+    delta: { output_tokens: 12 },
+    input: 40 + 1000 + 200,
+  },
+  {
+    name: "message_delta repeats the cumulative counts",
+    start: { input_tokens: 40, cache_read_input_tokens: 1000, cache_creation_input_tokens: 200 },
+    delta: {
+      input_tokens: 40,
+      cache_read_input_tokens: 1000,
+      cache_creation_input_tokens: 200,
+      output_tokens: 12,
+    },
+    input: 40 + 1000 + 200,
+  },
+  {
+    name: "message_delta repeats input without cache counts",
+    start: { input_tokens: 40, cache_read_input_tokens: 1000, cache_creation_input_tokens: 200 },
+    delta: { input_tokens: 40, output_tokens: 12 },
+    input: 40 + 1000 + 200,
+  },
+  {
+    name: "no input count reported",
+    start: { cache_read_input_tokens: 1000 },
+    delta: { output_tokens: 12 },
+    input: undefined,
+  },
+])(
+  "streamed input tokens include cache reads and writes: $name",
+  async ({ start, delta, input }) => {
+    const spans = setupSpans();
+    const events = streamEvents().map((event) => {
+      if (event.type === "message_start")
+        return { ...event, message: { ...(event.message as JsonRecord), usage: start } };
+
+      return event.type === "message_delta" ? { ...event, usage: delta } : event;
+    });
+    const fake = createFakeFetch(namedSseResponse(events));
+
+    const stream = await clientWith(fake.fetch).messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 64,
+      messages: [{ role: "user", content: "Say hello" }],
+      stream: true,
+    });
+    await collectStream(stream);
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(input);
+    expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(12);
+    expect(span.attributes["gen_ai.usage.cache_read.input_tokens"]).toBe(1000);
+  },
+);
 
 test("messages.create streaming preserves events and records aggregated text usage and time to first chunk", async () => {
   const spans = setupSpans();
@@ -868,7 +925,7 @@ test("beta.messages.create records a generation span for the beta endpoint", asy
   expect(span.attributes["gen_ai.provider.name"]).toBe("anthropic");
   expect(span.attributes["gen_ai.response.id"]).toBe("msg_beta");
   expect(span.attributes["gen_ai.input.messages"]).toBe(JSON.stringify(messages));
-  expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(10);
+  expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(10 + 3 + 2);
   expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["end_turn"]);
 });
 

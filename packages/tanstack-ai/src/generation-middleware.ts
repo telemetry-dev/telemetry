@@ -8,6 +8,7 @@ import {
 
 import { resolveConfig, type TelemetryDevOptions } from "./config.ts";
 import { errorDetails } from "./errors.ts";
+import { inputTokens } from "./usage.ts";
 
 export interface GenerationMiddlewareContextCompat {
   requestId: string;
@@ -71,7 +72,7 @@ export function generationTelemetryDev(
       "gen_ai.provider.name": ctx.provider,
       "gen_ai.request.model": ctx.model,
       "gen_ai.request.id": ctx.requestId,
-      "gen_ai.usage.input_tokens": usage?.promptTokens,
+      "gen_ai.usage.input_tokens": inputTokens(ctx.provider, usage),
       "gen_ai.usage.output_tokens": usage?.completionTokens,
       "gen_ai.usage.cache_read.input_tokens": usage?.promptTokensDetails?.cachedTokens,
       "gen_ai.usage.cache_creation.input_tokens": usage?.promptTokensDetails?.cacheWriteTokens,
@@ -111,9 +112,9 @@ export function generationTelemetryDev(
 
     emitter.recordDuration(Math.max(info.duration, 0) / 1000, metricAttributes);
 
-    if (usage?.promptTokens !== undefined) {
-      emitter.recordTokens("input", usage.promptTokens, metricAttributes);
-    }
+    const input = inputTokens(ctx.provider, usage);
+
+    if (input !== undefined) emitter.recordTokens("input", input, metricAttributes);
 
     if (usage?.completionTokens !== undefined) {
       emitter.recordTokens("output", usage.completionTokens, metricAttributes);

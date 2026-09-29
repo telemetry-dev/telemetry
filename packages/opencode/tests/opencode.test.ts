@@ -154,7 +154,7 @@ test("completed assistant message creates one normalized, retroactive chat span"
     "gen_ai.usage.cache_creation.input_tokens": 25,
     "gen_ai.usage.cache_read.input_tokens": 300,
     "gen_ai.usage.cost": 0.0037,
-    "gen_ai.usage.input_tokens": 120,
+    "gen_ai.usage.input_tokens": 120 + 300 + 25,
     "gen_ai.usage.output_tokens": 40,
     "gen_ai.usage.reasoning.output_tokens": 10,
     "gen_ai.usage.total_tokens": 485,
@@ -400,7 +400,7 @@ test("tool spans nest under the session's open chat span", async () => {
   expect(chat.attributes).toMatchObject({
     "gen_ai.response.finish_reasons": ["stop"],
     "gen_ai.usage.cost": 0.0037,
-    "gen_ai.usage.input_tokens": 120,
+    "gen_ai.usage.input_tokens": 120 + 300 + 25,
   });
   expect(chat.endTime[0]).toBe(1_700_000_002);
 });

@@ -115,7 +115,8 @@ function usageFields(message: JsonObject): TokenUsage {
   const cacheWrite = numberField(cache, "write") ?? 0;
 
   return {
-    inputTokens: input,
+    // opencode reports input without cache reads and writes; span input tokens include them.
+    inputTokens: input + cacheRead + cacheWrite,
     outputTokens: output + reasoning,
     totalTokens:
       numberField(tokens, "total") ?? input + output + reasoning + cacheRead + cacheWrite,

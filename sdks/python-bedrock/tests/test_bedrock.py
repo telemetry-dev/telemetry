@@ -171,6 +171,8 @@ def test_converse_happy_path(memory: SimpleNamespace, monkeypatch: pytest.Monkey
     assert span.attributes["aws.request.attempts"] == 2
     assert span.attributes["aws.http.status_code"] == 200
     assert span.attributes["aws.request.total_retry_delay_ms"] == 8
+    assert span.attributes["gen_ai.usage.input_tokens"] == 3 + 1 + 2
+    assert span.attributes["gen_ai.usage.total_tokens"] == 3 + 1 + 2 + 4
     assert span.attributes["gen_ai.usage.cache_creation.input_tokens"] == 2
     assert span.attributes["td.metadata.server_latency_ms"] == "12"
     assert _json_attr(span, "gen_ai.input.messages") == [
@@ -669,7 +671,7 @@ def test_invoke_model_provider_native_and_streaming_body(
     assert (
         _json_attr(stream_span, "gen_ai.output.messages")[0]["parts"][0]["content"] == "hi legacy"
     )
-    assert stream_span.attributes["gen_ai.usage.input_tokens"] == 5
+    assert stream_span.attributes["gen_ai.usage.input_tokens"] == 5 + 1
     assert stream_span.attributes["gen_ai.usage.output_tokens"] == 2
     assert stream_span.attributes["gen_ai.usage.cache_read.input_tokens"] == 1
     assert list(stream_span.attributes["gen_ai.response.finish_reasons"]) == ["end_turn"]

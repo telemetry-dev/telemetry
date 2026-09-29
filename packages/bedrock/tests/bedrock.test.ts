@@ -69,7 +69,8 @@ test("Converse captures normalized messages, usage, metadata, request id, and sa
   expect(span.attributes["aws.request.attempts"]).toBe(2);
   expect(span.attributes["aws.http.status_code"]).toBe(200);
   expect(span.attributes["aws.request.total_retry_delay_ms"]).toBe(7);
-  expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(3);
+  expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(3 + 1 + 2);
+  expect(span.attributes["gen_ai.usage.total_tokens"]).toBe(3 + 1 + 2 + 4);
   expect(span.attributes["gen_ai.usage.cache_creation.input_tokens"]).toBe(2);
   expect(span.attributes["gen_ai.response.model"]).toBe("routed-model");
   expect(span.attributes["td.metadata.server_latency_ms"]).toBe("12");
@@ -420,6 +421,50 @@ test("InvokeModelWithResponseStream preserves optional invocation metrics", asyn
   expect(span).toMatchObject({
     [Symbol.for("telemetry.dev.outputChunkHistogram")]: { count: 4 },
   });
+});
+
+test("InvokeModelWithResponseStream input tokens include cache reads and writes", async () => {
+  const spans = setup();
+  const start = {
+    type: "message_start",
+    message: {
+      usage: { input_tokens: 40, cache_read_input_tokens: 1000, cache_creation_input_tokens: 200 },
+    },
+  };
+
+  const client = wrapBedrock(
+    new FakeClient([
+      {
+        body: streamOf([
+          { chunk: { bytes: bytes(start) } },
+          { chunk: { bytes: bytes({ delta: { text: "hi", stop_reason: "end_turn" } }) } },
+          { chunk: { bytes: bytes({ type: "message_delta", usage: { output_tokens: 12 } }) } },
+          {
+            chunk: {
+              bytes: bytes({
+                "amazon-bedrock-invocationMetrics": { inputTokenCount: 40, outputTokenCount: 12 },
+              }),
+            },
+          },
+        ]),
+      },
+    ]),
+  );
+
+  const response = (await client.send(
+    new InvokeModelWithResponseStreamCommand({
+      modelId: "anthropic.claude",
+      contentType: "application/json",
+      body: bytes({ messages: [], max_tokens: 10 }),
+    }),
+  )) as { body: AsyncIterable<unknown> };
+
+  await collect(response.body);
+
+  const [span] = spans.getFinishedSpans();
+  expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(40 + 1000 + 200);
+  expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(12);
+  expect(span.attributes["gen_ai.usage.cache_read.input_tokens"]).toBe(1000);
 });
 
 test("InvokeModelWithResponseStream parses each payload once and delivers malformed payloads", async () => {
