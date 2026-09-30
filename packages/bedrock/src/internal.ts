@@ -150,8 +150,10 @@ function withCacheInclusiveInput(fields: SpanFields | undefined): SpanFields | u
   const usage = fields?.usage;
 
   if (usage?.inputTokens === undefined) return fields;
+
   const inputTokens =
     usage.inputTokens + (usage.cacheReadInputTokens ?? 0) + (usage.cacheCreationInputTokens ?? 0);
+
   const totalTokens =
     usage.totalTokens !== undefined && usage.outputTokens !== undefined
       ? inputTokens + usage.outputTokens

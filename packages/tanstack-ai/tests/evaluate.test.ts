@@ -93,6 +93,7 @@ test.each([
   "decide from $provider records input tokens with cache reads and writes once",
   async ({ provider, input }) => {
     const { middleware, metrics, spanBatches } = capture();
+
     const judge = adapter(provider, async () => ({
       ...answer("judge-model", 10, 2),
       usage: {

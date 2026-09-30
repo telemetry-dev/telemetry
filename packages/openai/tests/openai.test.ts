@@ -2088,23 +2088,26 @@ test("wrapOpenAI supports require-created streams and Azure clients", async () =
   const required = require(packageName) as typeof import("openai");
   const RequiredOpenAI = required.default;
   const RequiredAzureOpenAI = required.AzureOpenAI;
+
+  const streamEvents = [
+    {
+      id: "chatcmpl_cjs_stream",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "gpt-4o",
+      choices: [{ index: 0, delta: { role: "assistant", content: "CJS" } }],
+    },
+    {
+      id: "chatcmpl_cjs_stream",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "gpt-4o",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    },
+  ];
+
   const fake = createFakeFetch(
-    sseResponse([
-      {
-        id: "chatcmpl_cjs_stream",
-        object: "chat.completion.chunk",
-        created: 1,
-        model: "gpt-4o",
-        choices: [{ index: 0, delta: { role: "assistant", content: "CJS" } }],
-      },
-      {
-        id: "chatcmpl_cjs_stream",
-        object: "chat.completion.chunk",
-        created: 1,
-        model: "gpt-4o",
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-      },
-    ]),
+    sseResponse(streamEvents),
     jsonResponse({
       id: "chatcmpl_cjs_azure",
       object: "chat.completion",
@@ -2113,9 +2116,11 @@ test("wrapOpenAI supports require-created streams and Azure clients", async () =
       choices: [{ index: 0, message: { role: "assistant", content: "Azure" } }],
     }),
   );
+
   const streamClient = wrapOpenAI(
     new RequiredOpenAI({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 }),
   );
+
   const stream = await streamClient.chat.completions.create({
     model: "gpt-4o",
     messages: [{ role: "user", content: "CJS" }],
@@ -2128,8 +2133,8 @@ test("wrapOpenAI supports require-created streams and Azure clients", async () =
   const [left, right] = stream.tee();
   expect(left.controller).toBe(stream.controller);
   const [leftEvents, rightEvents] = await Promise.all([collectStream(left), collectStream(right)]);
-  expect(leftEvents).toHaveLength(2);
-  expect(rightEvents).toHaveLength(2);
+  expect(leftEvents).toEqual(streamEvents);
+  expect(rightEvents).toEqual(streamEvents);
   stream.controller.abort();
   expect(stream.controller.signal.aborted).toBe(true);
 
