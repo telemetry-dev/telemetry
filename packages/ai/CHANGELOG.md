@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/ai-sdk-v0.1.7...ai-sdk-v0.1.8) (2026-09-30)
+
+
+### Documentation
+
+* clarify that experimental realtime APIs are not instrumented ([#27](https://github.com/telemetry-dev/telemetry/issues/27)) ([2f490d4](https://github.com/telemetry-dev/telemetry/commit/2f490d43a5da48d3097af4116118f60625965530))
+
 ## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/ai-sdk-v0.1.6...ai-sdk-v0.1.7) (2026-09-27)
 
 ### Features

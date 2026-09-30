@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/openai-v0.1.7...openai-v0.1.8) (2026-09-30)
+
+
+### Bug Fixes
+
+* preserve CommonJS stream constructors and detect Azure clients without ESM class identity ([#27](https://github.com/telemetry-dev/telemetry/issues/27)) ([2f490d4](https://github.com/telemetry-dev/telemetry/commit/2f490d43a5da48d3097af4116118f60625965530))
+* recognize shell-call command deltas as streamed output ([#22](https://github.com/telemetry-dev/telemetry/issues/22)) ([cee7079](https://github.com/telemetry-dev/telemetry/commit/cee707948779667c3fc5f3709f752b7ee3d4ec9b))
+
 ## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/openai-v0.1.6...openai-v0.1.7) (2026-09-27)
 
 ### Features

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.4](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.1.3...python-bedrock-v0.1.4) (2026-09-30)
+
+
+### Bug Fixes
+
+* **sdk:** include cache tokens in input totals ([#26](https://github.com/telemetry-dev/telemetry/issues/26)) ([fa2e833](https://github.com/telemetry-dev/telemetry/commit/fa2e83309e5e67d36abfeaa047c8a5e62da3befe))
+* expose `StreamingBody.readinto` only when botocore supports it ([#22](https://github.com/telemetry-dev/telemetry/issues/22)) ([cee7079](https://github.com/telemetry-dev/telemetry/commit/cee707948779667c3fc5f3709f752b7ee3d4ec9b))
+
 ## [0.1.3](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.1.2...python-bedrock-v0.1.3) (2026-09-27)
 
 
