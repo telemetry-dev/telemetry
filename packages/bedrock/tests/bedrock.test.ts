@@ -425,6 +425,7 @@ test("InvokeModelWithResponseStream preserves optional invocation metrics", asyn
 
 test("InvokeModelWithResponseStream input tokens include cache reads and writes", async () => {
   const spans = setup();
+
   const start = {
     type: "message_start",
     message: {

@@ -1105,6 +1105,7 @@ function wrapStream<T>(
   ) {
     return value;
   }
+
   const end = endOnce(span);
   const source = value as Stream<JsonValue>;
   let observed: Stream<JsonValue>;
@@ -1121,7 +1122,8 @@ function wrapStream<T>(
     iterator: () => AsyncIterator<JsonValue>,
     controller: AbortController,
   ) => Stream<JsonValue>;
-  const iterator = asRecord(observed)?.iterator as unknown as () => AsyncIterator<JsonValue>;
+
+  const iterator = () => observed[Symbol.asyncIterator]();
 
   return new StreamConstructor(iterator, source.controller);
 }

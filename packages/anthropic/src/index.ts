@@ -433,6 +433,7 @@ function streamPartialFields(state: StreamState): SpanFields {
   };
 
   if (state.responseModel !== undefined) fields.responseModel = state.responseModel;
+
   if (
     state.captureTruncated ||
     state.unresolvedReplacements.size > 0 ||
@@ -523,6 +524,7 @@ function stripStaleSignature(index: number, state: StreamState): void {
     state.captureItems += capture.items - held.items;
     state.reservations.set(index, { bytes: capture.bytes, items: capture.items });
   }
+
   state.blocks.set(index, stripped);
   state.unresolvedReplacements.add(index);
 }
@@ -587,14 +589,11 @@ function defaultBlock(deltaType: string | undefined): ValueRecord | ToolBlockSta
     return block;
   }
 
-  const block =
-    deltaType === "thinking_delta"
-      ? { type: "thinking", thinking: "" }
-      : deltaType === "compaction_delta"
-        ? { type: "compaction" }
-        : { type: "text", text: "" };
+  if (deltaType === "thinking_delta") return { type: "thinking", thinking: "" };
 
-  return block;
+  if (deltaType === "compaction_delta") return { type: "compaction" };
+
+  return { type: "text", text: "" };
 }
 
 function appendStringField(target: ValueRecord, key: string, value: string | undefined): void {
@@ -621,6 +620,7 @@ function recordContentBlockDelta(event: ValueRecord, state: StreamState): void {
 
     if (deltaType === "compaction_delta") {
       data.content = delta.content;
+
       if ("encrypted_content" in delta) data.encrypted_content = delta.encrypted_content;
     } else if (delta.signature !== undefined) {
       data.signature = delta.signature;
@@ -632,6 +632,7 @@ function recordContentBlockDelta(event: ValueRecord, state: StreamState): void {
 
     if (reserveReplacement(index, replacement, state)) {
       state.blocks.set(index, replacement);
+
       if (deltaType === "compaction_delta" && "encrypted_content" in delta)
         state.unresolvedEncryptedContent.delete(index);
     } else if (deltaType === "compaction_delta") {
@@ -643,6 +644,7 @@ function recordContentBlockDelta(event: ValueRecord, state: StreamState): void {
           state.captureTruncated = true;
         else state.unresolvedEncryptedContent.add(index);
       }
+
       dropBlock(index, state);
     } else stripStaleSignature(index, state);
 
@@ -744,6 +746,7 @@ function createObservedMessagesStream(
     unresolvedReplacements: new Set(),
     unresolvedEncryptedContent: new Set(),
   };
+
   let consumed = false;
   const signal = source.controller.signal;
 
@@ -901,6 +904,7 @@ let restorePatches: Array<() => void> = [];
 export function wrapAnthropic<T extends AnthropicClient>(client: T): T {
   if (wrappedClients.has(client)) return client;
   const provider = providerForClient(client);
+
   // beta.messages.stream(), parse(), and toolRunner() all route through beta.messages.create().
   for (const resource of [client.messages, client.beta?.messages]) {
     const messages = asRecord(resource);

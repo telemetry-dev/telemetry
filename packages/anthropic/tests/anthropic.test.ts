@@ -459,12 +459,14 @@ test.each<{ name: string; start: JsonRecord; delta: JsonRecord; input: number | 
   "streamed input tokens include cache reads and writes: $name",
   async ({ start, delta, input }) => {
     const spans = setupSpans();
+
     const events = streamEvents().map((event) => {
       if (event.type === "message_start")
         return { ...event, message: { ...(event.message as JsonRecord), usage: start } };
 
       return event.type === "message_delta" ? { ...event, usage: delta } : event;
     });
+
     const fake = createFakeFetch(namedSseResponse(events));
 
     const stream = await clientWith(fake.fetch).messages.create({
@@ -473,6 +475,7 @@ test.each<{ name: string; start: JsonRecord; delta: JsonRecord; input: number | 
       messages: [{ role: "user", content: "Say hello" }],
       stream: true,
     });
+
     await collectStream(stream);
 
     const span = await exportedSpan(spans);
@@ -516,6 +519,7 @@ test("messages.create streaming preserves events and records aggregated text usa
 
 test("stream capture is bounded without changing delivered events", async () => {
   const spans = setupSpans();
+
   const events: JsonRecord[] = [
     { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
     ...Array.from({ length: 80 }, () => ({
@@ -525,7 +529,9 @@ test("stream capture is bounded without changing delivered events", async () => 
     })),
     { type: "message_stop" },
   ];
+
   const fake = createFakeFetch(namedSseResponse(events));
+
   const stream = await clientWith(fake.fetch).messages.create({
     model: "claude-sonnet-4-6",
     max_tokens: 64,
@@ -536,10 +542,12 @@ test("stream capture is bounded without changing delivered events", async () => 
   expect(await collectStream(stream)).toEqual(events);
   const span = await exportedSpan(spans);
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+
   const output = jsonAttr<Array<{ content: Array<{ text: string }> }>>(
     span,
     "gen_ai.output.messages",
   );
+
   expect(output[0]!.content[0]!.text.length).toBeLessThan(48 * 1024);
 });
 
@@ -553,11 +561,14 @@ test("stream capture retains no output when output capture is disabled", async (
     const end = span.end.bind(span);
     vi.spyOn(span, "end").mockImplementation((fields) => {
       endedFields.push(fields);
+
       return end(fields);
     });
+
     return span;
   });
   const fake = createFakeFetch(namedSseResponse(streamEvents()));
+
   const stream = await clientWith(fake.fetch).messages.create({
     model: "claude-sonnet-4-6",
     max_tokens: 64,
@@ -577,10 +588,13 @@ test("wrapAnthropic observes a CommonJS client subclass stream", async () => {
   const fake = createFakeFetch(namedSseResponse(streamEvents()));
   const require = createRequire(import.meta.url);
   const CommonJsAnthropic = require("@anthropic-ai/sdk").default as typeof Anthropic;
+
   class CustomAnthropic extends CommonJsAnthropic {}
+
   const client = wrapAnthropic(
     new CustomAnthropic({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 }),
   );
+
   const stream = await client.messages.create({
     model: "claude-sonnet-4-6",
     max_tokens: 64,
@@ -1011,6 +1025,7 @@ test.each<{ client: keyof typeof providerClients; subclass: boolean; expected: s
     const spans = setupSpans();
     const Base = providerClients[client];
     const Client = subclass ? class CustomClient extends Base {} : Base;
+
     const instance = Object.assign(new Client(), {
       messages: { create: async (_params: JsonValue) => messagePayload({ id: "msg_provider" }) },
     });
@@ -1171,6 +1186,7 @@ test("instrumentAnthropic covers beta.messages and uninstrumentAnthropic restore
   );
 
   const client = new Anthropic({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 });
+
   const params = {
     model: "claude-sonnet-4-6",
     max_tokens: 64,
@@ -1219,6 +1235,7 @@ function betaStreamEvents(...blocks: [JsonRecord, JsonRecord[]][]): JsonRecord[]
 
   blocks.forEach(([block, deltas], index) => {
     events.push({ type: "content_block_start", index, content_block: block });
+
     for (const delta of deltas) events.push({ type: "content_block_delta", index, delta });
     events.push({ type: "content_block_stop", index });
   });
@@ -1262,6 +1279,7 @@ function fallbackStream(iterations: JsonRecord[]): JsonRecord[] {
     [fallbackBlock, []],
     [{ type: "text", text: "" }, [{ type: "text_delta", text: "Hi" }]],
   );
+
   const messageDelta = events.find((event) => event.type === "message_delta")!;
   messageDelta.usage = { output_tokens: 2, iterations };
 
@@ -1471,6 +1489,7 @@ test("beta stream rejected signature stays incomplete until a later signature fi
       { type: "signature_delta", signature: "x".repeat(60 * 1024) },
     ],
   ]);
+
   const rejected = await streamedBetaSpan(events);
 
   expect(rejected.attributes["telemetry.dev.capture.truncated"]).toBe(true);
@@ -1505,6 +1524,7 @@ test("beta stream releases a rejected signature before retaining a sibling", asy
     ],
     [{ type: "text", text: "" }, [{ type: "text_delta", text: "t".repeat(10 * 1024) }]],
   );
+
   events.splice(-2, 0, {
     type: "content_block_delta",
     index: 0,
@@ -1526,6 +1546,7 @@ test("beta stream releases a rejected signature before retaining a sibling", asy
 
 test("beta stream does not retain rejected signatures for unseen indexes", async () => {
   const events = betaStreamEvents();
+
   for (let index = 0; index < 2_000; index += 1) {
     events.splice(-2, 0, {
       type: "content_block_delta",
@@ -1549,6 +1570,7 @@ test("beta stream replacement budget retains raw tool JSON bytes", async () => {
     type: "signature_delta",
     signature: `sig-${index}`,
   }));
+
   const span = await streamedBetaSpan(
     betaStreamEvents([
       { type: "tool_use", id: "toolu_1", name: "lookup", input: {} },
