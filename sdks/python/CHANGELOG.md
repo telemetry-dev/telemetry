@@ -5,7 +5,7 @@
 
 ### Bug Fixes
 
-* **sdk:** support anthropic 1.x and openai 3.x in the Python integrations ([#22](https://github.com/telemetry-dev/telemetry/issues/22)) ([cee7079](https://github.com/telemetry-dev/telemetry/commit/cee707948779667c3fc5f3709f752b7ee3d4ec9b))
+* require OpenTelemetry 1.39 or newer and drop SDK-internal metric-reader telemetry ([#22](https://github.com/telemetry-dev/telemetry/issues/22)) ([cee7079](https://github.com/telemetry-dev/telemetry/commit/cee707948779667c3fc5f3709f752b7ee3d4ec9b))
 
 ## [0.2.6](https://github.com/telemetry-dev/telemetry/compare/python-v0.2.5...python-v0.2.6) (2026-09-27)
 
