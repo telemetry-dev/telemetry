@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/omp-v0.1.6...omp-v0.1.7) (2026-09-30)
+
+
+### Bug Fixes
+
+* **sdk:** include cache tokens in input totals ([#26](https://github.com/telemetry-dev/telemetry/issues/26)) ([fa2e833](https://github.com/telemetry-dev/telemetry/commit/fa2e83309e5e67d36abfeaa047c8a5e62da3befe))
+
 ## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/omp-v0.1.5...omp-v0.1.6) (2026-09-27)
 
 ### Dependencies

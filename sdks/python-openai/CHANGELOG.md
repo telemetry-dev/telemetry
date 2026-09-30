@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.5](https://github.com/telemetry-dev/telemetry/compare/python-openai-v0.1.4...python-openai-v0.1.5) (2026-09-30)
+
+
+### Bug Fixes
+
+* **sdk:** bound streamed capture and preserve provider compatibility ([#27](https://github.com/telemetry-dev/telemetry/issues/27)) ([2f490d4](https://github.com/telemetry-dev/telemetry/commit/2f490d43a5da48d3097af4116118f60625965530))
+* **sdk:** support anthropic 1.x and openai 3.x in the Python integrations ([#22](https://github.com/telemetry-dev/telemetry/issues/22)) ([cee7079](https://github.com/telemetry-dev/telemetry/commit/cee707948779667c3fc5f3709f752b7ee3d4ec9b))
+
 ## [0.1.4](https://github.com/telemetry-dev/telemetry/compare/python-openai-v0.1.3...python-openai-v0.1.4) (2026-09-27)
 
 

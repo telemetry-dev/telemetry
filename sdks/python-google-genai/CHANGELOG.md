@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/telemetry-dev/telemetry/compare/python-google-genai-v0.1.3...python-google-genai-v0.1.4) (2026-09-30)
+
+
+### Bug Fixes
+
+* **sdk:** support anthropic 1.x and openai 3.x in the Python integrations ([#22](https://github.com/telemetry-dev/telemetry/issues/22)) ([cee7079](https://github.com/telemetry-dev/telemetry/commit/cee707948779667c3fc5f3709f752b7ee3d4ec9b))
+
 ## [0.1.3](https://github.com/telemetry-dev/telemetry/compare/python-google-genai-v0.1.2...python-google-genai-v0.1.3) (2026-09-27)
 
 
