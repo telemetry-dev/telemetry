@@ -31,9 +31,9 @@ def truncate(text: str, max_len: int) -> str:
     encoded = text.encode("utf-16-le")
     if len(encoded) <= max_len * 2:
         return text
-    # Total stays within max_len so the provider's attribute_value_length_limit backstop,
-    # set to the same cap, never slices the marker off.
-    head = encoded[: max(max_len - len(TRUNCATION_MARKER), 0) * 2]
+    if max_len < len(TRUNCATION_MARKER):
+        return TRUNCATION_MARKER[: max(max_len, 0)]
+    head = encoded[: (max_len - len(TRUNCATION_MARKER)) * 2]
     try:
         return head.decode("utf-16-le") + TRUNCATION_MARKER
     except UnicodeDecodeError:

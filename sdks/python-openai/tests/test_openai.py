@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import time
+import types
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mapping, Sequence
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -14,7 +15,7 @@ from openai import AsyncOpenAI, OpenAI
 from openai.resources.chat.completions.completions import AsyncCompletions, Completions
 from openai.resources.embeddings import AsyncEmbeddings, Embeddings
 from openai.resources.responses.responses import AsyncResponses, Responses
-from openai.types.chat import ChatCompletionChunk
+from openai.types.chat.chat_completion_chunk import ChoiceDelta
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import StatusCode
 from pydantic import BaseModel
@@ -58,6 +59,55 @@ def only_span(env: SimpleNamespace) -> ReadableSpan:
 
 def attrs(span: ReadableSpan) -> dict[str, object]:
     return dict(span.attributes or {})
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_response_mapping_failure_returns_provider_result_and_marks_capture(
+    make: Any, async_mode: bool
+) -> None:
+    errors: list[BaseException] = []
+    memory = make(on_error=errors.append)
+    mapping_error = RuntimeError("mapping failed")
+    provider_result = object()
+
+    def request_mapper(_params: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+        return "chat gpt-4o", {"type": "generation", "model": "gpt-4o"}
+
+    def response_mapper(_response: Any) -> dict[str, Any]:
+        raise mapping_error
+
+    def provider(_resource: object | None) -> str:
+        return "openai"
+
+    if async_mode:
+
+        async def async_original(**_kwargs: Any) -> object:
+            return provider_result
+
+        wrapper = vars(telemetry_dev_openai)["_wrap_async"](
+            async_original, "chat", request_mapper, response_mapper, provider, False
+        )
+        result = await wrapper(model="gpt-4o")
+    else:
+
+        def sync_original(**_kwargs: Any) -> object:
+            return provider_result
+
+        wrapper = vars(telemetry_dev_openai)["_wrap_sync"](
+            sync_original, "chat", request_mapper, response_mapper, provider, False
+        )
+        result = wrapper(model="gpt-4o")
+
+    assert result is provider_result
+    assert errors == [mapping_error]
+    assert attrs(only_span(memory))["telemetry.dev.capture.truncated"] is True
+
+
+def small_chat_budget(max_bytes: int, reserve_output_list: bool = False) -> Any:
+    budget = telemetry_dev.CaptureBudget(max_bytes, 1_000)
+    if reserve_output_list:
+        budget.accept([])
+    return budget
 
 
 def request_json(request: httpx.Request) -> dict[str, Any]:
@@ -213,6 +263,12 @@ def chat_stream_events() -> list[dict[str, Any]]:
     ]
 
 
+def terminal_chat_stream_event() -> dict[str, Any]:
+    event = chat_stream_events()[0]
+    event["choices"][0]["finish_reason"] = "stop"
+    return event
+
+
 def oversized_chat_stream_events() -> list[dict[str, Any]]:
     return [
         {
@@ -232,7 +288,7 @@ def oversized_chat_stream_events() -> list[dict[str, Any]]:
             "choices": [
                 {
                     "index": 0,
-                    "delta": {"role": "assistant"},
+                    "delta": {"role": "assistant", "content": "not-retained"},
                     "finish_reason": "stop",
                 }
             ],
@@ -450,6 +506,35 @@ def test_streamed_image_edit_maps_aggregate_output_tokens_to_image(memory: Simpl
     assert attrs(span)["gen_ai.usage.image.output_tokens"] == 9
 
 
+@pytest.mark.parametrize("completed", [True, False])
+def test_image_stream_is_flagged_only_without_a_terminal_event(
+    memory: SimpleNamespace, completed: bool
+) -> None:
+    events: list[dict[str, Any]] = [
+        {"type": "image_generation.partial_image", "b64_json": "QQ==", "partial_image_index": 0}
+    ]
+    if completed:
+        events.append(
+            {
+                "type": "image_generation.completed",
+                "b64_json": "QQ==",
+                "usage": {"input_tokens": 4, "output_tokens": 9, "total_tokens": 13},
+            }
+        )
+    client = wrap_openai(sync_client(lambda _request: sse_response(events)))
+
+    stream = cast(Any, client.images.generate)(
+        model="gpt-image-1", prompt="otter", stream=True, partial_images=1
+    )
+
+    assert len(list(stream)) == len(events)
+    a = attrs(only_span(memory))
+    if completed:
+        assert "telemetry.dev.capture.truncated" not in a
+    else:
+        assert a["telemetry.dev.capture.truncated"] is True
+
+
 def test_media_stream_preserves_sync_context_manager_cleanup(memory: SimpleNamespace) -> None:
     client = wrap_openai(
         sync_client(
@@ -522,6 +607,7 @@ def test_streaming_transcription_records_terminal_text_and_usage(memory: SimpleN
     a = attrs(span)
     assert a["gen_ai.output.messages"] == "complete transcript"
     assert a["gen_ai.usage.text.output_tokens"] == 3
+    assert "telemetry.dev.capture.truncated" not in a
 
 
 def test_unpaired_surrogate_does_not_replace_unary_result(memory: SimpleNamespace) -> None:
@@ -668,8 +754,233 @@ async def test_interrupted_transcription_stream_records_bounded_partial_text(
     assert attrs(span)["telemetry.dev.capture.truncated"] is True
 
 
-def test_terminal_transcription_capture_is_incrementally_bounded(make: Any) -> None:
-    make(max_attribute_length=5)
+def test_non_streaming_transcription_over_the_cap_reaches_the_mask(make: Any) -> None:
+    seen: list[Any] = []
+
+    def mask(value: Any, _context: Any) -> Any:
+        seen.append(value)
+        return value
+
+    memory = make(max_attribute_length=1_000, mask=mask)
+    transcript = "x" * 1_500
+    client = wrap_openai(sync_client(lambda _request: json_response({"text": transcript})))
+
+    cast(Any, client.audio.transcriptions.create)(
+        model="gpt-4o-transcribe", file=("audio.wav", b"audio")
+    )
+
+    a = attrs(only_span(memory))
+    assert seen == [transcript]
+    assert len(str(a["gen_ai.output.messages"])) == 1_000
+    assert str(a["gen_ai.output.messages"]).endswith("...[truncated]")
+    assert "telemetry.dev.capture.truncated" not in a
+
+
+@pytest.mark.parametrize(
+    ("max_attribute_length", "redact", "expected"),
+    [(1_000, False, "東" * 400), (1_000, True, "[redacted]"), (0, False, None)],
+)
+def test_chat_stream_configured_cap_applies_after_the_mask(
+    make: Any, max_attribute_length: int, redact: bool, expected: str | None
+) -> None:
+    def mask(value: Any, _context: Any) -> Any:
+        return [{"role": "assistant", "content": "[redacted]"}] if redact else value
+
+    memory = make(max_attribute_length=max_attribute_length, mask=mask)
+    content = "x" * 5_000 if redact else "東" * 400
+    events: list[dict[str, Any]] = [
+        {
+            "id": "chatcmpl_cap",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": "stop"}],
+        }
+    ]
+    client = wrap_openai(sync_client(lambda _request: sse_response(events)))
+
+    list(
+        cast(Any, client.chat.completions.create)(
+            model="gpt-4o", messages=CHAT_MESSAGES, stream=True
+        )
+    )
+
+    a = attrs(only_span(memory))
+    assert "telemetry.dev.capture.truncated" not in a
+    if expected is None:
+        assert a.get("gen_ai.output.messages", "") == ""
+    else:
+        assert json.loads(str(a["gen_ai.output.messages"]))[0]["content"] == expected
+
+
+def test_many_small_transcript_deltas_are_not_item_capped(memory: SimpleNamespace) -> None:
+    events = [{"type": "transcript.text.delta", "delta": "x"} for _ in range(2_000)]
+    client = wrap_openai(sync_client(lambda _request: sse_response(events)))
+
+    list(
+        cast(Any, client.audio.transcriptions.create)(
+            model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
+        )
+    )
+
+    assert attrs(only_span(memory))["gen_ai.output.messages"] == "x" * 2_000
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("masked", [False, True])
+def test_complete_transcript_above_the_chat_stream_budget_is_kept(
+    make: Any, streaming: bool, masked: bool
+) -> None:
+    def identity_mask(value: Any, _context: Any) -> Any:
+        return value
+
+    memory = make(mask=identity_mask) if masked else make()
+    transcript = "x" * 55_000
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        if streaming:
+            return sse_response(
+                [
+                    {"type": "transcript.text.delta", "delta": transcript},
+                    {"type": "transcript.text.done", "text": transcript},
+                ]
+            )
+        return json_response({"text": transcript})
+
+    client = wrap_openai(sync_client(handler))
+    result = cast(Any, client.audio.transcriptions.create)(
+        model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=streaming
+    )
+    if streaming:
+        list(result)
+
+    a = attrs(only_span(memory))
+    assert a["gen_ai.output.messages"] == transcript
+    assert "telemetry.dev.capture.truncated" not in a
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("kind", ["responses", "transcription"])
+@pytest.mark.parametrize("masked", [False, True])
+async def test_complete_streams_are_not_flagged_incomplete(
+    make: Any, async_mode: bool, kind: str, masked: bool
+) -> None:
+    def identity_mask(value: Any, _context: Any) -> Any:
+        return value
+
+    memory = make(mask=identity_mask) if masked else make()
+    completed = response_payload(response_id="resp_done", text="done")
+    if kind == "responses":
+        in_progress: dict[str, Any] = {**completed, "status": "in_progress", "output": []}
+        events: list[dict[str, Any]] = [
+            {"type": "response.created", "response": in_progress},
+            {"type": "response.completed", "response": completed},
+        ]
+    else:
+        events = [
+            {"type": "transcript.text.delta", "delta": "partial"},
+            {"type": "transcript.text.done", "text": "complete transcript"},
+        ]
+
+    async def create_async(client: Any) -> Any:
+        if kind == "responses":
+            return await client.responses.create(model="gpt-4.1", input="x", stream=True)
+        return await client.audio.transcriptions.create(
+            model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
+        )
+
+    def create_sync(client: Any) -> Any:
+        if kind == "responses":
+            return client.responses.create(model="gpt-4.1", input="x", stream=True)
+        return client.audio.transcriptions.create(
+            model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
+        )
+
+    if async_mode:
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return sse_response(events)
+
+        client = wrap_openai(async_client(handler))
+        delivered = [item async for item in await create_async(client)]
+        await client.close()
+    else:
+        client = wrap_openai(sync_client(lambda _request: sse_response(events)))
+        delivered = list(create_sync(client))
+
+    assert len(delivered) == len(events)
+    a = attrs(only_span(memory))
+    assert "telemetry.dev.capture.truncated" not in a
+    if kind == "responses":
+        assert json.loads(str(a["gen_ai.output.messages"])) == completed["output"]
+    else:
+        assert a["gen_ai.output.messages"] == "complete transcript"
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("ending", ["error", "close", "eof"])
+@pytest.mark.parametrize("masked", [False, True])
+async def test_short_transcription_stream_without_terminal_event_is_incomplete(
+    make: Any, async_mode: bool, ending: str, masked: bool
+) -> None:
+    def identity_mask(value: Any, _context: Any) -> Any:
+        return value
+
+    memory = make(mask=identity_mask) if masked else make()
+    event = {"type": "transcript.text.delta", "delta": "partial"}
+
+    def response() -> httpx.Response:
+        if ending == "error":
+            return (
+                failing_async_sse_response(event, "interrupted")
+                if async_mode
+                else failing_sync_sse_response(event, "interrupted")
+            )
+        return sse_response([event])
+
+    if async_mode:
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return response()
+
+        client = wrap_openai(async_client(handler))
+        stream = await cast(Any, client.audio.transcriptions.create)(
+            model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
+        )
+        assert (await stream.__anext__()).type == "transcript.text.delta"
+        if ending == "error":
+            with pytest.raises(Exception) as exc_info:
+                await stream.__anext__()
+            assert_stream_transport_error(exc_info.value, "interrupted")
+        elif ending == "close":
+            await stream.close()
+        else:
+            assert [item async for item in stream] == []
+        await client.close()
+    else:
+        client = wrap_openai(sync_client(lambda _request: response()))
+        stream = cast(Any, client.audio.transcriptions.create)(
+            model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
+        )
+        assert next(stream).type == "transcript.text.delta"
+        if ending == "error":
+            with pytest.raises(Exception) as exc_info:
+                next(stream)
+            assert_stream_transport_error(exc_info.value, "interrupted")
+        elif ending == "close":
+            stream.close()
+        else:
+            assert list(stream) == []
+
+    a = attrs(only_span(memory))
+    assert a.get("gen_ai.output.messages") == (None if masked else "partial")
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def test_terminal_transcription_capture_is_incrementally_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(telemetry_dev_openai, "_TRANSCRIPT_CAPTURE_MAX_BYTES", 5)
     mapper = vars(telemetry_dev_openai)["_media_stream_event_fields"]
 
     fields = mapper(
@@ -682,15 +993,103 @@ def test_terminal_transcription_capture_is_incrementally_bounded(make: Any) -> N
     assert fields["attributes"]["telemetry.dev.capture.truncated"] is True
 
 
+@pytest.mark.parametrize("capture_output", [False, True])
+def test_text_media_response_uses_the_policy_that_created_its_span(
+    monkeypatch: pytest.MonkeyPatch, capture_output: bool
+) -> None:
+    ended: list[dict[str, Any]] = []
+    reported: list[BaseException] = []
+
+    def mask(value: Any, _context: telemetry_dev.MaskContext) -> Any:
+        return value
+
+    def end(**fields: Any) -> None:
+        ended.append(fields)
+
+    handle = SimpleNamespace(
+        _client=SimpleNamespace(capture_output=capture_output, mask=mask),
+        _state=SimpleNamespace(capture_output=capture_output),
+        report_error=reported.append,
+    )
+    monkeypatch.setattr(
+        telemetry_dev,
+        "get_client",
+        lambda: SimpleNamespace(capture_output=not capture_output, mask=None),
+    )
+    implementation = cast(Any, telemetry_dev_openai)
+
+    implementation._end_mapped_response(
+        handle,
+        end,
+        implementation._text_media_response,
+        SimpleNamespace(text="sensitive transcript"),
+    )
+
+    assert reported == []
+    assert ended[-1].get("output") == ("sensitive transcript" if capture_output else None)
+    assert "attributes" not in ended[-1]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_transcription_stream_uses_the_policy_that_created_its_span(
+    monkeypatch: pytest.MonkeyPatch, async_mode: bool
+) -> None:
+    ended: list[dict[str, Any]] = []
+    reported: list[BaseException] = []
+    event = SimpleNamespace(type="transcript.text.done", text="sensitive transcript")
+
+    def mask(value: Any, _context: telemetry_dev.MaskContext) -> Any:
+        return value
+
+    def end(**fields: Any) -> None:
+        ended.append(fields)
+
+    handle = SimpleNamespace(
+        _client=SimpleNamespace(capture_output=True, mask=mask),
+        _state=SimpleNamespace(capture_output=True),
+        end=end,
+        report_error=reported.append,
+    )
+    monkeypatch.setattr(
+        telemetry_dev,
+        "get_client",
+        lambda: SimpleNamespace(capture_output=False, mask=None),
+    )
+    implementation = cast(Any, telemetry_dev_openai)
+
+    if async_mode:
+
+        async def source() -> AsyncIterator[Any]:
+            yield event
+
+        stream = implementation._InstrumentedAsyncMediaStream(
+            source(), handle, implementation._text_media_response
+        )
+        assert await stream.__anext__() is event
+    else:
+        stream = implementation._InstrumentedMediaStream(
+            iter([event]), handle, implementation._text_media_response
+        )
+        assert next(stream) is event
+
+    assert reported == []
+    assert ended[-1]["output"] == "sensitive transcript"
+    assert "attributes" not in ended[-1]
+
+
 @pytest.mark.parametrize("async_mode", [False, True])
 async def test_transcription_delta_capture_is_incrementally_bounded(
-    make: Any, async_mode: bool
+    make: Any, monkeypatch: pytest.MonkeyPatch, async_mode: bool
 ) -> None:
-    make(max_attribute_length=5)
+    make()
+    monkeypatch.setattr(telemetry_dev_openai, "_TRANSCRIPT_CAPTURE_MAX_BYTES", 5)
     ended: list[dict[str, Any]] = []
     event = SimpleNamespace(type="transcript.text.delta", delta=UnencodableText("ééé"))
 
     class Handle:
+        capture_output = True
+        capture_masked = False
+
         def end(self, **fields: Any) -> None:
             ended.append(fields)
 
@@ -778,6 +1177,10 @@ def test_disabled_transcription_stream_capture_does_not_read_text(make: Any) -> 
             raise AssertionError("capture-disabled output was read")
 
     class Handle:
+        capture_output = False
+        capture_masked = False
+        max_attribute_length = 5
+
         def end(self, **_fields: Any) -> None:
             pass
 
@@ -1129,6 +1532,115 @@ def test_chat_streaming_injects_usage_when_opted_in_and_filters_synthetic_chunk(
     assert list(cast(Any, a["gen_ai.response.finish_reasons"])) == ["stop"]
 
 
+def test_chat_stream_reads_fields_the_sdk_keeps_as_pydantic_extras(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chunk_calls: list[float | None] = []
+    original = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        chunk_calls.append(timestamp_ms)
+        return original(handle, timestamp_ms)
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
+    base = {
+        "id": "chatcmpl_extra",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "gpt-4o",
+    }
+    events: list[dict[str, Any]] = [
+        {
+            **base,
+            "choices": [{"index": 0, "delta": {"audio": {"id": "audio_1", "data": "QQ=="}}}],
+        },
+        {
+            **base,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_custom",
+                                "type": "custom",
+                                "custom": {"name": "lookup", "input": "order 42"},
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        },
+    ]
+    client = wrap_openai(sync_client(lambda _request: sse_response(events)))
+
+    stream = cast(Any, client.chat.completions.create)(
+        model="gpt-4o", messages=CHAT_MESSAGES, stream=True
+    )
+
+    assert len(list(stream)) == len(events)
+    assert len(chunk_calls) == 2
+    a = attrs(only_span(memory))
+    output = str(a["gen_ai.output.messages"])
+    assert "lookup" in output
+    assert "order 42" in output
+    assert "telemetry.dev.capture.truncated" not in a
+
+
+def _spoofed_and_aliased_storage(calls: list[str]) -> list[Any]:
+    class Payload:
+        def __get__(self, instance: Any, owner: Any) -> dict[str, Any]:
+            calls.append("payload")
+            return {"custom": {"input": "x"}, "text": "x"}
+
+    class Spoofed(Payload):
+        @property
+        def __class__(self) -> type:  # type: ignore[override]
+            calls.append("__class__")
+            return types.MemberDescriptorType
+
+        __name__ = "__pydantic_extra__"
+
+    class SpoofedModel:
+        __pydantic_extra__ = Spoofed()
+
+    class Meta(type):
+        __pydantic_extra__ = type.__dict__["__doc__"]
+        __dict__ = type.__dict__["__doc__"]  # type: ignore[assignment]
+
+    class Aliased(metaclass=Meta):
+        __doc__ = Payload()  # type: ignore[assignment]
+
+    return [SpoofedModel(), Aliased]
+
+
+def test_field_reads_never_run_storage_properties() -> None:
+    calls: list[str] = []
+
+    class HostileDelta:
+        @property
+        def __dict__(self) -> dict[str, Any]:  # type: ignore[override]
+            calls.append("__dict__")
+            return {"custom": {"input": "x" * 1_000}}
+
+        @property
+        def __pydantic_extra__(self) -> dict[str, Any]:
+            calls.append("__pydantic_extra__")
+            return {"custom": {"input": "x" * 1_000}}
+
+    own_field = vars(telemetry_dev_openai)["_own_field"]
+    budget = telemetry_dev.CaptureBudget(max_bytes=0)
+
+    assert own_field(HostileDelta(), "custom", budget) is None
+    for hostile in _spoofed_and_aliased_storage(calls):
+        assert own_field(hostile, "custom", budget) is None
+    assert calls == []
+
+
 @pytest.mark.parametrize("async_mode", [False, True])
 async def test_chunk_timing_excludes_control_and_empty_deltas(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, async_mode: bool
@@ -1196,6 +1708,53 @@ async def test_chunk_timing_excludes_control_and_empty_deltas(
     assert memory.metric_reader.get_metrics_data() is not None
 
 
+def test_chat_streaming_reconstructs_legacy_function_call() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    states: dict[int, Any] = {}
+    output_budget = implementation._chat_capture_budget(reserve_output_list=True)
+    finish_reason_budget = implementation._chat_capture_budget()
+    events = [
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"function_call": {"name": "lookup", "arguments": '{"city":'}},
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"function_call": {"arguments": '"Paris"}'}},
+                    "finish_reason": "stop",
+                }
+            ]
+        },
+    ]
+
+    for event in events:
+        implementation._record_chat_chunk(
+            event,
+            states,
+            {},
+            {},
+            set(),
+            output_budget,
+            finish_reason_budget,
+            True,
+        )
+
+    assert implementation._chat_output(states) == [
+        {
+            "role": "assistant",
+            "content": None,
+            "function_call": {"name": "lookup", "arguments": '{"city":"Paris"}'},
+        }
+    ]
+    assert output_budget.truncated is False
+
+
 @pytest.mark.parametrize(
     ("event_type", "chunks"),
     [("response.shell_call_command.delta", 2), ("response.shell_call_output_content.delta", 0)],
@@ -1239,6 +1798,7 @@ async def test_chunk_receipt_time_precedes_mapping(
     clock = 12.0
     recorded: list[float] = []
     original_record = telemetry_dev.SpanHandle.record_output_chunk
+    original_record_chunk = vars(telemetry_dev_openai)["_record_chat_chunk"]
 
     def record_output_chunk(
         handle: telemetry_dev.SpanHandle, timestamp_ms: float
@@ -1249,16 +1809,14 @@ async def test_chunk_receipt_time_precedes_mapping(
     def perf_counter() -> float:
         return clock
 
-    original_getattribute = ChatCompletionChunk.__getattribute__
-
-    def delayed_choices(chunk: ChatCompletionChunk, name: str) -> Any:
+    def delayed_record_chunk(*args: Any, **kwargs: Any) -> Any:
         nonlocal clock
-        if name == "choices":
-            clock = 47.0
-        return original_getattribute(chunk, name)
+        result = original_record_chunk(*args, **kwargs)
+        clock = 47.0
+        return result
 
     monkeypatch.setattr(time, "perf_counter", perf_counter)
-    monkeypatch.setattr(ChatCompletionChunk, "__getattribute__", delayed_choices)
+    monkeypatch.setattr(telemetry_dev_openai, "_record_chat_chunk", delayed_record_chunk)
     monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
     events = [
         {
@@ -1496,10 +2054,1316 @@ def test_chat_streaming_bounds_retained_state_without_dropping_metadata(
     assert budget.bytes_used <= budget.max_bytes
     assert source_content.startswith(state.content)
     assert len(state.content) < len(source_content)
-    assert state.role == "assistant"
+    assert state.role is None
+    assert not state.content.endswith("not-retained")
     a = attrs(only_span(memory))
+    assert len(str(a["gen_ai.output.messages"]).encode()) <= 48 * 1024
     assert a["gen_ai.response.finish_reasons"] == ("stop",)
     assert a["gen_ai.usage.total_tokens"] == 7
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("max_attribute_length", [0, 256])
+async def test_chat_stream_finish_reasons_do_not_depend_on_content_limit(
+    make: Any, async_mode: bool, max_attribute_length: int
+) -> None:
+    memory = make(max_attribute_length=max_attribute_length)
+    events: list[dict[str, Any]] = [
+        {
+            "id": "chatcmpl_limit",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4o",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "Hi"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+    ]
+
+    if async_mode:
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return sse_response(events)
+
+        client = wrap_openai(async_client(handler))
+        stream = await cast(Any, client.chat.completions.create)(
+            model="gpt-4o", messages=CHAT_MESSAGES, stream=True
+        )
+        delivered = [item async for item in stream]
+        await client.close()
+    else:
+        client = wrap_openai(sync_client(lambda _request: sse_response(events)))
+        stream = cast(Any, client.chat.completions.create)(
+            model="gpt-4o", messages=CHAT_MESSAGES, stream=True
+        )
+        delivered = list(stream)
+
+    assert len(delivered) == 1
+    a = attrs(only_span(memory))
+    assert a["gen_ai.response.finish_reasons"] == ("stop",)
+    if max_attribute_length == 0:
+        assert a.get("gen_ai.output.messages", "") == ""
+    else:
+        assert json.loads(str(a["gen_ai.output.messages"])) == [
+            {"role": "assistant", "content": "Hi"}
+        ]
+        assert "telemetry.dev.capture.truncated" not in a
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_multi_choice_finish_reasons_survive_a_zero_content_limit(
+    make: Any, async_mode: bool
+) -> None:
+    memory = make(max_attribute_length=0, capture_input=False, capture_output=False)
+    events: list[dict[str, Any]] = [
+        {
+            "id": "chatcmpl_two",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4o",
+            "choices": [
+                {"index": 0, "delta": {}, "finish_reason": "stop"},
+                {"index": 1, "delta": {}, "finish_reason": "length"},
+            ],
+        }
+    ]
+
+    if async_mode:
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return sse_response(events)
+
+        client = wrap_openai(async_client(handler))
+        stream = await cast(Any, client.chat.completions.create)(
+            model="gpt-4o", messages=CHAT_MESSAGES, stream=True
+        )
+        delivered = [item async for item in stream]
+        await client.close()
+    else:
+        client = wrap_openai(sync_client(lambda _request: sse_response(events)))
+        stream = cast(Any, client.chat.completions.create)(
+            model="gpt-4o", messages=CHAT_MESSAGES, stream=True
+        )
+        delivered = list(stream)
+
+    assert len(delivered) == 1
+    a = attrs(only_span(memory))
+    assert a["gen_ai.response.finish_reasons"] == ("stop", "length")
+    assert "telemetry.dev.capture.truncated" not in a
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("masked", [False, True])
+async def test_post_finish_content_filter_chunk_keeps_chat_stream_complete(
+    make: Any, async_mode: bool, masked: bool
+) -> None:
+    def identity_mask(value: Any, _context: Any) -> Any:
+        return value
+
+    memory = make(mask=identity_mask) if masked else make()
+    base = {"id": "chatcmpl_azure", "object": "chat.completion.chunk", "created": 1}
+    events: list[dict[str, Any]] = [
+        {
+            **base,
+            "model": "gpt-4o",
+            "choices": [
+                {"index": 0, "delta": {"role": "assistant", "content": "Hi"}, "finish_reason": None}
+            ],
+        },
+        {
+            **base,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+        {
+            **base,
+            "model": "",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": None,
+                    "content_filter_offsets": {
+                        "check_offset": 0,
+                        "start_offset": 0,
+                        "end_offset": 2,
+                    },
+                    "content_filter_results": {"hate": {"filtered": False, "severity": "safe"}},
+                }
+            ],
+        },
+    ]
+
+    if async_mode:
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return sse_response(events)
+
+        client = wrap_openai(async_client(handler))
+        stream = await cast(Any, client.chat.completions.create)(
+            model="gpt-4o", messages=CHAT_MESSAGES, stream=True
+        )
+        delivered = [item async for item in stream]
+        await client.close()
+    else:
+        client = wrap_openai(sync_client(lambda _request: sse_response(events)))
+        stream = cast(Any, client.chat.completions.create)(
+            model="gpt-4o", messages=CHAT_MESSAGES, stream=True
+        )
+        delivered = list(stream)
+
+    assert len(delivered) == len(events)
+    a = attrs(only_span(memory))
+    assert "telemetry.dev.capture.truncated" not in a
+    assert a["gen_ai.response.finish_reasons"] == ("stop",)
+    assert json.loads(str(a["gen_ai.output.messages"])) == [{"role": "assistant", "content": "Hi"}]
+
+
+def test_chat_streaming_omits_bounded_prefix_when_mask_cannot_inspect_complete_output(
+    make: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def mask(value: Any, _context: telemetry_dev.MaskContext) -> Any:
+        return "[REDACTED]" if "SECRET" in json.dumps(value) else value
+
+    monkeypatch.setattr(telemetry_dev_openai, "_CHAT_STREAM_CAPTURE_MAX_BYTES", 128)
+    memory = make(mask=mask)
+    base = {
+        "id": "chatcmpl_masked_stream",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "gpt-4o-mini",
+    }
+    events: list[dict[str, Any]] = [
+        {**base, "choices": [{"index": 0, "delta": {"content": "x"}}]} for _ in range(200)
+    ]
+    events.append(
+        {
+            **base,
+            "choices": [{"index": 0, "delta": {"content": "SECRET"}, "finish_reason": "stop"}],
+        }
+    )
+
+    stream = cast(
+        Any,
+        wrap_openai(sync_client(lambda _request: sse_response(events))).chat.completions.create,
+    )(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+
+    assert len(list(stream)) == len(events)
+    a = attrs(only_span(memory))
+    assert "gen_ai.output.messages" not in a
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def test_chat_streaming_omits_masked_output_without_terminal_finish_reason(make: Any) -> None:
+    def mask(value: Any, _context: telemetry_dev.MaskContext) -> Any:
+        return value
+
+    memory = make(mask=mask)
+    event = {
+        "id": "chatcmpl_incomplete",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "gpt-4o-mini",
+        "choices": [{"index": 0, "delta": {"content": "partial"}}],
+    }
+
+    stream = cast(
+        Any,
+        wrap_openai(sync_client(lambda _request: sse_response([event]))).chat.completions.create,
+    )(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+
+    assert len(list(stream)) == 1
+    a = attrs(only_span(memory))
+    assert "gen_ai.output.messages" not in a
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_chat_streaming_bounds_choice_and_finish_reason_state(
+    memory: SimpleNamespace, async_mode: bool
+) -> None:
+    event: dict[str, Any] = {
+        "id": "chatcmpl_many_choices",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "gpt-4o-mini",
+        "choices": [{"index": index, "delta": {}, "finish_reason": "stop"} for index in range(400)],
+    }
+
+    if async_mode:
+
+        async def async_handler(_request: httpx.Request) -> httpx.Response:
+            return sse_response([event])
+
+        client = wrap_openai(async_client(async_handler))
+        stream = await cast(Any, client.chat.completions.create)(
+            model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+        delivered = [chunk async for chunk in stream]
+        await client.close()
+    else:
+        client = wrap_openai(sync_client(lambda _request: sse_response([event])))
+        stream = cast(Any, client.chat.completions.create)(
+            model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+        delivered = list(stream)
+        client.close()
+
+    assert len(delivered) == 1
+    assert len(stream._states) == 333
+    a = attrs(only_span(memory))
+    output = json.loads(str(a["gen_ai.output.messages"]))
+    finish_reasons = cast(Sequence[str], a["gen_ai.response.finish_reasons"])
+    assert len(output) == 333
+    assert len(finish_reasons) == 200
+    assert len(str(a["gen_ai.output.messages"]).encode()) <= 48 * 1024
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def test_chat_streaming_reclaims_finish_reason_items_on_replacement(make: Any) -> None:
+    memory = make(capture_output=False)
+    events: list[dict[str, Any]] = [
+        {
+            "id": "chatcmpl_finish_reasons",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4o-mini",
+            "choices": [
+                {"index": index, "delta": {}, "finish_reason": "stop"} for index in range(200)
+            ],
+        },
+        {
+            "id": "chatcmpl_finish_reasons",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4o-mini",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+        },
+    ]
+    client = wrap_openai(sync_client(lambda _request: sse_response(events)))
+
+    list(
+        cast(Any, client.chat.completions.create)(
+            model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+    )
+
+    a = attrs(only_span(memory))
+    finish_reasons = cast(Sequence[str], a["gen_ai.response.finish_reasons"])
+    assert len(finish_reasons) == 200
+    assert finish_reasons[0] == "length"
+    assert "gen_ai.output.messages" not in a
+    assert "telemetry.dev.capture.truncated" not in a
+
+
+def test_chat_streaming_retains_exact_multibyte_finish_reason_budget(make: Any) -> None:
+    memory = make(capture_output=False)
+    reason = ('"🙂\\\n' * 4_905) + "🙂"
+    event: dict[str, Any] = {
+        "id": "chatcmpl_finish_reason_budget",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "gpt-4o-mini",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
+    }
+    client = wrap_openai(sync_client(lambda _request: sse_response([event])))
+
+    list(
+        cast(Any, client.chat.completions.create)(
+            model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+    )
+
+    a = attrs(only_span(memory))
+    finish_reasons = list(cast(Sequence[str], a["gen_ai.response.finish_reasons"]))
+    assert len(reason) == 19_621
+    assert finish_reasons == [reason]
+    serialized = json.dumps(finish_reasons, ensure_ascii=False, separators=(",", ":")).encode()
+    assert len(serialized) == 49_058
+    assert "telemetry.dev.capture.truncated" not in a
+
+
+def test_chat_streaming_clears_recovered_finish_reason_truncation(memory: SimpleNamespace) -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    states: dict[int, Any] = {}
+    finish_reason_states: dict[int, str] = {}
+    finish_reason_reservations: dict[int, tuple[int, int]] = {}
+    rejected_finish_reasons: set[int] = set()
+    output_budget = implementation._chat_capture_budget(reserve_output_list=True)
+    finish_reason_budget = implementation._chat_capture_budget()
+
+    implementation._record_chat_chunk(
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "x" * 70_000}]},
+        states,
+        finish_reason_states,
+        finish_reason_reservations,
+        rejected_finish_reasons,
+        output_budget,
+        finish_reason_budget,
+        False,
+    )
+    implementation._record_chat_chunk(
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        states,
+        finish_reason_states,
+        finish_reason_reservations,
+        rejected_finish_reasons,
+        output_budget,
+        finish_reason_budget,
+        False,
+    )
+
+    assert finish_reason_states == {0: "stop"}
+    assert rejected_finish_reasons == set()
+    partial = implementation._chat_partial(
+        states,
+        finish_reason_states,
+        None,
+        False,
+        output_budget.truncated or finish_reason_budget.truncated or bool(rejected_finish_reasons),
+    )
+    assert finish_reason_budget.truncated is False
+    assert partial["attributes"] is None
+
+
+def test_chat_streaming_incrementally_accounts_for_many_tiny_deltas(
+    memory: SimpleNamespace,
+) -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    states: dict[int, Any] = {}
+    finish_reason_states: dict[int, str] = {}
+    finish_reason_reservations: dict[int, tuple[int, int]] = {}
+    rejected_finish_reasons: set[int] = set()
+    output_budget = implementation._chat_capture_budget(reserve_output_list=True)
+    finish_reason_budget = implementation._chat_capture_budget()
+
+    for _ in range(60_000):
+        implementation._record_chat_chunk(
+            {"choices": [{"index": 0, "delta": {"content": "x"}}]},
+            states,
+            finish_reason_states,
+            finish_reason_reservations,
+            rejected_finish_reasons,
+            output_budget,
+            finish_reason_budget,
+            True,
+        )
+
+    retained_content = "x" * 49_036
+    assert output_budget.truncated is True
+    assert states[0].content == retained_content
+    assert states[0].content_fragments.getvalue() == retained_content
+    assert output_budget.bytes_used == 48 * 1024
+    assert json.dumps(implementation._chat_output(states), separators=(",", ":")) == json.dumps(
+        [{"role": "assistant", "content": retained_content}], separators=(",", ":")
+    )
+
+
+def test_chat_streaming_replaces_default_role_within_exact_budget(
+    memory: SimpleNamespace,
+) -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    states: dict[int, Any] = {}
+    finish_reason_states: dict[int, str] = {}
+    finish_reason_reservations: dict[int, tuple[int, int]] = {}
+    rejected_finish_reasons: set[int] = set()
+    output_budget = implementation._chat_capture_budget(reserve_output_list=True)
+    finish_reason_budget = implementation._chat_capture_budget()
+
+    implementation._record_chat_chunk(
+        {"choices": [{"index": 0, "delta": {}}]},
+        states,
+        finish_reason_states,
+        finish_reason_reservations,
+        rejected_finish_reasons,
+        output_budget,
+        finish_reason_budget,
+        True,
+    )
+    retained_content = "x" * 49_036
+    implementation._record_chat_chunk(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "developer", "content": retained_content},
+                }
+            ]
+        },
+        states,
+        finish_reason_states,
+        finish_reason_reservations,
+        rejected_finish_reasons,
+        output_budget,
+        finish_reason_budget,
+        True,
+    )
+
+    assert output_budget.bytes_used == output_budget.max_bytes
+    assert output_budget.truncated is False
+    assert states[0].role == "developer"
+    assert states[0].content == retained_content
+
+
+def test_chat_streaming_recovers_after_rejecting_role_replacement() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    states: dict[int, Any] = {}
+    finish_reason_states: dict[int, str] = {}
+    finish_reason_reservations: dict[int, tuple[int, int]] = {}
+    rejected_finish_reasons: set[int] = set()
+    output_budget = small_chat_budget(160, reserve_output_list=True)
+    finish_reason_budget = small_chat_budget(160)
+
+    for role in ("x" * 256, "developer"):
+        implementation._record_chat_chunk(
+            {"choices": [{"index": 0, "delta": {"role": role}}]},
+            states,
+            finish_reason_states,
+            finish_reason_reservations,
+            rejected_finish_reasons,
+            output_budget,
+            finish_reason_budget,
+            True,
+        )
+
+    assert states[0].role == "developer"
+    assert states[0].role_resolved is True
+    assert output_budget.truncated is False
+
+
+def test_recoverable_scalar_capture_recovers_after_item_limit_rejection() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    budget = small_chat_budget(160)
+    budget.items_used = budget.max_items
+
+    assert (
+        implementation._capture_chat_string("developer", budget, "role", recoverable=True) is False
+    )
+    assert budget.truncated is False
+
+    budget.items_used = 0
+    assert (
+        implementation._capture_chat_string("developer", budget, "role", recoverable=True) is True
+    )
+    assert budget.truncated is False
+
+
+def test_chat_streaming_replaces_retained_scalar_after_additive_truncation() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    states: dict[int, Any] = {}
+    finish_reason_states: dict[int, str] = {}
+    finish_reason_reservations: dict[int, tuple[int, int]] = {}
+    rejected_finish_reasons: set[int] = set()
+    output_budget = small_chat_budget(240, reserve_output_list=True)
+    finish_reason_budget = small_chat_budget(240)
+
+    for event in (
+        {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "old"}]}}]},
+        {"choices": [{"index": 0, "delta": {"content": "x" * 300}}]},
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"tool_calls": [{"index": 0, "id": "new"}]},
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+    ):
+        implementation._record_chat_chunk(
+            event,
+            states,
+            finish_reason_states,
+            finish_reason_reservations,
+            rejected_finish_reasons,
+            output_budget,
+            finish_reason_budget,
+            True,
+        )
+
+    assert implementation._chat_output(states) == [
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "new"}]}
+    ]
+    assert output_budget.truncated is True
+
+
+@pytest.mark.parametrize("field", ["id", "type", "name"])
+def test_chat_streaming_reclaims_replaced_tool_call_scalars(field: str) -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    state = implementation._ChatChoice()
+    previous = "x" * 128
+    if field == "name":
+        state.tool_calls[0] = {"function": {"name": previous}}
+        delta = {"index": 0, "function": {"name": "replaced"}}
+    else:
+        state.tool_calls[0] = {field: previous}
+        delta = {"index": 0, field: "replaced"}
+    budget = implementation._chat_capture_budget()
+    budget.bytes_used = budget.max_bytes
+    budget.items_used = 10
+
+    implementation._capture_tool_call_delta(
+        state, implementation._read_tool_call_delta(delta, budget), budget
+    )
+
+    captured = (
+        state.tool_calls[0]["function"]["name"] if field == "name" else state.tool_calls[0][field]
+    )
+    assert captured == "replaced"
+    assert budget.bytes_used == budget.max_bytes - (len(previous) - len("replaced"))
+    assert budget.truncated is False
+
+
+def test_chat_streaming_recovers_after_rejecting_tool_call_scalar_growth() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    state = implementation._ChatChoice()
+    budget = implementation._chat_capture_budget()
+    initial = implementation._read_tool_call_delta({"index": 0, "id": "xxxx"}, budget)
+    implementation._capture_tool_call_delta(state, initial, budget)
+    budget.bytes_used = budget.max_bytes
+    delta = implementation._read_tool_call_delta({"index": 0, "id": '""""'}, budget)
+
+    implementation._capture_tool_call_delta(state, delta, budget)
+
+    assert "id" not in state.tool_calls[0]
+    assert budget.bytes_used == budget.max_bytes - 38
+    assert budget.truncated is False
+    assert state.unresolved_tool_scalars == {0: {"id"}}
+    assert "id" not in implementation._chat_message(state)["tool_calls"][0]
+
+    recovery = implementation._read_tool_call_delta({"index": 0, "id": "ok"}, budget)
+    implementation._capture_tool_call_delta(state, recovery, budget)
+
+    assert state.tool_calls[0]["id"] == "ok"
+    assert state.unresolved_tool_scalars == {}
+    assert budget.bytes_used == budget.max_bytes - 2
+    assert budget.truncated is False
+
+
+def test_chat_streaming_persists_function_shell_after_rejected_name() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    state = implementation._ChatChoice()
+    budget = small_chat_budget(225)
+
+    rejected = implementation._read_tool_call_delta(
+        {"index": 0, "function": {"name": "x" * 256}}, budget
+    )
+    implementation._capture_tool_call_delta(state, rejected, budget)
+
+    assert state.tool_calls[0]["function"] == {}
+    assert state.unresolved_tool_scalars == {0: {"function.name"}}
+    shell_bytes = budget.bytes_used
+
+    recovery = implementation._read_tool_call_delta(
+        {"index": 0, "function": {"name": "lookup", "arguments": "{}"}}, budget
+    )
+    implementation._capture_tool_call_delta(state, recovery, budget)
+
+    assert state.tool_calls[0]["function"]["name"] == "lookup"
+    assert state.tool_calls[0]["function"]["arguments"].getvalue() == "{}"
+    assert state.unresolved_tool_scalars == {}
+    assert budget.bytes_used > shell_bytes
+    assert budget.truncated is False
+
+
+def test_chat_streaming_replaces_tool_call_null_content_at_exact_budget() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    states: dict[int, Any] = {}
+    finish_reason_states: dict[int, str] = {}
+    finish_reason_reservations: dict[int, tuple[int, int]] = {}
+    rejected_finish_reasons: set[int] = set()
+    output_budget = small_chat_budget(256, reserve_output_list=True)
+    finish_reason_budget = implementation._chat_capture_budget()
+
+    implementation._record_chat_chunk(
+        {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call"}]}}]},
+        states,
+        finish_reason_states,
+        finish_reason_reservations,
+        rejected_finish_reasons,
+        output_budget,
+        finish_reason_budget,
+        True,
+    )
+    retained_content = "x" * 44
+    implementation._record_chat_chunk(
+        {"choices": [{"index": 0, "delta": {"content": retained_content}}]},
+        states,
+        finish_reason_states,
+        finish_reason_reservations,
+        rejected_finish_reasons,
+        output_budget,
+        finish_reason_budget,
+        True,
+    )
+
+    assert output_budget.remaining_bytes == 0
+    assert output_budget.truncated is False
+    assert states[0].content == retained_content
+
+
+def test_chat_streaming_does_not_retain_repeated_empty_tool_arguments() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    state = implementation._ChatChoice()
+    budget = implementation._chat_capture_budget()
+    delta = implementation._read_tool_call_delta(
+        {"index": 0, "function": {"arguments": ""}}, budget
+    )
+
+    for _ in range(10_000):
+        implementation._capture_tool_call_delta(state, delta, budget)
+
+    assert state.tool_calls[0]["function"]["arguments"].getvalue() == ""
+    assert budget.truncated is False
+
+
+def test_chat_streaming_rejects_the_first_tool_argument_byte_beyond_the_budget() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    state = implementation._ChatChoice()
+    budget = small_chat_budget(256)
+    empty = implementation._read_tool_call_delta(
+        {"index": 0, "function": {"arguments": ""}}, budget
+    )
+    implementation._capture_tool_call_delta(state, empty, budget)
+    fitting = implementation._read_tool_call_delta(
+        {
+            "index": 0,
+            "function": {"arguments": "x" * 78},
+        },
+        budget,
+    )
+    implementation._capture_tool_call_delta(state, fitting, budget)
+    arguments = state.tool_calls[0]["function"]["arguments"]
+
+    assert arguments.getvalue() == "x" * 78
+    assert budget.remaining_bytes == 0
+    assert budget.truncated is False
+
+    overflow = implementation._read_tool_call_delta(
+        {"index": 0, "function": {"arguments": "y"}}, budget
+    )
+    implementation._capture_tool_call_delta(state, overflow, budget)
+
+    assert arguments.getvalue() == "x" * 78
+    assert budget.truncated is True
+
+
+def test_chat_streaming_marks_failed_null_content_replacement_incomplete() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    states: dict[int, Any] = {}
+    output_budget = small_chat_budget(512, reserve_output_list=True)
+    finish_reason_budget = small_chat_budget(512)
+
+    implementation._record_chat_chunk(
+        {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call"}]}}]},
+        states,
+        {},
+        {},
+        set(),
+        output_budget,
+        finish_reason_budget,
+        True,
+    )
+    assert implementation._chat_message(states[0])["content"] is None
+    content = "x" * (output_budget.remaining_bytes + 1)
+    implementation._record_chat_chunk(
+        {"choices": [{"index": 0, "delta": {"content": content}}]},
+        states,
+        {},
+        {},
+        set(),
+        output_budget,
+        finish_reason_budget,
+        True,
+    )
+
+    assert implementation._chat_message(states[0])["content"] is None
+    assert output_budget.truncated is True
+
+
+def test_chat_streaming_caps_per_chunk_choice_and_tool_call_inspection() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    choice_reads = 0
+    tool_call_reads = 0
+
+    class HostileSequence(Sequence[Any]):
+        def __init__(self, values: list[Any]) -> None:
+            self.values = values
+
+        def __len__(self) -> int:
+            return len(self.values)
+
+        def __getitem__(self, index: int | slice) -> Any:
+            if isinstance(index, slice):
+                if (index.stop or len(self.values)) > 1_000:
+                    raise AssertionError("inspected beyond the per-chunk limit")
+                return self.values[index]
+            if index >= 1_000:
+                raise AssertionError("inspected beyond the per-chunk limit")
+            return self.values[index]
+
+    class CountingChoice(dict[str, Any]):
+        def get(self, key: str, default: Any = None) -> Any:
+            nonlocal choice_reads
+            if key == "delta":
+                choice_reads += 1
+            return super().get(key, default)
+
+    choices = HostileSequence(
+        [
+            CountingChoice(
+                index=index,
+                delta={"content": "beyond-limit"} if index == 1_000 else {},
+            )
+            for index in range(5_000)
+        ]
+    )
+    output_budget = implementation._chat_capture_budget(reserve_output_list=True)
+    finish_reason_budget = implementation._chat_capture_budget()
+    choice_update = implementation._record_chat_chunk(
+        {"choices": choices},
+        {},
+        {},
+        {},
+        set(),
+        output_budget,
+        finish_reason_budget,
+        True,
+    )
+
+    class CountingToolCall(dict[str, Any]):
+        def get(self, key: str, default: Any = None) -> Any:
+            nonlocal tool_call_reads
+            if key == "id":
+                tool_call_reads += 1
+            return super().get(key, default)
+
+    tool_calls = HostileSequence(
+        [
+            CountingToolCall(
+                index=index,
+                id=f"call-{index}",
+                function={"arguments": "beyond-limit"} if index == 1_000 else None,
+            )
+            for index in range(5_000)
+        ]
+    )
+    output_budget = implementation._chat_capture_budget(reserve_output_list=True)
+    finish_reason_budget = implementation._chat_capture_budget()
+    tool_update = implementation._record_chat_chunk(
+        {"choices": [{"index": 0, "delta": {"tool_calls": tool_calls}}]},
+        {},
+        {},
+        {},
+        set(),
+        output_budget,
+        finish_reason_budget,
+        True,
+    )
+
+    assert choice_reads == 1_000
+    assert tool_call_reads == 1_000
+    assert choice_update["has_output"] is True
+    assert tool_update["has_output"] is True
+    assert output_budget.truncated is True
+
+
+def test_chat_streaming_retains_exact_content_for_all_fragment_accumulators() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    states: dict[int, Any] = {}
+    output_budget = implementation._chat_capture_budget(reserve_output_list=True)
+    finish_reason_budget = implementation._chat_capture_budget()
+
+    for _ in range(200):
+        implementation._record_chat_chunk(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "content": "c",
+                            "refusal": "r",
+                            "function_call": {"arguments": "f"},
+                            "tool_calls": [{"index": 0, "function": {"arguments": "t"}}],
+                        },
+                    }
+                ]
+            },
+            states,
+            {},
+            {},
+            set(),
+            output_budget,
+            finish_reason_budget,
+            True,
+        )
+
+    state = states[0]
+    assert state.content == "c" * 200
+    assert state.refusal == "r" * 200
+    assert implementation._chat_message(state)["function_call"]["arguments"] == "f" * 200
+    assert implementation._chat_message(state)["tool_calls"][0]["function"]["arguments"] == (
+        "t" * 200
+    )
+    assert output_budget.items_used <= output_budget.max_items
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_chat_streaming_reconstructs_legacy_function_calls_and_custom_tools(
+    make: Any, async_mode: bool
+) -> None:
+    memory = make()
+    implementation = cast(Any, telemetry_dev_openai)
+    events = [
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "function_call": {"name": "legacy_lookup", "arguments": '{"city":'},
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "custom_1",
+                                "type": "custom",
+                                "custom": {"name": "code_exec", "input": "print("},
+                            }
+                        ],
+                    },
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "function_call": {"arguments": '"Paris"}'},
+                        "tool_calls": [{"index": 0, "custom": {"input": "42)"}}],
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        },
+    ]
+    handle = telemetry_dev.start_span(
+        "chat gpt-4o-mini", type="generation", model="gpt-4o-mini", provider="openai"
+    )
+
+    if async_mode:
+
+        async def source() -> AsyncIterator[Any]:
+            for event in events:
+                yield event
+
+        stream = implementation._InstrumentedAsyncStream(
+            source(), handle, False, time.perf_counter()
+        )
+        delivered = [event async for event in stream]
+    else:
+        stream = implementation._InstrumentedStream(
+            iter(events), handle, False, time.perf_counter()
+        )
+        delivered = list(stream)
+
+    assert delivered == events
+    assert json.loads(str(attrs(only_span(memory))["gen_ai.output.messages"])) == [
+        {
+            "role": "assistant",
+            "content": None,
+            "function_call": {"name": "legacy_lookup", "arguments": '{"city":"Paris"}'},
+            "tool_calls": [
+                {
+                    "id": "custom_1",
+                    "type": "custom",
+                    "custom": {"name": "code_exec", "input": "print(42)"},
+                }
+            ],
+        }
+    ]
+
+
+def test_chat_streaming_bounds_rejected_finish_reason_indexes() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    states: dict[int, Any] = {}
+    finish_reason_states: dict[int, str] = {}
+    finish_reason_reservations: dict[int, tuple[int, int]] = {}
+    rejected_finish_reasons: set[int] = set()
+    output_budget = implementation._chat_capture_budget()
+    finish_reason_budget = implementation._chat_capture_budget()
+    oversized_reason = "x" * 70_000
+
+    for indexes in (range(1_000), range(1_000, 1_100)):
+        implementation._record_chat_chunk(
+            {
+                "choices": [
+                    {"index": index, "delta": {}, "finish_reason": oversized_reason}
+                    for index in indexes
+                ]
+            },
+            states,
+            finish_reason_states,
+            finish_reason_reservations,
+            rejected_finish_reasons,
+            output_budget,
+            finish_reason_budget,
+            False,
+        )
+
+    assert len(rejected_finish_reasons) == 1_000
+    assert finish_reason_budget.truncated is True
+
+
+def test_chat_streaming_finish_reason_budget_counts_json_escapes() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    reservations: dict[int, tuple[int, int]] = {}
+    budget = implementation._chat_capture_budget()
+    reason = '"\\\n'
+
+    assert implementation._replace_finish_reason(0, reason, budget, reservations) is True
+    assert reservations[0] == (98 + len(json.dumps(reason).encode()) - 2, 5)
+
+
+def test_chat_streaming_rejected_replacement_invalidates_retained_finish_reason() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    states: dict[int, Any] = {}
+    finish_reason_states: dict[int, str] = {}
+    reservations: dict[int, tuple[int, int]] = {}
+    rejected: set[int] = set()
+    output_budget = implementation._chat_capture_budget()
+    finish_reason_budget = small_chat_budget(130)
+
+    for index, reason in ((0, "x" * 20), (0, "x" * 200), (1, "stop")):
+        implementation._record_chat_chunk(
+            {"choices": [{"index": index, "delta": {}, "finish_reason": reason}]},
+            states,
+            finish_reason_states,
+            reservations,
+            rejected,
+            output_budget,
+            finish_reason_budget,
+            False,
+        )
+
+    assert finish_reason_states == {1: "stop"}
+    assert set(reservations) == {1}
+    assert rejected == {0}
+
+
+def test_chat_streaming_mapping_attribute_error_is_reported_and_marks_capture() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    errors: list[BaseException] = []
+
+    class ThrowingMapping(dict[str, Any]):
+        def get(self, key: str, default: Any = None) -> Any:
+            raise AttributeError(f"cannot read {key}")
+
+    states: dict[int, Any] = {}
+    output_budget = implementation._chat_capture_budget(reserve_output_list=True)
+    finish_reason_budget = implementation._chat_capture_budget()
+
+    update = implementation._record_chat_chunk(
+        ThrowingMapping(),
+        states,
+        {},
+        {},
+        set(),
+        output_budget,
+        finish_reason_budget,
+        True,
+        errors.append,
+    )
+
+    assert update["has_output"] is False
+    assert states == {}
+    assert output_budget.truncated is True
+    assert errors
+    assert all(isinstance(error, AttributeError) for error in errors)
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("failure", ["record", "classifier"])
+async def test_chat_stream_instrumentation_failures_do_not_interrupt_iteration(
+    make: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    async_mode: bool,
+    failure: str,
+) -> None:
+    errors: list[BaseException] = []
+    memory = make(on_error=errors.append)
+
+    def fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(f"{failure} failed")
+
+    monkeypatch.setattr(
+        telemetry_dev_openai,
+        "_record_chat_chunk" if failure == "record" else "_synthetic_usage_chunk",
+        fail,
+    )
+    events = [terminal_chat_stream_event(), terminal_chat_stream_event()]
+
+    if async_mode:
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return sse_response(events)
+
+        client = wrap_openai(async_client(handler), inject_stream_usage=True)
+        stream = await cast(Any, client.chat.completions.create)(
+            model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+        delivered = [chunk async for chunk in stream]
+        await client.close()
+    else:
+        client = wrap_openai(
+            sync_client(lambda _request: sse_response(events)), inject_stream_usage=True
+        )
+        stream = cast(Any, client.chat.completions.create)(
+            model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+        delivered = list(stream)
+        client.close()
+
+    assert len(delivered) == 2
+    assert all(chunk.id == "chatcmpl_stream" for chunk in delivered)
+    assert all(chunk.model == "gpt-4o-mini-2024-07-18" for chunk in delivered)
+    assert all(chunk.choices[0].delta.role == "assistant" for chunk in delivered)
+    assert all(chunk.choices[0].delta.content == "Hello" for chunk in delivered)
+    assert all(chunk.choices[0].finish_reason == "stop" for chunk in delivered)
+    assert [str(error) for error in errors if str(error) == f"{failure} failed"] == [
+        f"{failure} failed"
+    ]
+    assert attrs(only_span(memory))["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_chat_stream_instrumentation_propagates_process_control_exceptions(
+    memory: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    async_mode: bool,
+) -> None:
+    def interrupt(*_args: Any, **_kwargs: Any) -> Any:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(telemetry_dev_openai, "_record_chat_chunk", interrupt)
+    events = [terminal_chat_stream_event()]
+
+    if async_mode:
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return sse_response(events)
+
+        client = wrap_openai(async_client(handler))
+        stream = await cast(Any, client.chat.completions.create)(
+            model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+        with pytest.raises(KeyboardInterrupt):
+            [chunk async for chunk in stream]
+        await client.close()
+    else:
+        client = wrap_openai(sync_client(lambda _request: sse_response(events)))
+        stream = cast(Any, client.chat.completions.create)(
+            model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+        with pytest.raises(KeyboardInterrupt):
+            list(stream)
+        client.close()
+
+    assert attrs(only_span(memory))["telemetry.dev.capture.truncated"] is True
+
+
+def test_chat_streaming_ignores_inherited_tool_call_fields_and_getters() -> None:
+    implementation = cast(Any, telemetry_dev_openai)
+    getter_reads = {"outer": 0, "nested": 0}
+
+    class InheritedToolCall:
+        index = 7
+        id = "inherited"
+        type = "function"
+
+        @property
+        def function(self) -> object:
+            getter_reads["outer"] += 1
+            return {"name": "inherited", "arguments": "{}"}
+
+    class InheritedFunction:
+        name = "inherited"
+
+        @property
+        def arguments(self) -> str:
+            getter_reads["nested"] += 1
+            return "{}"
+
+    nested = SimpleNamespace(index=3, function=InheritedFunction())
+    states: dict[int, Any] = {}
+    finish_reason_states: dict[int, str] = {}
+    finish_reason_reservations: dict[int, tuple[int, int]] = {}
+    rejected_finish_reasons: set[int] = set()
+    output_budget = implementation._chat_capture_budget(reserve_output_list=True)
+    finish_reason_budget = implementation._chat_capture_budget()
+
+    implementation._record_chat_chunk(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"tool_calls": [InheritedToolCall(), nested]},
+                }
+            ]
+        },
+        states,
+        finish_reason_states,
+        finish_reason_reservations,
+        rejected_finish_reasons,
+        output_budget,
+        finish_reason_budget,
+        True,
+    )
+
+    assert implementation._chat_output(states) == [{"role": "assistant"}]
+    assert getter_reads == {"outer": 0, "nested": 0}
+    assert output_budget.truncated is False
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_chat_streaming_skips_output_state_when_capture_is_disabled(
+    make: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    async_mode: bool,
+) -> None:
+    memory = make(capture_output=False)
+    implementation = cast(Any, telemetry_dev_openai)
+    original_own_field = implementation._own_field
+    output_reads: list[str] = []
+
+    def counting_own_field(value: Any, name: str, *args: Any) -> Any:
+        if isinstance(value, ChoiceDelta) and name == "role":
+            output_reads.append(name)
+        return original_own_field(value, name, *args)
+
+    monkeypatch.setattr(implementation, "_own_field", counting_own_field)
+    events = chat_stream_events()
+
+    if async_mode:
+
+        async def async_handler(_request: httpx.Request) -> httpx.Response:
+            return sse_response(events)
+
+        client = wrap_openai(async_client(async_handler))
+        stream = await cast(Any, client.chat.completions.create)(
+            model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+        delivered = [chunk async for chunk in stream]
+        states = stream._states
+        await client.close()
+    else:
+        client = wrap_openai(sync_client(lambda _request: sse_response(events)))
+        stream = cast(Any, client.chat.completions.create)(
+            model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+        delivered = list(stream)
+        states = stream._states
+        client.close()
+
+    assert len(delivered) == len(events)
+    assert states == {}
+    assert output_reads == []
+    a = attrs(only_span(memory))
+    assert "gen_ai.output.messages" not in a
+    assert a["gen_ai.response.finish_reasons"] == ("stop",)
+    assert a["gen_ai.usage.total_tokens"] == 7
+    assert "telemetry.dev.capture.truncated" not in a
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_chat_stream_clean_eof_without_finish_reason_is_incomplete_when_output_disabled(
+    make: Any, async_mode: bool
+) -> None:
+    memory = make(capture_output=False)
+    implementation = cast(Any, telemetry_dev_openai)
+    events = [{"choices": [{"index": 0, "delta": {"content": "partial"}}]}]
+    handle = telemetry_dev.start_span(
+        "chat gpt-4o-mini", type="generation", model="gpt-4o-mini", provider="openai"
+    )
+
+    if async_mode:
+
+        async def source() -> AsyncIterator[Any]:
+            for event in events:
+                yield event
+
+        stream = implementation._InstrumentedAsyncStream(
+            source(), handle, False, time.perf_counter()
+        )
+        delivered = [event async for event in stream]
+    else:
+        stream = implementation._InstrumentedStream(
+            iter(events), handle, False, time.perf_counter()
+        )
+        delivered = list(stream)
+
+    assert delivered == events
+    a = attrs(only_span(memory))
+    assert "gen_ai.output.messages" not in a
+    assert "gen_ai.response.finish_reasons" not in a
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def test_chat_stream_uses_the_client_policy_that_created_its_span(
+    make: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def mask(value: Any, _context: telemetry_dev.MaskContext) -> Any:
+        return value
+
+    original = make(
+        capture_output=True,
+        mask=mask,
+        max_attribute_length=256,
+    )
+    handle = telemetry_dev.start_span(
+        "chat gpt-4o-mini", type="generation", model="gpt-4o-mini", provider="openai"
+    )
+    monkeypatch.setattr(
+        telemetry_dev,
+        "get_client",
+        lambda: SimpleNamespace(capture_output=False, mask=None, max_attribute_length=1),
+    )
+    old_handle = SimpleNamespace(
+        _client=cast(Any, handle)._client,
+        _state=cast(Any, handle)._state,
+        end=handle.end,
+        update=handle.update,
+    )
+    implementation = cast(Any, telemetry_dev_openai)
+    stream = implementation._InstrumentedStream(
+        iter(
+            [
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "x" * 100},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            ]
+        ),
+        old_handle,
+        False,
+        time.perf_counter(),
+    )
+    list(stream)
+
+    a = attrs(only_span(original))
+    assert json.loads(str(a["gen_ai.output.messages"])) == [
+        {"role": "assistant", "content": "x" * 100}
+    ]
+    assert "telemetry.dev.capture.truncated" not in a
 
 
 def test_chat_streaming_preserves_explicit_usage_chunk(memory: SimpleNamespace) -> None:
@@ -1541,6 +3405,24 @@ def test_chat_stream_close_ends_partial_span(memory: SimpleNamespace) -> None:
         {"role": "assistant", "content": "Hello"}
     ]
     assert "gen_ai.usage.total_tokens" not in a
+    assert "gen_ai.response.finish_reasons" not in a
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def test_chat_stream_close_marks_truncation_when_output_capture_is_disabled(make: Any) -> None:
+    memory = make(capture_output=False)
+    client = wrap_openai(sync_client(lambda _request: sse_response(chat_stream_events())))
+    stream = cast(Any, client.chat.completions.create)(
+        model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+    )
+
+    next(stream)
+    stream.close()
+
+    a = attrs(only_span(memory))
+    assert "gen_ai.output.messages" not in a
+    assert "gen_ai.response.finish_reasons" not in a
+    assert a["telemetry.dev.capture.truncated"] is True
 
 
 def test_responses_create_and_stream_map_instructions_and_completed_event(
@@ -1644,8 +3526,6 @@ def test_responses_stream_bounds_output_without_dropping_terminal_metadata(
 ) -> None:
     retained = response_payload(response_id="resp_bounded", text="prefix")
     retained["status"] = "in_progress"
-    # 70k chars exceed the SDK's 64KiB default capture budget, so the completed
-    # snapshot's output must be dropped while its metadata still lands.
     completed = response_payload(response_id="resp_bounded", text="x" * 70_000)
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1762,6 +3642,382 @@ def test_responses_stream_fitting_terminal_clears_prior_truncation(memory: Simpl
     assert "telemetry.dev.capture.truncated" not in a
 
 
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_responses_stream_mapping_failure_preserves_provider_events(
+    make: Any, async_mode: bool
+) -> None:
+    errors: list[BaseException] = []
+    memory = make(on_error=errors.append)
+    mapping_error = RuntimeError("response mapping failed")
+    retained_response = response_payload(response_id="resp_mapping_failure", text="public")
+    retained = {
+        "type": "response.in_progress",
+        "response": retained_response,
+    }
+
+    class BrokenResponse:
+        id = "resp_mapping_failure"
+        status = "completed"
+
+        @property
+        def output(self) -> Any:
+            raise mapping_error
+
+    failed = {"type": "response.completed", "response": BrokenResponse()}
+    events = [retained, failed]
+    handle = telemetry_dev.start_span(
+        "responses gpt-4o-mini", type="generation", model="gpt-4o-mini", provider="openai"
+    )
+    implementation = cast(Any, telemetry_dev_openai)
+
+    if async_mode:
+
+        async def source() -> AsyncIterator[Any]:
+            for event in events:
+                yield event
+
+        stream = implementation._InstrumentedAsyncResponsesStream(
+            source(), handle, time.perf_counter()
+        )
+        delivered = [event async for event in stream]
+    else:
+        stream = implementation._InstrumentedResponsesStream(
+            iter(events), handle, time.perf_counter()
+        )
+        delivered = list(stream)
+
+    assert delivered[0] is retained
+    assert delivered[1] is failed
+    assert errors == [mapping_error]
+    a = attrs(only_span(memory))
+    assert json.loads(str(a["gen_ai.output.messages"])) == retained_response["output"]
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_responses_stream_mask_omits_stale_output_after_terminal_truncation(
+    make: Any, async_mode: bool
+) -> None:
+    def mask(value: Any, _context: telemetry_dev.MaskContext) -> Any:
+        return "[REDACTED]" if "SECRET" in json.dumps(value) else value
+
+    memory = make(mask=mask)
+    retained = response_payload(response_id="resp_masked_terminal", text="public")
+    retained["status"] = "in_progress"
+    terminal = response_payload(response_id="resp_masked_terminal", text=f"SECRET{'x' * 70_000}")
+    events = [
+        {"type": "response.in_progress", "response": retained},
+        {"type": "response.completed", "response": terminal},
+    ]
+    handle = telemetry_dev.start_span(
+        "responses gpt-4o-mini", type="generation", model="gpt-4o-mini", provider="openai"
+    )
+    implementation = cast(Any, telemetry_dev_openai)
+
+    if async_mode:
+
+        async def source() -> AsyncIterator[Any]:
+            for event in events:
+                yield event
+
+        stream = implementation._InstrumentedAsyncResponsesStream(
+            source(), handle, time.perf_counter()
+        )
+        delivered = [event async for event in stream]
+    else:
+        stream = implementation._InstrumentedResponsesStream(
+            iter(events), handle, time.perf_counter()
+        )
+        delivered = list(stream)
+
+    assert delivered == events
+    a = attrs(only_span(memory))
+    assert "gen_ai.output.messages" not in a
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_responses_stream_keeps_provider_failure_when_mapping_failed_event_throws(
+    memory: SimpleNamespace, async_mode: bool
+) -> None:
+    mapping_error = RuntimeError("response mapping failed")
+
+    class FailedResponse:
+        id = "resp_failed_mapping"
+        status = "failed"
+        error = SimpleNamespace(code="server_error", message="boom")
+
+        @property
+        def output(self) -> Any:
+            raise mapping_error
+
+    event = SimpleNamespace(type="response.failed", response=FailedResponse())
+    reported: list[BaseException] = []
+    handle = telemetry_dev.start_span(
+        "responses gpt-4o-mini", type="generation", model="gpt-4o-mini", provider="openai"
+    )
+    cast(Any, handle).report_error = reported.append
+    implementation = cast(Any, telemetry_dev_openai)
+
+    if async_mode:
+
+        async def source() -> AsyncIterator[Any]:
+            yield event
+
+        stream = implementation._InstrumentedAsyncResponsesStream(
+            source(), handle, time.perf_counter()
+        )
+        delivered = [item async for item in stream]
+    else:
+        stream = implementation._InstrumentedResponsesStream(
+            iter([event]), handle, time.perf_counter()
+        )
+        delivered = list(stream)
+
+    assert delivered == [event]
+    assert reported == [mapping_error]
+    span = only_span(memory)
+    assert span.status.status_code == StatusCode.ERROR
+    assert dict(span.events[0].attributes or {})["exception.message"] == (
+        "response.failed: server_error: boom"
+    )
+    assert attrs(span)["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("event_type", ["transcript.text.delta", "image_generation.failed"])
+async def test_media_stream_mapping_failure_fails_open(
+    memory: SimpleNamespace, async_mode: bool, event_type: str
+) -> None:
+    mapping_error = RuntimeError("media mapping failed")
+
+    class BrokenEvent:
+        type = event_type
+        error = SimpleNamespace(code="server_error", message="boom")
+
+        @property
+        def usage(self) -> Any:
+            raise mapping_error
+
+    events = [BrokenEvent(), BrokenEvent()]
+    reported: list[BaseException] = []
+    handle = telemetry_dev.start_span(
+        "transcription gpt-4o-transcribe", type="generation", model="gpt-4o-transcribe"
+    )
+    cast(Any, handle).report_error = reported.append
+    implementation = cast(Any, telemetry_dev_openai)
+
+    if async_mode:
+
+        async def source() -> AsyncIterator[Any]:
+            for event in events:
+                yield event
+
+        stream = implementation._InstrumentedAsyncMediaStream(
+            source(), handle, implementation._text_media_response
+        )
+        delivered = [item async for item in stream]
+    else:
+        stream = implementation._InstrumentedMediaStream(
+            iter(events), handle, implementation._text_media_response
+        )
+        delivered = list(stream)
+
+    assert delivered == events
+    assert reported == [mapping_error]
+    span = only_span(memory)
+    assert attrs(span)["telemetry.dev.capture.truncated"] is True
+    if event_type.endswith(".failed"):
+        assert span.status.status_code == StatusCode.ERROR
+        assert dict(span.events[0].attributes or {})["exception.message"] == "server_error: boom"
+    else:
+        assert span.status.status_code != StatusCode.ERROR
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("stream_limited", [False, True])
+async def test_responses_stream_retention_follows_the_stream_ceiling_not_the_cap(
+    make: Any, monkeypatch: pytest.MonkeyPatch, async_mode: bool, stream_limited: bool
+) -> None:
+    if stream_limited:
+        monkeypatch.setattr(telemetry_dev_openai, "_CHAT_STREAM_CAPTURE_MAX_BYTES", 128)
+        memory = make()
+    else:
+        memory = make(max_attribute_length=128)
+    terminal = response_payload(response_id="resp_small_limit", text="x" * 1_000)
+    event = {"type": "response.completed", "response": terminal}
+    handle = telemetry_dev.start_span(
+        "responses gpt-4o-mini", type="generation", model="gpt-4o-mini", provider="openai"
+    )
+    implementation = cast(Any, telemetry_dev_openai)
+
+    if async_mode:
+
+        async def source() -> AsyncIterator[Any]:
+            yield event
+
+        stream = implementation._InstrumentedAsyncResponsesStream(
+            source(), handle, time.perf_counter()
+        )
+        delivered = [item async for item in stream]
+    else:
+        stream = implementation._InstrumentedResponsesStream(
+            iter([event]), handle, time.perf_counter()
+        )
+        delivered = list(stream)
+
+    assert delivered == [event]
+    a = attrs(only_span(memory))
+    if stream_limited:
+        assert "gen_ai.output.messages" not in a
+        assert a["telemetry.dev.capture.truncated"] is True
+    else:
+        assert len(str(a["gen_ai.output.messages"])) == 128
+        assert str(a["gen_ai.output.messages"]).endswith("...[truncated]")
+        assert "telemetry.dev.capture.truncated" not in a
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_responses_stream_honors_hard_capture_limit(make: Any, async_mode: bool) -> None:
+    memory = make(max_attribute_length=100 * 1024)
+    terminal = response_payload(response_id="resp_hard_limit", text="x" * (60 * 1024))
+    event = {"type": "response.completed", "response": terminal}
+    handle = telemetry_dev.start_span(
+        "responses gpt-4o-mini", type="generation", model="gpt-4o-mini", provider="openai"
+    )
+    implementation = cast(Any, telemetry_dev_openai)
+
+    if async_mode:
+
+        async def source() -> AsyncIterator[Any]:
+            yield event
+
+        stream = implementation._InstrumentedAsyncResponsesStream(
+            source(), handle, time.perf_counter()
+        )
+        delivered = [item async for item in stream]
+    else:
+        stream = implementation._InstrumentedResponsesStream(
+            iter([event]), handle, time.perf_counter()
+        )
+        delivered = list(stream)
+
+    assert delivered == [event]
+    a = attrs(only_span(memory))
+    assert "gen_ai.output.messages" not in a
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("mode", ["eof", "early_close", "error_event", "throw"])
+async def test_responses_stream_omits_masked_partial_output_after_interruption(
+    make: Any, async_mode: bool, mode: str
+) -> None:
+    def identity_mask(value: Any, _context: Any) -> Any:
+        return value
+
+    memory = make(mask=identity_mask)
+    retained_response = response_payload(response_id="resp_interrupted", text="partial")
+    retained_response["status"] = "in_progress"
+    retained = {"type": "response.in_progress", "response": retained_response}
+    error_event = {"type": "error", "code": "stream_error", "message": "interrupted"}
+    terminal = {
+        "type": "response.completed",
+        "response": {**retained_response, "status": "completed"},
+    }
+    stream_error = RuntimeError("responses stream interrupted")
+    handle = telemetry_dev.start_span(
+        "responses gpt-4o-mini", type="generation", model="gpt-4o-mini", provider="openai"
+    )
+    implementation = cast(Any, telemetry_dev_openai)
+
+    if async_mode:
+
+        async def async_source() -> AsyncIterator[Any]:
+            yield retained
+            if mode == "error_event":
+                yield error_event
+            elif mode == "throw":
+                raise stream_error
+            elif mode == "early_close":
+                yield terminal
+
+        stream = implementation._InstrumentedAsyncResponsesStream(
+            async_source(), handle, time.perf_counter()
+        )
+        if mode == "early_close":
+            assert await stream.__anext__() is retained
+            await stream.close()
+        elif mode == "throw":
+            with pytest.raises(RuntimeError, match="responses stream interrupted"):
+                [item async for item in stream]
+        else:
+            [item async for item in stream]
+    else:
+
+        def source() -> Iterator[Any]:
+            yield retained
+            if mode == "error_event":
+                yield error_event
+            elif mode == "throw":
+                raise stream_error
+            elif mode == "early_close":
+                yield terminal
+
+        stream = implementation._InstrumentedResponsesStream(source(), handle, time.perf_counter())
+        if mode == "early_close":
+            assert next(stream) is retained
+            stream.close()
+        elif mode == "throw":
+            with pytest.raises(RuntimeError, match="responses stream interrupted"):
+                list(stream)
+        else:
+            list(stream)
+
+    a = attrs(only_span(memory))
+    assert "gen_ai.output.messages" not in a
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_responses_stream_propagates_process_control_mapping_failures(
+    make: Any, async_mode: bool
+) -> None:
+    errors: list[BaseException] = []
+    make(on_error=errors.append)
+
+    class InterruptedResponse:
+        status = "completed"
+
+        @property
+        def output(self) -> Any:
+            raise KeyboardInterrupt
+
+    event = {"type": "response.completed", "response": InterruptedResponse()}
+    handle = telemetry_dev.start_span(
+        "responses gpt-4o-mini", type="generation", model="gpt-4o-mini", provider="openai"
+    )
+    implementation = cast(Any, telemetry_dev_openai)
+
+    with pytest.raises(KeyboardInterrupt):
+        if async_mode:
+
+            async def source() -> AsyncIterator[Any]:
+                yield event
+
+            stream = implementation._InstrumentedAsyncResponsesStream(
+                source(), handle, time.perf_counter()
+            )
+            [item async for item in stream]
+        else:
+            stream = implementation._InstrumentedResponsesStream(
+                iter([event]), handle, time.perf_counter()
+            )
+            list(stream)
+
+    assert errors == []
+
+
 def test_embeddings_map_usage_without_output(memory: SimpleNamespace) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request_json(request)["input"] == "embed me"
@@ -1875,10 +4131,13 @@ async def test_async_chat_streaming_bounds_retained_state_without_dropping_metad
     assert budget.bytes_used <= budget.max_bytes
     assert source_content.startswith(state.content)
     assert len(state.content) < len(source_content)
-    assert state.role == "assistant"
+    assert state.role is None
+    assert not state.content.endswith("not-retained")
     a = attrs(only_span(memory))
+    assert len(str(a["gen_ai.output.messages"]).encode()) <= 48 * 1024
     assert a["gen_ai.response.finish_reasons"] == ("stop",)
     assert a["gen_ai.usage.total_tokens"] == 7
+    assert a["telemetry.dev.capture.truncated"] is True
 
 
 async def test_async_responses_create_and_embeddings_map_usage_like_sync(
@@ -1978,7 +4237,7 @@ async def test_async_chat_stream_iteration_error_records_one_error_span(
     memory: SimpleNamespace,
 ) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
-        return failing_async_sse_response(chat_stream_events()[0], "async stream broke")
+        return failing_async_sse_response(terminal_chat_stream_event(), "async stream broke")
 
     client = wrap_openai(async_client(handler))
     stream = await cast(Any, client.chat.completions.create)(
@@ -1999,6 +4258,8 @@ async def test_async_chat_stream_iteration_error_records_one_error_span(
     assert json.loads(str(a["gen_ai.output.messages"])) == [
         {"role": "assistant", "content": "Hello"}
     ]
+    assert a["gen_ai.response.finish_reasons"] == ("stop",)
+    assert a["telemetry.dev.capture.truncated"] is True
     events = list(span.events)
     assert len(events) == 1
     event_attrs = dict(events[0].attributes or {})
@@ -2007,17 +4268,34 @@ async def test_async_chat_stream_iteration_error_records_one_error_span(
     assert event_attrs["exception.message"] == str(exc_info.value)
 
 
-def test_chat_stream_early_break_ends_span_once(memory: SimpleNamespace) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return sse_response(chat_stream_events())
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_chat_stream_terminal_chunk_then_early_close_is_incomplete(
+    memory: SimpleNamespace, async_mode: bool
+) -> None:
+    events = [terminal_chat_stream_event(), *chat_stream_events()[1:]]
 
-    client = wrap_openai(sync_client(handler))
-    stream = cast(Any, client.chat.completions.create)(
-        model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
-    )
-    for chunk in stream:
-        assert chunk.choices[0].delta.content == "Hello"
-        break
+    def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    async def async_handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    if async_mode:
+        client = wrap_openai(async_client(async_handler))
+        stream = await cast(Any, client.chat.completions.create)(
+            model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+        assert (await stream.__anext__()).choices[0].delta.content == "Hello"
+        await stream.close()
+        await client.close()
+    else:
+        client = wrap_openai(sync_client(handler))
+        stream = cast(Any, client.chat.completions.create)(
+            model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+        assert next(stream).choices[0].delta.content == "Hello"
+        stream.close()
+        client.close()
 
     spans = memory.span_exporter.get_finished_spans()
     assert len(spans) == 1
@@ -2025,11 +4303,31 @@ def test_chat_stream_early_break_ends_span_once(memory: SimpleNamespace) -> None
     assert json.loads(str(a["gen_ai.output.messages"])) == [
         {"role": "assistant", "content": "Hello"}
     ]
+    assert a["gen_ai.response.finish_reasons"] == ("stop",)
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def test_chat_stream_plain_for_break_ends_span_once(memory: SimpleNamespace) -> None:
+    client = wrap_openai(sync_client(lambda _request: sse_response(chat_stream_events())))
+    stream = cast(Any, client.chat.completions.create)(
+        model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+    )
+
+    for chunk in stream:
+        assert chunk.choices[0].delta.content == "Hello"
+        break
+
+    span = only_span(memory)
+    assert json.loads(str(attrs(span)["gen_ai.output.messages"])) == [
+        {"role": "assistant", "content": "Hello"}
+    ]
+    assert attrs(span)["telemetry.dev.capture.truncated"] is True
+    client.close()
 
 
 def test_chat_stream_iteration_error_records_one_error_span(memory: SimpleNamespace) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return failing_sync_sse_response(chat_stream_events()[0], "sync stream broke")
+        return failing_sync_sse_response(terminal_chat_stream_event(), "sync stream broke")
 
     client = wrap_openai(sync_client(handler))
     stream = cast(Any, client.chat.completions.create)(
@@ -2049,12 +4347,33 @@ def test_chat_stream_iteration_error_records_one_error_span(memory: SimpleNamesp
     assert json.loads(str(a["gen_ai.output.messages"])) == [
         {"role": "assistant", "content": "Hello"}
     ]
+    assert a["gen_ai.response.finish_reasons"] == ("stop",)
+    assert a["telemetry.dev.capture.truncated"] is True
     events = list(span.events)
     assert len(events) == 1
     event_attrs = dict(events[0].attributes or {})
     assert events[0].name == "exception"
     assert event_attrs["exception.type"] == type(exc_info.value).__name__
     assert event_attrs["exception.message"] == str(exc_info.value)
+
+
+def test_nonterminal_chat_stream_error_omits_finish_reason(memory: SimpleNamespace) -> None:
+    first_event = chat_stream_events()[0]
+    client = wrap_openai(
+        sync_client(lambda _request: failing_sync_sse_response(first_event, "stream broke early"))
+    )
+    stream = cast(Any, client.chat.completions.create)(
+        model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+    )
+
+    next(stream)
+    with pytest.raises(Exception) as exc_info:
+        next(stream)
+    assert_stream_transport_error(exc_info.value, "stream broke early")
+
+    a = attrs(only_span(memory))
+    assert "gen_ai.response.finish_reasons" not in a
+    assert a["telemetry.dev.capture.truncated"] is True
 
 
 def test_responses_stream_failed_sets_error_status(memory: SimpleNamespace) -> None:
@@ -2523,8 +4842,6 @@ async def test_async_responses_stream_bounds_output_without_dropping_terminal_me
 ) -> None:
     retained = response_payload(response_id="resp_bounded_async", text="prefix")
     retained["status"] = "in_progress"
-    # 70k chars exceed the SDK's 64KiB default capture budget, so the completed
-    # snapshot's output must be dropped while its metadata still lands.
     completed = response_payload(response_id="resp_bounded_async", text="x" * 70_000)
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -2711,6 +5028,7 @@ def test_chat_stream_context_manager_exit_ends_partial_span_once(
     assert json.loads(str(attrs(spans[0])["gen_ai.output.messages"])) == [
         {"role": "assistant", "content": "Hello"}
     ]
+    assert attrs(spans[0])["telemetry.dev.capture.truncated"] is True
 
 
 async def test_async_chat_stream_context_manager_exit_ends_partial_span_once(
@@ -2733,6 +5051,7 @@ async def test_async_chat_stream_context_manager_exit_ends_partial_span_once(
     assert json.loads(str(attrs(spans[0])["gen_ai.output.messages"])) == [
         {"role": "assistant", "content": "Hello"}
     ]
+    assert attrs(spans[0])["telemetry.dev.capture.truncated"] is True
 
 
 def test_chat_stream_response_close_directly_ends_partial_span_once(
@@ -2755,6 +5074,7 @@ def test_chat_stream_response_close_directly_ends_partial_span_once(
     assert json.loads(str(attrs(spans[0])["gen_ai.output.messages"])) == [
         {"role": "assistant", "content": "Hello"}
     ]
+    assert attrs(spans[0])["telemetry.dev.capture.truncated"] is True
 
 
 def test_chat_stream_manager_context_exit_closes_response_and_ends_span_once(
@@ -2776,6 +5096,7 @@ def test_chat_stream_manager_context_exit_closes_response_and_ends_span_once(
     assert json.loads(str(attrs(spans[0])["gen_ai.output.messages"])) == [
         {"role": "assistant", "content": "Hello"}
     ]
+    assert attrs(spans[0])["telemetry.dev.capture.truncated"] is True
 
 
 def test_text_media_response_captures_text_and_falls_back_text_tokens(
@@ -2789,14 +5110,14 @@ def test_text_media_response_captures_text_and_falls_back_text_tokens(
     assert fields["usage"]["text_output_tokens"] == 7
 
 
-def test_text_media_response_capture_is_incrementally_bounded(make: Any) -> None:
+def test_text_media_response_passes_the_complete_transcript_to_the_core(make: Any) -> None:
     make(max_attribute_length=5)
     mapper = vars(telemetry_dev_openai)["_text_media_response"]
 
-    fields = mapper(SimpleNamespace(text=UnencodableText("ééé")))
+    fields = mapper(SimpleNamespace(text="ééé"))
 
-    assert fields["output"] == "éé"
-    assert fields["attributes"]["telemetry.dev.capture.truncated"] is True
+    assert fields["output"] == "ééé"
+    assert "attributes" not in fields
 
 
 def test_bounded_responses_conversion_does_not_model_dump(memory: SimpleNamespace) -> None:

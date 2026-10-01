@@ -1,7 +1,7 @@
 """E2E scenario driver for the cross-SDK conformance suite.
 
 This script EMITS the shared conformance scenario against a real ingest endpoint; the
-ClickHouse row assertions live in apps/ingest/src/sdk_conformance.ts (C1-C19), keyed by the
+ClickHouse row assertions live in apps/ingest/src/sdk_conformance.ts (C1-C22), keyed by the
 session id below. Keep the scenario in lockstep with apps/ingest/src/sdk_otlp_e2e_test.ts and
 docs/sdk-conformance.md.
 
@@ -81,9 +81,10 @@ def main() -> int:
                 generation.update(
                     output={"role": "assistant", "content": "It is sunny."},
                     usage={
-                        "input_tokens": 11,
+                        "input_tokens": 17,
                         "output_tokens": 7,
                         "cache_read_input_tokens": 4,
+                        "cache_creation_input_tokens": 2,
                         "text_input_tokens": 6,
                         "text_output_tokens": 4,
                         "text_cache_read_input_tokens": 2,
@@ -156,6 +157,7 @@ def main() -> int:
             streamed.end(
                 time_to_first_chunk_ms=250,
                 output={"role": "assistant", "content": "chunk..."},
+                attributes={"telemetry.dev.capture.truncated": True},
             )
 
         # C13: continue the trace from a serialized W3C traceparent.

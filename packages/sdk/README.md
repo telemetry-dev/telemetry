@@ -55,10 +55,20 @@ Without an API key every call is a silent no-op — the SDK never throws into yo
 
 Other `init()` options: `enabled` (kill switch), `registerGlobal`, `exportMode: "batched" |
 "immediate"`, `captureInput` / `captureOutput`, `mask(value, { key })` redaction hook,
-`maxAttributeLength` (default 65536, truncated values end with `...[truncated]`), `batch`
+`maxAttributeLength` (a non-negative safe integer or `Infinity`; default 65536; `null` and
+`undefined` select the default, while other invalid values disable telemetry and are reported
+through `onError`; truncated values use `...[truncated]`, or its prefix when the cap is shorter than
+the marker; the cap also applies, with the marker, to string metadata and log attributes, and any
+other string attribute is cut at the cap without a marker, except that a cap of `0` leaves those at
+65536), `batch`
 (`maxExportBatchSize` 64, `scheduledDelayMillis` 1000, `maxQueueSize` 2048,
 `exportTimeoutMillis` 30000), `spanFilter`, `resourceAttributes`, `logLevel` (SDK diagnostics,
 default `"warn"`), `fetch`, `waitUntil`, `onError`.
+
+`captureInput: false` and `captureOutput: false` omit captured content. Provider integrations may
+still record non-content metadata such as response IDs and models, finish reasons, usage, timing,
+and errors. Capture flags do not gate stop sequences, tool descriptions and definitions (`gen_ai.tool.description`, `gen_ai.tool.definitions`), caller-supplied metadata or raw attributes,
+or exception messages and stack traces; redact those separately when needed.
 
 Root spans remain independent by default. `init({ sessionMode: "process" })` groups otherwise
 uncorrelated spans and logs using a fresh opaque UUID for each enabled SDK initialization.
@@ -115,9 +125,13 @@ after the ended span passes `spanFilter`, including interrupted streams. Chunk t
 histogram state and does not retain individual intervals. Pull-based timing includes consumer delay
 between reads. An explicit timestamp uses the same monotonic millisecond clock for every chunk.
 
-Provider integrations feature-detect chunk recording. With an older core SDK that lacks
-`recordOutputChunk`, streams and existing tracing continue normally, but chunk-interval metrics are
-unavailable. Upgrade the core SDK with provider integrations to enable the new metric.
+Provider integrations feature-detect stream APIs. With an older core SDK that lacks the stream
+capture policy, streams are still traced with usage, model, finish reason, and timing, but output
+retention assumes the default 65536 limit and treats a mask as configured, so incomplete output is
+withheld. Instrumentation failures are not reported to `onError` with such a core. If only
+`recordOutputChunk` is unavailable, tracing and reconstruction continue but chunk-interval metrics
+are unavailable. Upgrade the core SDK with provider integrations to enable the full stream
+telemetry.
 
 ## Serverless
 

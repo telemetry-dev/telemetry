@@ -135,13 +135,18 @@ the core SDK with provider integrations to enable the new metric.
 | `log_level` | `"warn"` | SDK diagnostics level: `debug`/`info`/`warn`/`error`/`silent`. |
 | `capture_input`, `capture_output` | `True` | Global content-capture defaults. |
 | `mask` | `None` | `Callable[[Any, MaskContext], Any]` redaction hook, runs before JSON serialization on input/output/log messages (`MaskContext.key` is the attribute being written). Not applied to correlation identifiers. |
-| `max_attribute_length` | `65536` | Per-content-attribute cap; truncated values get an ASCII `...[truncated]` marker appended. |
+| `max_attribute_length` | `65536` | Non-negative integer per-content-attribute cap. Invalid values call `on_error`, do not raise into application code, and install a disabled client; truncated values use the ASCII `...[truncated]` marker, or its prefix when the cap is shorter than the marker. The cap also applies, with the marker, to string metadata and log attributes; any other string attribute is cut at the cap without a marker, except that a cap of `0` leaves those at 65536. |
 | `span_filter` | `None` | Export predicate `Callable[[ReadableSpan], bool]`. |
 | `sampler` | OTel environment configuration | OTel `Sampler` that overrides environment settings. Session roots use its root policy. Real parents keep their sampling decisions. |
-| `on_error` | `None` | Receives every internal SDK error; the SDK never raises. |
+| `on_error` | `None` | Receives internal SDK errors; repeated instrumentation failures from one stream may be coalesced into one report. The SDK never raises them into application code. |
 | `disable_atexit` | `False` | Skip the automatic atexit shutdown. |
 | `timeout` | `10.0` | OTLP HTTP timeout in seconds. |
 | `span_exporter`, `log_exporter`, `metric_reader` | `None` | Test seams / offline mode; any of them enables the client without an API key. |
+
+`capture_input=False` and `capture_output=False` omit captured content. Provider integrations may
+still record non-content metadata such as response IDs and models, finish reasons, usage, timing,
+and errors. Capture flags do not gate stop sequences, tool descriptions and definitions (`gen_ai.tool.description`, `gen_ai.tool.definitions`), caller-supplied metadata or raw attributes,
+or exception messages and stack traces; redact those separately when needed.
 
 Session roots share trace IDs from the API key and session ID. The hash matches the TypeScript SDK.
 The SDK uses the configured OTel sampling policy, not the synthetic parent's flags.

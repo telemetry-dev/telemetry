@@ -1,6 +1,5 @@
 import {
   boundedCaptureDetails,
-  captureEnabled,
   startSpan,
   type SpanFields,
   type SpanHandle,
@@ -69,10 +68,15 @@ interface ToolBlockState {
 interface StreamState {
   blocks: Map<number, ValueRecord | ToolBlockState>;
   captureOutput: boolean;
+  maskOutputWhenIncomplete: boolean;
+  maxCaptureBytes: number;
   reservations: Map<number, { bytes: number; items: number }>;
   captureBytes: number;
   captureItems: number;
   captureTruncated: boolean;
+  metadataTruncated: boolean;
+  expectMessageStop: boolean;
+  messageStopped: boolean;
   unresolvedReplacements: Set<number>;
   unresolvedEncryptedContent: Set<number>;
   usage?: SpanFields["usage"];
@@ -80,7 +84,8 @@ interface StreamState {
   responseModel?: string;
 }
 
-const MAX_UNRESOLVED_REPLACEMENTS = 1_000;
+const STREAM_CAPTURE_MAX_ITEMS = 1_000;
+const MAX_UNRESOLVED_REPLACEMENTS = STREAM_CAPTURE_MAX_ITEMS;
 
 function asRecord<T>(value: T): (T & ValueRecord) | undefined {
   if (value === null || value === undefined || value instanceof Function) return undefined;
@@ -287,12 +292,24 @@ function mapRawResponse(response: Response): SpanFields {
 
 function finalizeParsedValue(value: Value, ctx: TracePromiseContext): Value {
   if (ctx.streaming) {
-    const wrapped = wrapStream(value, ctx.span, ctx.startedAt, ctx.end);
+    try {
+      const wrapped = wrapStream(value, ctx.span, ctx.startedAt, ctx.end);
 
-    if (wrapped !== value) return wrapped;
+      if (wrapped !== value) return wrapped;
+    } catch (cause) {
+      reportSpanError(ctx.span, cause);
+      ctx.end({ attributes: { "telemetry.dev.capture.truncated": true } });
+
+      return value;
+    }
   }
 
-  ctx.end(ctx.mapResponse(value));
+  try {
+    ctx.end(ctx.mapResponse(value));
+  } catch (cause) {
+    reportSpanError(ctx.span, cause);
+    ctx.end({ attributes: { "telemetry.dev.capture.truncated": true } });
+  }
 
   return value;
 }
@@ -426,30 +443,82 @@ function streamOutput(state: StreamState): ValueRecord[] | undefined {
 }
 
 function streamPartialFields(state: StreamState): SpanFields {
+  const retainedOutput = state.captureOutput ? streamOutput(state) : undefined;
+
+  const boundedOutput =
+    retainedOutput === undefined
+      ? undefined
+      : boundedCaptureDetails(retainedOutput, {
+          maxBytes: state.maxCaptureBytes,
+          maxItems: 1_000,
+        });
+
+  const outputIncomplete =
+    state.captureTruncated ||
+    boundedOutput?.truncated === true ||
+    (state.expectMessageStop && !state.messageStopped) ||
+    state.unresolvedReplacements.size > 0 ||
+    state.unresolvedEncryptedContent.size > 0;
+
+  const captureIncomplete = outputIncomplete || state.metadataTruncated;
+
   const fields: SpanFields = {
-    output: streamOutput(state),
+    output: state.maskOutputWhenIncomplete && outputIncomplete ? undefined : boundedOutput?.value,
     usage: cacheInclusiveUsage(state.usage),
     finishReason: state.finishReason,
   };
 
   if (state.responseModel !== undefined) fields.responseModel = state.responseModel;
 
-  if (
-    state.captureTruncated ||
-    state.unresolvedReplacements.size > 0 ||
-    state.unresolvedEncryptedContent.size > 0
-  )
-    fields.attributes = { "telemetry.dev.capture.truncated": true };
+  if (captureIncomplete) fields.attributes = { "telemetry.dev.capture.truncated": true };
 
   return fields;
 }
 
+const APPENDED_DELTA_FIELDS = new Map([
+  ["text_delta", "text"],
+  ["thinking_delta", "thinking"],
+  ["input_json_delta", "partial_json"],
+]);
+
+function reserveAppendedText(
+  index: number,
+  field: string,
+  delta: ValueRecord,
+  state: StreamState,
+): ValueRecord | undefined {
+  const text = readString(delta[field]) ?? "";
+
+  const capture = boundedCaptureDetails(text, {
+    maxBytes: Math.max(state.maxCaptureBytes - state.captureBytes + 2, 0),
+  });
+
+  if (capture.truncated) {
+    state.captureTruncated = true;
+
+    return undefined;
+  }
+
+  const bytes = capture.bytes - 2;
+  const held = state.reservations.get(index) ?? { bytes: 0, items: 0 };
+  state.reservations.set(index, { bytes: held.bytes + bytes, items: held.items });
+  state.captureBytes += bytes;
+
+  return { [field]: text };
+}
+
+// The terminal output wraps blocks in [{"role":"assistant","content":[...]}] with a comma
+// between blocks; charging both while streaming keeps an accepted state within the limit.
+const STREAM_OUTPUT_ENVELOPE = boundedCaptureDetails([{ role: "assistant", content: [] }]);
+const BLOCK_SEPARATOR_BYTES = 1;
+
 function reserveStreamValue(index: number, value: unknown, state: StreamState): unknown {
   const capture = boundedCaptureDetails(value);
+  const bytes = capture.bytes + (state.reservations.has(index) ? 0 : BLOCK_SEPARATOR_BYTES);
 
   if (
     capture.truncated ||
-    state.captureBytes + capture.bytes > 48 * 1024 ||
+    state.captureBytes + bytes > state.maxCaptureBytes ||
     state.captureItems + capture.items > 1_000
   ) {
     state.captureTruncated = true;
@@ -459,10 +528,10 @@ function reserveStreamValue(index: number, value: unknown, state: StreamState): 
 
   const held = state.reservations.get(index) ?? { bytes: 0, items: 0 };
   state.reservations.set(index, {
-    bytes: held.bytes + capture.bytes,
+    bytes: held.bytes + bytes,
     items: held.items + capture.items,
   });
-  state.captureBytes += capture.bytes;
+  state.captureBytes += bytes;
   state.captureItems += capture.items;
 
   return capture.value;
@@ -472,18 +541,24 @@ function reserveReplacement(
   index: number,
   value: ValueRecord | ToolBlockState,
   state: StreamState,
+  recoverUnseen: boolean,
 ): boolean {
-  if (state.captureTruncated) return false;
+  if (
+    state.captureTruncated &&
+    (!recoverUnseen || (!state.blocks.has(index) && !state.unresolvedReplacements.has(index)))
+  )
+    return false;
 
   const capture = boundedCaptureDetails(value);
+  const bytes = capture.bytes + BLOCK_SEPARATOR_BYTES;
   const held = state.reservations.get(index) ?? { bytes: 0, items: 0 };
 
   if (
     capture.truncated ||
-    state.captureBytes - held.bytes + capture.bytes > 48 * 1024 ||
+    state.captureBytes - held.bytes + bytes > state.maxCaptureBytes ||
     state.captureItems - held.items + capture.items > 1_000
   ) {
-    if (state.blocks.has(index) || state.unresolvedReplacements.has(index)) {
+    if (recoverUnseen || state.blocks.has(index) || state.unresolvedReplacements.has(index)) {
       if (
         !state.unresolvedReplacements.has(index) &&
         state.unresolvedReplacements.size >= MAX_UNRESOLVED_REPLACEMENTS
@@ -495,9 +570,9 @@ function reserveReplacement(
     return false;
   }
 
-  state.captureBytes += capture.bytes - held.bytes;
+  state.captureBytes += bytes - held.bytes;
   state.captureItems += capture.items - held.items;
-  state.reservations.set(index, { bytes: capture.bytes, items: capture.items });
+  state.reservations.set(index, { bytes, items: capture.items });
   state.unresolvedReplacements.delete(index);
 
   return true;
@@ -513,16 +588,17 @@ function stripStaleSignature(index: number, state: StreamState): void {
   delete data.signature;
   const stripped = isToolBlockState(block) ? { ...block, data } : data;
   const capture = boundedCaptureDetails(stripped);
+  const bytes = capture.bytes + BLOCK_SEPARATOR_BYTES;
   const held = state.reservations.get(index) ?? { bytes: 0, items: 0 };
 
   if (
     !capture.truncated &&
-    state.captureBytes - held.bytes + capture.bytes <= 48 * 1024 &&
+    state.captureBytes - held.bytes + bytes <= state.maxCaptureBytes &&
     state.captureItems - held.items + capture.items <= 1_000
   ) {
-    state.captureBytes += capture.bytes - held.bytes;
+    state.captureBytes += bytes - held.bytes;
     state.captureItems += capture.items - held.items;
-    state.reservations.set(index, { bytes: capture.bytes, items: capture.items });
+    state.reservations.set(index, { bytes, items: capture.items });
   }
 
   state.blocks.set(index, stripped);
@@ -540,6 +616,35 @@ function dropBlock(index: number, state: StreamState): void {
 function recordContentBlockStart(event: ValueRecord, state: StreamState): void {
   if (!state.captureOutput || state.captureTruncated) return;
   const index = readNumber(event.index) ?? state.blocks.size;
+  const rawContentBlock = asRecord(event.content_block);
+
+  if (
+    rawContentBlock &&
+    !Array.isArray(rawContentBlock) &&
+    readString(rawContentBlock.type) === "compaction"
+  ) {
+    const contentBlock = rawContentBlock as ValueRecord;
+
+    if (reserveReplacement(index, contentBlock, state, true)) {
+      state.blocks.set(index, contentBlock);
+
+      if ("encrypted_content" in contentBlock) state.unresolvedEncryptedContent.delete(index);
+    } else {
+      if ("encrypted_content" in contentBlock) {
+        if (
+          !state.unresolvedEncryptedContent.has(index) &&
+          state.unresolvedEncryptedContent.size >= MAX_UNRESOLVED_REPLACEMENTS
+        )
+          state.captureTruncated = true;
+        else state.unresolvedEncryptedContent.add(index);
+      }
+
+      dropBlock(index, state);
+    }
+
+    return;
+  }
+
   const contentBlock = asRecord(reserveStreamValue(index, event.content_block, state));
 
   if (!contentBlock) return;
@@ -630,7 +735,7 @@ function recordContentBlockDelta(event: ValueRecord, state: StreamState): void {
 
     const replacement = isToolBlockState(block) ? { ...block, data } : data;
 
-    if (reserveReplacement(index, replacement, state)) {
+    if (reserveReplacement(index, replacement, state, deltaType === "compaction_delta")) {
       state.blocks.set(index, replacement);
 
       if (deltaType === "compaction_delta" && "encrypted_content" in delta)
@@ -653,7 +758,12 @@ function recordContentBlockDelta(event: ValueRecord, state: StreamState): void {
 
   if (state.captureTruncated) return;
 
-  const capturedDelta = asRecord(reserveStreamValue(index, delta, state));
+  const appendedField = deltaType === undefined ? undefined : APPENDED_DELTA_FIELDS.get(deltaType);
+
+  const capturedDelta =
+    appendedField !== undefined && state.blocks.has(index)
+      ? reserveAppendedText(index, appendedField, delta, state)
+      : asRecord(reserveStreamValue(index, delta, state));
 
   if (!capturedDelta) return;
   const block = blockForDelta(index, deltaType, state);
@@ -676,13 +786,21 @@ function recordContentBlockDelta(event: ValueRecord, state: StreamState): void {
 
 // A fallback block only marks where a fallback was attempted. The model that served the
 // response is the one on the fallback_message entry in the terminal usage.iterations.
-function fallbackServingModel<T>(usage: T): string | undefined {
+function fallbackServingModel<T>(usage: T, state: StreamState): string | undefined {
   const iterations = asRecord(usage)?.iterations;
 
   if (!Array.isArray(iterations)) return undefined;
-  const served = iterations.map(asRecord).findLast((entry) => entry?.type === "fallback_message");
 
-  return readString(served?.model);
+  if (iterations.length > STREAM_CAPTURE_MAX_ITEMS) state.metadataTruncated = true;
+  const firstIndex = Math.max(0, iterations.length - STREAM_CAPTURE_MAX_ITEMS);
+
+  for (let index = iterations.length - 1; index >= firstIndex; index -= 1) {
+    const entry = asRecord(iterations[index]);
+
+    if (entry?.type === "fallback_message") return readString(entry.model);
+  }
+
+  return undefined;
 }
 
 function recordStreamEvent<T>(event: T, state: StreamState): SpanFields {
@@ -705,10 +823,38 @@ function recordStreamEvent<T>(event: T, state: StreamState): SpanFields {
     const delta = asRecord(record.delta) ?? {};
     state.finishReason = readString(delta.stop_reason) ?? state.finishReason;
     state.usage = mergeUsage(state.usage, messagesUsage(record.usage));
-    state.responseModel = fallbackServingModel(record.usage) ?? state.responseModel;
+    state.responseModel = fallbackServingModel(record.usage, state) ?? state.responseModel;
   }
 
+  if (type === "message_stop") state.messageStopped = true;
+
   return fields;
+}
+
+// Older cores enforce captureOutput and masking when the span ends but expose no policy, so
+// retain output within the default limit and withhold incomplete output from their mask.
+const LEGACY_CAPTURE_POLICY: NonNullable<SpanHandle["capturePolicy"]> = {
+  output: true,
+  mask: true,
+  maxAttributeLength: 65_536,
+};
+
+function reportSpanError(span: SpanHandle, cause: unknown): void {
+  try {
+    span.reportError?.(cause);
+  } catch {
+    return;
+  }
+}
+
+function createSpanErrorReporter(span: SpanHandle): (cause: unknown) => void {
+  let reported = false;
+
+  return (cause) => {
+    if (reported) return;
+    reported = true;
+    reportSpanError(span, cause);
+  };
 }
 
 function isStreamLike<T>(value: T): value is T & StreamLike<Value> {
@@ -736,13 +882,21 @@ function createObservedMessagesStream(
   startedAt: number,
   end: (fields?: SpanFields) => void,
 ): Stream<Value> {
+  const capturePolicy = span.capturePolicy ?? LEGACY_CAPTURE_POLICY;
+  const reportError = createSpanErrorReporter(span);
+
   const state: StreamState = {
     blocks: new Map(),
-    captureOutput: captureEnabled("output"),
+    captureOutput: capturePolicy.output,
+    maskOutputWhenIncomplete: capturePolicy.mask,
+    maxCaptureBytes: 48 * 1024,
     reservations: new Map(),
-    captureBytes: 0,
-    captureItems: 0,
+    captureBytes: STREAM_OUTPUT_ENVELOPE.bytes,
+    captureItems: STREAM_OUTPUT_ENVELOPE.items,
     captureTruncated: false,
+    metadataTruncated: false,
+    expectMessageStop: true,
+    messageStopped: false,
     unresolvedReplacements: new Set(),
     unresolvedEncryptedContent: new Set(),
   };
@@ -769,10 +923,20 @@ function createObservedMessagesStream(
     try {
       for await (const event of source) {
         const receivedAt = performance.now();
-        const fields = recordStreamEvent(event, state);
+        let fields: SpanFields = {};
+        let hasOutput = false;
+
+        try {
+          fields = recordStreamEvent(event, state);
+          hasOutput = streamEventHasOutput(event);
+        } catch (cause) {
+          state.captureTruncated = true;
+          reportError(cause);
+        }
+
         setFirstStreamUpdate(span, startedAt, sawFirst, fields);
 
-        if (streamEventHasOutput(event)) span.recordOutputChunk?.(receivedAt);
+        if (hasOutput) span.recordOutputChunk?.(receivedAt);
         yield event;
       }
     } catch (error) {
@@ -804,11 +968,23 @@ function streamEventHasOutput(event: unknown): boolean {
   if (value?.type === "compaction" || value?.type === "compaction_delta")
     return typeof value.content === "string" && value.content.length > 0;
 
+  let inputHasValue = false;
+
+  if (Array.isArray(input)) inputHasValue = input.length > 0;
+  else if (input !== undefined) {
+    const objectInput = input as { [key: string]: JsonValue | undefined };
+
+    for (const key in objectInput) {
+      if (!Object.hasOwn(input, key)) continue;
+      inputHasValue = true;
+      break;
+    }
+  }
+
   return (
     [value?.text, value?.thinking, value?.partial_json].some(
       (part) => typeof part === "string" && part.length > 0,
-    ) ||
-    (input !== undefined && Object.keys(input).length > 0)
+    ) || inputHasValue
   );
 }
 
@@ -891,10 +1067,11 @@ function patchPrototype(
 
   if (!(original instanceof Function) || isWrapped(original)) return () => {};
 
-  prototype[key] = wrapCreate(original, request, response, providerForResource);
+  const wrapped = wrapCreate(original, request, response, providerForResource);
+  prototype[key] = wrapped;
 
   return () => {
-    prototype[key] = original;
+    if (prototype[key] === wrapped) prototype[key] = original;
   };
 }
 

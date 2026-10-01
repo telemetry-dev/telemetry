@@ -51,6 +51,7 @@ export {
   getTraceparent,
   injectW3cContext,
   type ParentRef,
+  type SpanCapturePolicy,
   type SpanHandle,
   startActiveSpan,
   startSpan,

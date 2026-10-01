@@ -1,13 +1,22 @@
 import { ExportResultCode } from "@opentelemetry/core";
-import { trace } from "@opentelemetry/api";
+import { diag, trace } from "@opentelemetry/api";
 import { InMemorySpanExporter, type SpanExporter } from "@opentelemetry/sdk-trace-base";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 
-import { flush, init, log, observe, shutdown, startSpan } from "../src/index.ts";
+import {
+  flush,
+  init,
+  log,
+  observe,
+  shutdown,
+  startSpan,
+  type TelemetryOptions,
+} from "../src/index.ts";
 import { setup } from "./helpers.ts";
 
 afterEach(async () => {
   await shutdown();
+  vi.restoreAllMocks();
 });
 
 test("primitives are safe no-ops before init", async () => {
@@ -33,6 +42,139 @@ test("enabled:false yields a no-op client even with a key", () => {
   expect(client.enabled).toBe(false);
   startSpan("nope").end();
   expect(spans.getFinishedSpans()).toHaveLength(0);
+});
+
+test.each([-1, 1.5, Number.NaN, Number.NEGATIVE_INFINITY])(
+  "invalid maxAttributeLength %s fails open through onError",
+  (maxAttributeLength) => {
+    const errors: Error[] = [];
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const client = init({
+      apiKey: "td_live_test",
+      maxAttributeLength: maxAttributeLength as number,
+      onError: (error) => errors.push(error),
+      logLevel: "silent",
+    });
+
+    expect(client.enabled).toBe(false);
+    expect(errors[0]).toBeInstanceOf(RangeError);
+    expect(logged).not.toHaveBeenCalled();
+  },
+);
+
+test("null maxAttributeLength uses the default for untyped callers", async () => {
+  const untypedOptions: TelemetryOptions = JSON.parse('{"maxAttributeLength":null}');
+  const { client, spans } = setup(untypedOptions);
+
+  expect(client.enabled).toBe(true);
+  startSpan("default-limit", { output: "x".repeat(70_000) }).end();
+  await flush();
+  expect(String(spans.getFinishedSpans()[0]?.attributes["gen_ai.output.messages"])).toHaveLength(
+    65_536,
+  );
+});
+
+test("maxAttributeLength Infinity preserves unlimited capture", async () => {
+  const { client, spans } = setup({ maxAttributeLength: Number.POSITIVE_INFINITY });
+
+  expect(client.enabled).toBe(true);
+  startSpan("unlimited", { output: "x".repeat(70_000) }).end();
+  await flush();
+  expect(spans.getFinishedSpans()[0]?.attributes["gen_ai.output.messages"]).toBe(
+    "x".repeat(70_000),
+  );
+});
+
+test("maxAttributeLength 0 drops content without disabling the raw attribute backstop", async () => {
+  const warned = vi.spyOn(diag, "warn");
+  const { client, spans } = setup({ maxAttributeLength: 0 });
+
+  expect(client.enabled).toBe(true);
+  startSpan("zero-limit", { model: "m".repeat(70_000), output: "secret" }).end();
+  await flush();
+  const attributes = spans.getFinishedSpans()[0]?.attributes ?? {};
+  expect(attributes["gen_ai.output.messages"] ?? "").toBe("");
+  expect(attributes["gen_ai.request.model"]).toBe("m".repeat(65_536));
+  expect(warned).not.toHaveBeenCalled();
+});
+
+test("invalid reinitialization shuts down the previous client", async () => {
+  const previous = setup();
+
+  const replacement = init({
+    apiKey: "td_live_test",
+    logLevel: "silent",
+    maxAttributeLength: Number.NaN,
+  });
+
+  expect(replacement.enabled).toBe(false);
+  expect(previous.client.enabled).toBe(false);
+  startSpan("after-invalid-reinit").end();
+  await flush();
+  expect(previous.spans.getFinishedSpans()).toHaveLength(0);
+});
+
+test("synchronous shutdown failure cannot escape reinitialization", () => {
+  const previous = setup();
+  const shutdownError = new Error("shutdown failed synchronously");
+  const errors: Error[] = [];
+  vi.spyOn(previous.client, "shutdown").mockImplementation(() => {
+    throw shutdownError;
+  });
+
+  const replacement = init({
+    apiKey: "td_live_test",
+    logLevel: "silent",
+    maxAttributeLength: Number.NaN,
+    onError: (error) => errors.push(error),
+  });
+
+  expect(replacement.enabled).toBe(false);
+  expect(errors).toHaveLength(2);
+  expect(errors[0]).toBeInstanceOf(RangeError);
+  expect(errors[1]).toBe(shutdownError);
+});
+
+test("a throwing logLevel getter fails open", () => {
+  const error = new Error("logLevel getter failed");
+  const errors: Error[] = [];
+
+  const options = {
+    apiKey: "td_live_test",
+    onError: (cause: Error) => errors.push(cause),
+    get logLevel(): never {
+      throw error;
+    },
+  };
+
+  expect(init(options)).toMatchObject({ enabled: false });
+  expect(errors).toEqual([error]);
+});
+
+test("failed reinitialization preserves a client created by the previous shutdown handoff", async () => {
+  const replacementSpans = new InMemorySpanExporter();
+  let replacement: ReturnType<typeof init> | undefined;
+  setup({
+    waitUntil: () => {
+      replacement = init(
+        { exportMode: "immediate", logLevel: "silent" },
+        { spanExporter: replacementSpans },
+      );
+    },
+  });
+
+  const failed = init({
+    apiKey: "td_live_test",
+    logLevel: "silent",
+    maxAttributeLength: Number.NaN,
+  });
+
+  expect(failed.enabled).toBe(false);
+  expect(replacement?.enabled).toBe(true);
+  startSpan("replacement-survived").end();
+  await flush();
+  expect(replacementSpans.getFinishedSpans()).toHaveLength(1);
 });
 
 test("missing api key disables the client", () => {

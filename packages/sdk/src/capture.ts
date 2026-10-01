@@ -168,7 +168,7 @@ export function boundedCaptureDetails(
         return result;
       }
 
-      const result: CapturedObject = {};
+      const result = {} as CapturedObject;
       let emitted = false;
 
       for (const key in value) {
@@ -213,7 +213,17 @@ export function boundedCaptureDetails(
         if (converted === undefined) {
           bytes = previousBytes;
         } else {
-          result[key] = converted;
+          if (key === "__proto__") {
+            Object.defineProperty(result, key, {
+              configurable: true,
+              enumerable: true,
+              value: converted,
+              writable: true,
+            });
+          } else {
+            result[key] = converted;
+          }
+
           emitted = true;
         }
       }
@@ -243,9 +253,10 @@ export function boundedCapture(
 export function truncate(value: string, maxLength: number): string {
   if (value.length <= maxLength) return value;
 
-  // Total stays within maxLength so the provider's attributeValueLengthLimit backstop
-  // (set to the same cap) never slices the marker off.
-  return value.slice(0, Math.max(maxLength - TRUNCATION_MARKER.length, 0)) + TRUNCATION_MARKER;
+  const limit = Math.max(maxLength, 0);
+  const marker = TRUNCATION_MARKER.slice(0, limit);
+
+  return value.slice(0, limit - marker.length) + marker;
 }
 
 /** The single content funnel: mask → JSON stringify → truncate. */

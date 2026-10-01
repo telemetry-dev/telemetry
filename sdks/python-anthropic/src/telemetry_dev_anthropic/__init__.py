@@ -4,6 +4,7 @@ import importlib
 import json
 import threading
 import time
+import types
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
 from functools import wraps
 from typing import Any, TypeVar, cast
@@ -23,10 +24,11 @@ ResponseMapper = Callable[[Any], dict[str, Any]]
 
 _WRAPPED_ATTR = "_telemetry_dev_anthropic_wrapped"
 _ORIGINAL_ATTR = "_telemetry_dev_anthropic_original"
-_ORIGINALS: list[tuple[type[Any], str, Any]] = []
+_ORIGINALS: list[tuple[type[Any], str, Any, Any]] = []
 _installed = False
 _install_lock = threading.Lock()
 _T = TypeVar("_T")
+_OMIT = object()
 # Each of these issues its own request: parse() and stream() do not route through create().
 _RESPONSE_METHODS = ("create", "parse")
 # Bedrock and Vertex clients expose their own beta resource classes, which copy the
@@ -38,7 +40,6 @@ _PROVIDER_BETA_MODULES = (
 
 
 def _provider_beta_classes() -> tuple[type[Any], ...]:
-    """Load provider beta resources, skipping any a future SDK renames or removes."""
     classes: list[type[Any]] = []
     for module_name in _PROVIDER_BETA_MODULES:
         try:
@@ -57,6 +58,47 @@ def _field(value: Any, name: str) -> Any:
         mapping = cast(Mapping[str, Any], value)
         return mapping.get(name)
     return getattr(value, name, None)
+
+
+_TYPE_MRO = type.__dict__["__mro__"]
+_TYPE_NAMESPACE = type.__dict__["__dict__"]
+
+
+def _is_storage_descriptor(descriptor: object, name: str) -> bool:
+    kind = type(descriptor)
+    allowed = kind is types.MemberDescriptorType or (
+        name == "__dict__" and kind is types.GetSetDescriptorType
+    )
+    return allowed and cast(Any, descriptor).__name__ == name
+
+
+def _stored(value: Any, name: str) -> Any:
+    # Read instance storage through C-level slot descriptors only, so a property on a
+    # hostile object never runs inside a bounded read.
+    cls = type(cast(object, value))
+    for klass in _TYPE_MRO.__get__(cls):
+        namespace = _TYPE_NAMESPACE.__get__(klass)
+        if name not in namespace:
+            continue
+        descriptor = namespace[name]
+        if not _is_storage_descriptor(descriptor, name):
+            return None
+        try:
+            return descriptor.__get__(value, cls)
+        except (AttributeError, TypeError):
+            return None
+    return None
+
+
+def _field_present(value: Any, name: str) -> bool:
+    if isinstance(value, Mapping):
+        return name in cast(Mapping[str, Any], value)
+    for storage in ("__pydantic_fields_set__", "__fields_set__"):
+        fields_set: object = _stored(value, storage)
+        if type(fields_set) is set:
+            return name in cast(set[str], fields_set)
+    namespace = _stored(value, "__dict__")
+    return type(namespace) is dict and name in cast(dict[str, Any], namespace)
 
 
 def _sequence_items(value: Any) -> list[Any]:
@@ -284,22 +326,39 @@ def _end_once(handle: telemetry_dev.SpanHandle) -> Callable[..., None]:
 
 
 class _StreamState:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        capture_output: bool = True,
+        expect_message_stop: bool = False,
+    ) -> None:
+        self.capture_output = capture_output
+        self.expect_message_stop = expect_message_stop
+        self.message_stopped = False
         self.blocks: dict[int, dict[str, Any]] = {}
         self.tool_json: dict[int, str] = {}
         self.usage: dict[str, int | float] | None = None
         self.finish_reason: str | None = None
         self.response_model: str | None = None
-        self.budget = telemetry_dev.CaptureBudget.from_client()
+        self.metadata_truncated = False
+        self.budget = telemetry_dev.CaptureBudget(
+            _STREAM_CAPTURE_MAX_BYTES, _STREAM_CAPTURE_MAX_ITEMS
+        )
         self.block_reservations: dict[int, tuple[int, int]] = {}
         self.unresolved_replacements: set[int] = set()
+        self.unresolved_encrypted_content: set[int] = set()
 
 
-_MAX_UNRESOLVED_REPLACEMENTS = 1024
+_STREAM_CAPTURE_MAX_BYTES = 48 * 1024
+_STREAM_CAPTURE_MAX_ITEMS = 1000
+_STREAM_CAPTURE_MAX_DEPTH = 32
+_MAX_UNRESOLVED_REPLACEMENTS = _STREAM_CAPTURE_MAX_ITEMS
+
+
+class _StreamCaptureLimit(Exception):
+    pass
 
 
 def _reserve(index: int, value: Any, state: _StreamState) -> bool:
-    """Reserve budget for a value retained as part of a block, recording it for that block."""
     budget = state.budget
     before_bytes, before_items = budget.bytes_used, budget.items_used
     if not budget.accept(value):
@@ -312,12 +371,125 @@ def _reserve(index: int, value: Any, state: _StreamState) -> bool:
     return True
 
 
+_APPENDED_DELTA_FIELDS = {
+    "text_delta": "text",
+    "thinking_delta": "thinking",
+    "input_json_delta": "partial_json",
+}
+
+
+def _reserve_appended_text(index: int, value: Any, state: _StreamState) -> bool:
+    budget = state.budget
+    if budget.truncated:
+        return False
+    text = _string(value)
+    if not text:
+        return True
+    if len(text) > budget.remaining_bytes:
+        budget.truncated = True
+        return False
+    size = len(json.dumps(text, ensure_ascii=False).encode("utf-8", "surrogatepass")) - 2
+    if size > budget.remaining_bytes:
+        budget.truncated = True
+        return False
+    budget.bytes_used += size
+    held_bytes, held_items = state.block_reservations.get(index, (0, 0))
+    state.block_reservations[index] = (held_bytes + size, held_items)
+    return True
+
+
+def _bounded_native(value: Any) -> Any:
+    remaining_items = [_STREAM_CAPTURE_MAX_ITEMS]
+    try:
+        return _bounded_stream_native(value, remaining_items, 0, set())
+    except _StreamCaptureLimit:
+        return _OMIT
+
+
+def _bounded_stream_native(
+    value: Any, remaining_items: list[int], depth: int, seen: set[int]
+) -> Any:
+    if depth > _STREAM_CAPTURE_MAX_DEPTH or remaining_items[0] <= 0:
+        raise _StreamCaptureLimit
+    remaining_items[0] -= 1
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        sequence = cast(Sequence[Any], value)
+        source_id = id(cast(object, value))
+        if len(sequence) > remaining_items[0] or source_id in seen:
+            raise _StreamCaptureLimit
+        seen.add(source_id)
+        try:
+            return [
+                _bounded_stream_native(sequence[index], remaining_items, depth + 1, seen)
+                for index in range(len(sequence))
+            ]
+        finally:
+            seen.remove(source_id)
+    if isinstance(value, Mapping):
+        return _bounded_stream_mappings(
+            (cast(Mapping[Any, Any], value),),
+            id(cast(object, value)),
+            remaining_items,
+            depth,
+            seen,
+        )
+    namespace = _stored(value, "__dict__")
+    if type(namespace) is not dict:
+        return value
+    extra = _stored(value, "__pydantic_extra__")
+    mappings = (
+        (cast(Mapping[Any, Any], extra), cast(Mapping[Any, Any], namespace))
+        if type(extra) is dict
+        else (cast(Mapping[Any, Any], namespace),)
+    )
+    return _bounded_stream_mappings(
+        mappings,
+        id(value),
+        remaining_items,
+        depth,
+        seen,
+    )
+
+
+def _bounded_stream_mappings(
+    mappings: tuple[Mapping[Any, Any], ...],
+    source_id: int,
+    remaining_items: list[int],
+    depth: int,
+    seen: set[int],
+) -> dict[str, Any]:
+    if sum(len(mapping) for mapping in mappings) * 2 > remaining_items[0] or source_id in seen:
+        raise _StreamCaptureLimit
+    seen.add(source_id)
+    try:
+        converted: dict[str, Any] = {}
+        seen_keys: set[Any] = set()
+        for mapping in mappings:
+            for key, item in mapping.items():
+                if remaining_items[0] < 2:
+                    raise _StreamCaptureLimit
+                remaining_items[0] -= 1
+                if key in seen_keys:
+                    remaining_items[0] -= 1
+                    continue
+                seen_keys.add(key)
+                if item is not None:
+                    converted[str(key)] = _bounded_stream_native(
+                        item, remaining_items, depth + 1, seen
+                    )
+                else:
+                    remaining_items[0] -= 1
+        return converted
+    finally:
+        seen.remove(source_id)
+
+
 def _parse_tool_input(raw: str) -> Any:
     if raw == "":
         return {}
     try:
         return json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         return raw
 
 
@@ -351,14 +523,55 @@ def _stream_output(state: _StreamState) -> list[dict[str, Any]] | None:
     ]
 
 
-def _stream_partial(state: _StreamState) -> dict[str, Any]:
+def _bounded_stream_output(
+    blocks: list[dict[str, Any]], max_bytes: int, max_items: int
+) -> tuple[list[dict[str, Any]] | None, bool]:
+    def encoded_size(value: Any) -> int:
+        return len(json.dumps(value, default=repr, ensure_ascii=False).encode())
+
+    envelope: list[dict[str, Any]] = [{"role": "assistant", "content": []}]
+    item_budget = telemetry_dev.CaptureBudget(max_items=max_items)
+    kept: list[dict[str, Any]] = []
+    try:
+        size = encoded_size(envelope)
+        if not item_budget.accept(envelope):
+            return None, True
+        for block in blocks:
+            block_size = encoded_size(block) + (2 if kept else 0)
+            if size + block_size > max_bytes or not item_budget.accept(block):
+                break
+            size += block_size
+            kept.append(block)
+    except (TypeError, ValueError, RecursionError):
+        return None, True
+    truncated = len(kept) < len(blocks)
+    return ([{"role": "assistant", "content": kept}] if kept else None), truncated
+
+
+def _stream_partial(
+    state: _StreamState, *, mask_output_when_incomplete: bool = False
+) -> dict[str, Any]:
+    output = _stream_output(state) if state.capture_output else None
+    output_truncated = False
+    if output is not None:
+        output, output_truncated = _bounded_stream_output(
+            output[0]["content"], state.budget.max_bytes, state.budget.max_items
+        )
+    output_incomplete = bool(
+        state.budget.truncated
+        or output_truncated
+        or (state.expect_message_stop and not state.message_stopped)
+        or state.unresolved_replacements
+        or state.unresolved_encrypted_content
+    )
+    capture_incomplete = output_incomplete or state.metadata_truncated
     fields: dict[str, Any] = {
-        "output": _stream_output(state),
+        "output": None if mask_output_when_incomplete and output_incomplete else output,
         "usage": _cache_inclusive_usage(state.usage),
         "finish_reason": state.finish_reason,
         "response_model": state.response_model,
     }
-    if state.budget.truncated or state.unresolved_replacements:
+    if capture_incomplete:
         fields["attributes"] = {"telemetry.dev.capture.truncated": True}
     return fields
 
@@ -384,10 +597,37 @@ def _append_item(target: dict[str, Any], key: str, value: Any) -> None:
 
 
 def _record_content_block_start(event: Any, state: _StreamState) -> None:
+    if not state.capture_output:
+        return
     index = _field(event, "index")
     block_index = index if isinstance(index, int) else len(state.blocks)
-    content_block = _native(_field(event, "content_block"))
+    raw_content_block = _field(event, "content_block")
+    raw_block_type = _string(_field(raw_content_block, "type"))
+    content_block = _bounded_native(raw_content_block)
+    if content_block is _OMIT:
+        if raw_block_type == "compaction":
+            _reject_replacement(block_index, state, recover_unseen=True)
+            if _field_present(raw_content_block, "encrypted_content"):
+                _mark_unresolved_encrypted_content(block_index, state)
+        else:
+            state.budget.truncated = True
+        return
     block_type = _string(_field(content_block, "type"))
+    retained_block: dict[str, Any] = (
+        cast(dict[str, Any], content_block)
+        if isinstance(content_block, dict)
+        else {"type": block_type}
+    )
+    if block_type == "compaction":
+        if not _reserve_replacement(block_index, retained_block, state, recover_unseen=True):
+            if _field_present(content_block, "encrypted_content"):
+                _mark_unresolved_encrypted_content(block_index, state)
+            _drop_stale_compaction(block_index, state)
+            return
+        state.blocks[block_index] = retained_block
+        if _field_present(content_block, "encrypted_content"):
+            state.unresolved_encrypted_content.discard(block_index)
+        return
     if not _reserve(block_index, content_block, state):
         return
     if block_type == "text":
@@ -408,13 +648,10 @@ def _record_content_block_start(event: Any, state: _StreamState) -> None:
             "thinking": _string(_field(content_block, "thinking")) or "",
         }
         return
-    state.blocks[block_index] = (
-        content_block if isinstance(content_block, dict) else {"type": block_type}
-    )
+    state.blocks[block_index] = retained_block
 
 
 def _default_block(delta_type: str | None) -> dict[str, Any]:
-    """The block a delta implies when its content_block_start was never recorded."""
     if delta_type == "input_json_delta":
         return {"type": "tool_use"}
     if delta_type == "thinking_delta":
@@ -437,12 +674,12 @@ _REPLACEMENT_DELTAS = frozenset({"compaction_delta", "signature_delta"})
 
 
 def _replaced_block(index: int, delta: Any, state: _StreamState) -> dict[str, Any] | None:
-    """The block that results from applying a replacement delta, or None if it changes nothing."""
     delta_type = _string(_field(delta, "type"))
     block = dict(state.blocks.get(index) or _default_block(delta_type))
     if delta_type == "compaction_delta":
         block["content"] = _field(delta, "content")
-        block["encrypted_content"] = _field(delta, "encrypted_content")
+        if _field_present(delta, "encrypted_content"):
+            block["encrypted_content"] = _field(delta, "encrypted_content")
     elif _field(delta, "signature") is not None:
         block["signature"] = _field(delta, "signature")
     else:
@@ -451,15 +688,22 @@ def _replaced_block(index: int, delta: Any, state: _StreamState) -> dict[str, An
 
 
 def _release(index: int, state: _StreamState) -> None:
-    """Hand back everything a block holds: its start and every accepted delta."""
     held_bytes, held_items = state.block_reservations.pop(index, (0, 0))
     state.budget.bytes_used -= held_bytes
     state.budget.items_used -= held_items
 
 
-def _reserve_replacement(index: int, block: dict[str, Any], state: _StreamState) -> bool:
+def _can_reserve_replacement(index: int, state: _StreamState, recover_unseen: bool) -> bool:
+    return not state.budget.truncated or (
+        recover_unseen and (index in state.blocks or index in state.unresolved_replacements)
+    )
+
+
+def _reserve_replacement(
+    index: int, block: dict[str, Any], state: _StreamState, *, recover_unseen: bool
+) -> bool:
     budget = state.budget
-    if budget.truncated:
+    if not _can_reserve_replacement(index, state, recover_unseen):
         return False
     raw_input = state.tool_json.get(index)
     retained = block if raw_input is None else (block, raw_input)
@@ -468,22 +712,53 @@ def _reserve_replacement(index: int, block: dict[str, Any], state: _StreamState)
     candidate.bytes_used = budget.bytes_used - held_bytes
     candidate.items_used = budget.items_used - held_items
     if not candidate.accept(retained):
-        if index in state.blocks or index in state.unresolved_replacements:
-            if (
-                index not in state.unresolved_replacements
-                and len(state.unresolved_replacements) >= _MAX_UNRESOLVED_REPLACEMENTS
-            ):
-                budget.truncated = True
-            else:
-                state.unresolved_replacements.add(index)
-        else:
-            budget.truncated = True
+        _reject_replacement(index, state, recover_unseen=recover_unseen)
         return False
-    _release(index, state)
-    reserved = _reserve(index, retained, state)
-    if reserved:
-        state.unresolved_replacements.discard(index)
-    return reserved
+    base_bytes = budget.bytes_used - held_bytes
+    base_items = budget.items_used - held_items
+    measured_bytes = candidate.bytes_used - base_bytes
+    measured_items = candidate.items_used - base_items
+    budget.bytes_used = base_bytes + measured_bytes
+    budget.items_used = base_items + measured_items
+    state.block_reservations[index] = (measured_bytes, measured_items)
+    state.unresolved_replacements.discard(index)
+    return True
+
+
+def _reject_replacement(index: int, state: _StreamState, *, recover_unseen: bool) -> None:
+    if not (recover_unseen or index in state.blocks or index in state.unresolved_replacements):
+        state.budget.truncated = True
+    elif (
+        index in state.unresolved_replacements
+        or len(state.unresolved_replacements) < _MAX_UNRESOLVED_REPLACEMENTS
+    ):
+        state.unresolved_replacements.add(index)
+    else:
+        state.budget.truncated = True
+
+
+def _mark_unresolved_encrypted_content(index: int, state: _StreamState) -> None:
+    if (
+        index not in state.unresolved_encrypted_content
+        and len(state.unresolved_encrypted_content) >= _MAX_UNRESOLVED_REPLACEMENTS
+    ):
+        state.budget.truncated = True
+    else:
+        state.unresolved_encrypted_content.add(index)
+
+
+def _drop_rejected_replacement(
+    index: int, delta_type: str, encrypted_content_present: bool, state: _StreamState
+) -> None:
+    recover_unseen = delta_type == "compaction_delta"
+    if _can_reserve_replacement(index, state, recover_unseen):
+        _reject_replacement(index, state, recover_unseen=recover_unseen)
+    if delta_type == "compaction_delta":
+        if encrypted_content_present:
+            _mark_unresolved_encrypted_content(index, state)
+        _drop_stale_compaction(index, state)
+    else:
+        _drop_stale_signature(index, state)
 
 
 def _drop_stale_signature(index: int, state: _StreamState) -> None:
@@ -516,22 +791,56 @@ def _drop_stale_compaction(index: int, state: _StreamState) -> None:
 
 
 def _record_content_block_delta(event: Any, state: _StreamState) -> None:
+    if not state.capture_output:
+        return
     index = _field(event, "index")
     block_index = index if isinstance(index, int) else 0
-    delta = _native(_field(event, "delta"))
+    raw_delta = _field(event, "delta")
+    raw_delta_type = _string(_field(raw_delta, "type"))
+    replacing = raw_delta_type in _REPLACEMENT_DELTAS
+    delta = _bounded_native(raw_delta)
+    if delta is _OMIT:
+        if replacing:
+            _drop_rejected_replacement(
+                block_index,
+                raw_delta_type,
+                _field_present(raw_delta, "encrypted_content")
+                or _field_present(state.blocks.get(block_index), "encrypted_content"),
+                state,
+            )
+        else:
+            state.budget.truncated = True
+        return
+    if isinstance(delta, dict) and _field_present(raw_delta, "encrypted_content"):
+        delta["encrypted_content"] = _field(raw_delta, "encrypted_content")
     delta_type = _string(_field(delta, "type"))
     if delta_type in _REPLACEMENT_DELTAS:
         replaced = _replaced_block(block_index, delta, state)
         if replaced is None:
             return
-        if _reserve_replacement(block_index, replaced, state):
+        if _reserve_replacement(
+            block_index,
+            replaced,
+            state,
+            recover_unseen=delta_type == "compaction_delta",
+        ):
             state.blocks[block_index] = replaced
-        elif delta_type == "compaction_delta":
-            _drop_stale_compaction(block_index, state)
+            if delta_type == "compaction_delta" and _field_present(delta, "encrypted_content"):
+                state.unresolved_encrypted_content.discard(block_index)
         else:
-            _drop_stale_signature(block_index, state)
+            if delta_type == "compaction_delta" and "encrypted_content" in replaced:
+                _mark_unresolved_encrypted_content(block_index, state)
+                _drop_stale_compaction(block_index, state)
+            elif delta_type == "compaction_delta":
+                _drop_stale_compaction(block_index, state)
+            else:
+                _drop_stale_signature(block_index, state)
         return
-    if not _reserve(block_index, delta, state):
+    appended_field = _APPENDED_DELTA_FIELDS.get(delta_type or "")
+    if appended_field is not None and block_index in state.blocks:
+        if not _reserve_appended_text(block_index, _field(delta, appended_field), state):
+            return
+    elif not _reserve(block_index, delta, state):
         return
     block = _block_for_delta(block_index, delta_type, state)
     if delta_type == "input_json_delta":
@@ -546,18 +855,19 @@ def _record_content_block_delta(event: Any, state: _StreamState) -> None:
         _append_string(block, "thinking", _field(delta, "thinking"))
 
 
-def _fallback_serving_model(usage: Any) -> str | None:
-    """Model named by the fallback_message entry in the terminal usage iterations.
-
-    A fallback block only marks where a fallback was attempted; the fallback_message
-    iteration is what shows a fallback model actually served the response.
-    """
-    served = [
-        entry
-        for entry in _sequence_items(_field(usage, "iterations"))
-        if _string(_field(entry, "type")) == "fallback_message"
-    ]
-    return _string(_field(served[-1], "model")) if served else None
+def _fallback_serving_model(usage: Any, state: _StreamState) -> str | None:
+    value = _field(usage, "iterations")
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes | bytearray):
+        return None
+    iterations = cast(Sequence[Any], value)
+    if len(iterations) > _STREAM_CAPTURE_MAX_ITEMS:
+        state.metadata_truncated = True
+    first_index = max(0, len(iterations) - _STREAM_CAPTURE_MAX_ITEMS)
+    for index in range(len(iterations) - 1, first_index - 1, -1):
+        entry = iterations[index]
+        if _string(_field(entry, "type")) == "fallback_message":
+            return _string(_field(entry, "model"))
+    return None
 
 
 def _record_stream_event(event: Any, state: _StreamState) -> dict[str, Any]:
@@ -577,8 +887,10 @@ def _record_stream_event(event: Any, state: _StreamState) -> dict[str, Any]:
         state.finish_reason = _string(_field(delta, "stop_reason")) or state.finish_reason
         state.usage = _merge_usage(state.usage, _messages_usage(_field(event, "usage")))
         state.response_model = (
-            _fallback_serving_model(_field(event, "usage")) or state.response_model
+            _fallback_serving_model(_field(event, "usage"), state) or state.response_model
         )
+    elif event_type == "message_stop":
+        state.message_stopped = True
     return update
 
 
@@ -602,13 +914,71 @@ def _stream_event_has_output(event: Any) -> bool:
     return input_value not in (None, "", [], {})
 
 
+def _stream_span_capture_policy(handle: telemetry_dev.SpanHandle) -> tuple[bool, bool]:
+    compatible = cast(Any, handle)
+    client = getattr(compatible, "_client", None)
+    state = getattr(compatible, "_state", None)
+    capture_output = getattr(compatible, "capture_output", None)
+    if not isinstance(capture_output, bool):
+        capture_output = getattr(state, "capture_output", None)
+    if not isinstance(capture_output, bool):
+        capture_output = getattr(client, "capture_output", False)
+    capture_masked = getattr(compatible, "capture_masked", None)
+    if not isinstance(capture_masked, bool):
+        capture_masked = getattr(client, "mask", _OMIT) is not None if client is not None else True
+    return capture_output, capture_masked
+
+
+def _stream_span_reporter(
+    handle: telemetry_dev.SpanHandle,
+) -> Callable[[BaseException], None]:
+    compatible = cast(Any, handle)
+    reporter = getattr(compatible, "report_error", None)
+    client = getattr(compatible, "_client", None)
+    reported = False
+
+    def report(cause: BaseException) -> None:
+        nonlocal reported
+        if reported:
+            return
+        reported = True
+        try:
+            if callable(reporter):
+                reporter(cause)
+                return
+            client_report = getattr(client, "report", None)
+            if callable(client_report):
+                client_report("provider instrumentation failed", cause)
+        except Exception:
+            return
+
+    return report
+
+
+def _end_mapped_response(
+    handle: telemetry_dev.SpanHandle,
+    end: Callable[..., None],
+    mapper: ResponseMapper,
+    response: Any,
+) -> None:
+    try:
+        fields = mapper(response)
+    except Exception as exc:
+        _stream_span_reporter(handle)(exc)
+        end(attributes={"telemetry.dev.capture.truncated": True})
+        return
+    end(**fields)
+
+
 class _InstrumentedStream:
     def __init__(self, inner: Any, handle: telemetry_dev.SpanHandle, started_at: float) -> None:
         self._inner = inner
         self._handle = handle
         self._end = _end_once(handle)
         self._started_at = started_at
-        self._state = _StreamState()
+        capture_output, self._mask_output_when_incomplete = _stream_span_capture_policy(handle)
+        self._state = _StreamState(capture_output, expect_message_stop=True)
+        self._report_error = _stream_span_reporter(handle)
         self._saw_first = False
         self._consume: Iterator[Any] | None = None
 
@@ -623,7 +993,9 @@ class _InstrumentedStream:
         )
 
     def finish(self, error: BaseException | None = None) -> None:
-        fields = _stream_partial(self._state)
+        fields = _stream_partial(
+            self._state, mask_output_when_incomplete=self._mask_output_when_incomplete
+        )
         if error is not None:
             fields["error"] = error
         self._end(**fields)
@@ -641,12 +1013,13 @@ class _InstrumentedStream:
                     raise
                 try:
                     update = _record_stream_event(event, self._state)
-                except BaseException as exc:
-                    client = telemetry_dev.get_client()
-                    if client is not None:
-                        client.report("failed to map Anthropic stream event", exc)
+                    has_output = _stream_event_has_output(event)
+                except Exception as exc:
+                    self._state.budget.truncated = True
+                    self._report_error(exc)
                     update = {}
-                if _stream_event_has_output(event):
+                    has_output = False
+                if has_output:
                     record_output_chunk = getattr(self._handle, "record_output_chunk", None)
                     if callable(record_output_chunk):
                         record_output_chunk(received_at * 1000)
@@ -692,7 +1065,9 @@ class _InstrumentedAsyncStream:
         self._handle = handle
         self._end = _end_once(handle)
         self._started_at = started_at
-        self._state = _StreamState()
+        capture_output, self._mask_output_when_incomplete = _stream_span_capture_policy(handle)
+        self._state = _StreamState(capture_output, expect_message_stop=True)
+        self._report_error = _stream_span_reporter(handle)
         self._saw_first = False
         self._consume: AsyncIterator[Any] | None = None
 
@@ -707,7 +1082,9 @@ class _InstrumentedAsyncStream:
         )
 
     def finish(self, error: BaseException | None = None) -> None:
-        fields = _stream_partial(self._state)
+        fields = _stream_partial(
+            self._state, mask_output_when_incomplete=self._mask_output_when_incomplete
+        )
         if error is not None:
             fields["error"] = error
         self._end(**fields)
@@ -725,12 +1102,13 @@ class _InstrumentedAsyncStream:
                     raise
                 try:
                     update = _record_stream_event(event, self._state)
-                except BaseException as exc:
-                    client = telemetry_dev.get_client()
-                    if client is not None:
-                        client.report("failed to map Anthropic stream event", exc)
+                    has_output = _stream_event_has_output(event)
+                except Exception as exc:
+                    self._state.budget.truncated = True
+                    self._report_error(exc)
                     update = {}
-                if _stream_event_has_output(event):
+                    has_output = False
+                if has_output:
                     record_output_chunk = getattr(self._handle, "record_output_chunk", None)
                     if callable(record_output_chunk):
                         record_output_chunk(received_at * 1000)
@@ -885,7 +1263,7 @@ def _wrap_sync(
             raise
         if streaming:
             return _InstrumentedStream(result, handle, started_at)
-        end(**response_mapper(result))
+        _end_mapped_response(handle, end, response_mapper, result)
         return result
 
     setattr(wrapper, _WRAPPED_ATTR, True)
@@ -914,7 +1292,7 @@ def _wrap_async(
             raise
         if streaming:
             return _InstrumentedAsyncStream(result, handle, started_at)
-        end(**response_mapper(result))
+        _end_mapped_response(handle, end, response_mapper, result)
         return result
 
     setattr(wrapper, _WRAPPED_ATTR, True)
@@ -994,8 +1372,9 @@ def _patch_class_method(cls: type[Any], name: str, async_resource: bool) -> None
     original = getattr(cls, name, None)
     if original is None or getattr(original, _WRAPPED_ATTR, False):
         return
-    _ORIGINALS.append((cls, name, original))
-    setattr(cls, name, _wrap_method(original, name, async_resource, _provider_for_resource))
+    wrapped = _wrap_method(original, name, async_resource, _provider_for_resource)
+    _ORIGINALS.append((cls, name, original, wrapped))
+    setattr(cls, name, wrapped)
 
 
 def _beta_messages(client: object) -> object | None:
@@ -1035,8 +1414,9 @@ def uninstrument_anthropic() -> None:
     global _installed
     with _install_lock:
         while _ORIGINALS:
-            cls, method, original = _ORIGINALS.pop()
-            setattr(cls, method, original)
+            cls, method, original, wrapped = _ORIGINALS.pop()
+            if vars(cls).get(method, _OMIT) is wrapped:
+                setattr(cls, method, original)
         _installed = False
 
 

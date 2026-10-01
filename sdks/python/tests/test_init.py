@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from opentelemetry import trace
@@ -28,6 +29,67 @@ def test_enabled_false_kill_switch_beats_exporter_seams(make: MakeClient) -> Non
     assert env.client.enabled is False
     telemetry_dev.start_span("x").end()
     assert env.span_exporter.get_finished_spans() == ()
+
+
+@pytest.mark.parametrize("max_attribute_length", [-1, 1.5, float("nan"), float("inf"), True])
+def test_invalid_max_attribute_length_fails_open_through_on_error(
+    max_attribute_length: Any,
+) -> None:
+    errors: list[BaseException] = []
+
+    client = telemetry_dev.init(
+        api_key="[REDACTED:api-key]",
+        max_attribute_length=max_attribute_length,
+        on_error=errors.append,
+        log_level="silent",
+        disable_atexit=True,
+    )
+
+    assert client.enabled is False
+    assert isinstance(errors[0], ValueError)
+
+
+def test_large_max_attribute_length_remains_enabled(make: MakeClient) -> None:
+    env = make(max_attribute_length=2**53)
+
+    assert env.client.enabled is True
+    assert env.client.max_attribute_length == 2**53
+
+
+def test_zero_max_attribute_length_drops_content_but_keeps_raw_attributes(
+    make: MakeClient,
+) -> None:
+    env = make(max_attribute_length=0)
+
+    telemetry_dev.start_span(
+        "zero-limit", type="generation", model="m" * 70_000, output="secret"
+    ).end()
+
+    attributes = dict(env.span_exporter.get_finished_spans()[0].attributes or {})
+    assert attributes.get("gen_ai.output.messages", "") == ""
+    assert attributes["gen_ai.request.model"] == "m" * 65_536
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "max_attribute_length", "expected"),
+    [
+        ("gen_ai.response.finish_reasons", ["stop", "length"], 0, ("stop", "length")),
+        ("gen_ai.response.finish_reasons", ["stop", "length"], 4, ("stop", "leng")),
+        ("gen_ai.operation.name", "generate_content", 0, "generate_content"),
+        ("gen_ai.operation.name", "generate_content", 5, "gener"),
+        ("payload", "x" * 100_000, 200_000, "x" * 100_000),
+        ("payload", "x" * 100_000, 0, "x" * 65_536),
+    ],
+)
+def test_raw_attributes_follow_the_attribute_backstop_not_the_content_cap(
+    make: MakeClient, key: str, value: Any, max_attribute_length: int, expected: Any
+) -> None:
+    env = make(max_attribute_length=max_attribute_length)
+
+    telemetry_dev.start_span("chat", type="generation", attributes={key: value}).end()
+
+    attributes = dict(env.span_exporter.get_finished_spans()[0].attributes or {})
+    assert attributes[key] == expected
 
 
 def test_exporter_seam_enables_without_api_key(make: MakeClient) -> None:

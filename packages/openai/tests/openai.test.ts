@@ -4,8 +4,8 @@ import {
   InMemoryMetricExporter,
   type PushMetricExporter,
 } from "@opentelemetry/sdk-metrics";
-import { flush, init, shutdown } from "@telemetry-dev/sdk";
-import * as sdk from "@telemetry-dev/sdk";
+import { flush, init, shutdown, type TelemetryOptions } from "@telemetry-dev/sdk";
+import * as telemetrySdk from "@telemetry-dev/sdk";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import OpenAI, { AzureOpenAI } from "openai";
@@ -179,7 +179,7 @@ function createFakeFetch(...responses: Response[]): FakeFetch {
 
 function setupSpans(
   metricExporter?: PushMetricExporter,
-  options: { captureOutput?: boolean } = {},
+  options: Pick<TelemetryOptions, "captureOutput" | "mask" | "maxAttributeLength" | "onError"> = {},
 ): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
   init(
@@ -232,6 +232,31 @@ function jsonAttr<T>(span: ReadableSpan, key: string): T {
   expect(String(value) === value).toBe(true);
 
   return JSON.parse(String(value)) as T;
+}
+
+interface ChatChoiceTestState {
+  content: string;
+  toolCalls: Map<number, { function?: { arguments?: string } }>;
+}
+
+function observeChatChoiceStates(): () => Map<number, ChatChoiceTestState> {
+  const set = vi.spyOn(Map.prototype, "set");
+
+  return () => {
+    for (let index = set.mock.calls.length - 1; index >= 0; index -= 1) {
+      const value = set.mock.calls[index]?.[1];
+
+      if (
+        isObject(value) &&
+        typeof (value as { content?: unknown }).content === "string" &&
+        (value as { toolCalls?: unknown }).toolCalls instanceof Map
+      ) {
+        return set.mock.contexts[index] as Map<number, ChatChoiceTestState>;
+      }
+    }
+
+    throw new Error("chat choice state was not observed");
+  };
 }
 
 function isObject<T>(value: T): value is T & object {
@@ -345,6 +370,30 @@ test("chat completions map request, response, usage, finish reason, provider, an
   expect(span.attributes["gen_ai.request.seed"]).toBe(7);
   expect(span.attributes["gen_ai.request.frequency_penalty"]).toBe(0.1);
   expect(span.attributes["gen_ai.request.presence_penalty"]).toBe(0.2);
+});
+
+test("chat completions return the provider result when response mapping fails", async () => {
+  const errors: Error[] = [];
+  const spans = setupSpans(undefined, { onError: (error) => errors.push(error) });
+  const mappingError = new Error("mapping failed");
+
+  const source = {
+    get choices(): never {
+      throw mappingError;
+    },
+  };
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: {},
+    embeddings: {},
+  });
+
+  const result = await client.chat.completions.create({ model: "gpt-4o", messages: [] });
+
+  expect(result).toBe(source);
+  expect(errors).toEqual([mappingError]);
+  expect((await exportedSpan(spans)).attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
 test("wrapped chat completion APIPromise keeps parse helper and promise identity", async () => {
@@ -629,18 +678,8 @@ test("chat completions record finish reasons for single and multi-choice respons
   expect(multi?.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop", "length"]);
 });
 
-test.each([false, true])("chunk timing preserves delivery with old core=%s", async (oldCore) => {
+test("chunk timing preserves delivery", async () => {
   const spans = setupSpans();
-
-  if (oldCore) {
-    const start = sdk.startSpan;
-    vi.spyOn(sdk, "startSpan").mockImplementation((...args) => {
-      const handle = start(...args);
-      Reflect.deleteProperty(handle, "recordOutputChunk");
-
-      return handle;
-    });
-  }
 
   const deltas = [
     { role: "assistant" },
@@ -682,13 +721,9 @@ test.each([false, true])("chunk timing preserves delivery with old core=%s", asy
   expect(await collectStream(stream)).toHaveLength(deltas.length);
   const span = await exportedSpan(spans);
   expect(span.status.code).toBe(SPAN_STATUS_UNSET);
-
-  if (oldCore) expect(Symbol.for("telemetry.dev.outputChunkHistogram") in span).toBe(false);
-  else {
-    expect(span).toMatchObject({
-      [Symbol.for("telemetry.dev.outputChunkHistogram")]: { count: 3 },
-    });
-  }
+  expect(span).toMatchObject({
+    [Symbol.for("telemetry.dev.outputChunkHistogram")]: { count: 3 },
+  });
 });
 
 test.each(["chat", "responses"])("%s timestamps precede telemetry mapping", async (operation) => {
@@ -907,6 +942,1708 @@ test("chat streams leave the request unchanged and capture no usage by default",
   expect(span.attributes["gen_ai.usage.total_tokens"]).toBeUndefined();
 });
 
+test("chat streams bound retained content without changing events or usage", async () => {
+  const spans = setupSpans();
+  const states = observeChatChoiceStates();
+
+  const events = [
+    {
+      id: "chatcmpl_bounded_content",
+      model: "gpt-4o-2024-11-20",
+      choices: [{ index: 0, delta: { role: "assistant", content: "kept" } }],
+    },
+    {
+      id: "chatcmpl_bounded_content",
+      model: "gpt-4o-2024-11-20",
+      choices: [{ index: 0, delta: { content: "x".repeat(70_000) }, finish_reason: "stop" }],
+    },
+    {
+      id: "chatcmpl_bounded_content",
+      model: "gpt-4o-2024-11-20",
+      choices: [{ index: 0, delta: { content: "not-retained" } }],
+    },
+    {
+      choices: [],
+      usage: { prompt_tokens: 9, completion_tokens: 2, total_tokens: 11 },
+    },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+    stream_options: { include_usage: true },
+  });
+
+  const iterator = stream[Symbol.asyncIterator]();
+  const delivered: unknown[] = [];
+
+  for (let index = 0; index < events.length; index += 1) {
+    delivered.push((await iterator.next()).value);
+
+    if (index >= 1) expect(states().get(0)?.content).toBe("kept");
+  }
+
+  expect(await iterator.next()).toEqual({ done: true, value: undefined });
+  expect(delivered).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: "kept" },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
+  expect(span.attributes["gen_ai.usage.total_tokens"]).toBe(11);
+});
+
+test.each(["chat", "responses", "transcription"] as const)(
+  "%s streams keep telemetry on a core span without a capture policy",
+  async (kind) => {
+    const spans = setupSpans();
+    const startSpan = telemetrySdk.startSpan;
+    vi.spyOn(telemetrySdk, "startSpan").mockImplementation((...args) => {
+      const legacySpan = { ...startSpan(...args) };
+      Reflect.deleteProperty(legacySpan, "capturePolicy");
+      Reflect.deleteProperty(legacySpan, "recordOutputChunk");
+      Reflect.deleteProperty(legacySpan, "reportError");
+
+      return legacySpan;
+    });
+
+    const output = [
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] },
+    ];
+
+    const events = {
+      chat: [
+        {
+          model: "gpt-4o-2024-11-20",
+          choices: [{ index: 0, delta: { content: "done" }, finish_reason: "stop" }],
+        },
+      ],
+      responses: [
+        {
+          type: "response.completed",
+          response: { id: "resp_legacy", status: "completed", output },
+        },
+      ],
+      transcription: [{ type: "transcript.text.done", text: "done" }],
+    }[kind];
+
+    const source = new Stream(async function* () {
+      yield* events;
+    }, new AbortController());
+
+    const client = wrapOpenAI({
+      chat: { completions: { create: async (_params: unknown) => source } },
+      responses: { create: async (_params: unknown) => source },
+      embeddings: { create() {} },
+      audio: { transcriptions: { create: async (_params: unknown) => source } },
+    });
+
+    let stream: Stream<unknown>;
+
+    if (kind === "chat")
+      stream = await client.chat.completions.create({
+        model: "gpt-4o",
+        messages: [],
+        stream: true,
+      });
+    else if (kind === "responses")
+      stream = await client.responses.create({ model: "gpt-4.1", input: "x", stream: true });
+    else
+      stream = await client.audio!.transcriptions!.create({
+        model: "gpt-4o-transcribe",
+        stream: true,
+      });
+
+    expect(await collectStream(stream)).toEqual(events);
+    const span = await exportedSpan(spans);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+
+    if (kind === "chat") {
+      expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
+      expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+        { role: "assistant", content: "done" },
+      ]);
+    } else if (kind === "responses") {
+      expect(jsonAttr(span, "gen_ai.output.messages")).toEqual(output);
+    } else {
+      expect(span.attributes["gen_ai.output.messages"]).toBe("done");
+    }
+  },
+);
+
+test("chat streams retain output when the core span lacks chunk recording", async () => {
+  const spans = setupSpans();
+  const startSpan = telemetrySdk.startSpan;
+  vi.spyOn(telemetrySdk, "startSpan").mockImplementation((...args) => {
+    const legacySpan = { ...startSpan(...args) };
+    Reflect.deleteProperty(legacySpan, "recordOutputChunk");
+
+    return legacySpan;
+  });
+
+  const events = [
+    { choices: [{ index: 0, delta: { content: "delivered" }, finish_reason: "stop" }] },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  expect(jsonAttr(await exportedSpan(spans), "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: "delivered" },
+  ]);
+});
+
+test("chat streams bound retained tool arguments", async () => {
+  const spans = setupSpans();
+  const states = observeChatChoiceStates();
+
+  const events = [
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            role: "assistant",
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_bounded",
+                type: "function",
+                function: { name: "lookup", arguments: '{"q":"' },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [{ index: 0, function: { arguments: "x".repeat(70_000) } }],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  const iterator = stream[Symbol.asyncIterator]();
+  expect((await iterator.next()).value).toBe(events[0]);
+  const retainedArguments = states().get(0)?.toolCalls.get(0)?.function?.arguments;
+  expect(retainedArguments).toBe('{"q":"');
+
+  expect((await iterator.next()).value).toBe(events[1]);
+  expect(states().get(0)?.toolCalls.get(0)?.function?.arguments).toBe(retainedArguments);
+  expect(await iterator.next()).toEqual({ done: true, value: undefined });
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          id: "call_bounded",
+          type: "function",
+          function: { name: "lookup", arguments: '{"q":"' },
+        },
+      ],
+    },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["tool_calls"]);
+});
+
+test("chat streams reconstruct legacy function calls and custom tools", async () => {
+  const spans = setupSpans();
+
+  const events = [
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            function_call: { name: "legacy_lookup", arguments: '{"city":' },
+            tool_calls: [
+              {
+                index: 0,
+                id: "custom_1",
+                type: "custom",
+                custom: { name: "code_exec", input: "print(" },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            function_call: { arguments: '"Paris"}' },
+            tool_calls: [{ index: 0, custom: { input: "42)" } }],
+          },
+          finish_reason: "stop",
+        },
+      ],
+    },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: null,
+      function_call: { name: "legacy_lookup", arguments: '{"city":"Paris"}' },
+      tool_calls: [
+        {
+          id: "custom_1",
+          type: "custom",
+          custom: { name: "code_exec", input: "print(42)" },
+        },
+      ],
+    },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test("chat streams retain the sanitized tool-call value they measured", async () => {
+  const spans = setupSpans();
+  let argumentReads = 0;
+
+  const event = {
+    choices: [
+      {
+        index: 0,
+        delta: {
+          tool_calls: [
+            {
+              index: 0,
+              id: 1n as never,
+              type: "function",
+              function: {
+                name: "lookup",
+                get arguments() {
+                  argumentReads += 1;
+
+                  return argumentReads <= 3 ? '{"q":"ok"}' : "x".repeat(70_000);
+                },
+              },
+            },
+          ],
+        },
+      },
+    ],
+  };
+
+  const source = new Stream(async function* () {
+    yield event;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  const visible = await collectStream(stream);
+
+  expect(visible).toHaveLength(1);
+  expect(visible[0]).toBe(event);
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          type: "function",
+          function: { name: "lookup", arguments: '{"q":"ok"}' },
+        },
+      ],
+    },
+  ]);
+  expect(argumentReads).toBe(1);
+});
+
+test("chat stream field getter failures fail open and mark capture truncated", async () => {
+  const errors: Error[] = [];
+  const spans = setupSpans(undefined, { onError: (error) => errors.push(error) });
+
+  const toolCall = {
+    index: 0,
+    function: {
+      get arguments() {
+        throw new Error("cannot read arguments");
+      },
+    },
+  };
+
+  const event = {
+    choices: [{ index: 0, delta: { tool_calls: [toolCall] } }],
+  };
+
+  const source = new Stream(async function* () {
+    yield event;
+    yield event;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual([event, event]);
+  expect(errors).toHaveLength(1);
+  expect(errors[0]?.message).toBe("cannot read arguments");
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("chat stream top-level field failures fail open", async () => {
+  const spans = setupSpans();
+
+  const event = {
+    get choices() {
+      throw new Error("cannot read choices");
+    },
+  };
+
+  const source = new Stream(async function* () {
+    yield event;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual([event]);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("chat stream synthetic-usage classification failures fail open", async () => {
+  const spans = setupSpans();
+  let usageReads = 0;
+
+  const event = {
+    choices: [],
+    get usage() {
+      usageReads += 1;
+
+      if (usageReads === 1) return { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 };
+      throw new Error("cannot classify usage chunk");
+    },
+  };
+
+  const source = new Stream(async function* () {
+    yield event;
+  }, new AbortController());
+
+  const client = wrapOpenAI(
+    {
+      chat: { completions: { create: async (_params: unknown) => source } },
+      responses: { create() {} },
+      embeddings: { create() {} },
+    },
+    { injectStreamUsage: true },
+  );
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual([event]);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("chat streams do not promote __proto__ data into tool-call fields", async () => {
+  const spans = setupSpans();
+
+  const inheritedToolCall = Object.create({
+    index: 7,
+    id: "inherited",
+    type: "function",
+    function: { name: "polluted", arguments: "{}" },
+  });
+
+  const event = {
+    choices: [
+      JSON.parse(
+        '{"index":0,"delta":{"tool_calls":[{"__proto__":{"index":7,"id":"injected","type":"function","function":{"name":"polluted","arguments":"{}"}}}]}}',
+      ),
+      { index: 0, delta: { tool_calls: [inheritedToolCall] } },
+    ],
+  };
+
+  const source = new Stream(async function* () {
+    yield event;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual([event]);
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([{ role: "assistant" }]);
+  expect(String(span.attributes["gen_ai.output.messages"])).not.toContain("injected");
+  expect(String(span.attributes["gen_ai.output.messages"])).not.toContain("inherited");
+  expect(String(span.attributes["gen_ai.output.messages"])).not.toContain("polluted");
+});
+
+test("chat streams apply one budget across individually fitting content and refusal deltas", async () => {
+  const spans = setupSpans();
+
+  const events = [
+    ...Array.from({ length: 80 }, () => ({
+      choices: [
+        {
+          index: 0,
+          delta: { content: "c".repeat(400), refusal: "r".repeat(400) },
+        },
+      ],
+    })),
+    {
+      choices: [],
+      usage: { prompt_tokens: 8, completion_tokens: 80, total_tokens: 88 },
+    },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+    stream_options: { include_usage: true },
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  const serializedOutput = String(span.attributes["gen_ai.output.messages"]);
+
+  const output = jsonAttr<Array<{ content: string; refusal: string }>>(
+    span,
+    "gen_ai.output.messages",
+  );
+
+  expect(output[0]!.content.length + output[0]!.refusal.length).toBeLessThanOrEqual(48 * 1024);
+  expect(serializedOutput.length).toBeLessThanOrEqual(48 * 1024);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(span.attributes["gen_ai.usage.total_tokens"]).toBe(88);
+});
+
+test("chat streams replace the default role within an exact byte budget", async () => {
+  const spans = setupSpans();
+  const emptyOutput = JSON.stringify([{ role: "developer", content: "" }]);
+  const retainedContent = "x".repeat(48 * 1024 - emptyOutput.length);
+
+  const event = {
+    choices: [
+      {
+        index: 0,
+        delta: { role: "developer", content: retainedContent },
+        finish_reason: "stop",
+      },
+    ],
+  };
+
+  const source = new Stream(async function* () {
+    yield event;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual([event]);
+  const span = await exportedSpan(spans);
+  expect(String(span.attributes["gen_ai.output.messages"])).toHaveLength(48 * 1024);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "developer", content: retainedContent },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test("chat streams refund the role separator before an exact-budget recovery", async () => {
+  const expectedOutput = [{ role: "developer", content: "x" }];
+
+  const spans = setupSpans(undefined, {
+    maxAttributeLength: JSON.stringify(expectedOutput).length,
+  });
+
+  const events = [
+    { choices: [{ index: 0, delta: { content: "x" } }] },
+    { choices: [{ index: 0, delta: { role: "y".repeat(256) } }] },
+    { choices: [{ index: 0, delta: { role: "developer" }, finish_reason: "stop" }] },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual(expectedOutput);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test("chat streams recover a sole rejected role in a later choice", async () => {
+  const expectedOutput = [{ role: "assistant", content: "x".repeat(100) }, { role: "developer" }];
+
+  const spans = setupSpans(undefined, {
+    maxAttributeLength: JSON.stringify(expectedOutput).length,
+  });
+
+  const events = [
+    {
+      choices: [
+        { index: 0, delta: { content: "x".repeat(100) }, finish_reason: "stop" },
+        { index: 1, delta: { role: "y".repeat(256) } },
+      ],
+    },
+    { choices: [{ index: 1, delta: { role: "developer" }, finish_reason: "stop" }] },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual(expectedOutput);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test("chat streams recover rejected role and tool-call scalar replacements", async () => {
+  const spans = setupSpans(undefined, { maxAttributeLength: 160 });
+
+  const events = [
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            role: "x".repeat(256),
+            tool_calls: [{ index: 0, id: "y".repeat(256) }],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          index: 0,
+          delta: { role: "developer", tool_calls: [{ index: 0, id: "call_1" }] },
+          finish_reason: "stop",
+        },
+      ],
+    },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "developer", content: null, tool_calls: [{ id: "call_1" }] },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test("chat streams replace retained scalars after additive capture truncates", async () => {
+  const spans = setupSpans();
+
+  const events = [
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "old" }] } }] },
+    { choices: [{ index: 0, delta: { content: "x".repeat(49_200) } }] },
+    {
+      choices: [
+        {
+          index: 0,
+          delta: { tool_calls: [{ index: 0, id: "new" }] },
+          finish_reason: "tool_calls",
+        },
+      ],
+    },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: null, tool_calls: [{ id: "new" }] },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("chat streams refund rejected scalar fields before later capture", async () => {
+  const spans = setupSpans(undefined, { maxAttributeLength: 170 });
+
+  const events = [
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: "old",
+                type: "function",
+                function: { name: "old_name" },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: "x".repeat(256),
+                type: "y".repeat(256),
+                function: { name: "z".repeat(256) },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: "new",
+                type: "function",
+                function: { name: "new_name", arguments: "{}" },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          id: "new",
+          type: "function",
+          function: { name: "new_name", arguments: "{}" },
+        },
+      ],
+    },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test("chat streams reserve a rejected function shell only once", async () => {
+  const expectedOutput = [
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ function: { name: "lookup", arguments: "{}" } }],
+    },
+  ];
+
+  const spans = setupSpans(undefined, {
+    maxAttributeLength: JSON.stringify(expectedOutput).length + 3,
+  });
+
+  const events = [
+    {
+      choices: [
+        {
+          index: 0,
+          delta: { tool_calls: [{ index: 0, function: { name: "x".repeat(256) } }] },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [{ index: 0, function: { name: "lookup", arguments: "{}" } }],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual(expectedOutput);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test("chat streams replace null content after a tool call within an exact byte budget", async () => {
+  const spans = setupSpans();
+
+  const emptyOutput = JSON.stringify([
+    { role: "assistant", content: "", tool_calls: [{ id: "call" }] },
+  ]);
+
+  const retainedContent = "x".repeat(48 * 1024 - emptyOutput.length - 1);
+
+  const events = [
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call" }] } }] },
+    { choices: [{ index: 0, delta: { content: retainedContent }, finish_reason: "stop" }] },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(String(span.attributes["gen_ai.output.messages"])).toHaveLength(48 * 1024 - 1);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: retainedContent, tool_calls: [{ id: "call" }] },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test("chat streams leave the configured attribute limit to the core", async () => {
+  const spans = setupSpans(undefined, { maxAttributeLength: 128 });
+
+  const event = {
+    choices: [{ index: 0, delta: { content: "x".repeat(1_000) }, finish_reason: "stop" }],
+  };
+
+  const source = new Stream(async function* () {
+    yield event;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual([event]);
+  const span = await exportedSpan(spans);
+  const output = String(span.attributes["gen_ai.output.messages"]);
+  expect(output).toHaveLength(128);
+  expect(output.endsWith("...[truncated]")).toBe(true);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test.each([
+  [1_000, false, "東".repeat(400)],
+  [1_000, true, "[redacted]"],
+  [0, false, undefined],
+] as const)(
+  "chat stream cap applies after the mask, not to stream retention (cap %s, redact %s)",
+  async (maxAttributeLength, redact, expected) => {
+    const spans = setupSpans(undefined, {
+      maxAttributeLength,
+      mask: (value) => (redact ? [{ role: "assistant", content: "[redacted]" }] : value),
+    });
+
+    const content = redact ? "x".repeat(5_000) : "東".repeat(400);
+    const event = { choices: [{ index: 0, delta: { content }, finish_reason: "stop" }] };
+
+    const source = new Stream(async function* () {
+      yield event;
+    }, new AbortController());
+
+    const client = wrapOpenAI({
+      chat: { completions: { create: async (_params: unknown) => source } },
+      responses: { create() {} },
+      embeddings: { create() {} },
+    });
+
+    const stream = await client.chat.completions.create({
+      model: "gpt-4o",
+      messages: [],
+      stream: true,
+    });
+
+    expect(await collectStream(stream)).toEqual([event]);
+    const span = await exportedSpan(spans);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+
+    if (expected === undefined) expect(span.attributes["gen_ai.output.messages"] ?? "").toBe("");
+    else
+      expect(jsonAttr<Array<{ content: string }>>(span, "gen_ai.output.messages")[0]?.content).toBe(
+        expected,
+      );
+  },
+);
+
+test.each([0, 64])(
+  "chat stream finish reasons do not depend on a %s-character content limit",
+  async (maxAttributeLength) => {
+    const spans = setupSpans(undefined, { maxAttributeLength });
+    const event = { choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: "stop" }] };
+
+    const source = new Stream(async function* () {
+      yield event;
+    }, new AbortController());
+
+    const client = wrapOpenAI({
+      chat: { completions: { create: async (_params: unknown) => source } },
+      responses: { create() {} },
+      embeddings: { create() {} },
+    });
+
+    const stream = await client.chat.completions.create({
+      model: "gpt-4o",
+      messages: [],
+      stream: true,
+    });
+
+    expect(await collectStream(stream)).toEqual([event]);
+    const span = await exportedSpan(spans);
+    expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
+
+    if (maxAttributeLength === 0) {
+      expect(span.attributes["gen_ai.output.messages"] ?? "").toBe("");
+    } else {
+      expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+        { role: "assistant", content: "Hi" },
+      ]);
+      expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+    }
+  },
+);
+
+test("chat streams reclaim a replaced tool-call scalar at the byte limit", async () => {
+  const spans = setupSpans();
+
+  const emptyOutput = JSON.stringify([
+    { role: "assistant", content: null, tool_calls: [{ id: "" }] },
+  ]);
+
+  const initialId = "x".repeat(48 * 1024 - emptyOutput.length - 1);
+  const replacementId = "call_replaced";
+  const reclaimedContent = "y".repeat(initialId.length - replacementId.length + 2);
+
+  const events = [
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: initialId }] } }] },
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: replacementId }] } }] },
+    { choices: [{ index: 0, delta: { content: reclaimedContent }, finish_reason: "stop" }] },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: reclaimedContent,
+      tool_calls: [{ id: replacementId }],
+    },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test("chat streams include the assembled output wrapper in the byte budget", async () => {
+  const spans = setupSpans();
+  const emptyOutput = JSON.stringify([{ role: "assistant", content: "" }]);
+  const retainedContent = "x".repeat(48 * 1024 - emptyOutput.length);
+
+  const events = [
+    { choices: [{ index: 0, delta: { content: retainedContent } }] },
+    { choices: [{ index: 0, delta: { content: "y" } }] },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  const serializedOutput = String(span.attributes["gen_ai.output.messages"]);
+  expect(serializedOutput).toHaveLength(48 * 1024);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: retainedContent },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("chat streams account for separators while extending later choices", async () => {
+  const spans = setupSpans();
+  const emptyOutput = JSON.stringify([{ role: "assistant" }, { role: "assistant", content: "" }]);
+  const retainedContent = "x".repeat(48 * 1024 - emptyOutput.length);
+
+  const events = [
+    {
+      choices: [
+        { index: 0, delta: {} },
+        { index: 1, delta: { content: retainedContent } },
+      ],
+    },
+    { choices: [{ index: 1, delta: { content: "y" } }] },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  const serializedOutput = String(span.attributes["gen_ai.output.messages"]);
+  expect(serializedOutput).toHaveLength(48 * 1024);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant" },
+    { role: "assistant", content: retainedContent },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("chat streams incrementally account for many tiny deltas", async () => {
+  const spans = setupSpans();
+  const states = observeChatChoiceStates();
+  const chunkCount = 60_000;
+  const emptyOutput = JSON.stringify([{ role: "assistant", content: "" }]);
+  const retainedContent = "x".repeat(48 * 1024 - emptyOutput.length);
+
+  const source = new Stream(async function* () {
+    for (let index = 0; index < chunkCount; index += 1) {
+      yield { choices: [{ index: 0, delta: { content: "x" } }] };
+    }
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  let visibleChunks = 0;
+  let peakRetainedLength = 0;
+
+  for await (const _chunk of stream) {
+    visibleChunks += 1;
+    const retainedLength = states().get(0)?.content.length ?? 0;
+    peakRetainedLength = Math.max(peakRetainedLength, retainedLength);
+  }
+
+  expect(visibleChunks).toBe(chunkCount);
+  expect(peakRetainedLength).toBe(retainedContent.length);
+  const span = await exportedSpan(spans);
+  const serializedOutput = String(span.attributes["gen_ai.output.messages"]);
+  expect(serializedOutput).toBe(JSON.stringify([{ role: "assistant", content: retainedContent }]));
+  expect(serializedOutput).toHaveLength(48 * 1024);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("chat streams omit a bounded prefix when a mask cannot inspect the complete output", async () => {
+  const spans = setupSpans(undefined, {
+    mask: (value) => (JSON.stringify(value).includes("SECRET") ? "[REDACTED]" : value),
+  });
+
+  const events = [
+    { choices: [{ index: 0, delta: { content: "x".repeat(49_200) } }] },
+    { choices: [{ index: 0, delta: { content: "SECRET" }, finish_reason: "stop" }] },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("chat streams omit masked output without a terminal finish reason", async () => {
+  const spans = setupSpans(undefined, { mask: (value) => value });
+  const event = { choices: [{ index: 0, delta: { content: "partial" } }] };
+
+  const source = new Stream(async function* () {
+    yield event;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual([event]);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("chat streams mark clean EOF without a finish reason incomplete when output capture is disabled", async () => {
+  const spans = setupSpans(undefined, { captureOutput: false });
+  const event = { choices: [{ index: 0, delta: { content: "partial" } }] };
+
+  const source = new Stream(async function* () {
+    yield event;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual([event]);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("chat streams bound finish reasons independently of output capture", async () => {
+  const spans = setupSpans(undefined, { captureOutput: false });
+
+  const event = {
+    choices: Array.from({ length: 250 }, (_, index) => ({
+      index,
+      delta: {},
+      finish_reason: `reason-${index}-${'"🙂'.repeat(128)}`,
+    })),
+  };
+
+  const source = new Stream(async function* () {
+    yield event;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  const visible = await collectStream(stream);
+
+  expect(visible).toHaveLength(1);
+  expect(visible[0]).toBe(event);
+  const span = await exportedSpan(spans);
+  const finishReasons = span.attributes["gen_ai.response.finish_reasons"];
+  expect(Array.isArray(finishReasons)).toBe(true);
+  expect((finishReasons as unknown[]).length).toBeGreaterThan(0);
+  expect((finishReasons as string[]).length).toBeLessThanOrEqual(333);
+  expect(Buffer.byteLength(JSON.stringify(finishReasons), "utf8")).toBeLessThanOrEqual(48 * 1024);
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("finish-reason truncation does not suppress captured output", async () => {
+  const spans = setupSpans();
+
+  const event = {
+    choices: [
+      {
+        index: 0,
+        delta: { content: "kept" },
+        finish_reason: "x".repeat(70_000),
+      },
+    ],
+  };
+
+  const source = new Stream(async function* () {
+    yield event;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual([event]);
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: "kept" },
+  ]);
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("chat streams replace a retained finish reason within the shared limit", async () => {
+  const spans = setupSpans(undefined, { captureOutput: false });
+
+  const events = [
+    {
+      choices: [{ index: 0, delta: {}, finish_reason: "x".repeat(49_100) }],
+    },
+    {
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test("chat streams invalidate a retained finish reason when its replacement is rejected", async () => {
+  const spans = setupSpans(undefined, { captureOutput: false });
+
+  const events = [
+    { choices: [{ index: 0, delta: {}, finish_reason: "x".repeat(60) }] },
+    { choices: [{ index: 0, delta: {}, finish_reason: "x".repeat(49_200) }] },
+    { choices: [{ index: 1, delta: {}, finish_reason: "stop" }] },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("chat streams reclaim finish-reason items when replacing a choice", async () => {
+  const spans = setupSpans(undefined, { captureOutput: false });
+
+  const events = [
+    {
+      choices: Array.from({ length: 333 }, (_, index) => ({
+        index,
+        delta: {},
+        finish_reason: `reason-${index}`,
+      })),
+    },
+    { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  const finishReasons = span.attributes["gen_ai.response.finish_reasons"] as string[];
+  expect(finishReasons).toHaveLength(333);
+  expect(finishReasons[0]).toBe("stop");
+  expect(finishReasons.at(-1)).toBe("reason-332");
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test("chat streams bound retained choice states", async () => {
+  const spans = setupSpans();
+  const states = observeChatChoiceStates();
+
+  const event = {
+    choices: Array.from({ length: 500 }, (_, index) => ({
+      index,
+      delta: {},
+    })),
+  };
+
+  const source = new Stream(async function* () {
+    yield event;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  const iterator = stream[Symbol.asyncIterator]();
+  expect((await iterator.next()).value).toBe(event);
+  expect(states().size).toBe(499);
+  expect(await iterator.next()).toEqual({ done: true, value: undefined });
+  const span = await exportedSpan(spans);
+  const output = jsonAttr<unknown[]>(span, "gen_ai.output.messages");
+  expect(output).toHaveLength(499);
+  expect(String(span.attributes["gen_ai.output.messages"]).length).toBeLessThanOrEqual(48 * 1024);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("chat streams cap per-chunk choice and tool-call inspection", async () => {
+  const errors: unknown[] = [];
+  const spans = setupSpans(undefined, { onError: (error) => errors.push(error) });
+  let choiceReads = 0;
+  let toolCallReads = 0;
+
+  const boundedArray = <T>(items: T[]) =>
+    new Proxy(items, {
+      get(target, property) {
+        if (typeof property === "string" && /^\d+$/.test(property) && Number(property) >= 1_000)
+          throw new Error("inspected beyond the per-chunk limit");
+
+        return target[property as keyof T[]];
+      },
+    });
+
+  const choiceEvent = {
+    choices: boundedArray(
+      Array.from({ length: 5_000 }, (_, index) => ({
+        index,
+        get delta() {
+          choiceReads += 1;
+
+          return index === 1_000 ? { content: "beyond-limit" } : {};
+        },
+      })),
+    ),
+  };
+
+  const toolEvent = {
+    choices: [
+      {
+        index: 0,
+        delta: {
+          tool_calls: boundedArray(
+            Array.from({ length: 5_000 }, (_, index) => ({
+              index,
+              function: index === 1_000 ? { arguments: "beyond-limit" } : undefined,
+              get id() {
+                toolCallReads += 1;
+
+                return `call-${index}`;
+              },
+            })),
+          ),
+        },
+      },
+    ],
+  };
+
+  const source = new Stream(async function* () {
+    yield choiceEvent;
+    yield toolEvent;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  const delivered = await collectStream(stream);
+  expect(delivered[0]).toBe(choiceEvent);
+  expect(delivered[1]).toBe(toolEvent);
+  expect(errors).toEqual([]);
+  expect(choiceReads).toBe(1_000);
+  expect(toolCallReads).toBe(1_000);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(span).toMatchObject({
+    [Symbol.for("telemetry.dev.outputChunkHistogram")]: { count: 1 },
+  });
+});
+
+test("chat streams skip retained output work when capture is disabled", async () => {
+  const spans = setupSpans(undefined, { captureOutput: false });
+  let roleReads = 0;
+
+  const events = [
+    {
+      choices: Array.from({ length: 1_500 }, (_, index) => ({
+        index,
+        delta: {
+          get role() {
+            roleReads += 1;
+
+            return "assistant";
+          },
+          content: "x",
+        },
+      })),
+    },
+    {
+      choices: [],
+      usage: { prompt_tokens: 6, completion_tokens: 1, total_tokens: 7 },
+    },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+    stream_options: { include_usage: true },
+  });
+
+  const visible = await collectStream(stream);
+  expect(visible).toHaveLength(2);
+  expect(visible[0]).toBe(events[0]);
+  expect(visible[1]).toBe(events[1]);
+  expect(roleReads).toBe(0);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(span.attributes["gen_ai.usage.total_tokens"]).toBe(7);
+});
+
 test("chat stream helper routes through wrapped create and ends span", async () => {
   const spans = setupSpans();
 
@@ -1007,6 +2744,130 @@ test("chat streams inject include_usage when opted in and hide only the syntheti
   ).toBe("number");
 });
 
+test.each([true, false])(
+  "nonterminal chat stream close marks capture incomplete with output capture=%s",
+  async (captureOutput) => {
+    const spans = setupSpans(undefined, { captureOutput });
+
+    const event = {
+      choices: [{ index: 0, delta: { role: "assistant", content: "partial" } }],
+    };
+
+    const source = new Stream(async function* () {
+      yield event;
+      yield { choices: [{ index: 0, delta: { content: "unread" }, finish_reason: "stop" }] };
+    }, new AbortController());
+
+    const client = wrapOpenAI({
+      chat: { completions: { create: async (_params: unknown) => source } },
+      responses: { create() {} },
+      embeddings: { create() {} },
+    });
+
+    const stream = await client.chat.completions.create({
+      model: "gpt-4o",
+      messages: [],
+      stream: true,
+    });
+
+    for await (const chunk of stream) {
+      expect(chunk).toBe(event);
+      break;
+    }
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["gen_ai.response.finish_reasons"]).toBeUndefined();
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+
+    if (captureOutput)
+      expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+        { role: "assistant", content: "partial" },
+      ]);
+    else expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  },
+);
+
+test("nonterminal chat stream errors omit finish reasons and mark capture incomplete", async () => {
+  const spans = setupSpans();
+  const failure = new Error("stream failed before terminal chunk");
+
+  const event = {
+    choices: [{ index: 0, delta: { role: "assistant", content: "partial" } }],
+  };
+
+  const source = new Stream(async function* () {
+    yield event;
+    throw failure;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => source } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [],
+    stream: true,
+  });
+
+  await expect(collectStream(stream)).rejects.toBe(failure);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: "partial" },
+  ]);
+});
+
+test.each([false, true])(
+  "a post-finish content filter chunk keeps a complete chat stream complete (masked: %s)",
+  async (masked) => {
+    const spans = setupSpans(undefined, masked ? { mask: (value) => value } : {});
+
+    const events = [
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Hi" }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      {
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: null,
+            content_filter_offsets: { check_offset: 0, start_offset: 0, end_offset: 2 },
+            content_filter_results: { hate: { filtered: false, severity: "safe" } },
+          },
+        ],
+      },
+    ];
+
+    const source = new Stream(async function* () {
+      yield* events;
+    }, new AbortController());
+
+    const client = wrapOpenAI({
+      chat: { completions: { create: async (_params: unknown) => source } },
+      responses: { create() {} },
+      embeddings: { create() {} },
+    });
+
+    const stream = await client.chat.completions.create({
+      model: "gpt-4o",
+      messages: [],
+      stream: true,
+    });
+
+    expect(await collectStream(stream)).toEqual(events);
+    const span = await exportedSpan(spans);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+    expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
+    expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+      { role: "assistant", content: "Hi" },
+    ]);
+  },
+);
+
 test("chat streams end once with partial output when the caller stops early", async () => {
   const spans = setupSpans();
 
@@ -1016,7 +2877,7 @@ test("chat streams end once with partial output when the caller stops early", as
       object: "chat.completion.chunk",
       created: 1,
       model: "gpt-4o-2024-11-20",
-      choices: [{ index: 0, delta: { role: "assistant", content: "Hel" }, finish_reason: null }],
+      choices: [{ index: 0, delta: { role: "assistant", content: "Hel" }, finish_reason: "stop" }],
     },
     {
       id: "chatcmpl_abandoned",
@@ -1058,8 +2919,9 @@ test("chat streams end once with partial output when the caller stops early", as
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([{ role: "assistant", content: "Hel" }]);
   expect(span.attributes["gen_ai.response.id"]).toBe("chatcmpl_abandoned");
   expect(span.attributes["gen_ai.response.model"]).toBe("gpt-4o-2024-11-20");
-  expect(span.attributes["gen_ai.response.finish_reasons"]).toBeUndefined();
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
   expect(span.attributes["gen_ai.usage.total_tokens"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
   expect(
     Number(span.attributes["gen_ai.response.time_to_first_chunk"]) ===
       span.attributes["gen_ai.response.time_to_first_chunk"]
@@ -1077,7 +2939,7 @@ test("chat streams record one error span with partial output when the SSE body e
     object: "chat.completion.chunk",
     created: 1,
     model: "gpt-4o-2024-11-20",
-    choices: [{ index: 0, delta: { role: "assistant", content: "Hel" }, finish_reason: null }],
+    choices: [{ index: 0, delta: { role: "assistant", content: "Hel" }, finish_reason: "stop" }],
   };
 
   const fake = createFakeFetch(erroringSseResponse(firstChunk, streamError));
@@ -1101,6 +2963,8 @@ test("chat streams record one error span with partial output when the SSE body e
   const span = await exportedSpan(spans);
   expect(span.status.code).toBe(SPAN_STATUS_ERROR);
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([{ role: "assistant", content: "Hel" }]);
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
   expect(span.attributes["error.type"]).toBe("Error");
   const exception = span.events.find((event) => event.name === "exception");
   expect(exception?.attributes?.["exception.message"]).toBe("stream exploded");
@@ -1523,6 +3387,274 @@ test("responses streams retain the last fitting output when the terminal snapsho
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual(retainedOutput);
   expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
   expect(span.attributes["gen_ai.usage.total_tokens"]).toBe(28);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("responses streams omit stale output when a masked terminal snapshot truncates", async () => {
+  const spans = setupSpans(undefined, {
+    mask: (value) => (JSON.stringify(value).includes("SECRET") ? "[REDACTED]" : value),
+  });
+
+  const retained = {
+    id: "resp_masked_terminal",
+    status: "in_progress",
+    output: [
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "public" }] },
+    ],
+  };
+
+  const terminal = {
+    id: "resp_masked_terminal",
+    status: "completed",
+    output: [
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: `SECRET${"x".repeat(70_000)}` }],
+      },
+    ],
+  };
+
+  const source = new Stream(async function* () {
+    yield { type: "response.in_progress", response: retained };
+    yield { type: "response.completed", response: terminal };
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create: async (_params: unknown) => source },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.responses.create({ model: "gpt-4.1", input: "Finish", stream: true });
+  expect(await collectStream(stream)).toHaveLength(2);
+
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("responses streams leave the configured attribute limit to the core", async () => {
+  const spans = setupSpans(undefined, { maxAttributeLength: 128 });
+
+  const terminal = {
+    id: "resp_small_limit",
+    status: "completed",
+    output: [
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "x".repeat(1_000) }],
+      },
+    ],
+  };
+
+  const source = new Stream(async function* () {
+    yield { type: "response.completed", response: terminal };
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create: async (_params: unknown) => source },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.responses.create({ model: "gpt-4.1", input: "Finish", stream: true });
+  expect(await collectStream(stream)).toHaveLength(1);
+
+  const span = await exportedSpan(spans);
+  const output = String(span.attributes["gen_ai.output.messages"]);
+  expect(output).toHaveLength(128);
+  expect(output.endsWith("...[truncated]")).toBe(true);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
+test.each(["eof", "early-return", "error-event", "throw"] as const)(
+  "responses streams omit masked partial output after %s",
+  async (mode) => {
+    const spans = setupSpans(undefined, { mask: (value) => value });
+
+    const retained = {
+      type: "response.in_progress",
+      response: {
+        id: "resp_incomplete",
+        status: "in_progress",
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "partial" }],
+          },
+        ],
+      },
+    };
+
+    const streamError = new Error("responses stream interrupted");
+
+    const source = new Stream(async function* () {
+      yield retained;
+
+      if (mode === "error-event") {
+        yield { type: "error", code: "stream_error", message: "interrupted" };
+      } else if (mode === "throw") {
+        throw streamError;
+      } else if (mode === "early-return") {
+        yield {
+          type: "response.completed",
+          response: { ...retained.response, status: "completed" },
+        };
+      }
+    }, new AbortController());
+
+    const client = wrapOpenAI({
+      chat: { completions: { create() {} } },
+      responses: { create: async (_params: unknown) => source },
+      embeddings: { create() {} },
+    });
+
+    const stream = await client.responses.create({
+      model: "gpt-4.1",
+      input: "Finish",
+      stream: true,
+    });
+
+    if (mode === "early-return") {
+      const iterator = stream[Symbol.asyncIterator]();
+      expect((await iterator.next()).value).toBe(retained);
+      await iterator.return?.();
+    } else if (mode === "throw") {
+      await expect(collectStream(stream)).rejects.toBe(streamError);
+    } else {
+      await collectStream(stream);
+    }
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  },
+);
+
+test("responses streams preserve provider events when response mapping fails", async () => {
+  const errors: unknown[] = [];
+  const spans = setupSpans(undefined, { onError: (error) => errors.push(error) });
+  const mappingError = new Error("response mapping failed");
+
+  const retained = {
+    type: "response.in_progress",
+    response: {
+      id: "resp_mapping_failure",
+      status: "in_progress",
+      output: [
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "public" }] },
+      ],
+    },
+  };
+
+  const failed = {
+    type: "response.completed",
+    response: {
+      id: "resp_mapping_failure",
+      status: "completed",
+      get output() {
+        throw mappingError;
+      },
+    },
+  };
+
+  const source = new Stream(async function* () {
+    yield retained;
+    yield failed;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create: async (_params: unknown) => source },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.responses.create({ model: "gpt-4.1", input: "Finish", stream: true });
+  const delivered = await collectStream(stream);
+
+  expect(delivered[0]).toBe(retained);
+  expect(delivered[1]).toBe(failed);
+  expect(errors).toEqual([mappingError]);
+  const span = await exportedSpan(spans);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual(retained.response.output);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test.each([false, true])(
+  "a complete responses stream is not flagged incomplete (masked: %s)",
+  async (masked) => {
+    const spans = setupSpans(undefined, masked ? { mask: (value) => value } : {});
+
+    const output = [
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] },
+    ];
+
+    const events = [
+      {
+        type: "response.created",
+        response: { id: "resp_done", status: "in_progress", output: [] },
+      },
+      { type: "response.output_text.delta", delta: "done" },
+      { type: "response.completed", response: { id: "resp_done", status: "completed", output } },
+    ];
+
+    const source = new Stream(async function* () {
+      yield* events;
+    }, new AbortController());
+
+    const client = wrapOpenAI({
+      chat: { completions: { create() {} } },
+      responses: { create: async (_params: unknown) => source },
+      embeddings: { create() {} },
+    });
+
+    const stream = await client.responses.create({ model: "gpt-4.1", input: "x", stream: true });
+
+    expect(await collectStream(stream)).toEqual(events);
+    const span = await exportedSpan(spans);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+    expect(jsonAttr(span, "gen_ai.output.messages")).toEqual(output);
+  },
+);
+
+test("responses streams keep the provider failure when mapping a failed event throws", async () => {
+  const errors: unknown[] = [];
+  const spans = setupSpans(undefined, { onError: (error) => errors.push(error) });
+  const mappingError = new Error("response mapping failed");
+
+  const failed = {
+    type: "response.failed",
+    response: {
+      id: "resp_failed_mapping",
+      status: "failed",
+      error: { code: "server_error", message: "boom" },
+      get output() {
+        throw mappingError;
+      },
+    },
+  };
+
+  const source = new Stream(async function* () {
+    yield failed;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create: async (_params: unknown) => source },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.responses.create({ model: "gpt-4.1", input: "Fail", stream: true });
+
+  expect(await collectStream(stream)).toEqual([failed]);
+  expect(errors).toEqual([mappingError]);
+  const span = await exportedSpan(spans);
+  expect(span.status.code).toBe(SPAN_STATUS_ERROR);
+  const exception = span.events.find((event) => event.name === "exception");
+  expect(exception?.attributes?.["exception.message"]).toBe("response.failed: server_error: boom");
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
@@ -2505,6 +4637,41 @@ test("images generate maps modality usage without capturing image bytes", async 
   expect(String(span.attributes["gen_ai.output.messages"])).not.toContain("secret-image-bytes");
 });
 
+test.each([true, false])(
+  "image streams are flagged only without a terminal event (completed: %s)",
+  async (completed) => {
+    const spans = setupSpans();
+
+    const events = [
+      { type: "image_generation.partial_image", b64_json: "QQ==", partial_image_index: 0 },
+      ...(completed
+        ? [{ type: "image_generation.completed", b64_json: "QQ==", usage: { output_tokens: 9 } }]
+        : []),
+    ];
+
+    const source = new Stream(async function* () {
+      yield* events;
+    }, new AbortController());
+
+    const client = wrapOpenAI({
+      chat: { completions: { create() {} } },
+      responses: { create() {} },
+      embeddings: { create() {} },
+      images: { generate: async (_params: unknown) => source },
+    });
+
+    const stream = await client.images!.generate({
+      model: "gpt-image-1",
+      prompt: "otter",
+      stream: true,
+    });
+
+    expect(await collectStream(stream as Stream<unknown>)).toEqual(events);
+    const span = await exportedSpan(spans);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(completed ? undefined : true);
+  },
+);
+
 test("endpoint modality fills aggregate image and transcription output usage", async () => {
   const spans = setupSpans();
 
@@ -2575,6 +4742,102 @@ test("streaming transcription bounds captured output while yielding every event"
   expect(span.attributes["gen_ai.usage.text.output_tokens"]).toBe(5);
 });
 
+test("streaming transcription retains no more than the transcript ceiling", async () => {
+  const spans = setupSpans();
+  const events = [{ type: "transcript.text.delta", delta: "x".repeat(70_000) }];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+    audio: { transcriptions: { create: async (_params: unknown) => source } },
+  });
+
+  const stream = await client.audio!.transcriptions!.create({
+    model: "gpt-4o-transcribe",
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBe("x".repeat(65_534));
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("streaming transcription omits a bounded prefix that a mask cannot evaluate safely", async () => {
+  const spans = setupSpans(undefined, {
+    mask: (value) => (String(value).includes("SECRET") ? "[REDACTED]" : value),
+  });
+
+  const text = `${"x".repeat(70_000)}SECRET`;
+
+  const events = [
+    { type: "transcript.text.delta", delta: text },
+    { type: "transcript.text.done", text },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+    audio: { transcriptions: { create: async (_params: unknown) => source } },
+  });
+
+  const stream = await client.audio!.transcriptions!.create({
+    model: "gpt-4o-transcribe",
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("streaming media reports mapping failures once without changing provider delivery", async () => {
+  const errors: Error[] = [];
+  const spans = setupSpans(undefined, { onError: (error) => errors.push(error) });
+  const mappingError = new Error("media mapping failed");
+
+  const broken = {
+    get type(): never {
+      throw mappingError;
+    },
+  };
+
+  const source = new Stream(async function* () {
+    yield broken;
+    yield broken;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+    audio: { transcriptions: { create: async (_params: unknown) => source } },
+  });
+
+  const stream = await client.audio!.transcriptions!.create({
+    model: "gpt-4o-transcribe",
+    stream: true,
+  });
+
+  const delivered = await collectStream(stream);
+  expect(delivered).toHaveLength(2);
+  expect(delivered[0]).toBe(broken);
+  expect(delivered[1]).toBe(broken);
+  expect(errors).toEqual([mappingError]);
+  expect((await exportedSpan(spans)).attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
 test("streaming transcription bounds escaped Unicode at a code point boundary", async () => {
   const spans = setupSpans();
   const prefix = "😀\n\ud800";
@@ -2603,6 +4866,77 @@ test("streaming transcription bounds escaped Unicode at a code point boundary", 
   expect(output.startsWith(prefix)).toBe(true);
   expect(JSON.stringify(output).length).toBeLessThanOrEqual(65_536);
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test.each([
+  [false, false],
+  [false, true],
+  [true, false],
+  [true, true],
+] as const)(
+  "a complete transcript above the chat stream budget is kept (streaming: %s, masked: %s)",
+  async (streaming, masked) => {
+    const spans = setupSpans(undefined, masked ? { mask: (value) => value } : {});
+    const transcript = "x".repeat(55_000);
+
+    const events = [
+      { type: "transcript.text.delta", delta: transcript },
+      { type: "transcript.text.done", text: transcript },
+    ];
+
+    const response = streaming
+      ? new Stream(async function* () {
+          yield* events;
+        }, new AbortController())
+      : { text: transcript };
+
+    const client = wrapOpenAI({
+      chat: { completions: { create() {} } },
+      responses: { create() {} },
+      embeddings: { create() {} },
+      audio: { transcriptions: { create: async (_params: unknown) => response } },
+    });
+
+    const result = await client.audio!.transcriptions!.create({
+      model: "gpt-4o-transcribe",
+      stream: streaming,
+    });
+
+    if (streaming) await collectStream(result as Stream<unknown>);
+    const span = await exportedSpan(spans);
+    expect(span.attributes["gen_ai.output.messages"]).toBe(transcript);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  },
+);
+
+test("a complete masked transcription stream keeps its output and is not flagged", async () => {
+  const spans = setupSpans(undefined, { mask: (value) => value });
+
+  const events = [
+    { type: "transcript.text.delta", delta: "partial" },
+    { type: "transcript.text.done", text: "complete transcript" },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+    audio: { transcriptions: { create: async (_params: unknown) => source } },
+  });
+
+  const stream = await client.audio!.transcriptions!.create({
+    model: "gpt-4o-transcribe",
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBe("complete transcript");
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
 });
 
 test("streaming transcription replaces truncated deltas with complete terminal text", async () => {
@@ -2694,6 +5028,51 @@ test.each([
     expect(span.status.code).toBe(SPAN_STATUS_ERROR);
     expect(span.attributes["gen_ai.output.messages"]).toBe(expectedOutput);
     expect(span.attributes["gen_ai.response.time_to_first_chunk"]).toEqual(expect.any(Number));
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  },
+);
+
+test.each([
+  ["error", false],
+  ["error", true],
+  ["return", false],
+  ["return", true],
+  ["eof", false],
+  ["eof", true],
+] as const)(
+  "transcription ending with %s before its terminal event is incomplete (masked: %s)",
+  async (ending, masked) => {
+    const spans = setupSpans(undefined, masked ? { mask: (value) => value } : undefined);
+    const event = { type: "transcript.text.delta", delta: "partial" };
+
+    const source = new Stream(async function* () {
+      yield event;
+
+      if (ending === "error") throw new Error("stream failed");
+    }, new AbortController());
+
+    const client = wrapOpenAI({
+      chat: { completions: { create() {} } },
+      responses: { create() {} },
+      embeddings: { create() {} },
+      audio: { transcriptions: { create: async (_params: unknown) => source } },
+    });
+
+    const stream = await client.audio!.transcriptions!.create({
+      model: "gpt-4o-transcribe",
+      stream: true,
+    });
+
+    const iterator = stream[Symbol.asyncIterator]();
+
+    expect(await iterator.next()).toEqual({ done: false, value: event });
+
+    if (ending === "error") await expect(iterator.next()).rejects.toThrow("stream failed");
+    else if (ending === "return") await iterator.return?.();
+    else expect(await iterator.next()).toEqual({ done: true, value: undefined });
+    const span = await exportedSpan(spans);
+    expect(span.attributes["gen_ai.output.messages"]).toBe(masked ? undefined : "partial");
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
   },
 );
 

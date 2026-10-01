@@ -84,11 +84,17 @@ The integration maps native OpenAI request/response shapes directly into telemet
 
 Chat completion streams are traced. Requests are sent unchanged by default, so token usage is only captured when the caller sets `stream_options.include_usage` themselves. Pass `{ injectStreamUsage: true }` to `wrapOpenAI` or `instrumentOpenAI` to inject `stream_options.include_usage` automatically; the synthetic usage-only chunk is then hidden from the caller. Injection is opt-in because some providers reject `stream_options` — for example Azure OpenAI "on your data" (`data_sources`) returns 400 for it while plain `stream: true` works.
 
+Streamed chat output and finish reasons use separate budgets of up to 48 KiB and 1,000 items; The configured `maxAttributeLength` does not shrink these retention bounds; the core applies it to the exported attribute after the mask runs, with its `...[truncated]` marker, without setting `telemetry.dev.capture.truncated`. When present, `gen_ai.output.messages` contains bounded partial output. If output and/or finish-reason capture is incomplete, including when a choice ends without `finish_reason`, `telemetry.dev.capture.truncated` is `true`. With a mask configured, incomplete output is omitted because the mask cannot inspect the complete value. When output capture is disabled or omitted, response IDs and models, finish reasons, usage, timing, and errors may still be recorded.
+
+Capture flags do not gate stop sequences, caller-supplied metadata or raw attributes, or exception messages and stack traces; redact those separately when needed.
+
 ```ts
 const openai = wrapOpenAI(new OpenAI(), { injectStreamUsage: true });
 ```
 
 Responses API streams are traced through `responses.create({ stream: true })`; terminal `response.completed`, `response.failed`, and `response.incomplete` events close the span.
+
+Responses and transcription streams follow the same rule. A Responses stream that ends without a terminal snapshot, ends with an `error` event, fails to map an event, or has a terminal snapshot over the limit sets `telemetry.dev.capture.truncated`; it keeps the last snapshot that fit, unless a mask is configured, in which case output is omitted. Transcription text has its own retention limit of up to 64 KiB with no item limit. A complete non-streamed transcript is passed to the core whole. A transcription stream that ends before `transcript.text.done` (an error, early close, or end of stream) or whose text exceeds the limit is flagged the same way and keeps its bounded partial text only when no mask is configured.
 
 ## Embeddings
 

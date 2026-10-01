@@ -21,10 +21,11 @@ repository, not this SDK workspace. Paths below refer to that product repository
 | `type: "agent"`                                                                                                                                                                                                                                                                                                                                                                                                       | `gen_ai.operation.name = "invoke_agent"`                                                                                             |                                                                                                                         |
 | `type: "embedding"`                                                                                                                                                                                                                                                                                                                                                                                                   | `gen_ai.operation.name = "embeddings"`                                                                                               |                                                                                                                         |
 | `input` / `output`                                                                                                                                                                                                                                                                                                                                                                                                    | `gen_ai.input.messages` / `gen_ai.output.messages` (`gen_ai.tool.call.arguments` / `gen_ai.tool.call.result` for tools)              | mask → JSON stringify → truncate; gated by capture flags                                                                |
+| `attributes["telemetry.dev.capture.truncated"]`                                                                                                                                                                                                                                                                                                                                                                       | `telemetry.dev.capture.truncated = true`                                                                                             | captured telemetry is incomplete                                                                                        |
 | `model`, `provider`                                                                                                                                                                                                                                                                                                                                                                                                   | `gen_ai.request.model`, `gen_ai.provider.name`                                                                                       |                                                                                                                         |
 | `systemInstructions` / `system_instructions`                                                                                                                                                                                                                                                                                                                                                                          | `gen_ai.system_instructions`                                                                                                         | gated by captureInput                                                                                                   |
 | `responseModel`, `responseId`, `outputType`                                                                                                                                                                                                                                                                                                                                                                           | `gen_ai.response.model`, `gen_ai.response.id`, `gen_ai.output.type`                                                                  |                                                                                                                         |
-| `usage.{inputTokens,outputTokens,totalTokens,cacheReadInputTokens,cacheCreationInputTokens,reasoningOutputTokens}`                                                                                                                                                                                                                                                                                                    | `gen_ai.usage.{input_tokens,output_tokens,total_tokens,cache_read.input_tokens,cache_creation.input_tokens,reasoning.output_tokens}` | aggregate usage fields; `inputTokens` is all input, including cache reads and writes                                    |
+| `usage.{inputTokens,outputTokens,totalTokens,cacheReadInputTokens,cacheCreationInputTokens,reasoningOutputTokens}`                                                                                                                                                                                                                                                                                                    | `gen_ai.usage.{input_tokens,output_tokens,total_tokens,cache_read.input_tokens,cache_creation.input_tokens,reasoning.output_tokens}` | aggregate input tokens include cache reads and cache writes                                                             |
 | `usage.{textInputTokens,textOutputTokens,textCacheReadInputTokens,imageInputTokens,imageOutputTokens,imageCacheReadInputTokens,audioInputTokens,audioOutputTokens,audioCacheReadInputTokens}` / `usage.{text_input_tokens,text_output_tokens,text_cache_read_input_tokens,image_input_tokens,image_output_tokens,image_cache_read_input_tokens,audio_input_tokens,audio_output_tokens,audio_cache_read_input_tokens}` | `gen_ai.usage.{text,image,audio}.{input_tokens,output_tokens,cache_read.input_tokens}`                                               | flat TypeScript / Python modality fields; SDK usage objects drop unknown keys                                           |
 | `costUsd` / `cost_usd`                                                                                                                                                                                                                                                                                                                                                                                                | `gen_ai.usage.cost` (number)                                                                                                         | optional override; server pricing (`apps/ingest/src/pricing.ts`) is the default                                         |
 | `finishReason`                                                                                                                                                                                                                                                                                                                                                                                                        | `gen_ai.response.finish_reasons = [value]`                                                                                           | single-element array                                                                                                    |
@@ -43,7 +44,8 @@ repository, not this SDK workspace. Paths below refer to that product repository
 Shared constants: env vars `TELEMETRY_DEV_API_KEY` / `TELEMETRY_DEV_BASE_URL` (default
 `https://ingest.telemetry.dev`) / `TELEMETRY_DEV_ENVIRONMENT` (default `production`) /
 `OTEL_SERVICE_NAME` (default `unknown_service`); truncation cap 65536 chars **including** the
-`...[truncated]` marker; batch defaults 64/1000ms/2048/30000ms; instrumentation scopes
+`...[truncated]` marker (custom caps shorter than the marker retain its prefix); batch defaults
+64/1000ms/2048/30000ms; instrumentation scopes
 `@telemetry-dev/sdk` and `telemetry_dev` (both classify as framework `otel`).
 
 The SDK allowlists above drop unknown keys in SDK usage objects. Ingest reports
@@ -60,7 +62,22 @@ disabled and missing-key initialization remains a no-op and does not create a se
 Auto-metrics: `gen_ai.client.operation.duration` (unit `s`) for operations
 {chat, invoke_agent, embeddings, execute_tool}; `gen_ai.client.token.usage` (unit `{token}`,
 `gen_ai.token.type` input|output) for {chat, invoke_agent, embeddings}; nothing for `function`.
-DELTA temporality; bucket boundaries copied from `packages/ai/src/otel.ts`.
+`gen_ai.client.operation.time_to_first_chunk` (unit `s`) records one sample for a `chat` span
+with a finite, non-negative `gen_ai.response.time_to_first_chunk` value. Missing timings do not
+produce a sample. `gen_ai.client.operation.time_per_output_chunk` (unit `s`) records the interval
+between consecutive nonempty output chunks for `chat` spans. Usage-only and control events do not
+count. Zero or one output chunk produces no interval. These are client-observed timings, not
+server token timings; pull-based streams include time the consumer spends between reads.
+Both metrics are recorded only after the span passes filtering at span end, including spans that
+fail after receiving output. Chunk intervals use fixed-size histogram state, not retained samples;
+completed spans merge into at most 2,000 attribute sets per export, including an
+`otel.metric.overflow=true` series. No synthetic exemplars are generated for chunk intervals.
+In Python, this exact aggregate merge is available only with the built-in OTLP metric exporter.
+Passing a custom `metric_reader` preserves duration, token usage, and time-to-first-chunk metrics,
+but disables time-per-output-chunk because OpenTelemetry Python 1.x has no public aggregate-input
+or `MetricProducer` API. The first accepted span with intervals reports the limitation once through
+`on_error` and the SDK logger; no undrainable aggregate is retained.
+The metrics use DELTA temporality and the bucket boundaries in `packages/otel/src/metrics.ts`.
 
 ## The shared scenario
 
@@ -72,7 +89,8 @@ containing `SECRET` with `{masked: true}`.
 
 1. agent span `support-agent` (`agentName: "support"`) containing:
    - generation `chat-completion` (gpt-4o/openai, input "What is the weather?", output
-     "It is sunny.", usage 11/7 with cache-read 4 and text 6/4/2, image 3/2/1, audio
+     "It is sunny.", usage 17/7 where input is 11 + 4 cache-read + 2 cache-write, with text 6/4/2,
+     image 3/2/1, audio
      2/1/1 input/output/cache-read modality detail, finishReason stop) with `log("inside generation",
 eventName: "e2e.inside")` inside it
    - tool `web-search` (toolCallId `call_1`, input `{q:"weather"}`, output `{hits:1}`)
@@ -86,8 +104,9 @@ eventName: "e2e.inside")` inside it
    - generation `priced-call` (custom-model-x/custom, usage 5/2, costUsd 0.5)
    - generation `openrouter-call` (provider openrouter, no usage)
    - generation `masked-step` (input "SECRET stuff")
-   - generation `streamed-chat` (gpt-4o/openai, input "Stream please", output
-     "chunk...", timeToFirstChunkMs 250)
+   - generation `streamed-chat` (gpt-4o/openai, input "Stream please", bounded partial output
+     "chunk...", `telemetry.dev.capture.truncated = true`, four output chunk calls at
+     1000/1010/1050/1210 ms, timeToFirstChunkMs 250)
 2. plain span `background-job` started after the agent ended, with
    `parent = <agent traceparent captured via getTraceparent()>`
 3. agent span `follow-up-turn` (`agentName: "support"`) started after the agent ended with no
@@ -100,31 +119,32 @@ eventName: "e2e.inside")` inside it
 7. fail-open phase: re-`init()` WITHOUT an api key, run an observed function + `log()`,
    `flush()` + `shutdown()` — must emit nothing and never throw
 
-## Assertions (C1–C21)
+## Assertions (C1–C22)
 
-| #   | Assertion                                                                                                                                                                                                                |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| C1  | One trace per session: framework `otel`, userId/sessionId/metadata, token rollup 19/9 with the chat span's nine modality totals, server-computed cost >= 0.5, trace name `support-agent`                                 |
-| C2  | Agent root span: operation `invoke_agent`, `agent_name`, parented to the session parent (not stored); trace id = the session trace id                                                                                    |
-| C3  | Generation span: model/provider/aggregate and nine modality token fields/finish reason, extracted inputJson/outputJson, per-span cost                                                                                    |
-| C4  | Tool span: `tool_name`, extracted arguments/result JSON                                                                                                                                                                  |
-| C5  | Observed function: operation `function`, inputJson `{text}` / outputJson `{formatted}` (via the ingest's `function` extraction branch)                                                                                   |
-| C6  | Every span carries `conversation_id` = sessionId and 16-hex span ids                                                                                                                                                     |
-| C7  | Error span: status `error`, `error_type` = TypeError (TS) / ValueError (Python)                                                                                                                                          |
-| C8  | In-span `log()`: source `otlp-log`, severity 9, eventName, span-correlated, propagated attrs on the record                                                                                                               |
-| C9  | Exception event → error log row (source `span-event`, level `error`, message contains the error)                                                                                                                         |
-| C10 | Standalone `log()`: stored without trace correlation, severity 13, source `otlp-log`                                                                                                                                     |
-| C11 | Metrics: duration histograms for chat/invoke_agent/execute_tool/embeddings; token totals chat 16/9, embeddings 3; correct SDK scope on every point                                                                       |
-| C12 | Embedding span: operation `embeddings`, model extracted                                                                                                                                                                  |
-| C13 | Traceparent join: `background-job` lands in the same trace, parented to the agent, with the conversation id                                                                                                              |
-| C14 | captureInput:false strips content from inputJson and attributesJson                                                                                                                                                      |
-| C15 | `costUsd` client override stored verbatim (0.5)                                                                                                                                                                          |
-| C16 | Oversized content truncated to 65536 chars ending with `...[truncated]`, extracted into inputJson and stored once (source attribute stripped from the attribute columns); mask hook output replaces SECRET-bearing input |
-| C17 | Exact span census (14) — the fail-open no-key phase contributes nothing                                                                                                                                                  |
-| C18 | Streaming generation: `timeToFirstChunkMs` stored as 250 ms; wire attribute `gen_ai.response.time_to_first_chunk` = 0.25 s                                                                                               |
-| C19 | OpenRouter generation: provider stored as `openrouter`                                                                                                                                                                   |
-| C20 | Session trace: `follow-up-turn` (a second root call of the same session) lands in the same trace, parented to the session parent, started at or after the agent ended                                                    |
-| C21 | Process mode: two otherwise independent roots and a standalone log share one generated UUID session; a nested explicit-session span/log subtree consistently uses the explicit ID instead                                |
+| #   | Assertion                                                                                                                                                                                                                       |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| C1  | One trace per session: framework `otel`, userId/sessionId/metadata, token rollup 25/9 with the chat span's nine modality totals, server-computed cost >= 0.5, trace name `support-agent`                                        |
+| C2  | Agent root span: operation `invoke_agent`, `agent_name`, parented to the session parent (not stored); trace id = the session trace id                                                                                           |
+| C3  | Generation span: model/provider/aggregate, cache-read/cache-write, and nine modality token fields/finish reason, extracted inputJson/outputJson, per-span cost                                                                  |
+| C4  | Tool span: `tool_name`, extracted arguments/result JSON                                                                                                                                                                         |
+| C5  | Observed function: operation `function`, inputJson `{text}` / outputJson `{formatted}` (via the ingest's `function` extraction branch)                                                                                          |
+| C6  | Every span carries `conversation_id` = sessionId and 16-hex span ids                                                                                                                                                            |
+| C7  | Error span: status `error`, `error_type` = TypeError (TS) / ValueError (Python)                                                                                                                                                 |
+| C8  | In-span `log()`: source `otlp-log`, severity 9, eventName, span-correlated, propagated attrs on the record                                                                                                                      |
+| C9  | Exception event → error log row (source `span-event`, level `error`, message contains the error)                                                                                                                                |
+| C10 | Standalone `log()`: stored without trace correlation, severity 13, source `otlp-log`                                                                                                                                            |
+| C11 | Metrics: duration histograms for chat/invoke_agent/execute_tool/embeddings; token totals chat 22/9, embeddings 3; first-chunk 1 × 0.25 s; output-chunk intervals count 3, sum 0.21 s, min 0.01 s, max 0.16 s; correct SDK scope |
+| C12 | Embedding span: operation `embeddings`, model extracted                                                                                                                                                                         |
+| C13 | Traceparent join: `background-job` lands in the same trace, parented to the agent, with the conversation id                                                                                                                     |
+| C14 | captureInput:false strips content from inputJson and attributesJson                                                                                                                                                             |
+| C15 | `costUsd` client override stored verbatim (0.5)                                                                                                                                                                                 |
+| C16 | Oversized content truncated to 65536 chars ending with `...[truncated]`, extracted into inputJson and stored once (source attribute stripped from the attribute columns); mask hook output replaces SECRET-bearing input        |
+| C17 | Exact span census (14) — the fail-open no-key phase contributes nothing                                                                                                                                                         |
+| C18 | Streaming generation: `timeToFirstChunkMs` stored as 250 ms; wire attribute `gen_ai.response.time_to_first_chunk` = 0.25 s                                                                                                      |
+| C19 | OpenRouter generation: provider stored as `openrouter`                                                                                                                                                                          |
+| C20 | Session trace: `follow-up-turn` (a second root call of the same session) lands in the same trace, parented to the session parent, started at or after the agent ended                                                           |
+| C21 | Process mode: two otherwise independent roots and a standalone log share one generated UUID session; a nested explicit-session span/log subtree consistently uses the explicit ID instead                                       |
+| C22 | Streaming truncation: `telemetry.dev.capture.truncated = true` survives OTLP transport and ingest on the streamed generation                                                                                                    |
 
 ## Modality publication gate
 

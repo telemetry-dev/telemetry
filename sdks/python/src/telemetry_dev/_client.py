@@ -49,7 +49,7 @@ from ._metrics import (
 )
 from ._processor import ExportMode, StampingSpanProcessor
 from ._semconv import SCOPE_NAME
-from ._serialize import Mask, serialize_content
+from ._serialize import DEFAULT_MAX_ATTRIBUTE_LENGTH, Mask, serialize_content
 
 _lock = threading.RLock()
 _client: Client | None = None
@@ -182,14 +182,16 @@ class Client:
         )
 
         # The funnel keeps capped content (marker included) within max_attribute_length, so
-        # the backstop can use the same cap for raw attributes set outside the funnel.
+        # the backstop can use the same cap for raw attributes set outside the funnel. A zero
+        # cap only drops content; as a backstop it would blank every string attribute.
+        backstop_length = max_attribute_length or DEFAULT_MAX_ATTRIBUTE_LENGTH
         self._tracer_provider = TracerProvider(
             resource=resource,
             sampler=sampler,
             shutdown_on_exit=False,
             span_limits=SpanLimits(
-                max_attribute_length=max_attribute_length,
-                max_span_attribute_length=max_attribute_length,
+                max_attribute_length=backstop_length,
+                max_span_attribute_length=backstop_length,
             ),
         )
         self._tracer_provider.sampler = SessionSampler(self._tracer_provider.sampler)
@@ -365,6 +367,14 @@ def init(
     try:
         if session_mode not in ("explicit", "process"):
             raise ValueError(f"invalid session_mode: {session_mode!r}")
+        raw_max_attribute_length: Any = max_attribute_length
+        if (
+            isinstance(raw_max_attribute_length, bool)
+            or not isinstance(raw_max_attribute_length, int)
+            or raw_max_attribute_length < 0
+        ):
+            raise ValueError("max_attribute_length must be a non-negative integer")
+        max_attribute_length = raw_max_attribute_length
         client = Client(
             config=config,
             enabled=effective_enabled,

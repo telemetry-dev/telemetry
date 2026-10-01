@@ -91,6 +91,8 @@ operation, the submission span ends with an error instead of remaining open.
 
 The integration maps native Gemini request/response shapes directly. It never mutates caller requests.
 
+Tool definitions (`gen_ai.tool.definitions`, including tool descriptions and parameter schemas) are request attributes, not captured content: `capture_input`, the mask, and `max_attribute_length=0` do not remove them. They are cut only by the OpenTelemetry attribute limit (65,536 characters when `max_attribute_length` is 0).
+
 ## Streaming
 
 Gemini streams already include cumulative `usage_metadata` on chunks, so no request injection is needed. Stream spans record time-to-first-chunk, aggregate text parts (merging consecutive text with the same `thought` flag), last-seen usage/finish reasons, and end once when the stream completes, errors, or is closed.

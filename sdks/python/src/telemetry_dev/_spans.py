@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sys
 import threading
 import time
 import traceback
@@ -267,7 +268,7 @@ def _fields_to_attributes(
         for key, value in raw.items():
             attr = coerce_attr_value(
                 value,
-                max_len=client.max_attribute_length,
+                max_len=sys.maxsize,
                 key=key,
                 on_error=client.on_error,
             )
@@ -378,6 +379,22 @@ class SpanHandle:
         self._context = context
         self._context_token: Token[Context] | None = None
         self._ended = False
+
+    @property
+    def capture_output(self) -> bool:
+        return self._state.capture_output if self._state is not None else False
+
+    @property
+    def capture_masked(self) -> bool:
+        return self._client is not None and self._client.mask is not None
+
+    @property
+    def max_attribute_length(self) -> int:
+        return self._client.max_attribute_length if self._client is not None else 0
+
+    def report_error(self, cause: BaseException) -> None:
+        if self._client is not None:
+            self._client.report("provider instrumentation failed", cause)
 
     def _recording(self) -> bool:
         return (
