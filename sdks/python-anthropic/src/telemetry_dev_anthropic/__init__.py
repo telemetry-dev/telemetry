@@ -16,7 +16,7 @@ from anthropic.resources.beta.messages import AsyncMessages as AsyncBetaMessages
 from anthropic.resources.beta.messages import Messages as BetaMessages
 from anthropic.resources.messages import AsyncMessages, Messages
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 ProviderResolver = Callable[[object | None], str]
 RequestMapper = Callable[[Mapping[str, Any]], tuple[str, dict[str, Any]]]

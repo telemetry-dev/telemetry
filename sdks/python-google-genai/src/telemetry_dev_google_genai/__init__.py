@@ -22,7 +22,7 @@ from google.genai.client import AsyncClient, Client
 from google.genai.models import AsyncModels, Models
 from google.genai.operations import AsyncOperations, Operations
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 ProviderResolver = Callable[[object | None], str]
 RequestMapper = Callable[[Any, Any, Any], tuple[str, dict[str, Any]]]

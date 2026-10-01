@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.1.6...sdk-v0.1.7) (2026-10-01)
+
+
+### Bug Fixes
+
+* **sdk:** flag incomplete stream capture and keep it from masks ([#33](https://github.com/telemetry-dev/telemetry/issues/33)) ([9454284](https://github.com/telemetry-dev/telemetry/commit/9454284555a2b704c2616620311d36d9db7a9d82))
+
 ## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.1.5...sdk-v0.1.6) (2026-09-27)
 
 ### Features

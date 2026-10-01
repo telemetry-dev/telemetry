@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/mcp",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Model Context Protocol SDK instrumentation for telemetry.dev: instruments MCP v2 transports and emits OpenTelemetry spans.",
   "keywords": [
     "mcp",
