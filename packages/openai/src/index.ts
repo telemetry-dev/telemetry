@@ -1,5 +1,6 @@
 import {
   boundedCapture,
+  boundedCaptureDetails,
   captureEnabled,
   startSpan,
   type SpanFields,
@@ -28,6 +29,8 @@ const REALTIME_TRACE_TIMEOUT_MS = 5 * 60_000;
 const REALTIME_MAX_IN_FLIGHT = 100;
 const REALTIME_CAPTURE_MAX_BYTES = 48 * 1024;
 const REALTIME_CAPTURE_MAX_ITEMS = 1_000;
+const CHAT_STREAM_CAPTURE_MAX_BYTES = 48 * 1024;
+const CHAT_STREAM_CAPTURE_MAX_ITEMS = 1_000;
 
 type JsonValue =
   | string
@@ -85,8 +88,31 @@ function readNumber<T>(value: T): number | undefined {
   return Number(value) === value ? Number(value) : undefined;
 }
 
-function sanitizeResponsesCapture(value: unknown) {
+function readOwn(
+  record: JsonRecord,
+  key: string,
+  budget?: ChatCaptureBudget,
+  failure?: { value: boolean },
+  reportError?: (cause: unknown) => void,
+): unknown {
+  try {
+    if (!Object.hasOwn(record, key)) return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+
+    return descriptor?.get ? descriptor.get.call(record) : descriptor?.value;
+  } catch (error) {
+    if (budget) budget.truncated = true;
+
+    if (failure) failure.value = true;
+    reportError?.(error);
+
+    return undefined;
+  }
+}
+
+function sanitizeResponsesCapture(value: unknown, maxBytes = CHAT_STREAM_CAPTURE_MAX_BYTES) {
   return boundedCapture(value, {
+    maxBytes,
     skip(key, item, parent, path) {
       const type = readString(asRecord(parent)?.type) ?? path.at(-1);
 
@@ -261,11 +287,15 @@ function responsesUsage<T>(usage: T): SpanFields["usage"] {
   });
 }
 
-function responsesResponse<T>(response: T): SpanFields {
+function responsesResponse<T>(
+  response: T,
+  captureOutput = captureEnabled("output"),
+  maxBytes = CHAT_STREAM_CAPTURE_MAX_BYTES,
+): SpanFields {
   const r = asRecord(response) ?? {};
   const status = readString(r.status);
   const incompleteDetails = asRecord(r.incomplete_details);
-  const capture = captureEnabled("output") ? sanitizeResponsesCapture(r.output) : undefined;
+  const capture = captureOutput ? sanitizeResponsesCapture(r.output, maxBytes) : undefined;
 
   const fields: SpanFields = {
     responseModel: readString(r.model),
@@ -297,6 +327,26 @@ function responseStreamError<T>(event: T): Error {
   const message = readString(e?.message);
 
   return new Error(["response.error", code, message].filter(Boolean).join(": "));
+}
+
+function responsesEventFailure<T>(event: T): Error | undefined {
+  let type: unknown;
+
+  try {
+    type = asRecord(event)?.type;
+  } catch {
+    return undefined;
+  }
+
+  if (type !== "response.failed" && type !== "error") return undefined;
+
+  try {
+    return type === "response.failed"
+      ? responseFailedError(asRecord(event)?.response)
+      : responseStreamError(event);
+  } catch {
+    return new Error(type === "response.failed" ? "response.failed" : "response.error");
+  }
 }
 
 function embeddingsRequest(body: JsonRecord): RequestMapping {
@@ -575,13 +625,21 @@ function mapRawResponse(response: Response): SpanFields {
 
 function finalizeParsedValue<T>(value: T, ctx: TracePromiseContext): T | Stream<JsonValue> {
   if (ctx.streaming) {
-    return wrapStream(value, ctx.operation, ctx.span, ctx.startedAt, ctx.injectedUsage);
+    try {
+      return wrapStream(value, ctx.operation, ctx.span, ctx.startedAt, ctx.injectedUsage);
+    } catch (cause) {
+      reportSpanError(ctx.span, cause);
+      ctx.end({ attributes: { "telemetry.dev.capture.truncated": true } });
+
+      return value;
+    }
   }
 
   try {
     ctx.end(ctx.mapResponse(value));
-  } catch {
-    ctx.end();
+  } catch (cause) {
+    reportSpanError(ctx.span, cause);
+    ctx.end({ attributes: { "telemetry.dev.capture.truncated": true } });
   }
 
   return value;
@@ -679,140 +737,879 @@ function makeTracedPromise<T>(
 
 interface ChatChoiceState {
   role?: string;
+  roleResolved: boolean;
   content: string;
   refusal: string;
+  functionCall?: JsonRecord;
+  unresolvedFunctionScalars: Set<"name">;
   toolCalls: Map<number, JsonRecord>;
-  finishReason?: string;
+  unresolvedToolScalars: Map<number, Set<"id" | "type" | "function.name" | "custom.name">>;
+  terminal: boolean;
 }
 
-function getChoiceState(states: Map<number, ChatChoiceState>, index: number): ChatChoiceState {
-  let state = states.get(index);
+interface ChatMessageFields {
+  role?: string;
+  content?: string | null;
+  refusal?: string;
+  function_call?: JsonRecord;
+  tool_calls?: JsonRecord[];
+}
 
-  if (!state) {
-    state = { content: "", refusal: "", toolCalls: new Map() };
-    states.set(index, state);
+interface ChatCaptureBudget {
+  remainingBytes: number;
+  remainingItems: number;
+  truncated: boolean;
+}
+
+interface ChatCaptureReservation {
+  bytes: number;
+  items: number;
+}
+
+interface ChatToolCallDelta {
+  index?: number;
+  id?: string;
+  type?: string;
+  functionName?: string;
+  functionArguments?: string;
+  customName?: string;
+  customInput?: string;
+  readFailed: boolean;
+}
+
+function reserveChatStructure(budget: ChatCaptureBudget, bytes: number, items = 0): boolean {
+  if (budget.truncated || budget.remainingBytes < bytes || budget.remainingItems < items) {
+    budget.truncated = true;
+
+    return false;
   }
 
-  return state;
+  budget.remainingBytes -= bytes;
+  budget.remainingItems -= items;
+
+  return true;
 }
 
-function mergeToolCall(state: ChatChoiceState, delta: JsonRecord): void {
-  const index = readNumber(delta.index) ?? state.toolCalls.size;
-  const current = { ...state.toolCalls.get(index) };
+function captureChatString(
+  value: string,
+  budget: ChatCaptureBudget,
+  structureBytes: number,
+  includeQuotes: boolean,
+  includeItem: boolean,
+  recoverable = false,
+): string | undefined {
+  const quoteRefund = includeQuotes ? 0 : 2;
+  const availableBytes = budget.remainingBytes - structureBytes + quoteRefund;
 
-  if (delta.id !== undefined) current.id = delta.id;
+  if (budget.truncated || availableBytes < 0 || (includeItem && budget.remainingItems < 1)) {
+    if (!recoverable) budget.truncated = true;
 
-  if (delta.type !== undefined) current.type = delta.type;
-  const incomingFunction = asRecord(delta.function);
-
-  if (incomingFunction) {
-    const currentFunction = { ...asRecord(current.function) };
-
-    if (incomingFunction.name !== undefined) currentFunction.name = incomingFunction.name;
-
-    if (incomingFunction.arguments !== undefined) {
-      currentFunction.arguments = `${readString(currentFunction.arguments) ?? ""}${
-        readString(incomingFunction.arguments) ?? ""
-      }`;
-    }
-
-    current.function = currentFunction;
+    return undefined;
   }
 
-  state.toolCalls.set(index, current);
+  const capture = boundedCaptureDetails(value, {
+    maxBytes: availableBytes,
+    maxItems: 1,
+  });
+
+  const captured = readString(capture.value);
+
+  if (capture.truncated || captured === undefined) {
+    if (!recoverable) budget.truncated = true;
+
+    return undefined;
+  }
+
+  budget.remainingBytes -= capture.bytes - quoteRefund + structureBytes;
+
+  if (includeItem) budget.remainingItems -= 1;
+
+  return captured;
 }
 
-function chatOutput(states: Map<number, ChatChoiceState>): JsonRecord[] {
-  return [...states.entries()]
-    .sort(([left], [right]) => left - right)
-    .map(([, state]) => {
-      const message = { role: state.role ?? "assistant" };
-      const fields = Object.assign(message, {} as JsonRecord);
+function releaseCapturedChatString(
+  value: string,
+  budget: ChatCaptureBudget,
+  structureBytes: number,
+  includeQuotes: boolean,
+  includeItem: boolean,
+): void {
+  const capture = boundedCaptureDetails(value);
+  budget.remainingBytes += capture.bytes - (includeQuotes ? 0 : 2) + structureBytes;
 
-      if (state.content.length > 0) fields.content = state.content;
-      else if (state.toolCalls.size > 0) fields.content = null;
+  if (includeItem) budget.remainingItems += 1;
+}
 
-      if (state.refusal.length > 0) fields.refusal = state.refusal;
+function releaseCapturedChatField(
+  key: string,
+  value: string,
+  budget: ChatCaptureBudget,
+  hasSibling: boolean,
+): void {
+  const retained = boundedCaptureDetails({ [key]: value });
+  const empty = boundedCaptureDetails({});
+  budget.remainingBytes += retained.bytes - empty.bytes + (hasSibling ? 1 : 0);
+  budget.remainingItems += retained.items - empty.items;
+}
 
-      if (state.toolCalls.size > 0) {
-        fields.tool_calls = [...state.toolCalls.entries()]
-          .sort(([left], [right]) => left - right)
-          .map(([, toolCall]) => toolCall);
+function replaceChatString(
+  current: string,
+  value: string,
+  budget: ChatCaptureBudget,
+): string | undefined {
+  const held = boundedCaptureDetails(current);
+
+  const capture = boundedCaptureDetails(value, {
+    maxBytes: budget.remainingBytes + held.bytes,
+    maxItems: budget.remainingItems + held.items,
+  });
+
+  const captured = readString(capture.value);
+
+  if (capture.truncated || captured === undefined) return undefined;
+
+  budget.remainingBytes += held.bytes - capture.bytes;
+  budget.remainingItems += held.items - capture.items;
+
+  return captured;
+}
+
+function replaceChatNullWithString(value: string, budget: ChatCaptureBudget): string | undefined {
+  const held = boundedCaptureDetails(null);
+
+  const capture = boundedCaptureDetails(value, {
+    maxBytes: budget.remainingBytes + held.bytes,
+    maxItems: budget.remainingItems + held.items,
+  });
+
+  const captured = readString(capture.value);
+
+  if (capture.truncated || captured === undefined) {
+    budget.truncated = true;
+
+    return undefined;
+  }
+
+  budget.remainingBytes += held.bytes - capture.bytes;
+  budget.remainingItems += held.items - capture.items;
+
+  return captured;
+}
+
+function replaceFinishReason(
+  index: number,
+  finishReason: string,
+  states: Map<number, string>,
+  reservations: Map<number, ChatCaptureReservation>,
+  rejected: Set<number>,
+  budget: ChatCaptureBudget,
+): void {
+  const held = reservations.get(index) ?? { bytes: 0, items: 0 };
+
+  const capture = boundedCaptureDetails(
+    { index, finish_reason: finishReason },
+    {
+      maxBytes: budget.remainingBytes + held.bytes,
+      maxItems: budget.remainingItems + held.items,
+    },
+  );
+
+  const captured = asRecord(capture.value);
+  const capturedIndex = readNumber(captured?.index);
+  const capturedReason = readString(captured?.finish_reason);
+
+  if (capture.truncated || capturedIndex === undefined || capturedReason === undefined) {
+    budget.remainingBytes += held.bytes;
+    budget.remainingItems += held.items;
+    reservations.delete(index);
+    states.delete(index);
+
+    if (rejected.has(index) || rejected.size < CHAT_STREAM_CAPTURE_MAX_ITEMS) rejected.add(index);
+    else budget.truncated = true;
+
+    return;
+  }
+
+  budget.remainingBytes += held.bytes - capture.bytes;
+  budget.remainingItems += held.items - capture.items;
+  reservations.set(capturedIndex, { bytes: capture.bytes, items: capture.items });
+  states.set(capturedIndex, capturedReason);
+  rejected.delete(capturedIndex);
+}
+
+function readChatToolCallDelta(
+  delta: JsonRecord,
+  budget: ChatCaptureBudget | undefined,
+  reportError: (cause: unknown) => void,
+): ChatToolCallDelta {
+  const failure = { value: false };
+  const incomingFunction = asRecord(readOwn(delta, "function", budget, failure, reportError));
+  const incomingCustom = asRecord(readOwn(delta, "custom", budget, failure, reportError));
+
+  return {
+    index: readNumber(readOwn(delta, "index", budget, failure, reportError)),
+    id: readString(readOwn(delta, "id", budget, failure, reportError)),
+    type: readString(readOwn(delta, "type", budget, failure, reportError)),
+    functionName: incomingFunction
+      ? readString(readOwn(incomingFunction, "name", budget, failure, reportError))
+      : undefined,
+    functionArguments: incomingFunction
+      ? readString(readOwn(incomingFunction, "arguments", budget, failure, reportError))
+      : undefined,
+    customName: incomingCustom
+      ? readString(readOwn(incomingCustom, "name", budget, failure, reportError))
+      : undefined,
+    customInput: incomingCustom
+      ? readString(readOwn(incomingCustom, "input", budget, failure, reportError))
+      : undefined,
+    readFailed: failure.value,
+  };
+}
+
+function captureToolCallPayload(
+  current: JsonRecord,
+  payloadKey: "function" | "custom",
+  name: string | undefined,
+  valueKey: "arguments" | "input",
+  valueText: string | undefined,
+  unresolved: Set<"id" | "type" | "function.name" | "custom.name">,
+  budget: ChatCaptureBudget,
+): boolean {
+  if (name === undefined && valueText === undefined) return false;
+
+  let changed = false;
+  const unresolvedName = `${payloadKey}.name` as "function.name" | "custom.name";
+  const hadPayload = asRecord(current[payloadKey]) !== undefined;
+  const payload = { ...asRecord(current[payloadKey]) };
+
+  if (!hadPayload) {
+    if (!reserveChatStructure(budget, JSON.stringify(payloadKey).length + 4, 1)) return false;
+    current[payloadKey] = payload;
+    changed = true;
+  }
+
+  if (name !== undefined) {
+    const currentName = readString(payload.name);
+
+    const capturedName =
+      currentName === undefined
+        ? captureChatString(name, budget, JSON.stringify("name").length + 2, true, true, true)
+        : replaceChatString(currentName, name, budget);
+
+    if (capturedName !== undefined) {
+      payload.name = capturedName;
+      unresolved.delete(unresolvedName);
+      changed = true;
+    } else {
+      if (currentName !== undefined) {
+        releaseCapturedChatString(
+          currentName,
+          budget,
+          JSON.stringify("name").length + 2,
+          true,
+          true,
+        );
+        delete payload.name;
+        changed = true;
       }
 
-      return fields;
-    });
+      unresolved.add(unresolvedName);
+    }
+  }
+
+  if (!budget.truncated && valueText !== undefined) {
+    const existingValue = readString(payload[valueKey]);
+
+    const capturedValue = captureChatString(
+      valueText,
+      budget,
+      existingValue === undefined ? JSON.stringify(valueKey).length + 2 : 0,
+      existingValue === undefined,
+      existingValue === undefined,
+    );
+
+    if (capturedValue !== undefined) {
+      payload[valueKey] = `${existingValue ?? ""}${capturedValue}`;
+      changed = true;
+    }
+  }
+
+  current[payloadKey] = payload;
+
+  return changed;
 }
 
-function chatPartialFields(
-  states: Map<number, ChatChoiceState>,
-  usage: SpanFields["usage"],
-): SpanFields {
-  const finishReasons = [...states.entries()]
-    .sort(([left], [right]) => left - right)
-    .map(([, state]) => state.finishReason)
-    .filter((reason): reason is string => reason !== undefined);
+function captureToolCallDelta(
+  state: ChatChoiceState,
+  delta: ChatToolCallDelta,
+  budget: ChatCaptureBudget,
+): void {
+  const index = delta.index ?? state.toolCalls.size;
+  const hadToolCall = state.toolCalls.has(index);
+  const current = { ...state.toolCalls.get(index) };
+  const unresolved = new Set(state.unresolvedToolScalars.get(index));
+  const { id, type, functionName, functionArguments, customName, customInput } = delta;
+  let changed = false;
 
-  const fields: SpanFields = {
-    output: states.size > 0 ? chatOutput(states) : undefined,
-    usage,
-    finishReason: finishReasons[0],
+  const save = () => {
+    if (changed || unresolved.size > 0 || !hadToolCall) state.toolCalls.set(index, current);
+
+    if (unresolved.size > 0) state.unresolvedToolScalars.set(index, unresolved);
+    else state.unresolvedToolScalars.delete(index);
   };
 
-  if (finishReasons.length > 1) {
-    fields.attributes = { "gen_ai.response.finish_reasons": finishReasons };
+  if (
+    id === undefined &&
+    type === undefined &&
+    functionName === undefined &&
+    functionArguments === undefined &&
+    customName === undefined &&
+    customInput === undefined
+  )
+    return;
+
+  if (!state.toolCalls.has(index)) {
+    const firstToolCall = state.toolCalls.size === 0;
+
+    if (
+      !reserveChatStructure(
+        budget,
+        2 +
+          (firstToolCall ? JSON.stringify("tool_calls").length + 4 : 1) +
+          (firstToolCall && state.content.length === 0 && state.functionCall === undefined
+            ? JSON.stringify("content").length + 6
+            : 0),
+        1 +
+          (firstToolCall ? 1 : 0) +
+          (firstToolCall && state.content.length === 0 && state.functionCall === undefined ? 1 : 0),
+      )
+    ) {
+      return;
+    }
+  }
+
+  if (id !== undefined) {
+    const currentId = readString(current.id);
+
+    const capturedId =
+      currentId === undefined
+        ? captureChatString(id, budget, JSON.stringify("id").length + 2, true, true, true)
+        : replaceChatString(currentId, id, budget);
+
+    if (capturedId !== undefined) {
+      current.id = capturedId;
+      unresolved.delete("id");
+      changed = true;
+    } else {
+      if (currentId !== undefined) {
+        releaseCapturedChatString(currentId, budget, JSON.stringify("id").length + 2, true, true);
+        delete current.id;
+        changed = true;
+      }
+
+      unresolved.add("id");
+    }
+  }
+
+  if (type !== undefined) {
+    const currentType = readString(current.type);
+
+    const capturedType =
+      currentType === undefined
+        ? captureChatString(type, budget, JSON.stringify("type").length + 2, true, true, true)
+        : replaceChatString(currentType, type, budget);
+
+    if (capturedType !== undefined) {
+      current.type = capturedType;
+      unresolved.delete("type");
+      changed = true;
+    } else {
+      if (currentType !== undefined) {
+        releaseCapturedChatString(
+          currentType,
+          budget,
+          JSON.stringify("type").length + 2,
+          true,
+          true,
+        );
+        delete current.type;
+        changed = true;
+      }
+
+      unresolved.add("type");
+    }
+  }
+
+  changed =
+    captureToolCallPayload(
+      current,
+      "function",
+      functionName,
+      "arguments",
+      functionArguments,
+      unresolved,
+      budget,
+    ) || changed;
+
+  changed =
+    captureToolCallPayload(
+      current,
+      "custom",
+      customName,
+      "input",
+      customInput,
+      unresolved,
+      budget,
+    ) || changed;
+
+  save();
+}
+
+function captureFunctionCallDelta(
+  state: ChatChoiceState,
+  name: string | undefined,
+  argumentsText: string | undefined,
+  budget: ChatCaptureBudget,
+): void {
+  if (name === undefined && argumentsText === undefined) return;
+
+  const hadFunctionCall = state.functionCall !== undefined;
+  const current = { ...state.functionCall };
+
+  if (!hadFunctionCall) {
+    const reserveNullContent = state.content.length === 0 && state.toolCalls.size === 0;
+
+    if (
+      !reserveChatStructure(
+        budget,
+        JSON.stringify("function_call").length +
+          4 +
+          (reserveNullContent ? JSON.stringify("content").length + 6 : 0),
+        1 + (reserveNullContent ? 1 : 0),
+      )
+    )
+      return;
+    state.functionCall = current;
+  }
+
+  if (name !== undefined) {
+    const currentName = readString(current.name);
+
+    const capturedName =
+      currentName === undefined
+        ? captureChatString(name, budget, JSON.stringify("name").length + 2, true, true, true)
+        : replaceChatString(currentName, name, budget);
+
+    if (capturedName !== undefined) {
+      current.name = capturedName;
+      state.unresolvedFunctionScalars.delete("name");
+    } else {
+      if (currentName !== undefined) {
+        releaseCapturedChatString(
+          currentName,
+          budget,
+          JSON.stringify("name").length + 2,
+          true,
+          true,
+        );
+        delete current.name;
+      }
+
+      state.unresolvedFunctionScalars.add("name");
+    }
+  }
+
+  if (!budget.truncated && argumentsText !== undefined) {
+    const existingArguments = readString(current.arguments);
+
+    const capturedArguments = captureChatString(
+      argumentsText,
+      budget,
+      existingArguments === undefined ? JSON.stringify("arguments").length + 2 : 0,
+      existingArguments === undefined,
+      existingArguments === undefined,
+    );
+
+    if (capturedArguments !== undefined)
+      current.arguments = `${existingArguments ?? ""}${capturedArguments}`;
+  }
+
+  state.functionCall = current;
+}
+
+function chatMessage(state: ChatChoiceState) {
+  const fields: ChatMessageFields = {};
+
+  if (state.roleResolved) fields.role = state.role ?? "assistant";
+
+  if (state.content.length > 0) fields.content = state.content;
+  else if (state.functionCall || state.toolCalls.size > 0) fields.content = null;
+
+  if (state.refusal.length > 0) fields.refusal = state.refusal;
+
+  if (state.functionCall) {
+    const functionCall = { ...state.functionCall };
+
+    if (state.unresolvedFunctionScalars.has("name")) delete functionCall.name;
+    fields.function_call = functionCall;
+  }
+
+  if (state.toolCalls.size > 0) {
+    fields.tool_calls = [...state.toolCalls.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([index, toolCall]) => {
+        const captured = { ...toolCall };
+        const unresolved = state.unresolvedToolScalars.get(index);
+
+        if (unresolved?.has("id")) delete captured.id;
+
+        if (unresolved?.has("type")) delete captured.type;
+
+        if (unresolved?.has("function.name")) {
+          const fn = { ...asRecord(captured.function) };
+          delete fn.name;
+          captured.function = fn;
+        }
+
+        if (unresolved?.has("custom.name")) {
+          const custom = { ...asRecord(captured.custom) };
+          delete custom.name;
+          captured.custom = custom;
+        }
+
+        return captured;
+      });
   }
 
   return fields;
 }
 
-function recordChatChunk<T>(chunk: T, states: Map<number, ChatChoiceState>) {
-  const c = asRecord(chunk) ?? {};
-  let hasOutput = false;
+function chatOutput(states: Map<number, ChatChoiceState>): ChatMessageFields[] {
+  return [...states.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, state]) => chatMessage(state));
+}
 
-  for (const choice of asArray(c.choices) ?? []) {
+function chatStateHasFieldBesidesRole(state: ChatChoiceState): boolean {
+  return (
+    state.content.length > 0 ||
+    state.refusal.length > 0 ||
+    state.functionCall !== undefined ||
+    state.toolCalls.size > 0
+  );
+}
+
+function chatPartialFields(
+  states: Map<number, ChatChoiceState>,
+  finishReasonStates: Map<number, string>,
+  usage: SpanFields["usage"],
+  captureOutput: boolean,
+  captureTruncated: boolean,
+): SpanFields {
+  const finishReasons = [...finishReasonStates.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, reason]) => reason);
+
+  const fields: SpanFields = {
+    output: captureOutput && states.size > 0 ? chatOutput(states) : undefined,
+    usage,
+    finishReason: finishReasons[0],
+  };
+
+  if (finishReasons.length > 1 || captureTruncated) {
+    const attributes: NonNullable<SpanFields["attributes"]> = {};
+
+    if (finishReasons.length > 1) attributes["gen_ai.response.finish_reasons"] = finishReasons;
+
+    if (captureTruncated) attributes["telemetry.dev.capture.truncated"] = true;
+
+    fields.attributes = attributes;
+  }
+
+  return fields;
+}
+
+function recordChatChunk<T>(
+  chunk: T,
+  states: Map<number, ChatChoiceState>,
+  finishReasonStates: Map<number, string>,
+  finishReasonReservations: Map<number, ChatCaptureReservation>,
+  rejectedFinishReasons: Set<number>,
+  unterminatedChoices: Set<number>,
+  outputBudget: ChatCaptureBudget,
+  finishReasonBudget: ChatCaptureBudget,
+  captureOutput: boolean,
+  reportError: (cause: unknown) => void,
+) {
+  const c = asRecord(chunk) ?? {};
+  const fieldReadFailed = { value: false };
+  let hasOutput = false;
+  let remainingToolCalls = CHAT_STREAM_CAPTURE_MAX_ITEMS;
+  const choices = asArray(readOwn(c, "choices", outputBudget, fieldReadFailed, reportError)) ?? [];
+
+  for (const choice of choices.slice(0, CHAT_STREAM_CAPTURE_MAX_ITEMS)) {
     const choiceRecord = asRecord(choice) ?? {};
-    const state = getChoiceState(states, readNumber(choiceRecord.index) ?? 0);
-    const delta = asRecord(choiceRecord.delta) ?? {};
-    const audio = asRecord(delta.audio);
-    const legacyFunction = asRecord(delta.function_call);
+    const captureBudget = captureOutput ? outputBudget : undefined;
+
+    const choiceIndex =
+      readNumber(readOwn(choiceRecord, "index", captureBudget, fieldReadFailed, reportError)) ?? 0;
+
+    const delta =
+      asRecord(readOwn(choiceRecord, "delta", captureBudget, fieldReadFailed, reportError)) ?? {};
+
+    const content = readString(
+      readOwn(delta, "content", captureBudget, fieldReadFailed, reportError),
+    );
+
+    const refusal = readString(
+      readOwn(delta, "refusal", captureBudget, fieldReadFailed, reportError),
+    );
+
+    const audio = asRecord(readOwn(delta, "audio", undefined, fieldReadFailed, reportError));
+
+    const audioData = audio
+      ? readString(readOwn(audio, "data", undefined, fieldReadFailed, reportError))
+      : undefined;
+
+    const legacyFunction = asRecord(
+      readOwn(delta, "function_call", captureBudget, fieldReadFailed, reportError),
+    );
+
+    const legacyName = legacyFunction
+      ? readString(readOwn(legacyFunction, "name", captureBudget, fieldReadFailed, reportError))
+      : undefined;
+
+    const legacyArguments = legacyFunction
+      ? readString(
+          readOwn(legacyFunction, "arguments", captureBudget, fieldReadFailed, reportError),
+        )
+      : undefined;
+
+    const toolCallDeltas =
+      asArray(readOwn(delta, "tool_calls", captureBudget, fieldReadFailed, reportError)) ?? [];
 
     if (
-      (typeof delta.content === "string" && delta.content.length > 0) ||
-      (typeof delta.refusal === "string" && delta.refusal.length > 0) ||
-      (typeof audio?.data === "string" && audio.data.length > 0) ||
-      (typeof legacyFunction?.arguments === "string" && legacyFunction.arguments.length > 0) ||
-      (asArray(delta.tool_calls) ?? []).some((toolCall) => {
-        const fn = asRecord(asRecord(toolCall)?.function);
-
-        return typeof fn?.arguments === "string" && fn.arguments.length > 0;
-      })
+      (content !== undefined && content.length > 0) ||
+      (refusal !== undefined && refusal.length > 0) ||
+      (audioData !== undefined && audioData.length > 0) ||
+      (legacyArguments !== undefined && legacyArguments.length > 0)
     ) {
       hasOutput = true;
     }
 
-    if (typeof delta.role === "string") state.role = delta.role;
+    const finishReason = readString(
+      readOwn(choiceRecord, "finish_reason", finishReasonBudget, fieldReadFailed, reportError),
+    );
 
-    if (typeof delta.content === "string") state.content += delta.content;
-
-    if (typeof delta.refusal === "string") state.refusal += delta.refusal;
-
-    for (const toolCall of asArray(delta.tool_calls) ?? []) {
-      const toolCallRecord = asRecord(toolCall);
-
-      if (toolCallRecord) mergeToolCall(state, toolCallRecord);
+    if (finishReason !== undefined) {
+      unterminatedChoices.delete(choiceIndex);
+      replaceFinishReason(
+        choiceIndex,
+        finishReason,
+        finishReasonStates,
+        finishReasonReservations,
+        rejectedFinishReasons,
+        finishReasonBudget,
+      );
+    } else if (!finishReasonStates.has(choiceIndex) && !rejectedFinishReasons.has(choiceIndex)) {
+      if (
+        unterminatedChoices.has(choiceIndex) ||
+        unterminatedChoices.size < CHAT_STREAM_CAPTURE_MAX_ITEMS
+      ) {
+        unterminatedChoices.add(choiceIndex);
+      } else {
+        finishReasonBudget.truncated = true;
+      }
     }
 
-    const finishReason = readString(choiceRecord.finish_reason);
+    const hadState = states.has(choiceIndex);
+    const retainedState = captureOutput ? states.get(choiceIndex) : undefined;
 
-    if (finishReason) state.finishReason = finishReason;
+    if (retainedState && finishReason !== undefined) retainedState.terminal = true;
+    let state = retainedState;
+
+    if (captureOutput && !outputBudget.truncated && !state) {
+      if (reserveChatStructure(outputBudget, states.size > 0 ? 1 : 0)) {
+        const initialState: ChatChoiceState = {
+          content: "",
+          refusal: "",
+          roleResolved: true,
+          terminal: finishReason !== undefined,
+          unresolvedFunctionScalars: new Set(),
+          toolCalls: new Map(),
+          unresolvedToolScalars: new Map(),
+        };
+
+        const initialCapture = boundedCaptureDetails(chatMessage(initialState), {
+          maxBytes: outputBudget.remainingBytes,
+          maxItems: outputBudget.remainingItems,
+        });
+
+        if (initialCapture.truncated || initialCapture.value === undefined) {
+          outputBudget.truncated = true;
+        } else {
+          outputBudget.remainingBytes -= initialCapture.bytes;
+          outputBudget.remainingItems -= initialCapture.items;
+          state = initialState;
+          states.set(choiceIndex, state);
+        }
+      }
+    }
+
+    const role = state
+      ? readString(readOwn(delta, "role", outputBudget, fieldReadFailed, reportError))
+      : undefined;
+
+    if (
+      state &&
+      role !== undefined &&
+      (!state.roleResolved || role !== (state.role ?? "assistant"))
+    ) {
+      const capturedRole = state.roleResolved
+        ? replaceChatString(state.role ?? "assistant", role, outputBudget)
+        : captureChatString(
+            role,
+            outputBudget,
+            JSON.stringify("role").length + (chatStateHasFieldBesidesRole(state) ? 2 : 1),
+            true,
+            true,
+            true,
+          );
+
+      if (capturedRole === undefined) {
+        if (state.roleResolved)
+          releaseCapturedChatField(
+            "role",
+            state.role ?? "assistant",
+            outputBudget,
+            chatStateHasFieldBesidesRole(state),
+          );
+        state.role = undefined;
+        state.roleResolved = false;
+      } else {
+        state.role = capturedRole;
+        state.roleResolved = true;
+      }
+    }
+
+    if (state && !outputBudget.truncated && content) {
+      const hasContent = state.content.length > 0;
+
+      const capturedContent =
+        !hasContent && (state.functionCall !== undefined || state.toolCalls.size > 0)
+          ? replaceChatNullWithString(content, outputBudget)
+          : captureChatString(
+              content,
+              outputBudget,
+              hasContent ? 0 : JSON.stringify("content").length + 2,
+              !hasContent,
+              !hasContent,
+            );
+
+      if (capturedContent !== undefined) state.content += capturedContent;
+    }
+
+    if (state && !outputBudget.truncated && refusal) {
+      const hasRefusal = state.refusal.length > 0;
+
+      const capturedRefusal = captureChatString(
+        refusal,
+        outputBudget,
+        hasRefusal ? 0 : JSON.stringify("refusal").length + 2,
+        !hasRefusal,
+        !hasRefusal,
+      );
+
+      if (capturedRefusal !== undefined) state.refusal += capturedRefusal;
+    }
+
+    if (state) captureFunctionCallDelta(state, legacyName, legacyArguments, outputBudget);
+
+    const retainedToolCallDeltas = toolCallDeltas.slice(0, remainingToolCalls);
+    remainingToolCalls -= retainedToolCallDeltas.length;
+
+    if (retainedToolCallDeltas.length < toolCallDeltas.length) {
+      hasOutput = true;
+
+      if (captureOutput) outputBudget.truncated = true;
+    }
+
+    for (const rawToolCall of retainedToolCallDeltas) {
+      if (hasOutput && !state) break;
+
+      const toolCall = readChatToolCallDelta(
+        asRecord(rawToolCall) ?? {},
+        captureBudget,
+        reportError,
+      );
+
+      if (toolCall.readFailed) {
+        if (
+          !hadState &&
+          state &&
+          state.role === undefined &&
+          state.content.length === 0 &&
+          state.refusal.length === 0 &&
+          state.functionCall === undefined &&
+          state.toolCalls.size === 0
+        )
+          states.delete(choiceIndex);
+        break;
+      }
+
+      if (toolCall.functionArguments || toolCall.customInput) hasOutput = true;
+
+      if (state) captureToolCallDelta(state, toolCall, outputBudget);
+    }
+  }
+
+  if (choices.length > CHAT_STREAM_CAPTURE_MAX_ITEMS) {
+    hasOutput = true;
+
+    if (captureOutput) outputBudget.truncated = true;
+    finishReasonBudget.truncated = true;
+  }
+
+  const responseId = readString(readOwn(c, "id", undefined, fieldReadFailed, reportError));
+  const responseModel = readString(readOwn(c, "model", undefined, fieldReadFailed, reportError));
+  const usage = chatUsage(readOwn(c, "usage", undefined, fieldReadFailed, reportError));
+
+  if (fieldReadFailed.value) {
+    outputBudget.truncated = true;
+    finishReasonBudget.truncated = true;
   }
 
   return {
-    responseId: readString(c.id),
-    responseModel: readString(c.model),
-    usage: chatUsage(c.usage),
+    responseId,
+    responseModel,
+    usage,
     hasOutput,
+  };
+}
+
+// Older cores enforce captureOutput and masking when the span ends but expose no policy, so
+// retain output within the default limit and withhold incomplete output from their mask.
+const LEGACY_CAPTURE_POLICY: NonNullable<SpanHandle["capturePolicy"]> = {
+  output: true,
+  mask: true,
+  maxAttributeLength: 65_536,
+};
+
+function reportSpanError(span: SpanHandle, cause: unknown): void {
+  try {
+    span.reportError?.(cause);
+  } catch {
+    return;
+  }
+}
+
+function createSpanErrorReporter(span: SpanHandle): (cause: unknown) => void {
+  let reported = false;
+
+  return (cause) => {
+    if (reported) return;
+    reported = true;
+    reportSpanError(span, cause);
   };
 }
 
@@ -829,16 +1626,65 @@ function createObservedChatStream(
   end: (fields?: SpanFields) => void,
   hideSyntheticUsage: boolean,
 ): Stream<JsonValue> {
+  const capturePolicy = span.capturePolicy ?? LEGACY_CAPTURE_POLICY;
+  const captureOutput = capturePolicy.output;
+  const maskOutputWhenIncomplete = capturePolicy.mask;
+  const captureLimit = CHAT_STREAM_CAPTURE_MAX_BYTES;
+  const reportError = createSpanErrorReporter(span);
+
   async function* iterator() {
     const states = new Map<number, ChatChoiceState>();
+    const finishReasonStates = new Map<number, string>();
+    const finishReasonReservations = new Map<number, ChatCaptureReservation>();
+    const rejectedFinishReasons = new Set<number>();
+    const unterminatedChoices = new Set<number>();
+
+    const outputBudget: ChatCaptureBudget = {
+      remainingBytes: Math.max(captureLimit - 2, 0),
+      remainingItems: CHAT_STREAM_CAPTURE_MAX_ITEMS - 1,
+      truncated: captureOutput && captureLimit < 2,
+    };
+
+    const finishReasonBudget: ChatCaptureBudget = {
+      remainingBytes: CHAT_STREAM_CAPTURE_MAX_BYTES,
+      remainingItems: CHAT_STREAM_CAPTURE_MAX_ITEMS,
+      truncated: false,
+    };
+
     let usage: SpanFields["usage"];
     let sawFirst = false;
+    let completedNormally = false;
     let terminalError: Error | undefined;
 
     try {
       for await (const chunk of source) {
         const receivedAt = performance.now();
-        const update = recordChatChunk(chunk, states);
+        let update: ReturnType<typeof recordChatChunk>;
+
+        try {
+          update = recordChatChunk(
+            chunk,
+            states,
+            finishReasonStates,
+            finishReasonReservations,
+            rejectedFinishReasons,
+            unterminatedChoices,
+            outputBudget,
+            finishReasonBudget,
+            captureOutput,
+            reportError,
+          );
+        } catch (cause) {
+          outputBudget.truncated = true;
+          finishReasonBudget.truncated = true;
+          reportError(cause);
+          update = {
+            responseId: undefined,
+            responseModel: undefined,
+            usage: undefined,
+            hasOutput: false,
+          };
+        }
 
         if (update.hasOutput) span.recordOutputChunk?.(receivedAt);
 
@@ -853,13 +1699,49 @@ function createObservedChatStream(
 
         if (update.usage) usage = update.usage;
 
-        if (!hideSyntheticUsage || !isSyntheticUsageChunk(chunk)) yield chunk;
+        let syntheticUsage = false;
+
+        if (hideSyntheticUsage) {
+          try {
+            syntheticUsage = isSyntheticUsageChunk(chunk);
+          } catch (cause) {
+            outputBudget.truncated = true;
+            finishReasonBudget.truncated = true;
+            reportError(cause);
+          }
+        }
+
+        if (!syntheticUsage) yield chunk;
       }
+
+      completedNormally = true;
     } catch (error) {
       terminalError = asError(error);
       throw error;
     } finally {
-      const fields = chatPartialFields(states, usage);
+      const outputIncomplete =
+        !completedNormally ||
+        unterminatedChoices.size > 0 ||
+        (captureOutput &&
+          [...states.values()].some(
+            (state) =>
+              !state.terminal ||
+              !state.roleResolved ||
+              state.unresolvedFunctionScalars.size > 0 ||
+              [...state.unresolvedToolScalars.values()].some((fields) => fields.size > 0),
+          ));
+
+      const fields = chatPartialFields(
+        states,
+        finishReasonStates,
+        usage,
+        captureOutput &&
+          !(maskOutputWhenIncomplete && (outputBudget.truncated || outputIncomplete)),
+        outputBudget.truncated ||
+          outputIncomplete ||
+          finishReasonBudget.truncated ||
+          rejectedFinishReasons.size > 0,
+      );
 
       if (terminalError) fields.error = terminalError;
       end(fields);
@@ -869,14 +1751,29 @@ function createObservedChatStream(
   return new Stream(() => iterator(), source.controller);
 }
 
+function markResponsesCaptureIncomplete(fields: SpanFields, maskOutput: boolean): void {
+  fields.attributes = {
+    ...fields.attributes,
+    "telemetry.dev.capture.truncated": true,
+  };
+
+  if (maskOutput) delete fields.output;
+}
+
 function createObservedResponsesStream(
   source: Stream<JsonValue>,
   span: SpanHandle,
   startedAt: number,
   end: (fields?: SpanFields) => void,
 ): Stream<JsonValue> {
+  const capturePolicy = span.capturePolicy ?? LEGACY_CAPTURE_POLICY;
+  const captureLimit = CHAT_STREAM_CAPTURE_MAX_BYTES;
+  const maskOutputWhenIncomplete = capturePolicy.mask;
+  const reportError = createSpanErrorReporter(span);
+
   async function* iterator() {
     let sawFirst = false;
+    let sawTerminalSnapshot = false;
     let partial: SpanFields = {};
     let retainedOutput: SpanFields["output"];
     let terminalError: Error | undefined;
@@ -884,40 +1781,65 @@ function createObservedResponsesStream(
     try {
       for await (const event of source) {
         const receivedAt = performance.now();
-        const e = asRecord(event) ?? {};
 
-        if (responseEventHasOutput(e)) span.recordOutputChunk?.(receivedAt);
-        const response = asRecord(e.response);
+        try {
+          const e = asRecord(event) ?? {};
 
-        if (!sawFirst) {
-          sawFirst = true;
-          span.update({ timeToFirstChunkMs: performance.now() - startedAt });
-        }
+          if (responseEventHasOutput(e)) span.recordOutputChunk?.(receivedAt);
+          const response = asRecord(e.response);
 
-        if (response) {
-          const next = responsesResponse(response);
-          const truncated = next.attributes?.["telemetry.dev.capture.truncated"] === true;
+          if (!sawFirst) {
+            sawFirst = true;
+            span.update({ timeToFirstChunkMs: performance.now() - startedAt });
+          }
 
-          const fitsWithContent =
-            !truncated &&
-            next.output !== undefined &&
-            !(Array.isArray(next.output) && next.output.length === 0);
+          if (response) {
+            const next = responsesResponse(response, capturePolicy.output, captureLimit);
+            const truncated = next.attributes?.["telemetry.dev.capture.truncated"] === true;
 
-          if (fitsWithContent) retainedOutput = next.output;
+            const fitsWithContent =
+              !truncated &&
+              next.output !== undefined &&
+              !(Array.isArray(next.output) && next.output.length === 0);
 
-          partial = next;
+            if (fitsWithContent) retainedOutput = next.output;
 
-          if (retainedOutput !== undefined) partial.output = retainedOutput;
-        }
+            partial = next;
 
-        if (e.type === "response.failed") {
-          partial = { ...partial, error: responseFailedError(response) };
-          end(partial);
-        } else if (e.type === "error") {
-          partial = { ...partial, error: responseStreamError(event) };
-          end(partial);
-        } else if (e.type === "response.completed" || e.type === "response.incomplete") {
-          end(partial);
+            if (truncated && maskOutputWhenIncomplete) delete partial.output;
+            else if (retainedOutput !== undefined) partial.output = retainedOutput;
+          }
+
+          const terminalSnapshot =
+            response !== undefined &&
+            (e.type === "response.completed" ||
+              e.type === "response.failed" ||
+              e.type === "response.incomplete");
+
+          if (terminalSnapshot) sawTerminalSnapshot = true;
+
+          if (e.type === "response.failed") {
+            if (!terminalSnapshot)
+              markResponsesCaptureIncomplete(partial, maskOutputWhenIncomplete);
+
+            partial = { ...partial, error: responseFailedError(response) };
+            end(partial);
+          } else if (e.type === "error") {
+            markResponsesCaptureIncomplete(partial, maskOutputWhenIncomplete);
+            partial = { ...partial, error: responseStreamError(event) };
+            end(partial);
+          } else if (e.type === "response.completed" || e.type === "response.incomplete") {
+            if (!terminalSnapshot)
+              markResponsesCaptureIncomplete(partial, maskOutputWhenIncomplete);
+
+            end(partial);
+          }
+        } catch (cause) {
+          reportError(cause);
+          markResponsesCaptureIncomplete(partial, maskOutputWhenIncomplete);
+          const failure = responsesEventFailure(event);
+
+          if (failure) end({ ...partial, error: failure });
         }
 
         yield event;
@@ -926,6 +1848,8 @@ function createObservedResponsesStream(
       terminalError = asError(error);
       throw error;
     } finally {
+      if (!sawTerminalSnapshot) markResponsesCaptureIncomplete(partial, maskOutputWhenIncomplete);
+
       if (terminalError) partial.error = terminalError;
       end(partial);
     }
@@ -993,7 +1917,11 @@ function createObservedMediaStream(
   startedAt: number,
   end: (fields?: SpanFields) => void,
 ): Stream<JsonValue> {
-  const captureOutput = captureEnabled("output");
+  const capturePolicy = span.capturePolicy ?? LEGACY_CAPTURE_POLICY;
+  const captureOutput = capturePolicy.output;
+  const maskOutputWhenIncomplete = capturePolicy.mask;
+  const captureLimit = MAX_CAPTURE_LENGTH;
+  const reportError = createSpanErrorReporter(span);
 
   async function* iterator() {
     let sawFirst = false;
@@ -1002,71 +1930,84 @@ function createObservedMediaStream(
     let serializedTextLength = 2;
     let deltaCaptureStopped = false;
     let captureTruncated = false;
+    let sawTerminal = false;
     let terminalText: string | undefined;
     let usage: SpanFields["usage"];
     let error: Error | undefined;
 
     try {
       for await (const event of source) {
-        const e = asRecord(event) ?? {};
-        const delta = readString(e.delta);
+        try {
+          const e = asRecord(event) ?? {};
+          const delta = readString(e.delta);
+          sawTerminal ||=
+            (operation === "transcriptions" && e.type === "transcript.text.done") ||
+            (operation === "images" &&
+              (e.type === "image_generation.completed" ||
+                e.type === "image_generation.failed" ||
+                e.type === "image_edit.completed" ||
+                e.type === "image_edit.failed"));
 
-        if (operation === "transcriptions" && e.type === "transcript.text.delta") {
-          sawTranscriptDelta = true;
-        }
-
-        const segmentText =
-          operation === "transcriptions" && e.type === "transcript.text.segment"
-            ? readString(e.text)
-            : undefined;
-
-        const completeText =
-          captureOutput && operation === "transcriptions" && e.type === "transcript.text.done"
-            ? readString(e.text)
-            : undefined;
-
-        const hasOutput =
-          operation === "images"
-            ? typeof e.b64_json === "string" && e.b64_json.length > 0
-            : !!delta || !!segmentText || !!completeText;
-
-        if (hasOutput) {
-          span.recordOutputChunk?.(performance.now());
-
-          if (!sawFirst) {
-            sawFirst = true;
-            span.update({ timeToFirstChunkMs: performance.now() - startedAt });
+          if (operation === "transcriptions" && e.type === "transcript.text.delta") {
+            sawTranscriptDelta = true;
           }
-        }
 
-        const incrementalText =
-          delta ?? (!sawTranscriptDelta && segmentText ? segmentText : undefined);
+          const segmentText =
+            operation === "transcriptions" && e.type === "transcript.text.segment"
+              ? readString(e.text)
+              : undefined;
 
-        if (
-          captureOutput &&
-          operation === "transcriptions" &&
-          incrementalText &&
-          !deltaCaptureStopped
-        ) {
-          const capture = boundedTranscriptText(
-            incrementalText,
-            MAX_CAPTURE_LENGTH - serializedTextLength,
-          );
+          const completeText =
+            captureOutput && operation === "transcriptions" && e.type === "transcript.text.done"
+              ? readString(e.text)
+              : undefined;
 
-          if (capture.value) textChunks.push(capture.value);
-          serializedTextLength += capture.serializedLength;
-          deltaCaptureStopped = capture.truncated;
-          captureTruncated ||= capture.truncated;
-        }
+          const hasOutput =
+            operation === "images"
+              ? typeof e.b64_json === "string" && e.b64_json.length > 0
+              : !!delta || !!segmentText || !!completeText;
 
-        if (completeText !== undefined) {
-          const capture = boundedTranscriptText(completeText);
-          terminalText = capture.value;
-          captureTruncated = capture.truncated;
-        }
+          if (hasOutput) {
+            span.recordOutputChunk?.(performance.now());
 
-        if (e.usage) {
-          usage = modalityUsage(e.usage, operation === "images" ? "image" : "text");
+            if (!sawFirst) {
+              sawFirst = true;
+              span.update({ timeToFirstChunkMs: performance.now() - startedAt });
+            }
+          }
+
+          const incrementalText =
+            delta ?? (!sawTranscriptDelta && segmentText ? segmentText : undefined);
+
+          if (
+            captureOutput &&
+            operation === "transcriptions" &&
+            incrementalText &&
+            !deltaCaptureStopped
+          ) {
+            const capture = boundedTranscriptText(
+              incrementalText,
+              Math.max(captureLimit - serializedTextLength, 0),
+            );
+
+            if (capture.value) textChunks.push(capture.value);
+            serializedTextLength += capture.serializedLength;
+            deltaCaptureStopped = capture.truncated;
+            captureTruncated ||= capture.truncated;
+          }
+
+          if (completeText !== undefined) {
+            const capture = boundedTranscriptText(completeText, Math.max(captureLimit - 2, 0));
+            terminalText = capture.value;
+            captureTruncated = capture.truncated;
+          }
+
+          if (e.usage) {
+            usage = modalityUsage(e.usage, operation === "images" ? "image" : "text");
+          }
+        } catch (cause) {
+          captureTruncated = true;
+          reportError(cause);
         }
 
         yield event;
@@ -1076,11 +2017,15 @@ function createObservedMediaStream(
       throw cause;
     } finally {
       const text = captureOutput ? (terminalText ?? textChunks.join("")) : "";
+      const captureIncomplete = captureTruncated || !sawTerminal;
       end({
-        output: operation === "transcriptions" && text ? text : undefined,
+        output:
+          operation === "transcriptions" && text && !(maskOutputWhenIncomplete && captureIncomplete)
+            ? text
+            : undefined,
         usage,
         error,
-        attributes: captureTruncated ? { "telemetry.dev.capture.truncated": true } : undefined,
+        attributes: captureIncomplete ? { "telemetry.dev.capture.truncated": true } : undefined,
       });
     }
   }

@@ -59,6 +59,12 @@ export interface StartSpanOptions extends SpanFields {
   captureOutput?: boolean;
 }
 
+export interface SpanCapturePolicy {
+  readonly output: boolean;
+  readonly mask: boolean;
+  readonly maxAttributeLength: number;
+}
+
 export interface SpanHandle {
   /** Raw OTel span (interop escape hatch). */
   readonly span: Span;
@@ -69,9 +75,11 @@ export interface SpanHandle {
   /** W3C traceparent for this span; null for the no-op handle. */
   readonly traceparent: string | null;
   readonly isRecording: boolean;
+  readonly capturePolicy?: SpanCapturePolicy;
   update(fields: SpanFields): SpanHandle;
   /** Records an output chunk arrival. Pull-based streams include consumer delay between pulls. */
   recordOutputChunk(timestampMs?: number): void;
+  reportError?(cause: unknown): void;
   end(fields?: SpanFields & { endTime?: Date | number }): void;
 }
 
@@ -240,6 +248,11 @@ export function createSpanHandle(
     traceId: spanContext.traceId,
     spanId: spanContext.spanId,
     traceparent: `00-${spanContext.traceId}-${spanContext.spanId}-${flags}`,
+    capturePolicy: {
+      output: meta.capture.captureOutput,
+      mask: meta.capture.mask !== undefined,
+      maxAttributeLength: meta.capture.maxAttributeLength,
+    },
     get isRecording() {
       return span.isRecording();
     },
@@ -286,6 +299,9 @@ export function createSpanHandle(
       }
 
       previousOutputChunkTime = now;
+    },
+    reportError(cause) {
+      reportError(meta.onError, cause instanceof Error ? cause : new Error(String(cause)));
     },
     end(fields) {
       try {

@@ -36,7 +36,12 @@ import {
   type Transport,
 } from "@telemetry-dev/otel";
 
-import { type ResolvedConfig, resolveConfig, type TelemetryOptions } from "./config.ts";
+import {
+  DEFAULT_MAX_ATTRIBUTE_LENGTH,
+  type ResolvedConfig,
+  resolveConfig,
+  type TelemetryOptions,
+} from "./config.ts";
 
 /** Test seam: inject in-memory exporters instead of the OTLP fetch transport. */
 export interface ClientOverrides {
@@ -71,6 +76,14 @@ const NOOP_CLIENT: ClientHandle = {
 
 let activeClient: ClientHandle | undefined;
 
+function shutdownClient(client: ClientHandle, onError?: (cause: Error) => void): void {
+  try {
+    void client.shutdown().catch((error: Error) => reportError(onError, error));
+  } catch (error) {
+    reportError(onError, error instanceof Error ? error : new Error(String(error)));
+  }
+}
+
 export function currentClient(): ClientHandle {
   return activeClient ?? NOOP_CLIENT;
 }
@@ -90,11 +103,20 @@ export function shutdown(): Promise<void> {
 }
 
 export function init(options?: TelemetryOptions, overrides?: ClientOverrides): TelemetryClient {
+  const previousClient = activeClient;
+
   try {
+    setLogLevel(options?.logLevel ?? "warn");
+
     return initInner(options, overrides);
   } catch (error) {
     reportError(options?.onError, error instanceof Error ? error : new Error(String(error)));
-    activeClient = NOOP_CLIENT;
+
+    if (previousClient && previousClient !== NOOP_CLIENT) {
+      shutdownClient(previousClient, options?.onError);
+    }
+
+    if (activeClient === previousClient) activeClient = NOOP_CLIENT;
 
     return NOOP_CLIENT;
   }
@@ -102,12 +124,11 @@ export function init(options?: TelemetryOptions, overrides?: ClientOverrides): T
 
 function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): TelemetryClient {
   const config = resolveConfig(options);
-  setLogLevel(config.logLevel);
 
   if (activeClient && activeClient !== NOOP_CLIENT) {
     diag.warn("init() called again; replacing the previous client");
     // shutdown() synchronously releases global registrations before this init claims them.
-    void activeClient.shutdown().catch((error: Error) => reportError(config.onError, error));
+    shutdownClient(activeClient, config.onError);
   }
 
   const enabled = config.enabled && Boolean(config.apiKey ?? overrides?.spanExporter);
@@ -167,11 +188,14 @@ function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): Tel
     onError: config.onError,
   });
 
+  // A zero cap only drops content; OpenTelemetry rejects it as a provider limit.
+  const backstopLength = config.maxAttributeLength || DEFAULT_MAX_ATTRIBUTE_LENGTH;
+
   const provider = new BasicTracerProvider({
     resource,
     sampler: sessionSampler(config.sampler),
     spanProcessors: [processor],
-    spanLimits: { attributeValueLengthLimit: config.maxAttributeLength },
+    spanLimits: { attributeValueLengthLimit: backstopLength },
   });
 
   const tracer = provider.getTracer(SCOPE_NAME, SCOPE_VERSION);
@@ -220,7 +244,7 @@ function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): Tel
 
       const loggerProvider = new LoggerProvider({
         resource,
-        logRecordLimits: { attributeValueLengthLimit: config.maxAttributeLength },
+        logRecordLimits: { attributeValueLengthLimit: backstopLength },
         processors: [logProcessor],
       });
 

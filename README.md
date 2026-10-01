@@ -111,6 +111,18 @@ python trace.py
 The SDKs capture inputs and outputs by default.
 To disable input and output capture, set `captureInput: false` and `captureOutput: false` in TypeScript `init()`.
 For Python, use `capture_input=False` and `capture_output=False`.
+Disabling output capture omits message content; response IDs and models, finish reasons, usage,
+timing, and errors may still be recorded when providers supply them. For streamed OpenAI chat,
+usage requires provider support or the documented stream-usage option in the OpenAI integration.
+Capture flags do not gate stop sequences, tool descriptions and definitions (`gen_ai.tool.description`, `gen_ai.tool.definitions`), caller-supplied metadata or raw attributes, or exception
+messages and stack traces; redact those separately when needed.
+OpenAI streamed chat and Responses reconstruction, and Anthropic stream reconstruction, retain up
+to 48 KiB and 1,000 items; OpenAI transcription text retains up to 64 KiB with no item limit.
+These are fixed resource bounds: the configured attribute-length limit is applied by the core to
+the exported attribute after masking, not to stream retention. A truncated or otherwise
+incomplete stream sets
+`telemetry.dev.capture.truncated`; when a mask is configured, incomplete reconstructed output is
+omitted because the mask cannot inspect the complete value.
 
 ## Features
 

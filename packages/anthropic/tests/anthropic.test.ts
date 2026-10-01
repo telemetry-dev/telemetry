@@ -4,7 +4,7 @@ import {
   type PushMetricExporter,
 } from "@opentelemetry/sdk-metrics";
 import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
-import { flush, init, shutdown } from "@telemetry-dev/sdk";
+import { flush, init, shutdown, type TelemetryOptions } from "@telemetry-dev/sdk";
 import * as telemetrySdk from "@telemetry-dev/sdk";
 import Anthropic from "@anthropic-ai/sdk";
 import { createRequire } from "node:module";
@@ -159,6 +159,8 @@ function createFakeFetch(...responses: Response[]): FakeFetch {
 function setupSpans(
   metricExporter?: PushMetricExporter,
   captureOutput = true,
+  mask?: TelemetryOptions["mask"],
+  options: Pick<TelemetryOptions, "maxAttributeLength" | "onError"> = {},
 ): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
   init(
@@ -169,6 +171,8 @@ function setupSpans(
       exportMode: "immediate",
       logLevel: "silent",
       captureOutput,
+      mask,
+      ...options,
       fetch: async () => new Response(null, { status: 200 }),
     },
     { spanExporter, metricExporter },
@@ -313,6 +317,36 @@ test("messages.create maps request, response, usage, finish reason, provider, an
   expect(span.attributes["gen_ai.request.top_k"]).toBe(40);
   expect(span.attributes["gen_ai.request.max_tokens"]).toBe(64);
   expect(span.attributes["gen_ai.request.stop_sequences"]).toEqual(["END"]);
+});
+
+test("messages.create returns the provider result when response mapping fails", async () => {
+  const errors: Error[] = [];
+
+  const spans = setupSpans(undefined, true, undefined, {
+    onError: (error) => errors.push(error),
+  });
+
+  const mappingError = new Error("mapping failed");
+
+  const source = {
+    get role(): never {
+      throw mappingError;
+    },
+  };
+
+  const client = wrapAnthropic({
+    messages: { create: async (_params: unknown) => source },
+  });
+
+  const result = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [],
+  });
+
+  expect(result).toBe(source);
+  expect(errors).toEqual([mappingError]);
+  expect((await exportedSpan(spans)).attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
 test("messages.create preserves the Anthropic promise API", async () => {
@@ -864,10 +898,211 @@ test("messages.create streaming ends once with partial output when the caller st
     { role: "assistant", content: [{ type: "text", text: "Hello " }] },
   ]);
   expect(span.attributes["gen_ai.response.finish_reasons"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
   expect(
     Number(span.attributes["gen_ai.response.time_to_first_chunk"]) ===
       span.attributes["gen_ai.response.time_to_first_chunk"],
   ).toBe(true);
+});
+
+test("messages.create streaming omits early partial output when a mask is configured", async () => {
+  const spans = setupSpans(undefined, true, (value) => value);
+  const counted = countedSseResponse(streamEvents());
+
+  const stream = await clientWith(createFakeFetch(counted.response).fetch).messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Say hello" }],
+    stream: true,
+  });
+
+  for await (const event of stream) {
+    if (readString(asRecord(event)?.type) === "content_block_delta") break;
+  }
+
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("messages.create streaming reports mapping failures without changing provider delivery", async () => {
+  const errors: Error[] = [];
+
+  const spans = setupSpans(undefined, true, (value) => value, {
+    onError: (error) => errors.push(error),
+  });
+
+  const broken = {
+    get type() {
+      throw new Error("mapping failed");
+    },
+  };
+
+  const events = [
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial" } },
+    broken,
+    broken,
+    { type: "message_stop" },
+  ];
+
+  const source = {
+    controller: new AbortController(),
+    async *[Symbol.asyncIterator]() {
+      yield* events;
+    },
+  };
+
+  const client = wrapAnthropic({ messages: { create: async (_params: unknown) => source } });
+
+  const stream = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(errors).toHaveLength(1);
+  expect(errors[0]?.message).toBe("mapping failed");
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("messages.create streaming keeps telemetry on a core span without a capture policy", async () => {
+  const spans = setupSpans();
+  const startSpan = telemetrySdk.startSpan;
+  vi.spyOn(telemetrySdk, "startSpan").mockImplementation((...args) => {
+    const legacySpan = { ...startSpan(...args) };
+    Reflect.deleteProperty(legacySpan, "capturePolicy");
+    Reflect.deleteProperty(legacySpan, "recordOutputChunk");
+    Reflect.deleteProperty(legacySpan, "reportError");
+
+    return legacySpan;
+  });
+
+  const events = [
+    {
+      type: "message_start",
+      message: messagePayload({
+        id: "msg_legacy",
+        model: "claude-sonnet-4-6",
+        content: [],
+        usage: { input_tokens: 5, output_tokens: 0 },
+      }),
+    },
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "delivered" } },
+    { type: "content_block_stop", index: 0 },
+    { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } },
+    { type: "message_stop" },
+  ];
+
+  const source = {
+    controller: new AbortController(),
+    async *[Symbol.asyncIterator]() {
+      yield* events;
+    },
+  };
+
+  const client = wrapAnthropic({ messages: { create: async (_params: unknown) => source } });
+
+  const stream = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  expect(span.attributes["gen_ai.response.model"]).toBe("claude-sonnet-4-6");
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["end_turn"]);
+  expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(2);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ type: "text", text: "delivered" }] },
+  ]);
+});
+
+test("messages.create streaming retains output when the core span lacks chunk recording", async () => {
+  const spans = setupSpans();
+  const startSpan = telemetrySdk.startSpan;
+  vi.spyOn(telemetrySdk, "startSpan").mockImplementation((...args) => {
+    const legacySpan = { ...startSpan(...args) };
+    Reflect.deleteProperty(legacySpan, "recordOutputChunk");
+
+    return legacySpan;
+  });
+
+  const events = [
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "delivered" },
+    },
+    { type: "message_stop" },
+  ];
+
+  const source = {
+    controller: new AbortController(),
+    async *[Symbol.asyncIterator]() {
+      yield* events;
+    },
+  };
+
+  const client = wrapAnthropic({ messages: { create: async (_params: unknown) => source } });
+
+  const stream = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  expect(jsonAttr(await exportedSpan(spans), "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ type: "text", text: "delivered" }] },
+  ]);
+});
+
+test("messages.create streaming leaves the configured attribute limit to the core", async () => {
+  const spans = setupSpans(undefined, true, undefined, { maxAttributeLength: 128 });
+
+  const events = [
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "x".repeat(1_000) },
+    },
+    { type: "message_stop" },
+  ];
+
+  const source = {
+    controller: new AbortController(),
+    async *[Symbol.asyncIterator]() {
+      yield* events;
+    },
+  };
+
+  const client = wrapAnthropic({ messages: { create: async (_params: unknown) => source } });
+
+  const stream = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  const output = String(span.attributes["gen_ai.output.messages"]);
+  expect(output).toHaveLength(128);
+  expect(output.endsWith("...[truncated]")).toBe(true);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
 });
 
 test("messages.create streaming ends with error when aborted before iteration starts", async () => {
@@ -952,6 +1187,28 @@ test("instrumentAnthropic and wrapAnthropic are idempotent and uninstrumentAnthr
   expect(wrapped.requests).toHaveLength(1);
   expect(restored.requests).toHaveLength(1);
   expect(spans.getFinishedSpans()).toHaveLength(2);
+});
+
+test("uninstrumentAnthropic preserves a method installed after its own wrapper", () => {
+  const prototype = Object.getPrototypeOf(
+    new Anthropic({ apiKey: "test", maxRetries: 0 }).messages,
+  ) as { create: (...args: never[]) => unknown };
+
+  const original = prototype.create;
+
+  const laterOwner = function (this: unknown, ...args: never[]) {
+    return original.apply(this, args);
+  };
+
+  try {
+    instrumentAnthropic();
+    prototype.create = laterOwner;
+    uninstrumentAnthropic();
+
+    expect(prototype.create).toBe(laterOwner);
+  } finally {
+    prototype.create = original;
+  }
 });
 
 test("wrapAnthropic keeps a client instrumented after global instrumentation is removed", async () => {
@@ -1286,6 +1543,145 @@ function fallbackStream(iterations: JsonRecord[]): JsonRecord[] {
   return events;
 }
 
+test.each([false, true])(
+  "stream output over the encoded limit keeps a bounded prefix (masked: %s)",
+  async (masked) => {
+    const spans = setupSpans(undefined, true, masked ? (value) => value : undefined);
+
+    const events = betaStreamEvents(
+      [{ type: "text", text: "" }, [{ type: "text_delta", text: "first" }]],
+      [{ type: "text", text: "" }, [{ type: "text_delta", text: '"'.repeat(30_000) }]],
+    );
+
+    const span = await streamedBetaSpan(events, spans);
+
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+
+    if (masked) expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+    else {
+      const output = jsonAttr<Array<{ content: Array<{ text: string }> }>>(
+        span,
+        "gen_ai.output.messages",
+      );
+
+      expect(String(span.attributes["gen_ai.output.messages"])).not.toContain("[truncated]");
+      expect(output[0]?.content[0]).toEqual({ type: "text", text: "first" });
+      expect('"'.repeat(30_000).startsWith(output[0]?.content[1]?.text ?? "")).toBe(true);
+    }
+  },
+);
+
+test.each([
+  [400, true],
+  [6_000, false],
+] as const)(
+  "many small deltas do not exhaust the item budget (%s deltas)",
+  async (count, complete) => {
+    const spans = setupSpans(undefined, true, (value) => value);
+    const deltas = Array.from({ length: count }, () => ({ type: "text_delta", text: "Hello wor" }));
+    const events = betaStreamEvents([{ type: "text", text: "" }, deltas]);
+
+    const span = await streamedBetaSpan(events, spans);
+
+    if (complete) {
+      expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+      expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+        { role: "assistant", content: [{ type: "text", text: "Hello wor".repeat(count) }] },
+      ]);
+    } else {
+      expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+      expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+    }
+  },
+);
+
+test("deltas that fill the stream limit keep the text that was accepted", async () => {
+  const spans = setupSpans();
+
+  const events = betaStreamEvents([
+    { type: "text", text: "" },
+    [
+      { type: "text_delta", text: "x".repeat(49_000) },
+      { type: "text_delta", text: "y".repeat(127) },
+    ],
+  ]);
+
+  const span = await streamedBetaSpan(events, spans);
+
+  const output = jsonAttr<Array<{ content: Array<{ text?: string }> }>>(
+    span,
+    "gen_ai.output.messages",
+  );
+
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(output[0]?.content[0]?.text).toBe("x".repeat(49_000));
+  expect(String(span.attributes["gen_ai.output.messages"]).length).toBeLessThanOrEqual(48 * 1024);
+});
+
+test.each([
+  [200, true],
+  [300, false],
+] as const)(
+  "escape-heavy deltas are charged at their serialized size (%s deltas)",
+  async (count, complete) => {
+    const spans = setupSpans();
+    const chunk = '"\n'.repeat(50);
+    const deltas = Array.from({ length: count }, () => ({ type: "text_delta", text: chunk }));
+
+    const span = await streamedBetaSpan(
+      betaStreamEvents([{ type: "text", text: "" }, deltas]),
+      spans,
+    );
+
+    const text = jsonAttr<Array<{ content: Array<{ text: string }> }>>(
+      span,
+      "gen_ai.output.messages",
+    )[0]?.content[0]?.text;
+
+    if (complete) {
+      expect(text).toBe(chunk.repeat(count));
+      expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+    } else {
+      expect(text?.length).toBeGreaterThan(0);
+      expect(chunk.repeat(count).startsWith(text ?? "x")).toBe(true);
+      expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    }
+  },
+);
+
+test.each([
+  [1_000, false, "東".repeat(400)],
+  [1_000, true, "[redacted]"],
+  [0, false, undefined],
+] as const)(
+  "the configured cap applies after the mask, not to stream retention (cap %s, redact %s)",
+  async (maxAttributeLength, redact, expected) => {
+    const spans = setupSpans(
+      undefined,
+      true,
+      (value) =>
+        redact ? [{ role: "assistant", content: [{ type: "text", text: "[redacted]" }] }] : value,
+      { maxAttributeLength },
+    );
+
+    const text = redact ? "x".repeat(5_000) : "東".repeat(400);
+
+    const span = await streamedBetaSpan(
+      betaStreamEvents([{ type: "text", text: "" }, [{ type: "text_delta", text }]]),
+      spans,
+    );
+
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+
+    if (expected === undefined) expect(span.attributes["gen_ai.output.messages"] ?? "").toBe("");
+    else
+      expect(
+        jsonAttr<Array<{ content: Array<{ text: string }> }>>(span, "gen_ai.output.messages")[0]
+          ?.content[0]?.text,
+      ).toBe(expected);
+  },
+);
+
 const declinedIteration = {
   type: "message",
   model: "claude-opus-5",
@@ -1319,6 +1715,87 @@ const advisorIteration = {
   type: "advisor_message",
   model: "claude-haiku-4-5",
 };
+
+test.each([
+  ["at the oldest tail index", 1, "claude-opus-4-8"],
+  ["absent from the tail", undefined, "claude-opus-5"],
+] as const)(
+  "stream fallback inspection reads only the bounded tail (served %s)",
+  async (_case, servedIndex, model) => {
+    const errors: unknown[] = [];
+
+    const spans = setupSpans(undefined, true, undefined, {
+      onError: (error) => errors.push(error),
+    });
+
+    const iterations = Array<JsonRecord>(1_001).fill(declinedIteration);
+    Object.defineProperty(iterations, 0, {
+      get() {
+        throw new Error("inspected an iteration outside the bounded tail");
+      },
+    });
+
+    if (servedIndex !== undefined) iterations[servedIndex] = servedIteration;
+    iterations[1_000] = advisorIteration;
+
+    const events = [
+      {
+        type: "message_start",
+        message: messagePayload({
+          id: "msg_bounded_fallback",
+          model: "claude-opus-5",
+          content: [],
+          usage: { input_tokens: 5, output_tokens: 0 },
+        }),
+      },
+      {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+        usage: { output_tokens: 2, iterations },
+      },
+      { type: "message_stop" },
+    ];
+
+    const source = {
+      controller: new AbortController(),
+      async *[Symbol.asyncIterator]() {
+        yield* events;
+      },
+    };
+
+    const client = wrapAnthropic({ messages: { create: async (_params: unknown) => source } });
+
+    const stream = await client.messages.create({
+      model: "claude-opus-5",
+      max_tokens: 64,
+      messages: [],
+      stream: true,
+    });
+
+    expect(await collectStream(stream)).toHaveLength(events.length);
+    const span = await exportedSpan(spans);
+    expect(errors).toEqual([]);
+    expect(span.attributes["gen_ai.response.model"]).toBe(model);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  },
+);
+
+test("fallback metadata overflow preserves complete masked output", async () => {
+  const spans = setupSpans(undefined, true, (value) => value);
+  const iterations = Array<JsonRecord>(1_001).fill(declinedIteration);
+  iterations[999] = servedIteration;
+  iterations[1_000] = advisorIteration;
+
+  const span = await streamedBetaSpan(fallbackStream(iterations), spans);
+
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: [fallbackBlock, { type: "text", text: "Hi" }],
+    },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
 
 test.each<{ name: string; iterations: JsonRecord[]; expected: string }>([
   {
@@ -1395,6 +1872,7 @@ test("beta streams record output chunk timing for compaction content", async () 
   await streamedBetaSpan(
     compactionStream(
       { content: "Summary ", encrypted_content: "enc_1" },
+      { encrypted_content: "enc_ignored" },
       { content: "Summary so far.", encrypted_content: "enc_2" },
     ),
     setupSpans(metricExporter),
@@ -1427,6 +1905,39 @@ test("beta stream replacement recovery clears capture truncation", async () => {
   ]);
 });
 
+test("beta stream recovers from an oversized compaction start", async () => {
+  const span = await streamedBetaSpan(
+    betaStreamEvents([
+      { type: "compaction", content: "x".repeat(60 * 1024) },
+      [{ type: "compaction_delta", content: "recovered" }],
+    ]),
+  );
+
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ type: "compaction", content: "recovered" }] },
+  ]);
+});
+
+test("beta stream masks recovered compaction when its rejected start had encrypted content", async () => {
+  const spans = setupSpans(undefined, true, (value) => value);
+
+  const span = await streamedBetaSpan(
+    betaStreamEvents([
+      {
+        type: "compaction",
+        content: "x".repeat(60 * 1024),
+        encrypted_content: "encrypted",
+      },
+      [{ type: "compaction_delta", content: "recovered" }],
+    ]),
+    spans,
+  );
+
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
 test("beta stream recovers after repeated rejected compaction replacements", async () => {
   const span = await streamedBetaSpan(
     compactionStream(
@@ -1435,6 +1946,57 @@ test("beta stream recovers after repeated rejected compaction replacements", asy
       { content: "recovered" },
     ),
   );
+
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ type: "compaction", content: "recovered" }] },
+  ]);
+});
+
+test("beta stream retains a fitting compaction replacement after other output truncates", async () => {
+  const events = betaStreamEvents(
+    [{ type: "compaction" }, [{ type: "compaction_delta", content: "before" }]],
+    [{ type: "text", text: "" }, [{ type: "text_delta", text: "x".repeat(60 * 1024) }]],
+  );
+
+  events.splice(-2, 0, {
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "compaction_delta", content: "after" },
+  });
+
+  const span = await streamedBetaSpan(events);
+
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: [
+        { type: "compaction", content: "after" },
+        { type: "text", text: "" },
+      ],
+    },
+  ]);
+});
+
+test("beta stream recovers after rejecting an unseen compaction replacement", async () => {
+  const events = betaStreamEvents();
+  events.splice(
+    -2,
+    0,
+    {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "compaction_delta", content: "x".repeat(60 * 1024) },
+    },
+    {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "compaction_delta", content: "recovered" },
+    },
+  );
+
+  const span = await streamedBetaSpan(events);
 
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
@@ -1513,6 +2075,24 @@ test("beta stream rejected signature stays incomplete until a later signature fi
   ]);
 });
 
+test("beta streams omit incomplete retained output when a mask is configured", async () => {
+  const spans = setupSpans(undefined, true, (value) => value);
+
+  const span = await streamedBetaSpan(
+    betaStreamEvents([
+      { type: "thinking", thinking: "" },
+      [
+        { type: "thinking_delta", thinking: "retained" },
+        { type: "signature_delta", signature: "x".repeat(60 * 1024) },
+      ],
+    ]),
+    spans,
+  );
+
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
 test("beta stream releases a rejected signature before retaining a sibling", async () => {
   const events = betaStreamEvents(
     [
@@ -1546,18 +2126,25 @@ test("beta stream releases a rejected signature before retaining a sibling", asy
 
 test("beta stream does not retain rejected signatures for unseen indexes", async () => {
   const events = betaStreamEvents();
+  const rejectedSignature = "x".repeat(60 * 1024);
+  const firstIndex = 10_000;
+  const count = 2_000;
 
-  for (let index = 0; index < 2_000; index += 1) {
+  for (let offset = 0; offset < count; offset += 1) {
     events.splice(-2, 0, {
       type: "content_block_delta",
-      index,
-      delta: { type: "signature_delta", signature: "x".repeat(60 * 1024) },
+      index: firstIndex + offset,
+      delta: { type: "signature_delta", signature: rejectedSignature },
     });
   }
 
   const additions = vi.spyOn(Set.prototype, "add");
   const span = await streamedBetaSpan(events);
-  const retainedIndexes = additions.mock.calls.filter(([value]) => typeof value === "number");
+
+  const retainedIndexes = additions.mock.calls.filter(
+    ([value]) => typeof value === "number" && value >= firstIndex && value < firstIndex + count,
+  );
+
   additions.mockRestore();
 
   expect(retainedIndexes).toEqual([]);

@@ -75,6 +75,8 @@ Span names are `chat ${model}` for content generation, `generate_content ${model
 
 `config.httpOptions` and `config.abortSignal` are never recorded. Embedding vectors are never captured as output.
 
+Tool definitions (`gen_ai.tool.definitions`, including tool descriptions and parameter schemas) are request attributes, not captured content: `captureInput`, the mask, and `maxAttributeLength: 0` do not remove them. They are cut only by the OpenTelemetry attribute limit (65,536 characters when `maxAttributeLength` is 0).
+
 ## Streaming
 
 `generateContentStream` emits one span per call. Chunks pass through unchanged. The integration aggregates text parts (merging consecutive text with the same `thought` flag), finish reasons, usage, and block/safety metadata across chunks, records `gen_ai.response.time_to_first_chunk` on the first chunk, and ends the span once when the stream completes, errors, or the consumer stops early. Streams that are never consumed do not finish their span.

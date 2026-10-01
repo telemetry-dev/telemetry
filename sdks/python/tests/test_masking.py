@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
 from opentelemetry.sdk.trace import ReadableSpan
 
 import telemetry_dev
@@ -108,6 +109,18 @@ def test_truncation_counts_utf16_units(memory: SimpleNamespace) -> None:
 def test_truncation_never_splits_a_surrogate_pair() -> None:
     # keep = 6 UTF-16 units lands mid-emoji; the partial pair is dropped, not emitted.
     assert truncate("a" + "\U0001f916" * 40, 20) == "a" + "\U0001f916" * 2 + TRUNCATION_MARKER
+
+
+@pytest.mark.parametrize(
+    ("max_len", "expected"),
+    [
+        (0, ""),
+        (len(TRUNCATION_MARKER) - 1, TRUNCATION_MARKER[:-1]),
+        (len(TRUNCATION_MARKER), TRUNCATION_MARKER),
+    ],
+)
+def test_truncation_marker_stays_within_small_limits(max_len: int, expected: str) -> None:
+    assert truncate("x" * (len(TRUNCATION_MARKER) + 1), max_len) == expected
 
 
 def test_unserializable_value_drops_content(make: MakeClient) -> None:

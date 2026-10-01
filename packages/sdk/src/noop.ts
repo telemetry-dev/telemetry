@@ -12,7 +12,9 @@ export const NOOP_SPAN_HANDLE: SpanHandle = {
   spanId: INVALID_SPAN_CONTEXT.spanId,
   traceparent: null,
   isRecording: false,
+  capturePolicy: { output: false, mask: false, maxAttributeLength: 0 },
   update: () => NOOP_SPAN_HANDLE,
   recordOutputChunk: () => {},
+  reportError: () => {},
   end: () => {},
 };

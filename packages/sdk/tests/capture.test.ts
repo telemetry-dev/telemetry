@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, test } from "vitest";
 
-import { boundedCapture, boundedCaptureDetails, TRUNCATION_MARKER } from "../src/capture.ts";
+import {
+  boundedCapture,
+  boundedCaptureDetails,
+  truncate,
+  TRUNCATION_MARKER,
+} from "../src/capture.ts";
 import { flush, observe, shutdown, startSpan } from "../src/index.ts";
 import { setup } from "./helpers.ts";
 
@@ -72,6 +77,24 @@ describe("boundedCapture", () => {
     });
   });
 
+  test("preserves __proto__ as data without changing captured object prototypes", () => {
+    const input = JSON.parse('{"__proto__":{"index":7},"kept":true}');
+    const captured = boundedCapture(input);
+
+    const value = captured.value as {
+      __proto__?: { index: number };
+      index?: unknown;
+      kept?: boolean;
+    };
+
+    expect(Object.getPrototypeOf(value)).toBe(Object.prototype);
+    expect(Object.hasOwn(value, "__proto__")).toBe(true);
+    expect(value["__proto__"]).toEqual({ index: 7 });
+    expect(value.index).toBeUndefined();
+    expect(value.kept).toBe(true);
+    expect(captured.truncated).toBe(false);
+  });
+
   test.each([
     ["maxBytes", Number.NaN],
     ["maxBytes", Number.POSITIVE_INFINITY],
@@ -95,6 +118,14 @@ describe("boundedCapture", () => {
       truncated: true,
     });
   });
+});
+
+test.each([
+  [0, ""],
+  [TRUNCATION_MARKER.length - 1, TRUNCATION_MARKER.slice(0, -1)],
+  [TRUNCATION_MARKER.length, TRUNCATION_MARKER],
+])("truncate stays within a %i-character limit", (maxLength, expected) => {
+  expect(truncate("x".repeat(TRUNCATION_MARKER.length + 1), maxLength)).toBe(expected);
 });
 
 describe("capture integration", () => {

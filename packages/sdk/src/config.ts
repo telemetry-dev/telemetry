@@ -40,7 +40,7 @@ export interface TelemetryOptions {
   captureOutput?: boolean;
   /** Redaction hook run on captured content before stringify/truncate. */
   mask?: MaskFn;
-  /** Truncation cap (chars) for content attributes; also set as the provider's attributeValueLengthLimit. Default 65536. */
+  /** Non-negative safe-integer truncation cap for content attributes; Infinity disables truncation. The cap also applies, with the marker, to string metadata and log attributes; any other string attribute is cut at the cap without a marker, except that a cap of 0 leaves those at 65536. init() reports invalid values through onError and returns a disabled client. Default 65536. */
   maxAttributeLength?: number;
   batch?: BatchOptions;
   /** Export filter. Default when registerGlobal: only spans from this SDK's instrumentation scope. */
@@ -59,7 +59,7 @@ export interface TelemetryOptions {
   fetch?: typeof fetch;
   /** Serverless extender (e.g. Cloudflare `ctx.waitUntil`). When provided, `flush()` does not await exports. */
   waitUntil?: (p: Promise<unknown>) => void;
-  /** Receives any error raised while emitting telemetry; the SDK never throws into user code. */
+  /** Receives errors raised while emitting telemetry; repeated instrumentation failures from one stream may be coalesced into one report. The SDK never throws into user code. */
   onError?: (cause: Error) => void;
   /** Header value for a custom telemetry.dev integration. */
   sdkName?: string;
@@ -104,6 +104,16 @@ export function resolveConfig(options: TelemetryOptions = {}): ResolvedConfig {
     throw new TypeError(`Invalid sessionMode: ${String(options.sessionMode)}`);
   }
 
+  const maxAttributeLength =
+    options.maxAttributeLength == null ? DEFAULT_MAX_ATTRIBUTE_LENGTH : options.maxAttributeLength;
+
+  if (
+    maxAttributeLength !== Number.POSITIVE_INFINITY &&
+    (!Number.isSafeInteger(maxAttributeLength) || maxAttributeLength < 0)
+  ) {
+    throw new RangeError("maxAttributeLength must be a non-negative safe integer or Infinity");
+  }
+
   const baseUrl = (options.baseUrl ?? env.TELEMETRY_DEV_BASE_URL ?? DEFAULT_BASE_URL).replace(
     /\/+$/,
     "",
@@ -122,7 +132,7 @@ export function resolveConfig(options: TelemetryOptions = {}): ResolvedConfig {
     captureInput: options.captureInput ?? true,
     captureOutput: options.captureOutput ?? true,
     mask: options.mask,
-    maxAttributeLength: options.maxAttributeLength ?? DEFAULT_MAX_ATTRIBUTE_LENGTH,
+    maxAttributeLength,
     batch: { ...DEFAULT_BATCH, ...options.batch },
     spanFilter: options.spanFilter,
     sessionRootOf: options.sessionRootOf,

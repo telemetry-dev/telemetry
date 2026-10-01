@@ -68,6 +68,14 @@ The integration maps native Anthropic request and response shapes directly into 
 
 Native Anthropic stream events pass through unmodified. The span records time to first chunk on the first received event, merges usage from `message_start` and `message_delta`, aggregates text, tool-use JSON, and thinking blocks, and ends on stream exhaustion, close, context-manager exit, or error.
 
+Reconstructed output is bounded to 48 KiB and 1,000 items. The configured `max_attribute_length` does not shrink these retention bounds; the core applies it to the exported attribute after the mask runs, with its `...[truncated]` marker, without setting `telemetry.dev.capture.truncated`. A stream that ends without `message_stop`, encounters a mapping failure,
+or exceeds a capture bound sets `telemetry.dev.capture.truncated`. With a mask configured,
+incomplete output is omitted because the mask cannot inspect the complete value. When output
+capture is disabled, response IDs and models, finish reasons, usage, timing, and errors may still
+be recorded.
+Capture flags do not gate stop sequences, caller-supplied metadata or raw attributes, or exception
+messages and stack traces; redact those separately when needed. Request tools and `tool_choice` are part of the captured input, so `capture_input=False` removes them.
+
 `messages.stream()` starts the span when the context manager is entered, because that is when the Anthropic SDK opens the HTTP stream.
 
 ## Provider clients

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import threading
 import time
+import types
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from functools import wraps
+from io import StringIO
 from typing import Any, Literal, TypeVar, cast
 from urllib.parse import urlsplit
 
@@ -31,6 +33,9 @@ _installed = False
 _install_lock = threading.Lock()
 _T = TypeVar("_T")
 _OMIT = object()
+_CHAT_STREAM_CAPTURE_MAX_BYTES = 48 * 1024
+_TRANSCRIPT_CAPTURE_MAX_BYTES = 64 * 1024
+_CHAT_STREAM_CAPTURE_MAX_ITEMS = 1000
 
 
 class _CaptureLimit(Exception):
@@ -63,24 +68,90 @@ def _field(value: Any, name: str) -> Any:
     return getattr(value, name, None)
 
 
-def _sequence_items(value: Any) -> list[Any]:
+def _own_field(
+    value: Any,
+    name: str,
+    budget: telemetry_dev.CaptureBudget | None = None,
+    failure: list[bool] | None = None,
+    report_error: Callable[[BaseException], None] | None = None,
+) -> Any:
+    try:
+        if isinstance(value, Mapping):
+            mapping = cast(Mapping[str, Any], value)
+            return mapping.get(name)
+    except Exception as exc:
+        if budget is not None:
+            budget.truncated = True
+        if failure is not None:
+            failure[0] = True
+        if report_error is not None:
+            report_error(exc)
+        return None
+    for storage in ("__dict__", "__pydantic_extra__"):
+        stored = _stored_namespace(value, storage)
+        if stored is not None and name in stored:
+            return stored[name]
+    return None
+
+
+_TYPE_MRO = type.__dict__["__mro__"]
+_TYPE_NAMESPACE = type.__dict__["__dict__"]
+
+
+def _is_storage_descriptor(descriptor: object, name: str) -> bool:
+    kind = type(descriptor)
+    allowed = kind is types.MemberDescriptorType or (
+        name == "__dict__" and kind is types.GetSetDescriptorType
+    )
+    return allowed and cast(Any, descriptor).__name__ == name
+
+
+def _stored_namespace(value: Any, name: str) -> dict[str, Any] | None:
+    # Read instance storage through C-level slot descriptors only, so a property or a
+    # custom mapping on a hostile object never runs inside a bounded field read.
+    cls = type(cast(object, value))
+    for klass in _TYPE_MRO.__get__(cls):
+        namespace = _TYPE_NAMESPACE.__get__(klass)
+        if name not in namespace:
+            continue
+        descriptor = namespace[name]
+        if not _is_storage_descriptor(descriptor, name):
+            return None
+        try:
+            stored = descriptor.__get__(value, cls)
+        except (AttributeError, TypeError):
+            return None
+        return cast(dict[str, Any], stored) if type(stored) is dict else None
+    return None
+
+
+def _sequence_items(value: Any) -> Sequence[Any]:
     if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-        return list(cast(Sequence[Any], value))
-    return []
+        return cast(Sequence[Any], value)
+    return ()
 
 
 def _bounded_responses_capture(
     value: Any,
     capture: Literal["input", "output"] = "output",
     parent_type: str | None = None,
+    *,
+    capture_enabled: bool | None = None,
+    max_bytes: int | None = None,
+    report_error: Callable[[BaseException], None] | None = None,
 ) -> tuple[Any | None, bool]:
     client = telemetry_dev.get_client()
-    enabled = client is not None and (
-        client.capture_input if capture == "input" else client.capture_output
-    )
-    if not enabled:
+    if capture_enabled is None:
+        if client is None:
+            return None, False
+        capture_enabled = client.capture_input if capture == "input" else client.capture_output
+    if not capture_enabled:
         return None, False
-    budget = telemetry_dev.CaptureBudget.from_client()
+    budget = (
+        telemetry_dev.CaptureBudget(max_bytes=max_bytes)
+        if max_bytes is not None
+        else telemetry_dev.CaptureBudget()
+    )
     ancestors: set[int] = set()
 
     def reserve(byte_count: int) -> None:
@@ -169,7 +240,16 @@ def _bounded_responses_capture(
 
     try:
         return convert(value, parent_type, 0), False
-    except Exception:
+    except _CaptureLimit:
+        return None, True
+    except Exception as exc:
+        try:
+            if report_error is not None:
+                report_error(exc)
+            elif client is not None:
+                client.report("provider instrumentation failed", exc)
+        except Exception:
+            pass
         return None, True
 
 
@@ -214,10 +294,14 @@ def _sent_params(params: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _transcript_capture_budget() -> telemetry_dev.CaptureBudget:
+    return telemetry_dev.CaptureBudget(max_bytes=_TRANSCRIPT_CAPTURE_MAX_BYTES)
+
+
 def _capture_text(value: str, budget: telemetry_dev.CaptureBudget) -> str:
     if not value or budget.truncated:
         return ""
-    if budget.items_used >= budget.max_items or budget.remaining_bytes <= 0:
+    if budget.remaining_bytes <= 0:
         budget.truncated = True
         return ""
     byte_count = 0
@@ -239,7 +323,6 @@ def _capture_text(value: str, budget: telemetry_dev.CaptureBudget) -> str:
             break
         byte_count += character_bytes
         retained_characters = index + 1
-    budget.items_used += 1
     budget.bytes_used += byte_count
     if retained_characters < len(value):
         budget.truncated = True
@@ -422,16 +505,15 @@ def _media_response(response: Any) -> dict[str, Any]:
     }
 
 
-def _text_media_response(response: Any) -> dict[str, Any]:
+def _text_media_response(response: Any, *, capture_output: bool | None = None) -> dict[str, Any]:
     fields = _media_response(response)
-    client = telemetry_dev.get_client()
-    if client is not None and client.capture_output:
+    if capture_output is None:
+        client = telemetry_dev.get_client()
+        capture_output = client is not None and client.capture_output
+    if capture_output:
         text = _string(_field(response, "text"))
         if text is not None:
-            budget = telemetry_dev.CaptureBudget.from_client()
-            fields["output"] = _capture_text(text, budget)
-            if budget.truncated:
-                fields["attributes"] = {"telemetry.dev.capture.truncated": True}
+            fields["output"] = text
     return _text_media_usage(response, fields)
 
 
@@ -585,127 +667,695 @@ def _end_once(handle: telemetry_dev.SpanHandle) -> Callable[..., None]:
 class _ChatChoice:
     def __init__(self) -> None:
         self.role: str | None = None
-        self.content = ""
-        self.refusal = ""
+        self.role_resolved = True
+        self.content_fragments = StringIO()
+        self.refusal_fragments = StringIO()
+        self.function_call: dict[str, Any] | None = None
+        self.unresolved_function_scalars: set[str] = set()
         self.tool_calls: dict[int, dict[str, Any]] = {}
-        self.finish_reason: str | None = None
+        self.unresolved_tool_scalars: dict[int, set[str]] = {}
+        self.terminal = False
+
+    @property
+    def content(self) -> str:
+        return self.content_fragments.getvalue()
+
+    @property
+    def refusal(self) -> str:
+        return self.refusal_fragments.getvalue()
 
 
-def _choice_state(states: dict[int, _ChatChoice], index: int) -> _ChatChoice:
-    if index not in states:
-        states[index] = _ChatChoice()
-    return states[index]
+class _ChatToolCallDelta:
+    def __init__(
+        self,
+        *,
+        index: int | None,
+        tool_id: str | None,
+        tool_type: str | None,
+        function_name: str | None,
+        function_arguments: str | None,
+        custom_name: str | None,
+        custom_input: str | None,
+        read_failed: bool,
+    ) -> None:
+        self.index = index
+        self.tool_id = tool_id
+        self.tool_type = tool_type
+        self.function_name = function_name
+        self.function_arguments = function_arguments
+        self.custom_name = custom_name
+        self.custom_input = custom_input
+        self.read_failed = read_failed
 
 
-def _merge_tool_call(state: _ChatChoice, delta: Any) -> None:
-    index = _field(delta, "index")
-    tool_index = index if isinstance(index, int) else len(state.tool_calls)
+def _chat_capture_budget(*, reserve_output_list: bool = False) -> telemetry_dev.CaptureBudget:
+    budget = telemetry_dev.CaptureBudget(
+        _CHAT_STREAM_CAPTURE_MAX_BYTES,
+        _CHAT_STREAM_CAPTURE_MAX_ITEMS,
+    )
+    if reserve_output_list:
+        budget.accept([])
+    return budget
+
+
+def _replace_finish_reason(
+    index: int,
+    value: str,
+    budget: telemetry_dev.CaptureBudget,
+    reservations: dict[int, tuple[int, int]],
+) -> bool:
+    held_bytes, held_items = reservations.get(index, (0, 0))
+    base_bytes = budget.bytes_used - held_bytes
+    base_items = budget.items_used - held_items
+    available_bytes = budget.max_bytes - base_bytes - 98
+    if available_bytes < 0 or base_items + 5 > budget.max_items:
+        budget.bytes_used = base_bytes
+        budget.items_used = base_items
+        reservations.pop(index, None)
+        return False
+    value_bytes = _bounded_json_string_size(value, available_bytes)
+    if value_bytes > available_bytes:
+        budget.bytes_used = base_bytes
+        budget.items_used = base_items
+        reservations.pop(index, None)
+        return False
+    reservation = (98 + value_bytes, 5)
+    budget.bytes_used = base_bytes + reservation[0]
+    budget.items_used = base_items + reservation[1]
+    reservations[index] = reservation
+    return True
+
+
+def _reserve_chat_budget(
+    budget: telemetry_dev.CaptureBudget,
+    byte_count: int,
+    item_count: int = 0,
+    *,
+    recoverable: bool = False,
+) -> bool:
+    if (
+        budget.truncated
+        or budget.bytes_used + byte_count > budget.max_bytes
+        or budget.items_used + item_count > budget.max_items
+    ):
+        if not recoverable:
+            budget.truncated = True
+        return False
+    budget.bytes_used += byte_count
+    budget.items_used += item_count
+    return True
+
+
+def _bounded_json_string_size(value: str, limit: int) -> int:
+    size = 0
+    for character in value:
+        code = ord(character)
+        if character in {'"', "\\"} or character in {"\b", "\t", "\n", "\f", "\r"}:
+            size += 2
+        elif code <= 0x1F or 0xD800 <= code <= 0xDFFF:
+            size += 6
+        elif code <= 0x7F:
+            size += 1
+        elif code <= 0x7FF:
+            size += 2
+        elif code <= 0xFFFF:
+            size += 3
+        else:
+            size += 4
+        if size > limit:
+            return size
+    return size
+
+
+def _capture_chat_string(
+    value: str,
+    budget: telemetry_dev.CaptureBudget,
+    field_name: str | None = None,
+    *,
+    recoverable: bool = False,
+) -> bool:
+    structure_bytes = 0
+    structure_items = 0
+    if field_name is not None:
+        structure_bytes = 32 + len(field_name.encode())
+        structure_items = 2
+    available_bytes = budget.max_bytes - budget.bytes_used - structure_bytes
+    if available_bytes < 0:
+        if not recoverable:
+            budget.truncated = True
+        return False
+    value_bytes = _bounded_json_string_size(value, available_bytes)
+    if value_bytes > available_bytes:
+        if not recoverable:
+            budget.truncated = True
+        return False
+    return _reserve_chat_budget(
+        budget,
+        structure_bytes + value_bytes,
+        structure_items,
+        recoverable=recoverable,
+    )
+
+
+def _replace_chat_scalar(
+    current: str | None, value: str, budget: telemetry_dev.CaptureBudget
+) -> bool:
+    held_bytes = 16
+    if current is not None:
+        held_bytes += _bounded_json_string_size(current, budget.max_bytes)
+    base_bytes = budget.bytes_used - held_bytes
+    available_bytes = budget.max_bytes - base_bytes - 16
+    if available_bytes < 0:
+        return False
+    value_bytes = _bounded_json_string_size(value, available_bytes)
+    if value_bytes > available_bytes:
+        return False
+    budget.bytes_used = base_bytes + 16 + value_bytes
+    return True
+
+
+def _release_chat_field(field_name: str, value: str, budget: telemetry_dev.CaptureBudget) -> None:
+    budget.bytes_used -= (
+        32 + len(field_name.encode()) + _bounded_json_string_size(value, budget.max_bytes)
+    )
+    budget.items_used -= 2
+
+
+def _read_tool_call_delta(
+    delta: Any,
+    budget: telemetry_dev.CaptureBudget | None = None,
+    report_error: Callable[[BaseException], None] | None = None,
+) -> _ChatToolCallDelta:
+    failure = [False]
+    incoming_function = _own_field(delta, "function", budget, failure, report_error)
+    incoming_custom = _own_field(delta, "custom", budget, failure, report_error)
+    index = _own_field(delta, "index", budget, failure, report_error)
+    return _ChatToolCallDelta(
+        index=index if isinstance(index, int) else None,
+        tool_id=_string(_own_field(delta, "id", budget, failure, report_error)),
+        tool_type=_string(_own_field(delta, "type", budget, failure, report_error)),
+        function_name=_string(_own_field(incoming_function, "name", budget, failure, report_error)),
+        function_arguments=_string(
+            _own_field(incoming_function, "arguments", budget, failure, report_error)
+        ),
+        custom_name=_string(_own_field(incoming_custom, "name", budget, failure, report_error)),
+        custom_input=_string(_own_field(incoming_custom, "input", budget, failure, report_error)),
+        read_failed=failure[0],
+    )
+
+
+def _capture_tool_call_payload(
+    current: dict[str, Any],
+    payload_key: str,
+    name: str | None,
+    value_key: str,
+    value: str | None,
+    unresolved: set[str],
+    budget: telemetry_dev.CaptureBudget,
+) -> bool:
+    if name is None and value is None:
+        return False
+    raw_payload = current.get(payload_key)
+    had_payload = isinstance(raw_payload, Mapping)
+    payload = dict(cast(Mapping[str, Any], raw_payload)) if had_payload else {}
+    unresolved_name = f"{payload_key}.name"
+    changed = False
+    if not had_payload:
+        if not _reserve_chat_budget(budget, 32 + len(payload_key.encode()), 2):
+            return False
+        current[payload_key] = payload
+        changed = True
+    if name is not None:
+        current_name = _string(payload.get("name"))
+        captured = (
+            _capture_chat_string(name, budget, "name", recoverable=True)
+            if current_name is None
+            else _replace_chat_scalar(current_name, name, budget)
+        )
+        if captured:
+            payload["name"] = name
+            unresolved.discard(unresolved_name)
+            changed = True
+        else:
+            if current_name is not None:
+                _release_chat_field("name", current_name, budget)
+                payload.pop("name", None)
+                changed = True
+            unresolved.add(unresolved_name)
+    if not budget.truncated and value is not None:
+        fragments = payload.get(value_key)
+        had_value = isinstance(fragments, StringIO)
+        value_fragments = fragments if had_value else StringIO()
+        if value or not had_value:
+            if _capture_chat_string(
+                value,
+                budget,
+                None if had_value else value_key,
+            ):
+                value_fragments.write(value)
+                payload[value_key] = value_fragments
+                changed = True
+    if changed:
+        current[payload_key] = payload
+    return changed
+
+
+def _capture_tool_call_delta(
+    state: _ChatChoice, delta: _ChatToolCallDelta, budget: telemetry_dev.CaptureBudget
+) -> None:
+    tool_index = delta.index if delta.index is not None else len(state.tool_calls)
+    had_tool_call = tool_index in state.tool_calls
     current = dict(state.tool_calls.get(tool_index, {}))
-    tool_id = _field(delta, "id")
-    tool_type = _field(delta, "type")
+    unresolved = set(state.unresolved_tool_scalars.get(tool_index, set()))
+    tool_id = delta.tool_id
+    tool_type = delta.tool_type
+    changed = False
+
+    def save() -> None:
+        if changed or unresolved or not had_tool_call:
+            state.tool_calls[tool_index] = current
+        if unresolved:
+            state.unresolved_tool_scalars[tool_index] = unresolved
+        else:
+            state.unresolved_tool_scalars.pop(tool_index, None)
+
+    if (
+        tool_id is None
+        and tool_type is None
+        and delta.function_name is None
+        and delta.function_arguments is None
+        and delta.custom_name is None
+        and delta.custom_input is None
+    ):
+        return
+
+    if tool_index not in state.tool_calls:
+        first_tool_call = not state.tool_calls
+        structure_bytes = 16
+        structure_items = 1
+        if first_tool_call:
+            structure_bytes += 42
+            structure_items += 2
+            if state.content_fragments.tell() == 0 and state.function_call is None:
+                structure_bytes += 39
+                structure_items += 2
+        if not _reserve_chat_budget(budget, structure_bytes, structure_items):
+            return
+
     if tool_id is not None:
-        current["id"] = tool_id
+        current_id = _string(current.get("id"))
+        captured = (
+            _capture_chat_string(tool_id, budget, "id", recoverable=True)
+            if current_id is None
+            else _replace_chat_scalar(current_id, tool_id, budget)
+        )
+        if captured:
+            current["id"] = tool_id
+            unresolved.discard("id")
+            changed = True
+        else:
+            if current_id is not None:
+                _release_chat_field("id", current_id, budget)
+                current.pop("id", None)
+                changed = True
+            unresolved.add("id")
     if tool_type is not None:
-        current["type"] = tool_type
-    incoming_function = _field(delta, "function")
-    if incoming_function is not None:
-        current_function = dict(cast(Mapping[str, Any], current.get("function", {})))
-        name = _field(incoming_function, "name")
-        arguments = _field(incoming_function, "arguments")
-        if name is not None:
-            current_function["name"] = name
-        if isinstance(arguments, str):
-            current_function["arguments"] = f"{current_function.get('arguments', '')}{arguments}"
-        current["function"] = current_function
-    state.tool_calls[tool_index] = current
+        current_type = _string(current.get("type"))
+        captured = (
+            _capture_chat_string(tool_type, budget, "type", recoverable=True)
+            if current_type is None
+            else _replace_chat_scalar(current_type, tool_type, budget)
+        )
+        if captured:
+            current["type"] = tool_type
+            unresolved.discard("type")
+            changed = True
+        else:
+            if current_type is not None:
+                _release_chat_field("type", current_type, budget)
+                current.pop("type", None)
+                changed = True
+            unresolved.add("type")
+    changed = (
+        _capture_tool_call_payload(
+            current,
+            "function",
+            delta.function_name,
+            "arguments",
+            delta.function_arguments,
+            unresolved,
+            budget,
+        )
+        or changed
+    )
+    changed = (
+        _capture_tool_call_payload(
+            current,
+            "custom",
+            delta.custom_name,
+            "input",
+            delta.custom_input,
+            unresolved,
+            budget,
+        )
+        or changed
+    )
+    save()
+
+
+def _capture_function_call_delta(
+    state: _ChatChoice,
+    name: str | None,
+    arguments: str | None,
+    budget: telemetry_dev.CaptureBudget,
+) -> None:
+    if name is None and arguments is None:
+        return
+    current = dict(state.function_call or {})
+    if state.function_call is None:
+        structure_bytes = 45
+        structure_items = 2
+        if state.content_fragments.tell() == 0 and not state.tool_calls:
+            structure_bytes += 39
+            structure_items += 2
+        if not _reserve_chat_budget(budget, structure_bytes, structure_items):
+            return
+        state.function_call = current
+    if name is not None:
+        current_name = _string(current.get("name"))
+        captured = (
+            _capture_chat_string(name, budget, "name", recoverable=True)
+            if current_name is None
+            else _replace_chat_scalar(current_name, name, budget)
+        )
+        if captured:
+            current["name"] = name
+            state.unresolved_function_scalars.discard("name")
+        else:
+            if current_name is not None:
+                _release_chat_field("name", current_name, budget)
+                current.pop("name", None)
+            state.unresolved_function_scalars.add("name")
+    if not budget.truncated and arguments is not None:
+        fragments = current.get("arguments")
+        had_arguments = isinstance(fragments, StringIO)
+        argument_fragments = fragments if had_arguments else StringIO()
+        if arguments or not had_arguments:
+            if _capture_chat_string(
+                arguments,
+                budget,
+                None if had_arguments else "arguments",
+            ):
+                argument_fragments.write(arguments)
+                current["arguments"] = argument_fragments
+    state.function_call = current
 
 
 def _record_chat_chunk(
-    chunk: Any, states: dict[int, _ChatChoice], budget: telemetry_dev.CaptureBudget
+    chunk: Any,
+    states: dict[int, _ChatChoice],
+    finish_reason_states: dict[int, str],
+    finish_reason_reservations: dict[int, tuple[int, int]],
+    rejected_finish_reasons: set[int],
+    output_budget: telemetry_dev.CaptureBudget,
+    finish_reason_budget: telemetry_dev.CaptureBudget,
+    capture_output: bool,
+    report_error: Callable[[BaseException], None] | None = None,
+    unterminated_choices: set[int] | None = None,
 ) -> dict[str, Any]:
-    for choice in _sequence_items(_field(chunk, "choices")):
-        index = _field(choice, "index")
-        state = _choice_state(states, index if isinstance(index, int) else 0)
-        delta = _field(choice, "delta")
-        role = _field(delta, "role")
-        content = _field(delta, "content")
-        refusal = _field(delta, "refusal")
-        if isinstance(role, str):
-            state.role = role
-        if isinstance(content, str) and budget.accept(content):
-            state.content += content
-        if isinstance(refusal, str) and budget.accept(refusal):
-            state.refusal += refusal
-        for tool_call in _sequence_items(_field(delta, "tool_calls")):
-            if budget.accept(tool_call):
-                _merge_tool_call(state, tool_call)
-        finish_reason = _field(choice, "finish_reason")
-        if isinstance(finish_reason, str):
-            state.finish_reason = finish_reason
+    chunk_has_output = False
+    field_read_failed = [False]
+    choices = _own_field(chunk, "choices", output_budget, field_read_failed, report_error)
+    choice_items = _sequence_items(choices)
+    remaining_tool_calls = _CHAT_STREAM_CAPTURE_MAX_ITEMS
+    for choice in choice_items[:_CHAT_STREAM_CAPTURE_MAX_ITEMS]:
+        capture_budget = output_budget if capture_output else None
+        index = _own_field(choice, "index", capture_budget, field_read_failed, report_error)
+        choice_index = index if isinstance(index, int) else 0
+        delta = _own_field(choice, "delta", capture_budget, field_read_failed, report_error)
+        content = _string(
+            _own_field(delta, "content", capture_budget, field_read_failed, report_error)
+        )
+        refusal = _string(
+            _own_field(delta, "refusal", capture_budget, field_read_failed, report_error)
+        )
+        audio = _own_field(delta, "audio", None, field_read_failed, report_error)
+        audio_data = _string(_own_field(audio, "data", None, field_read_failed, report_error))
+        legacy_function = _own_field(
+            delta, "function_call", capture_budget, field_read_failed, report_error
+        )
+        legacy_name = _string(
+            _own_field(legacy_function, "name", capture_budget, field_read_failed, report_error)
+        )
+        legacy_arguments = _string(
+            _own_field(
+                legacy_function,
+                "arguments",
+                capture_budget,
+                field_read_failed,
+                report_error,
+            )
+        )
+        tool_call_deltas = _sequence_items(
+            _own_field(delta, "tool_calls", capture_budget, field_read_failed, report_error)
+        )
+        chunk_has_output = chunk_has_output or (
+            bool(content) or bool(refusal) or bool(audio_data) or bool(legacy_arguments)
+        )
+        finish_reason = _string(
+            _own_field(
+                choice,
+                "finish_reason",
+                finish_reason_budget,
+                field_read_failed,
+                report_error,
+            )
+        )
+        if finish_reason is not None:
+            if unterminated_choices is not None:
+                unterminated_choices.discard(choice_index)
+            if _replace_finish_reason(
+                choice_index,
+                finish_reason,
+                finish_reason_budget,
+                finish_reason_reservations,
+            ):
+                finish_reason_states[choice_index] = finish_reason
+                rejected_finish_reasons.discard(choice_index)
+            else:
+                finish_reason_states.pop(choice_index, None)
+                if (
+                    choice_index in rejected_finish_reasons
+                    or len(rejected_finish_reasons) < _CHAT_STREAM_CAPTURE_MAX_ITEMS
+                ):
+                    rejected_finish_reasons.add(choice_index)
+                else:
+                    finish_reason_budget.truncated = True
+        elif (
+            unterminated_choices is not None
+            and choice_index not in finish_reason_states
+            and choice_index not in rejected_finish_reasons
+        ):
+            if (
+                choice_index in unterminated_choices
+                or len(unterminated_choices) < _CHAT_STREAM_CAPTURE_MAX_ITEMS
+            ):
+                unterminated_choices.add(choice_index)
+            else:
+                finish_reason_budget.truncated = True
+        had_state = choice_index in states
+        retained_state = states.get(choice_index) if capture_output else None
+        if retained_state is not None and finish_reason is not None:
+            retained_state.terminal = True
+        state = retained_state
+        if capture_output and not output_budget.truncated and state is None:
+            initial_state = _ChatChoice()
+            initial_state.terminal = finish_reason is not None
+            if output_budget.accept(_chat_message(initial_state)):
+                state = initial_state
+                states[choice_index] = state
+        role = (
+            _string(_own_field(delta, "role", output_budget, field_read_failed, report_error))
+            if state is not None
+            else None
+        )
+        if (
+            state is not None
+            and role is not None
+            and (
+                not state.role_resolved
+                or role != (state.role if state.role is not None else "assistant")
+            )
+        ):
+            captured_role = (
+                _replace_chat_scalar(
+                    state.role if state.role is not None else "assistant",
+                    role,
+                    output_budget,
+                )
+                if state.role_resolved
+                else _capture_chat_string(role, output_budget, "role", recoverable=True)
+            )
+            if captured_role:
+                state.role = role
+                state.role_resolved = True
+            else:
+                if state.role_resolved:
+                    _release_chat_field(
+                        "role", state.role if state.role is not None else "assistant", output_budget
+                    )
+                state.role = None
+                state.role_resolved = False
+        if state is not None and not output_budget.truncated and content:
+            replacing_null = state.content_fragments.tell() == 0 and (
+                state.function_call is not None or bool(state.tool_calls)
+            )
+            captured_content = (
+                _replace_chat_scalar(None, content, output_budget)
+                if replacing_null
+                else _capture_chat_string(
+                    content,
+                    output_budget,
+                    None if state.content_fragments.tell() > 0 else "content",
+                )
+            )
+            if captured_content:
+                state.content_fragments.write(content)
+            elif replacing_null:
+                output_budget.truncated = True
+        if (
+            state is not None
+            and not output_budget.truncated
+            and refusal
+            and _capture_chat_string(
+                refusal,
+                output_budget,
+                None if state.refusal_fragments.tell() > 0 else "refusal",
+            )
+        ):
+            state.refusal_fragments.write(refusal)
+        if state is not None:
+            _capture_function_call_delta(state, legacy_name, legacy_arguments, output_budget)
+        retained_tool_call_deltas = tool_call_deltas[:remaining_tool_calls]
+        remaining_tool_calls -= len(retained_tool_call_deltas)
+        if len(retained_tool_call_deltas) < len(tool_call_deltas):
+            chunk_has_output = True
+            if capture_output:
+                output_budget.truncated = True
+        for raw_tool_call in retained_tool_call_deltas:
+            if chunk_has_output and state is None:
+                break
+            tool_call = _read_tool_call_delta(raw_tool_call, capture_budget, report_error)
+            if tool_call.read_failed:
+                if (
+                    not had_state
+                    and state is not None
+                    and state.role is None
+                    and state.content_fragments.tell() == 0
+                    and state.refusal_fragments.tell() == 0
+                    and state.function_call is None
+                    and not state.tool_calls
+                ):
+                    states.pop(choice_index, None)
+                break
+            if tool_call.function_arguments or tool_call.custom_input:
+                chunk_has_output = True
+            if state is not None:
+                _capture_tool_call_delta(state, tool_call, output_budget)
+
+    if len(choice_items) > _CHAT_STREAM_CAPTURE_MAX_ITEMS:
+        chunk_has_output = True
+        if capture_output:
+            output_budget.truncated = True
+        finish_reason_budget.truncated = True
+
+    response_id = _string(_own_field(chunk, "id", None, field_read_failed, report_error))
+    response_model = _string(_own_field(chunk, "model", None, field_read_failed, report_error))
+    usage = _chat_usage(_own_field(chunk, "usage", None, field_read_failed, report_error))
+    if field_read_failed[0]:
+        output_budget.truncated = True
+        finish_reason_budget.truncated = True
     return {
-        "response_id": _string(_field(chunk, "id")),
-        "response_model": _string(_field(chunk, "model")),
-        "usage": _chat_usage(_field(chunk, "usage")),
+        "response_id": response_id,
+        "response_model": response_model,
+        "usage": usage,
+        "has_output": chunk_has_output,
     }
 
 
+def _chat_message(state: _ChatChoice) -> dict[str, Any]:
+    message: dict[str, Any] = {}
+    if state.role_resolved:
+        message["role"] = state.role if state.role is not None else "assistant"
+    if state.content:
+        message["content"] = state.content
+    elif state.function_call is not None or state.tool_calls:
+        message["content"] = None
+    if state.refusal:
+        message["refusal"] = state.refusal
+    if state.function_call is not None:
+        captured_function_call = dict(state.function_call)
+        arguments = captured_function_call.get("arguments")
+        if isinstance(arguments, StringIO):
+            captured_function_call["arguments"] = arguments.getvalue()
+        if "name" in state.unresolved_function_scalars:
+            captured_function_call.pop("name", None)
+        message["function_call"] = captured_function_call
+    if state.tool_calls:
+        tool_calls: list[dict[str, Any]] = []
+        for index, tool_call in sorted(state.tool_calls.items()):
+            captured_tool_call = dict(tool_call)
+            unresolved = state.unresolved_tool_scalars.get(index, set())
+            if "id" in unresolved:
+                captured_tool_call.pop("id", None)
+            if "type" in unresolved:
+                captured_tool_call.pop("type", None)
+            for payload_key, value_key in (("function", "arguments"), ("custom", "input")):
+                raw_payload = tool_call.get(payload_key)
+                if isinstance(raw_payload, Mapping):
+                    captured_payload = dict(cast(Mapping[str, Any], raw_payload))
+                    fragments = captured_payload.get(value_key)
+                    if isinstance(fragments, StringIO):
+                        captured_payload[value_key] = fragments.getvalue()
+                else:
+                    captured_payload = {}
+                unresolved_name = f"{payload_key}.name"
+                if unresolved_name in unresolved:
+                    captured_payload.pop("name", None)
+                if captured_payload or raw_payload is not None or unresolved_name in unresolved:
+                    captured_tool_call[payload_key] = captured_payload
+            tool_calls.append(captured_tool_call)
+        message["tool_calls"] = tool_calls
+    return message
+
+
 def _chat_output(states: Mapping[int, _ChatChoice]) -> list[dict[str, Any]]:
-    output: list[dict[str, Any]] = []
-    for _, state in sorted(states.items()):
-        message: dict[str, Any] = {"role": state.role or "assistant"}
-        if state.content:
-            message["content"] = state.content
-        elif state.tool_calls:
-            message["content"] = None
-        if state.refusal:
-            message["refusal"] = state.refusal
-        if state.tool_calls:
-            message["tool_calls"] = [call for _, call in sorted(state.tool_calls.items())]
-        output.append(message)
-    return output
+    return [_chat_message(state) for _, state in sorted(states.items())]
 
 
 def _chat_partial(
-    states: Mapping[int, _ChatChoice], usage: dict[str, int | float] | None
+    states: Mapping[int, _ChatChoice],
+    finish_reason_states: Mapping[int, str],
+    usage: dict[str, int | float] | None,
+    capture_output: bool,
+    capture_truncated: bool,
 ) -> dict[str, Any]:
-    finish_reasons = [
-        state.finish_reason
-        for _, state in sorted(states.items())
-        if state.finish_reason is not None
-    ]
+    finish_reasons = [reason for _, reason in sorted(finish_reason_states.items())]
+    attributes = {
+        **({"gen_ai.response.finish_reasons": finish_reasons} if len(finish_reasons) > 1 else {}),
+        **({"telemetry.dev.capture.truncated": True} if capture_truncated else {}),
+    }
     return {
-        "output": _chat_output(states) if states else None,
+        "output": _chat_output(states) if capture_output and states else None,
         "usage": usage,
         "finish_reason": finish_reasons[0] if finish_reasons else None,
-        "attributes": (
-            {"gen_ai.response.finish_reasons": finish_reasons} if len(finish_reasons) > 1 else None
-        ),
+        "attributes": attributes or None,
     }
 
 
 def _synthetic_usage_chunk(chunk: Any) -> bool:
     choices = _sequence_items(_field(chunk, "choices"))
     return _field(chunk, "usage") is not None and len(choices) == 0
-
-
-def _chat_chunk_has_output(chunk: Any) -> bool:
-    for choice in _sequence_items(_field(chunk, "choices")):
-        delta = _field(choice, "delta")
-        for key in ("content", "refusal"):
-            value = _field(delta, key)
-            if isinstance(value, str) and value:
-                return True
-        audio = _field(delta, "audio")
-        if isinstance(_field(audio, "data"), str) and _field(audio, "data"):
-            return True
-        legacy_arguments = _field(_field(delta, "function_call"), "arguments")
-        if isinstance(legacy_arguments, str) and legacy_arguments:
-            return True
-        for tool_call in _sequence_items(_field(delta, "tool_calls")):
-            arguments = _field(_field(tool_call, "function"), "arguments")
-            if isinstance(arguments, str) and arguments:
-                return True
-    return False
 
 
 def _response_event_has_output(event: Any) -> bool:
@@ -756,6 +1406,24 @@ def _response_stream_error(event: Any) -> RuntimeError:
     return RuntimeError("response.error")
 
 
+def _responses_event_failure(event: Any) -> RuntimeError | None:
+    try:
+        event_type = _field(event, "type")
+    except Exception:
+        return None
+    if event_type == "response.failed":
+        try:
+            return _response_failed_error(_field(event, "response"))
+        except Exception:
+            return RuntimeError("response.failed")
+    if event_type == "error":
+        try:
+            return _response_stream_error(event)
+        except Exception:
+            return RuntimeError("response.error")
+    return None
+
+
 def _hook_response_close(inner: Any, finish: Callable[[], None]) -> None:
     """End the span when the transport response is closed behind our back.
 
@@ -791,6 +1459,66 @@ def _hook_response_close(inner: Any, finish: Callable[[], None]) -> None:
         response.aclose = _aclose_hook
 
 
+def _chat_span_capture_policy(handle: telemetry_dev.SpanHandle) -> tuple[bool, bool]:
+    compatible = cast(Any, handle)
+    client = getattr(compatible, "_client", None)
+    state = getattr(compatible, "_state", None)
+    capture_output = getattr(compatible, "capture_output", None)
+    if not isinstance(capture_output, bool):
+        capture_output = getattr(state, "capture_output", None)
+    if not isinstance(capture_output, bool):
+        capture_output = getattr(client, "capture_output", False)
+    capture_masked = getattr(compatible, "capture_masked", None)
+    if not isinstance(capture_masked, bool):
+        capture_masked = getattr(client, "mask", _OMIT) is not None if client is not None else True
+    return capture_output, capture_masked
+
+
+def _chat_span_reporter(
+    handle: telemetry_dev.SpanHandle,
+) -> Callable[[BaseException], None]:
+    compatible = cast(Any, handle)
+    reporter = getattr(compatible, "report_error", None)
+    client = getattr(compatible, "_client", None)
+    reported = False
+
+    def report(cause: BaseException) -> None:
+        nonlocal reported
+        if reported:
+            return
+        reported = True
+        try:
+            if callable(reporter):
+                reporter(cause)
+                return
+            client_report = getattr(client, "report", None)
+            if callable(client_report):
+                client_report("provider instrumentation failed", cause)
+        except Exception:
+            return
+
+    return report
+
+
+def _end_mapped_response(
+    handle: telemetry_dev.SpanHandle,
+    end: Callable[..., None],
+    mapper: ResponseMapper,
+    response: Any,
+) -> None:
+    try:
+        if mapper is _text_media_response:
+            capture_output, _ = _chat_span_capture_policy(handle)
+            fields = _text_media_response(response, capture_output=capture_output)
+        else:
+            fields = mapper(response)
+    except Exception as exc:
+        _chat_span_reporter(handle)(exc)
+        end(attributes={"telemetry.dev.capture.truncated": True})
+        return
+    end(**fields)
+
+
 class _InstrumentedStream:
     def __init__(
         self,
@@ -804,12 +1532,23 @@ class _InstrumentedStream:
         self._handle = handle
         self._injected_usage = injected_usage
         self._started_at = started_at
+        (
+            self._capture_output,
+            self._mask_output_when_incomplete,
+        ) = _chat_span_capture_policy(handle)
+        self._report_error = _chat_span_reporter(handle)
         self._states: dict[int, _ChatChoice] = {}
+        self._finish_reason_states: dict[int, str] = {}
+        self._finish_reason_reservations: dict[int, tuple[int, int]] = {}
+        self._rejected_finish_reasons: set[int] = set()
+        self._unterminated_choices: set[int] = set()
         self._usage: dict[str, int | float] | None = None
         self._saw_first = False
+        self._completed_normally = False
         self._consume: Iterator[Any] | None = None
         self._in_next = False
-        self._budget = telemetry_dev.CaptureBudget.from_client()
+        self._budget = _chat_capture_budget(reserve_output_list=self._capture_output)
+        self._finish_reason_budget = _chat_capture_budget()
         _hook_response_close(inner, self._on_response_close)
 
     def _iterate(self) -> Iterator[Any]:
@@ -820,14 +1559,15 @@ class _InstrumentedStream:
                     chunk = next(self._inner)
                     received_at = time.perf_counter()
                 except StopIteration:
+                    self._completed_normally = True
                     break
                 except BaseException as exc:
-                    self._end(**_chat_partial(self._states, self._usage), error=exc)
+                    self._end(**self._partial(), error=exc)
                     raise
                 finally:
                     self._in_next = False
-                self._record(chunk, received_at)
-                if self._injected_usage and _synthetic_usage_chunk(chunk):
+                self._record_safely(chunk, received_at)
+                if self._injected_usage and self._is_synthetic_usage(chunk):
                     continue
                 yield chunk
         finally:
@@ -851,15 +1591,42 @@ class _InstrumentedStream:
         self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: Any
     ) -> None:
         if exc is not None:
-            self._end(**_chat_partial(self._states, self._usage), error=exc)
+            self._end(**self._partial(), error=exc)
         self.close()
 
+    def _partial(self) -> dict[str, Any]:
+        output_incomplete = (
+            not self._completed_normally
+            or bool(self._unterminated_choices)
+            or (
+                self._capture_output
+                and any(
+                    not state.terminal
+                    or not state.role_resolved
+                    or bool(state.unresolved_function_scalars)
+                    or any(state.unresolved_tool_scalars.values())
+                    for state in self._states.values()
+                )
+            )
+        )
+        return _chat_partial(
+            self._states,
+            self._finish_reason_states,
+            self._usage,
+            self._capture_output
+            and not (
+                self._mask_output_when_incomplete and (self._budget.truncated or output_incomplete)
+            ),
+            self._budget.truncated
+            or output_incomplete
+            or self._finish_reason_budget.truncated
+            or bool(self._rejected_finish_reasons),
+        )
+
     def _finish(self) -> None:
-        self._end(**_chat_partial(self._states, self._usage))
+        self._end(**self._partial())
 
     def _on_response_close(self) -> None:
-        # Mid-iteration closes are part of error/exhaustion unwinding inside
-        # next(); those paths must win the end race to record the right status.
         if not self._in_next:
             self._finish()
 
@@ -872,9 +1639,37 @@ class _InstrumentedStream:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
+    def _record_safely(self, chunk: Any, received_at: float) -> None:
+        try:
+            self._record(chunk, received_at)
+        except Exception as exc:
+            self._budget.truncated = True
+            self._finish_reason_budget.truncated = True
+            self._report_error(exc)
+
+    def _is_synthetic_usage(self, chunk: Any) -> bool:
+        try:
+            return _synthetic_usage_chunk(chunk)
+        except Exception as exc:
+            self._budget.truncated = True
+            self._finish_reason_budget.truncated = True
+            self._report_error(exc)
+            return False
+
     def _record(self, chunk: Any, received_at: float) -> None:
-        update = _record_chat_chunk(chunk, self._states, self._budget)
-        if _chat_chunk_has_output(chunk):
+        update = _record_chat_chunk(
+            chunk,
+            self._states,
+            self._finish_reason_states,
+            self._finish_reason_reservations,
+            self._rejected_finish_reasons,
+            self._budget,
+            self._finish_reason_budget,
+            self._capture_output,
+            self._report_error,
+            self._unterminated_choices,
+        )
+        if update["has_output"]:
             record_output_chunk = getattr(self._handle, "record_output_chunk", None)
             if callable(record_output_chunk):
                 record_output_chunk(received_at * 1000)
@@ -902,12 +1697,23 @@ class _InstrumentedAsyncStream:
         self._handle = handle
         self._injected_usage = injected_usage
         self._started_at = started_at
+        (
+            self._capture_output,
+            self._mask_output_when_incomplete,
+        ) = _chat_span_capture_policy(handle)
+        self._report_error = _chat_span_reporter(handle)
         self._states: dict[int, _ChatChoice] = {}
+        self._finish_reason_states: dict[int, str] = {}
+        self._finish_reason_reservations: dict[int, tuple[int, int]] = {}
+        self._rejected_finish_reasons: set[int] = set()
+        self._unterminated_choices: set[int] = set()
         self._usage: dict[str, int | float] | None = None
         self._saw_first = False
+        self._completed_normally = False
         self._consume: AsyncIterator[Any] | None = None
         self._in_next = False
-        self._budget = telemetry_dev.CaptureBudget.from_client()
+        self._budget = _chat_capture_budget(reserve_output_list=self._capture_output)
+        self._finish_reason_budget = _chat_capture_budget()
         _hook_response_close(inner, self._on_response_close)
 
     async def _aiterate(self) -> AsyncIterator[Any]:
@@ -918,14 +1724,15 @@ class _InstrumentedAsyncStream:
                     chunk = await self._inner.__anext__()
                     received_at = time.perf_counter()
                 except StopAsyncIteration:
+                    self._completed_normally = True
                     break
                 except BaseException as exc:
-                    self._end(**_chat_partial(self._states, self._usage), error=exc)
+                    self._end(**self._partial(), error=exc)
                     raise
                 finally:
                     self._in_next = False
-                self._record(chunk, received_at)
-                if self._injected_usage and _synthetic_usage_chunk(chunk):
+                self._record_safely(chunk, received_at)
+                if self._injected_usage and self._is_synthetic_usage(chunk):
                     continue
                 yield chunk
         finally:
@@ -952,15 +1759,42 @@ class _InstrumentedAsyncStream:
         tb: Any,
     ) -> None:
         if exc is not None:
-            self._end(**_chat_partial(self._states, self._usage), error=exc)
+            self._end(**self._partial(), error=exc)
         await self.close()
 
+    def _partial(self) -> dict[str, Any]:
+        output_incomplete = (
+            not self._completed_normally
+            or bool(self._unterminated_choices)
+            or (
+                self._capture_output
+                and any(
+                    not state.terminal
+                    or not state.role_resolved
+                    or bool(state.unresolved_function_scalars)
+                    or any(state.unresolved_tool_scalars.values())
+                    for state in self._states.values()
+                )
+            )
+        )
+        return _chat_partial(
+            self._states,
+            self._finish_reason_states,
+            self._usage,
+            self._capture_output
+            and not (
+                self._mask_output_when_incomplete and (self._budget.truncated or output_incomplete)
+            ),
+            self._budget.truncated
+            or output_incomplete
+            or self._finish_reason_budget.truncated
+            or bool(self._rejected_finish_reasons),
+        )
+
     def _finish(self) -> None:
-        self._end(**_chat_partial(self._states, self._usage))
+        self._end(**self._partial())
 
     def _on_response_close(self) -> None:
-        # Mid-iteration closes are part of error/exhaustion unwinding inside
-        # __anext__(); those paths must win the end race to record the right status.
         if not self._in_next:
             self._finish()
 
@@ -975,9 +1809,37 @@ class _InstrumentedAsyncStream:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
+    def _record_safely(self, chunk: Any, received_at: float) -> None:
+        try:
+            self._record(chunk, received_at)
+        except Exception as exc:
+            self._budget.truncated = True
+            self._finish_reason_budget.truncated = True
+            self._report_error(exc)
+
+    def _is_synthetic_usage(self, chunk: Any) -> bool:
+        try:
+            return _synthetic_usage_chunk(chunk)
+        except Exception as exc:
+            self._budget.truncated = True
+            self._finish_reason_budget.truncated = True
+            self._report_error(exc)
+            return False
+
     def _record(self, chunk: Any, received_at: float) -> None:
-        update = _record_chat_chunk(chunk, self._states, self._budget)
-        if _chat_chunk_has_output(chunk):
+        update = _record_chat_chunk(
+            chunk,
+            self._states,
+            self._finish_reason_states,
+            self._finish_reason_reservations,
+            self._rejected_finish_reasons,
+            self._budget,
+            self._finish_reason_budget,
+            self._capture_output,
+            self._report_error,
+            self._unterminated_choices,
+        )
+        if update["has_output"]:
             record_output_chunk = getattr(self._handle, "record_output_chunk", None)
             if callable(record_output_chunk):
                 record_output_chunk(received_at * 1000)
@@ -992,13 +1854,28 @@ class _InstrumentedAsyncStream:
             self._usage = update["usage"]
 
 
+def _mark_responses_capture_incomplete(fields: dict[str, Any], mask_output: bool) -> None:
+    fields["attributes"] = {
+        **cast(dict[str, Any], fields.get("attributes") or {}),
+        "telemetry.dev.capture.truncated": True,
+    }
+    if mask_output:
+        fields.pop("output", None)
+
+
 class _InstrumentedResponsesStream:
     def __init__(self, inner: Any, handle: telemetry_dev.SpanHandle, started_at: float) -> None:
         self._inner = inner
         self._handle = handle
         self._end = _end_once(handle)
+        (
+            self._capture_output,
+            self._mask_output_when_incomplete,
+        ) = _chat_span_capture_policy(handle)
+        self._report_error = _chat_span_reporter(handle)
         self._started_at = started_at
         self._saw_first = False
+        self._saw_terminal_snapshot = False
         self._partial: dict[str, Any] = {}
         self._retained_output: Any | None = None
         self._consume: Iterator[Any] | None = None
@@ -1015,11 +1892,23 @@ class _InstrumentedResponsesStream:
                 except StopIteration:
                     break
                 except BaseException as exc:
+                    _mark_responses_capture_incomplete(
+                        self._partial, self._mask_output_when_incomplete
+                    )
                     self._end(**self._partial, error=exc)
                     raise
                 finally:
                     self._in_next = False
-                self._record(event, received_at)
+                try:
+                    self._record(event, received_at)
+                except Exception as exc:
+                    self._report_error(exc)
+                    _mark_responses_capture_incomplete(
+                        self._partial, self._mask_output_when_incomplete
+                    )
+                    failure = _responses_event_failure(event)
+                    if failure is not None:
+                        self._end(**self._partial, error=failure)
                 yield event
         finally:
             self.close()
@@ -1042,10 +1931,13 @@ class _InstrumentedResponsesStream:
         self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: Any
     ) -> None:
         if exc is not None:
+            _mark_responses_capture_incomplete(self._partial, self._mask_output_when_incomplete)
             self._end(**self._partial, error=exc)
         self.close()
 
     def _finish(self) -> None:
+        if not self._saw_terminal_snapshot:
+            _mark_responses_capture_incomplete(self._partial, self._mask_output_when_incomplete)
         self._end(**self._partial)
 
     def _on_response_close(self) -> None:
@@ -1073,6 +1965,7 @@ class _InstrumentedResponsesStream:
             self._handle.update(
                 time_to_first_chunk_ms=(time.perf_counter() - self._started_at) * 1000
             )
+        event_type = _field(event, "type")
         response = _field(event, "response")
         if response is not None:
             # Streams keep error out of the partial: their end paths pass an
@@ -1082,24 +1975,39 @@ class _InstrumentedResponsesStream:
             output = None
             truncated = False
             if raw_output is not None:
-                output, truncated = _bounded_responses_capture(raw_output)
+                output, truncated = _bounded_responses_capture(
+                    raw_output,
+                    capture_enabled=self._capture_output,
+                    max_bytes=_CHAT_STREAM_CAPTURE_MAX_BYTES,
+                    report_error=self._report_error,
+                )
                 if not truncated and output:
                     self._retained_output = output
             self._partial = fields
-            if self._retained_output is not None:
+            if self._retained_output is not None and not (
+                truncated and self._mask_output_when_incomplete
+            ):
                 self._partial["output"] = self._retained_output
             elif output is not None:
                 self._partial["output"] = output
             if truncated:
-                self._partial["attributes"] = {"telemetry.dev.capture.truncated": True}
-        event_type = _field(event, "type")
+                _mark_responses_capture_incomplete(self._partial, self._mask_output_when_incomplete)
+            if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                self._saw_terminal_snapshot = True
         if event_type == "response.completed":
+            if not self._saw_terminal_snapshot:
+                _mark_responses_capture_incomplete(self._partial, self._mask_output_when_incomplete)
             self._end(**self._partial)
         elif event_type == "response.failed":
+            if not self._saw_terminal_snapshot:
+                _mark_responses_capture_incomplete(self._partial, self._mask_output_when_incomplete)
             self._end(**self._partial, error=_response_failed_error(response))
         elif event_type == "response.incomplete":
+            if not self._saw_terminal_snapshot:
+                _mark_responses_capture_incomplete(self._partial, self._mask_output_when_incomplete)
             self._end(**self._partial)
         elif event_type == "error":
+            _mark_responses_capture_incomplete(self._partial, self._mask_output_when_incomplete)
             self._end(**self._partial, error=_response_stream_error(event))
 
 
@@ -1108,8 +2016,14 @@ class _InstrumentedAsyncResponsesStream:
         self._inner = inner
         self._handle = handle
         self._end = _end_once(handle)
+        (
+            self._capture_output,
+            self._mask_output_when_incomplete,
+        ) = _chat_span_capture_policy(handle)
+        self._report_error = _chat_span_reporter(handle)
         self._started_at = started_at
         self._saw_first = False
+        self._saw_terminal_snapshot = False
         self._partial: dict[str, Any] = {}
         self._retained_output: Any | None = None
         self._consume: AsyncIterator[Any] | None = None
@@ -1126,11 +2040,23 @@ class _InstrumentedAsyncResponsesStream:
                 except StopAsyncIteration:
                     break
                 except BaseException as exc:
+                    _mark_responses_capture_incomplete(
+                        self._partial, self._mask_output_when_incomplete
+                    )
                     self._end(**self._partial, error=exc)
                     raise
                 finally:
                     self._in_next = False
-                self._record(event, received_at)
+                try:
+                    self._record(event, received_at)
+                except Exception as exc:
+                    self._report_error(exc)
+                    _mark_responses_capture_incomplete(
+                        self._partial, self._mask_output_when_incomplete
+                    )
+                    failure = _responses_event_failure(event)
+                    if failure is not None:
+                        self._end(**self._partial, error=failure)
                 yield event
         finally:
             await self.close()
@@ -1156,10 +2082,13 @@ class _InstrumentedAsyncResponsesStream:
         tb: Any,
     ) -> None:
         if exc is not None:
+            _mark_responses_capture_incomplete(self._partial, self._mask_output_when_incomplete)
             self._end(**self._partial, error=exc)
         await self.close()
 
     def _finish(self) -> None:
+        if not self._saw_terminal_snapshot:
+            _mark_responses_capture_incomplete(self._partial, self._mask_output_when_incomplete)
         self._end(**self._partial)
 
     def _on_response_close(self) -> None:
@@ -1189,6 +2118,7 @@ class _InstrumentedAsyncResponsesStream:
             self._handle.update(
                 time_to_first_chunk_ms=(time.perf_counter() - self._started_at) * 1000
             )
+        event_type = _field(event, "type")
         response = _field(event, "response")
         if response is not None:
             # Streams keep error out of the partial: their end paths pass an
@@ -1198,29 +2128,46 @@ class _InstrumentedAsyncResponsesStream:
             output = None
             truncated = False
             if raw_output is not None:
-                output, truncated = _bounded_responses_capture(raw_output)
+                output, truncated = _bounded_responses_capture(
+                    raw_output,
+                    capture_enabled=self._capture_output,
+                    max_bytes=_CHAT_STREAM_CAPTURE_MAX_BYTES,
+                    report_error=self._report_error,
+                )
                 if not truncated and output:
                     self._retained_output = output
             self._partial = fields
-            if self._retained_output is not None:
+            if self._retained_output is not None and not (
+                truncated and self._mask_output_when_incomplete
+            ):
                 self._partial["output"] = self._retained_output
             elif output is not None:
                 self._partial["output"] = output
             if truncated:
-                self._partial["attributes"] = {"telemetry.dev.capture.truncated": True}
-        event_type = _field(event, "type")
+                _mark_responses_capture_incomplete(self._partial, self._mask_output_when_incomplete)
+            if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                self._saw_terminal_snapshot = True
         if event_type == "response.completed":
+            if not self._saw_terminal_snapshot:
+                _mark_responses_capture_incomplete(self._partial, self._mask_output_when_incomplete)
             self._end(**self._partial)
         elif event_type == "response.failed":
+            if not self._saw_terminal_snapshot:
+                _mark_responses_capture_incomplete(self._partial, self._mask_output_when_incomplete)
             self._end(**self._partial, error=_response_failed_error(response))
         elif event_type == "response.incomplete":
+            if not self._saw_terminal_snapshot:
+                _mark_responses_capture_incomplete(self._partial, self._mask_output_when_incomplete)
             self._end(**self._partial)
         elif event_type == "error":
+            _mark_responses_capture_incomplete(self._partial, self._mask_output_when_incomplete)
             self._end(**self._partial, error=_response_stream_error(event))
 
 
 def _media_stream_event_fields(
-    event: Any, response_mapper: ResponseMapper, capture_output: bool
+    event: Any,
+    response_mapper: ResponseMapper,
+    capture_output: bool,
 ) -> dict[str, Any]:
     if response_mapper is not _text_media_response:
         return response_mapper(event)
@@ -1228,7 +2175,7 @@ def _media_stream_event_fields(
     if capture_output and _string(_field(event, "type")) == "transcript.text.done":
         text = _string(_field(event, "text"))
         if text is not None:
-            budget = telemetry_dev.CaptureBudget.from_client()
+            budget = _transcript_capture_budget()
             fields["output"] = _capture_text(text, budget)
             if budget.truncated:
                 fields["attributes"] = {"telemetry.dev.capture.truncated": True}
@@ -1240,16 +2187,30 @@ def _media_stream_end_fields(
     response_mapper: ResponseMapper,
     text_parts: Sequence[str],
     budget: telemetry_dev.CaptureBudget,
+    mask_output_when_incomplete: bool,
+    stream_incomplete: bool,
 ) -> dict[str, Any]:
     result = dict(fields)
-    if response_mapper is _text_media_response and "output" not in result:
-        if text_parts:
-            result["output"] = "".join(text_parts)
-        if budget.truncated:
-            attributes = result.get("attributes")
-            result["attributes"] = (
-                dict(cast(Mapping[str, Any], attributes)) if isinstance(attributes, Mapping) else {}
-            ) | {"telemetry.dev.capture.truncated": True}
+    capture_incomplete = stream_incomplete
+    if response_mapper is _text_media_response:
+        attributes = result.get("attributes")
+        terminal_truncated = (
+            isinstance(attributes, Mapping)
+            and cast(Mapping[str, Any], attributes).get("telemetry.dev.capture.truncated") is True
+        )
+        if "output" not in result:
+            capture_incomplete = capture_incomplete or budget.truncated
+            if text_parts and not (mask_output_when_incomplete and capture_incomplete):
+                result["output"] = "".join(text_parts)
+        else:
+            capture_incomplete = capture_incomplete or terminal_truncated
+        if mask_output_when_incomplete and capture_incomplete:
+            result.pop("output", None)
+    if capture_incomplete:
+        attributes = result.get("attributes")
+        result["attributes"] = (
+            dict(cast(Mapping[str, Any], attributes)) if isinstance(attributes, Mapping) else {}
+        ) | {"telemetry.dev.capture.truncated": True}
     return result
 
 
@@ -1268,6 +2229,32 @@ def _media_stream_error(event: Any, event_type: str) -> BaseException | None:
     return RuntimeError(f"{code}: {message}" if code else message)
 
 
+def _media_event_failure(event: Any) -> BaseException | None:
+    try:
+        event_type = _string(_field(event, "type")) or ""
+    except Exception:
+        return None
+    if event_type not in _MEDIA_TERMINAL_EVENTS:
+        return None
+    try:
+        return _media_stream_error(event, event_type)
+    except Exception:
+        if event_type.endswith(".failed"):
+            return RuntimeError(f"OpenAI media stream ended with {event_type}")
+        return None
+
+
+_MEDIA_TERMINAL_EVENTS = frozenset(
+    {
+        "image_generation.completed",
+        "image_generation.failed",
+        "image_edit.completed",
+        "image_edit.failed",
+        "transcript.text.done",
+    }
+)
+
+
 class _InstrumentedMediaStream:
     def __init__(
         self, inner: Any, handle: telemetry_dev.SpanHandle, response_mapper: ResponseMapper
@@ -1276,11 +2263,16 @@ class _InstrumentedMediaStream:
         self._end = _end_once(handle)
         self._fields: dict[str, Any] = {}
         self._response_mapper = response_mapper
-        client = telemetry_dev.get_client()
-        self._capture_output = client is not None and client.capture_output
-        self._budget = telemetry_dev.CaptureBudget.from_client()
+        (
+            self._capture_output,
+            self._mask_output_when_incomplete,
+        ) = _chat_span_capture_policy(handle)
+        self._budget = _transcript_capture_budget()
         self._text_parts: list[str] = []
         self._saw_delta = False
+        self._saw_terminal = False
+        self._report_error = _chat_span_reporter(handle)
+        self._mapping_failed = False
 
     def __iter__(self) -> _InstrumentedMediaStream:
         return self
@@ -1319,12 +2311,28 @@ class _InstrumentedMediaStream:
         except BaseException as exc:
             self._end(**self._finish_fields(), error=exc)
             raise
-        self._record(event)
+        self._record_safely(event)
         return event
+
+    def _record_safely(self, event: Any) -> None:
+        try:
+            self._record(event)
+        except Exception as exc:
+            self._report_error(exc)
+            self._mapping_failed = True
+            failure = _media_event_failure(event)
+            if failure is not None:
+                self._end(**self._finish_fields(), error=failure)
 
     def _record(self, event: Any) -> None:
         event_type = _string(_field(event, "type")) or ""
-        mapped = _media_stream_event_fields(event, self._response_mapper, self._capture_output)
+        if event_type in _MEDIA_TERMINAL_EVENTS:
+            self._saw_terminal = True
+        mapped = _media_stream_event_fields(
+            event,
+            self._response_mapper,
+            self._capture_output,
+        )
         if "output" in mapped:
             self._fields = _clean_fields(mapped)
         else:
@@ -1340,19 +2348,18 @@ class _InstrumentedMediaStream:
                 captured = _capture_text(text, self._budget)
                 if captured:
                     self._text_parts.append(captured)
-        if event_type in {
-            "image_generation.completed",
-            "image_generation.failed",
-            "image_edit.completed",
-            "image_edit.failed",
-            "transcript.text.done",
-        }:
+        if event_type in _MEDIA_TERMINAL_EVENTS:
             error = _media_stream_error(event, event_type)
             self._end(**self._finish_fields(), **({"error": error} if error is not None else {}))
 
     def _finish_fields(self) -> dict[str, Any]:
         return _media_stream_end_fields(
-            self._fields, self._response_mapper, self._text_parts, self._budget
+            self._fields,
+            self._response_mapper,
+            self._text_parts,
+            self._budget,
+            self._mask_output_when_incomplete,
+            not self._saw_terminal or self._mapping_failed,
         )
 
     def close(self) -> None:
@@ -1373,11 +2380,16 @@ class _InstrumentedAsyncMediaStream:
         self._end = _end_once(handle)
         self._fields: dict[str, Any] = {}
         self._response_mapper = response_mapper
-        client = telemetry_dev.get_client()
-        self._capture_output = client is not None and client.capture_output
-        self._budget = telemetry_dev.CaptureBudget.from_client()
+        (
+            self._capture_output,
+            self._mask_output_when_incomplete,
+        ) = _chat_span_capture_policy(handle)
+        self._budget = _transcript_capture_budget()
         self._text_parts: list[str] = []
         self._saw_delta = False
+        self._saw_terminal = False
+        self._report_error = _chat_span_reporter(handle)
+        self._mapping_failed = False
 
     def __aiter__(self) -> _InstrumentedAsyncMediaStream:
         return self
@@ -1423,8 +2435,28 @@ class _InstrumentedAsyncMediaStream:
         except BaseException as exc:
             self._end(**self._finish_fields(), error=exc)
             raise
+        self._record_safely(event)
+        return event
+
+    def _record_safely(self, event: Any) -> None:
+        try:
+            self._record(event)
+        except Exception as exc:
+            self._report_error(exc)
+            self._mapping_failed = True
+            failure = _media_event_failure(event)
+            if failure is not None:
+                self._end(**self._finish_fields(), error=failure)
+
+    def _record(self, event: Any) -> None:
         event_type = _string(_field(event, "type")) or ""
-        mapped = _media_stream_event_fields(event, self._response_mapper, self._capture_output)
+        if event_type in _MEDIA_TERMINAL_EVENTS:
+            self._saw_terminal = True
+        mapped = _media_stream_event_fields(
+            event,
+            self._response_mapper,
+            self._capture_output,
+        )
         if "output" in mapped:
             self._fields = _clean_fields(mapped)
         else:
@@ -1440,20 +2472,18 @@ class _InstrumentedAsyncMediaStream:
                 captured = _capture_text(text, self._budget)
                 if captured:
                     self._text_parts.append(captured)
-        if event_type in {
-            "image_generation.completed",
-            "image_generation.failed",
-            "image_edit.completed",
-            "image_edit.failed",
-            "transcript.text.done",
-        }:
+        if event_type in _MEDIA_TERMINAL_EVENTS:
             error = _media_stream_error(event, event_type)
             self._end(**self._finish_fields(), **({"error": error} if error is not None else {}))
-        return event
 
     def _finish_fields(self) -> dict[str, Any]:
         return _media_stream_end_fields(
-            self._fields, self._response_mapper, self._text_parts, self._budget
+            self._fields,
+            self._response_mapper,
+            self._text_parts,
+            self._budget,
+            self._mask_output_when_incomplete,
+            not self._saw_terminal or self._mapping_failed,
         )
 
     async def close(self) -> None:
@@ -1517,7 +2547,7 @@ def _wrap_sync(
             return _InstrumentedResponsesStream(result, handle, started_at)
         if streaming and operation == "media":
             return _InstrumentedMediaStream(result, handle, response_mapper)
-        end(**response_mapper(result))
+        _end_mapped_response(handle, end, response_mapper, result)
         return result
 
     setattr(wrapper, _WRAPPED_ATTR, True)
@@ -1553,7 +2583,7 @@ def _wrap_async(
             return _InstrumentedAsyncResponsesStream(result, handle, started_at)
         if streaming and operation == "media":
             return _InstrumentedAsyncMediaStream(result, handle, response_mapper)
-        end(**response_mapper(result))
+        _end_mapped_response(handle, end, response_mapper, result)
         return result
 
     setattr(wrapper, _WRAPPED_ATTR, True)
@@ -1574,7 +2604,7 @@ def _wrap_sync_batch(
     @wraps(original)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         resource = args[0] if args and hasattr(args[0], "_client") else None
-        _handle, end, _started_at = _start_span(
+        handle, end, _started_at = _start_span(
             _batch_params(args, kwargs), request_mapper, provider(resource)
         )
         try:
@@ -1582,7 +2612,7 @@ def _wrap_sync_batch(
         except BaseException as exc:
             end(error=exc)
             raise
-        end(**response_mapper(result))
+        _end_mapped_response(handle, end, response_mapper, result)
         return result
 
     setattr(wrapper, _WRAPPED_ATTR, True)
@@ -1603,7 +2633,7 @@ def _wrap_async_batch(
     @wraps(original)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         resource = args[0] if args and hasattr(args[0], "_client") else None
-        _handle, end, _started_at = _start_span(
+        handle, end, _started_at = _start_span(
             _batch_params(args, kwargs), request_mapper, provider(resource)
         )
         try:
@@ -1611,7 +2641,7 @@ def _wrap_async_batch(
         except BaseException as exc:
             end(error=exc)
             raise
-        end(**response_mapper(result))
+        _end_mapped_response(handle, end, response_mapper, result)
         return result
 
     setattr(wrapper, _WRAPPED_ATTR, True)

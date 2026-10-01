@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from itertools import chain
 from typing import Final, cast
 
@@ -123,16 +123,18 @@ class CaptureBudget:
             return byte_count, item_count
         seen.add(value_id)
         try:
-            mapping: dict[object, object] | None = None
+            mapping: Mapping[object, object] | None = None
             children: Iterable[object] = ()
-            if isinstance(value, dict):
-                mapping = cast("dict[object, object]", value)
-            elif isinstance(value, list | tuple | set | frozenset):
+            if isinstance(value, Mapping):
+                mapping = cast("Mapping[object, object]", value)
+            elif isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+                children = cast("Iterable[object]", value)
+            elif isinstance(value, set | frozenset):
                 children = cast("Iterable[object]", value)
             else:
                 attributes = getattr(value, "__dict__", None)
-                if isinstance(attributes, dict):
-                    mapping = cast("dict[object, object]", attributes)
+                if isinstance(attributes, Mapping):
+                    mapping = cast("Mapping[object, object]", attributes)
 
             if mapping is not None:
                 children = chain.from_iterable(mapping.items())
