@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/telemetry-dev/telemetry/compare/python-anthropic-v0.1.3...python-anthropic-v0.1.4) (2026-10-01)
+
+
+### Bug Fixes
+
+* **sdk:** flag incomplete stream capture and keep it from masks ([#33](https://github.com/telemetry-dev/telemetry/issues/33)) ([9454284](https://github.com/telemetry-dev/telemetry/commit/9454284555a2b704c2616620311d36d9db7a9d82))
+
 ## [0.1.3](https://github.com/telemetry-dev/telemetry/compare/python-anthropic-v0.1.2...python-anthropic-v0.1.3) (2026-09-30)
 
 

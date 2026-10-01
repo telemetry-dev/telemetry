@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.9](https://github.com/telemetry-dev/telemetry/compare/anthropic-v0.1.8...anthropic-v0.1.9) (2026-10-01)
+
+
+### Bug Fixes
+
+* **sdk:** flag incomplete stream capture and keep it from masks ([#33](https://github.com/telemetry-dev/telemetry/issues/33)) ([9454284](https://github.com/telemetry-dev/telemetry/commit/9454284555a2b704c2616620311d36d9db7a9d82))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.1.7
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.1.7
+
 ## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/anthropic-v0.1.7...anthropic-v0.1.8) (2026-09-30)
 
 
