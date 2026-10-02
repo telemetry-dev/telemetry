@@ -832,7 +832,8 @@ function recordStreamEvent<T>(event: T, state: StreamState): SpanFields {
 }
 
 // Older cores enforce captureOutput and masking when the span ends but expose no policy, so
-// retain output within the default limit and withhold incomplete output from their mask.
+// withhold incomplete output from their mask. Retention uses the fixed stream bounds either way;
+// maxAttributeLength is only here to satisfy the policy type.
 const LEGACY_CAPTURE_POLICY: NonNullable<SpanHandle["capturePolicy"]> = {
   output: true,
   mask: true,
