@@ -94,7 +94,7 @@ const openai = wrapOpenAI(new OpenAI(), { injectStreamUsage: true });
 
 Responses API streams are traced through `responses.create({ stream: true })`; terminal `response.completed`, `response.failed`, and `response.incomplete` events close the span.
 
-Responses and transcription streams follow the same rule. A Responses stream that ends without a terminal snapshot, ends with an `error` event, fails to map an event, or has a terminal snapshot over the limit sets `telemetry.dev.capture.truncated`; it keeps the last snapshot that fit, unless a mask is configured, in which case output is omitted. Transcription text has its own retention limit of up to 64 KiB with no item limit. A complete non-streamed transcript is passed to the core whole. A transcription stream that ends before `transcript.text.done` (an error, early close, or end of stream) or whose text exceeds the limit is flagged the same way and keeps its bounded partial text only when no mask is configured.
+Responses and transcription streams follow the same rule. A Responses stream that ends without a terminal snapshot, ends with an `error` event, fails to map an event, or has a terminal snapshot over the limit sets `telemetry.dev.capture.truncated`; it keeps the last snapshot that fit, unless a mask is configured, in which case output is omitted. Transcription text has its own retention limit of up to 65,536 characters of serialized JSON (UTF-16 code units) with no item limit. A complete non-streamed transcript is passed to the core whole. A transcription stream that ends before `transcript.text.done` (an error, early close, or end of stream) or whose text exceeds the limit is flagged the same way and keeps its bounded partial text only when no mask is configured.
 
 ## Embeddings
 
