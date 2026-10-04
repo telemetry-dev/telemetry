@@ -1577,14 +1577,13 @@ test("chat streams replace the default role within an exact byte budget", async 
 });
 
 test("chat streams refund the role separator before an exact-budget recovery", async () => {
-  const expectedOutput = [{ role: "developer", content: "x" }];
-
-  const spans = setupSpans(undefined, {
-    maxAttributeLength: JSON.stringify(expectedOutput).length,
-  });
+  const spans = setupSpans();
+  const emptyOutput = JSON.stringify([{ role: "developer", content: "" }]);
+  const retainedContent = "x".repeat(48 * 1024 - emptyOutput.length);
+  const expectedOutput = [{ role: "developer", content: retainedContent }];
 
   const events = [
-    { choices: [{ index: 0, delta: { content: "x" } }] },
+    { choices: [{ index: 0, delta: { content: retainedContent } }] },
     { choices: [{ index: 0, delta: { role: "y".repeat(256) } }] },
     { choices: [{ index: 0, delta: { role: "developer" }, finish_reason: "stop" }] },
   ];
@@ -1607,21 +1606,23 @@ test("chat streams refund the role separator before an exact-budget recovery", a
 
   expect(await collectStream(stream)).toEqual(events);
   const span = await exportedSpan(spans);
+  expect(String(span.attributes["gen_ai.output.messages"])).toHaveLength(48 * 1024);
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual(expectedOutput);
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
 });
 
 test("chat streams recover a sole rejected role in a later choice", async () => {
-  const expectedOutput = [{ role: "assistant", content: "x".repeat(100) }, { role: "developer" }];
+  const spans = setupSpans();
 
-  const spans = setupSpans(undefined, {
-    maxAttributeLength: JSON.stringify(expectedOutput).length,
-  });
+  const emptyOutput = JSON.stringify([{ role: "assistant", content: "" }, { role: "developer" }]);
+
+  const retainedContent = "x".repeat(48 * 1024 - emptyOutput.length);
+  const expectedOutput = [{ role: "assistant", content: retainedContent }, { role: "developer" }];
 
   const events = [
     {
       choices: [
-        { index: 0, delta: { content: "x".repeat(100) }, finish_reason: "stop" },
+        { index: 0, delta: { content: retainedContent }, finish_reason: "stop" },
         { index: 1, delta: { role: "y".repeat(256) } },
       ],
     },
@@ -1646,14 +1647,22 @@ test("chat streams recover a sole rejected role in a later choice", async () => 
 
   expect(await collectStream(stream)).toEqual(events);
   const span = await exportedSpan(spans);
+  expect(String(span.attributes["gen_ai.output.messages"])).toHaveLength(48 * 1024);
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual(expectedOutput);
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
 });
 
 test("chat streams recover rejected role and tool-call scalar replacements", async () => {
-  const spans = setupSpans(undefined, { maxAttributeLength: 160 });
+  const spans = setupSpans();
+
+  const emptyOutput = JSON.stringify([
+    { role: "developer", content: "", tool_calls: [{ id: "call_1" }] },
+  ]);
+
+  const retainedContent = "x".repeat(48 * 1024 - emptyOutput.length - 1);
 
   const events = [
+    { choices: [{ index: 0, delta: { content: retainedContent } }] },
     {
       choices: [
         {
@@ -1694,8 +1703,9 @@ test("chat streams recover rejected role and tool-call scalar replacements", asy
 
   expect(await collectStream(stream)).toEqual(events);
   const span = await exportedSpan(spans);
+  expect(String(span.attributes["gen_ai.output.messages"])).toHaveLength(48 * 1024 - 1);
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
-    { role: "developer", content: null, tool_calls: [{ id: "call_1" }] },
+    { role: "developer", content: retainedContent, tool_calls: [{ id: "call_1" }] },
   ]);
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
 });
@@ -1742,9 +1752,22 @@ test("chat streams replace retained scalars after additive capture truncates", a
 });
 
 test("chat streams refund rejected scalar fields before later capture", async () => {
-  const spans = setupSpans(undefined, { maxAttributeLength: 170 });
+  const spans = setupSpans();
+
+  const emptyOutput = JSON.stringify([
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [
+        { id: "new", type: "function", function: { name: "new_name", arguments: "{}" } },
+      ],
+    },
+  ]);
+
+  const retainedContent = "x".repeat(48 * 1024 - emptyOutput.length - 2);
 
   const events = [
+    { choices: [{ index: 0, delta: { content: retainedContent } }] },
     {
       choices: [
         {
@@ -1817,10 +1840,11 @@ test("chat streams refund rejected scalar fields before later capture", async ()
 
   expect(await collectStream(stream)).toEqual(events);
   const span = await exportedSpan(spans);
+  expect(String(span.attributes["gen_ai.output.messages"])).toHaveLength(48 * 1024 - 2);
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
     {
       role: "assistant",
-      content: null,
+      content: retainedContent,
       tool_calls: [
         {
           id: "new",
@@ -1834,19 +1858,28 @@ test("chat streams refund rejected scalar fields before later capture", async ()
 });
 
 test("chat streams reserve a rejected function shell only once", async () => {
+  const spans = setupSpans();
+
+  const emptyOutput = JSON.stringify([
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [{ function: { name: "lookup", arguments: "{}" } }],
+    },
+  ]);
+
+  const retainedContent = "x".repeat(48 * 1024 - emptyOutput.length - 2);
+
   const expectedOutput = [
     {
       role: "assistant",
-      content: null,
+      content: retainedContent,
       tool_calls: [{ function: { name: "lookup", arguments: "{}" } }],
     },
   ];
 
-  const spans = setupSpans(undefined, {
-    maxAttributeLength: JSON.stringify(expectedOutput).length + 3,
-  });
-
   const events = [
+    { choices: [{ index: 0, delta: { content: retainedContent } }] },
     {
       choices: [
         {
@@ -1886,6 +1919,7 @@ test("chat streams reserve a rejected function shell only once", async () => {
 
   expect(await collectStream(stream)).toEqual(events);
   const span = await exportedSpan(spans);
+  expect(String(span.attributes["gen_ai.output.messages"])).toHaveLength(48 * 1024 - 2);
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual(expectedOutput);
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
 });

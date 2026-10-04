@@ -126,9 +126,9 @@ histogram state and does not retain individual intervals. Pull-based timing incl
 between reads. An explicit timestamp uses the same monotonic millisecond clock for every chunk.
 
 Provider integrations feature-detect stream APIs. With an older core SDK that lacks the stream
-capture policy, streams are still traced with usage, model, finish reason, and timing, but output
-retention assumes the default 65536 limit and treats a mask as configured, so incomplete output is
-withheld. Instrumentation failures are not reported to `onError` with such a core. If only
+capture policy, streams are still traced with usage, model, finish reason, and timing. Output is
+retained within the same fixed bounds as with a current core, but a mask is assumed to be
+configured, so incomplete output is withheld. Instrumentation failures are not reported to `onError` with such a core. If only
 `recordOutputChunk` is unavailable, tracing and reconstruction continue but chunk-interval metrics
 are unavailable. Upgrade the core SDK with provider integrations to enable the full stream
 telemetry.

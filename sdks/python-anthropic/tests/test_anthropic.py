@@ -2051,6 +2051,9 @@ def test_fallback_inspection_reads_only_the_bounded_tail(
             raise AssertionError("inspected an iteration outside the bounded tail")
 
         def __getitem__(self, index: Any) -> Any:
+            # A slice copies the whole sequence, so a full scan of the copy would go unseen.
+            if isinstance(index, slice):
+                raise AssertionError("sliced the iterations")
             if isinstance(index, int) and index < 1_001:
                 raise AssertionError("inspected an iteration outside the bounded tail")
             return super().__getitem__(index)

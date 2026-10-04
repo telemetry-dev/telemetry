@@ -116,8 +116,10 @@ timing, and errors may still be recorded when providers supply them. For streame
 usage requires provider support or the documented stream-usage option in the OpenAI integration.
 Capture flags do not gate stop sequences, tool descriptions and definitions (`gen_ai.tool.description`, `gen_ai.tool.definitions`), caller-supplied metadata or raw attributes, or exception
 messages and stack traces; redact those separately when needed.
-OpenAI streamed chat and Responses reconstruction, and Anthropic stream reconstruction, retain up
-to 48 KiB and 1,000 items; OpenAI transcription text retains up to 64 KiB with no item limit.
+OpenAI streamed chat reconstruction and Anthropic stream reconstruction retain up to 48 KiB and
+1,000 items. OpenAI Responses reconstruction retains up to 48 KiB and 1,000 items in TypeScript,
+and 1,024 items in Python. OpenAI transcription text has no item limit; TypeScript retains up to
+65,536 UTF-16 units of serialized JSON, and Python retains up to 64 KiB of UTF-8.
 These are fixed resource bounds: the configured attribute-length limit is applied by the core to
 the exported attribute after masking, not to stream retention. A truncated or otherwise
 incomplete stream sets
