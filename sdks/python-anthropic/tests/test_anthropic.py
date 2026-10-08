@@ -1942,6 +1942,193 @@ def test_escape_heavy_deltas_are_charged_at_their_serialized_size(
         assert a["telemetry.dev.capture.truncated"] is True
 
 
+def test_block_creating_text_delta_is_charged_at_its_serialized_size() -> None:
+    implementation = cast(Any, telemetry_dev_anthropic)
+    chunk = "\x01" * 100
+    state = implementation._StreamState()
+
+    implementation._record_stream_event(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": chunk},
+        },
+        state,
+    )
+
+    assert state.blocks[0] == {"type": "text", "text": chunk}
+    serialized = len(json.dumps(chunk, ensure_ascii=False).encode()) - 2
+    assert state.budget.bytes_used >= serialized
+
+
+def test_block_creating_text_delta_also_charges_the_block_it_creates() -> None:
+    implementation = cast(Any, telemetry_dev_anthropic)
+    state = implementation._StreamState()
+
+    implementation._record_stream_event(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "hi"},
+        },
+        state,
+    )
+
+    structure = telemetry_dev.CaptureBudget()
+    assert structure.accept({"type": "text", "text": ""})
+    assert state.budget.bytes_used >= structure.bytes_used
+    assert state.budget.items_used >= structure.items_used
+
+
+def test_lone_surrogate_does_not_discard_the_output_that_already_fit() -> None:
+    implementation = cast(Any, telemetry_dev_anthropic)
+    state = implementation._StreamState()
+    record = implementation._record_stream_event
+
+    record(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": "keep me"},
+        },
+        state,
+    )
+    record(
+        {
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "text", "text": "a\ud800"},
+        },
+        state,
+    )
+
+    partial = implementation._stream_partial(state)
+
+    assert partial["output"] is not None
+    assert partial["output"][0]["content"][0]["text"] == "keep me"
+
+
+def test_tool_input_over_the_bound_is_caught_while_streaming() -> None:
+    implementation = cast(Any, telemetry_dev_anthropic)
+    state = implementation._StreamState()
+    record = implementation._record_stream_event
+
+    record(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "t1", "name": "calc"},
+        },
+        state,
+    )
+    # Quote-light JSON: nothing to escape, but every element gains ", " once serialized.
+    payload = '{"n":[' + ",".join(["1"] * 20_000) + "]}"
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": payload},
+        },
+        state,
+    )
+    record({"type": "content_block_stop", "index": 0}, state)
+
+    assert state.budget.truncated is True
+
+
+def test_escape_heavy_text_is_charged_the_same_with_or_without_a_start_block() -> None:
+    implementation = cast(Any, telemetry_dev_anthropic)
+
+    def retained(with_start: bool) -> str:
+        state = implementation._StreamState()
+        record = implementation._record_stream_event
+        if with_start:
+            record(
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                state,
+            )
+        for text in ["\x01" * 2_000] + ["y" * 100] * 500:
+            record(
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": text},
+                },
+                state,
+            )
+        output = implementation._stream_partial(state)["output"]
+        return output[0]["content"][0]["text"] if output else ""
+
+    with_start = retained(True)
+    without_start = retained(False)
+
+    assert with_start != ""
+    assert without_start == with_start
+
+
+def test_settling_a_tool_input_refunds_its_previous_reservation() -> None:
+    implementation = cast(Any, telemetry_dev_anthropic)
+    state = implementation._StreamState()
+    record = implementation._record_stream_event
+
+    record(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "t1", "name": "calc"},
+        },
+        state,
+    )
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"a":1,"b":2}'},
+        },
+        state,
+    )
+    record({"type": "content_block_stop", "index": 0}, state)
+
+    settled_once = state.budget.bytes_used
+    implementation._settle_tool_input(0, state)
+
+    assert state.budget.bytes_used == settled_once
+    assert state.budget.truncated is False
+
+
+@pytest.mark.parametrize(("elements", "fits"), [(5_000, True), (20_000, False)])
+def test_tool_input_reservation_near_the_byte_limit(elements: int, fits: bool) -> None:
+    implementation = cast(Any, telemetry_dev_anthropic)
+    state = implementation._StreamState()
+    record = implementation._record_stream_event
+
+    record(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "t1", "name": "calc"},
+        },
+        state,
+    )
+    payload = '{"n":[' + ",".join(["1"] * elements) + "]}"
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": payload},
+        },
+        state,
+    )
+    record({"type": "content_block_stop", "index": 0}, state)
+
+    assert state.budget.truncated is not fits
+    assert state.budget.bytes_used <= state.budget.max_bytes
+
+
 @pytest.mark.parametrize(
     ("max_attribute_length", "redact", "expected"),
     [

@@ -527,7 +527,9 @@ def _bounded_stream_output(
     blocks: list[dict[str, Any]], max_bytes: int, max_items: int
 ) -> tuple[list[dict[str, Any]] | None, bool]:
     def encoded_size(value: Any) -> int:
-        return len(json.dumps(value, default=repr, ensure_ascii=False).encode())
+        return len(
+            json.dumps(value, default=repr, ensure_ascii=False).encode("utf-8", "surrogatepass")
+        )
 
     envelope: list[dict[str, Any]] = [{"role": "assistant", "content": []}]
     item_budget = telemetry_dev.CaptureBudget(max_items=max_items)
@@ -551,6 +553,8 @@ def _bounded_stream_output(
 def _stream_partial(
     state: _StreamState, *, mask_output_when_incomplete: bool = False
 ) -> dict[str, Any]:
+    for tool_index in list(state.tool_json):
+        _settle_tool_input(tool_index, state)
     output = _stream_output(state) if state.capture_output else None
     output_truncated = False
     if output is not None:
@@ -837,7 +841,11 @@ def _record_content_block_delta(event: Any, state: _StreamState) -> None:
                 _drop_stale_signature(block_index, state)
         return
     appended_field = _APPENDED_DELTA_FIELDS.get(delta_type or "")
-    if appended_field is not None and block_index in state.blocks:
+    if appended_field is not None:
+        if block_index not in state.blocks and not _reserve(
+            block_index, _default_block(delta_type), state
+        ):
+            return
         if not _reserve_appended_text(block_index, _field(delta, appended_field), state):
             return
     elif not _reserve(block_index, delta, state):
@@ -889,9 +897,41 @@ def _record_stream_event(event: Any, state: _StreamState) -> dict[str, Any]:
         state.response_model = (
             _fallback_serving_model(_field(event, "usage"), state) or state.response_model
         )
+    elif event_type == "content_block_stop":
+        stop_index = _field(event, "index")
+        if isinstance(stop_index, int):
+            _settle_tool_input(stop_index, state)
     elif event_type == "message_stop":
         state.message_stopped = True
     return update
+
+
+def _settle_tool_input(index: int, state: _StreamState) -> None:
+    """Recharge a finished tool input at the size it will serialize to.
+
+    Fragments are charged as escaped source while they stream, but the input is parsed
+    before serialization, so separators can push the finished block past the bound.
+    """
+    budget = state.budget
+    block = state.blocks.get(index)
+    if budget.truncated or block is None or state.tool_json.get(index) is None:
+        return
+    held_bytes, held_items = state.block_reservations.get(index, (0, 0))
+    try:
+        size = len(
+            json.dumps(
+                _finalize_block(index, block, state), default=repr, ensure_ascii=False
+            ).encode("utf-8", "surrogatepass")
+        )
+    except (TypeError, ValueError, RecursionError):
+        budget.truncated = True
+        return
+    base_bytes = budget.bytes_used - held_bytes
+    if base_bytes + size > budget.max_bytes:
+        budget.truncated = True
+        return
+    budget.bytes_used = base_bytes + size
+    state.block_reservations[index] = (size, held_items)
 
 
 def _stream_event_has_output(event: Any) -> bool:
