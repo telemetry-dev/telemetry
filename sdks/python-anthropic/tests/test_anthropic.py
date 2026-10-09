@@ -1982,6 +1982,36 @@ def test_block_creating_text_delta_also_charges_the_block_it_creates() -> None:
     assert state.budget.items_used >= structure.items_used
 
 
+@pytest.mark.parametrize(
+    ("tool_block", "deltas"),
+    [
+        (
+            {"type": "tool_use", "id": "t1", "name": "calc"},
+            [{"type": "input_json_delta", "partial_json": '{"x":"\\ud800"}'}],
+        ),
+        (
+            {"type": "tool_use", "id": "t1", "name": "calc"},
+            [{"type": "input_json_delta", "partial_json": '{"\\ud800":1}'}],
+        ),
+        ({"type": "tool_use", "id": "t1", "name": "calc", "input": {"\ud800": 1}}, []),
+    ],
+    ids=["streamed-value", "streamed-key", "start-key"],
+)
+def test_lone_surrogate_in_tool_input_keeps_the_exported_span_whole(
+    memory: SimpleNamespace, tool_block: dict[str, Any], deltas: list[dict[str, Any]]
+) -> None:
+    events = beta_stream_events(({"type": "text", "text": "keep me"}, []), (tool_block, deltas))
+
+    a = streamed_beta_span(events, memory)
+
+    assert "gen_ai.output.messages" in a
+    messages = str(a["gen_ai.output.messages"])
+    messages.encode()
+    assert "keep me" in messages
+    assert "\ud800" not in messages
+    assert "\ufffd" in messages
+
+
 def test_lone_surrogate_in_encrypted_content_keeps_the_span_encodable(
     memory: SimpleNamespace,
 ) -> None:
@@ -2099,19 +2129,15 @@ def test_tool_input_over_the_bound_is_caught_while_streaming() -> None:
     assert state.budget.truncated is True
 
 
-def _tool_stream(payloads: list[str]) -> Any:
+def _tool_stream(payloads: list[str], start_input: dict[str, Any] | None = None) -> Any:
     implementation = cast(Any, telemetry_dev_anthropic)
     state = implementation._StreamState()
     record = implementation._record_stream_event
     for index, payload in enumerate(payloads):
-        record(
-            {
-                "type": "content_block_start",
-                "index": index,
-                "content_block": {"type": "tool_use", "id": f"t{index}", "name": "calc"},
-            },
-            state,
-        )
+        block: dict[str, Any] = {"type": "tool_use", "id": f"t{index}", "name": "calc"}
+        if start_input is not None:
+            block["input"] = dict(start_input)
+        record({"type": "content_block_start", "index": index, "content_block": block}, state)
         record(
             {
                 "type": "content_block_delta",
@@ -2124,11 +2150,19 @@ def _tool_stream(payloads: list[str]) -> Any:
     return state
 
 
-def test_settled_tool_input_charge_covers_what_is_still_retained() -> None:
-    payload = '{"x":1}' + " " * 40_000
-    state = _tool_stream([payload, payload])
+@pytest.mark.parametrize(
+    ("payload", "start_input"),
+    [('{"x":1}' + " " * 40_000, None), ('{"x":1}', {"x": "a" * 40_000})],
+    ids=["padded-fragments", "overwritten-start-input"],
+)
+def test_settled_tool_input_charge_covers_what_is_still_retained(
+    payload: str, start_input: dict[str, Any] | None
+) -> None:
+    state = _tool_stream([payload, payload], start_input)
 
-    retained = sum(len(raw) for raw in state.tool_json.values())
+    retained = sum(len(raw) for raw in state.tool_json.values()) + sum(
+        len(json.dumps(block)) for block in state.blocks.values()
+    )
 
     assert retained <= state.budget.bytes_used
 
@@ -2137,10 +2171,23 @@ def test_settled_tool_input_charge_covers_what_is_still_retained() -> None:
 def test_settled_tool_input_agrees_with_the_final_bounded_check(elements: int) -> None:
     implementation = cast(Any, telemetry_dev_anthropic)
     state = _tool_stream(['{"n":[' + ",".join(["1"] * elements) + "]}"])
+    truncated_while_streaming = state.budget.truncated
 
     dropped = implementation._stream_partial(state)["output"] is None
 
-    assert dropped is state.budget.truncated
+    assert dropped is truncated_while_streaming
+
+
+def test_many_small_tool_blocks_are_all_kept() -> None:
+    implementation = cast(Any, telemetry_dev_anthropic)
+    state = _tool_stream(['{"a":1}'] * 60)
+    truncated_while_streaming = state.budget.truncated
+
+    output = implementation._stream_partial(state)["output"]
+
+    assert truncated_while_streaming is False
+    assert output is not None
+    assert len(output[0]["content"]) == 60
 
 
 def test_escape_heavy_text_is_charged_the_same_with_or_without_a_start_block() -> None:
@@ -2201,11 +2248,10 @@ def test_settling_a_tool_input_refunds_its_previous_reservation() -> None:
     record({"type": "content_block_stop", "index": 0}, state)
 
     finalized = implementation._finalize_block(0, state.blocks[0], state)
-    expected = (
-        len(json.dumps(implementation._STREAM_OUTPUT_ENVELOPE, ensure_ascii=False).encode())
-        + len(json.dumps(finalized, default=repr, ensure_ascii=False).encode())
-        + implementation._BLOCK_SEPARATOR_BYTES
-    )
+    # The only block, so the envelope is charged once and there is no separator.
+    expected = len(
+        json.dumps(implementation._STREAM_OUTPUT_ENVELOPE, ensure_ascii=False).encode()
+    ) + len(json.dumps(finalized, default=repr, ensure_ascii=False).encode())
 
     assert state.budget.bytes_used == expected
     implementation._settle_tool_input(0, state)
