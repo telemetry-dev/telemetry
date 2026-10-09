@@ -951,7 +951,9 @@ def test_stream_revalidates_expanded_tool_json_against_the_item_limit() -> None:
 
     partial = telemetry_dev_anthropic._stream_partial(state)  # pyright: ignore[reportPrivateUsage]
 
-    assert state.budget.truncated is False
+    # The expanded input is charged while streaming now, so the budget catches the item
+    # limit before the final check. The exported output and flag are unchanged.
+    assert state.budget.truncated is True
     assert partial["output"] is None
     assert partial["attributes"] == {"telemetry.dev.capture.truncated": True}
 
@@ -1980,6 +1982,67 @@ def test_block_creating_text_delta_also_charges_the_block_it_creates() -> None:
     assert state.budget.items_used >= structure.items_used
 
 
+def test_lone_surrogate_in_encrypted_content_keeps_the_span_encodable(
+    memory: SimpleNamespace,
+) -> None:
+    a = streamed_beta_span(
+        beta_stream_events(
+            (
+                {"type": "compaction", "content": None},
+                [
+                    {
+                        "type": "compaction_delta",
+                        "content": "Summary.",
+                        "encrypted_content": "enc_\ud800",
+                    }
+                ],
+            )
+        ),
+        memory,
+    )
+
+    messages = str(a["gen_ai.output.messages"])
+    messages.encode()  # encrypted_content is injected raw, bypassing the bounded capture
+    assert "\ud800" not in messages
+    assert "\ufffd" in messages
+
+
+def test_lone_surrogate_in_stream_metadata_keeps_the_span_encodable(
+    memory: SimpleNamespace,
+) -> None:
+    events = beta_stream_events(({"type": "text", "text": "hi"}, []))
+    events[0]["message"]["model"] = "claude-\ud800"
+    for event in events:
+        if event["type"] == "message_delta":
+            event["delta"]["stop_reason"] = "end_\ud800"
+
+    a = streamed_beta_span(events, memory)
+
+    model = str(a["gen_ai.response.model"])
+    reasons = list(cast(Any, a["gen_ai.response.finish_reasons"]))
+    "".join([model, *reasons]).encode()  # the exporter encodes these too
+    assert "\ud800" not in model
+    assert "\ufffd" in model
+    assert all("\ud800" not in reason for reason in reasons)
+
+
+def test_lone_surrogate_keeps_the_exported_span_whole(memory: SimpleNamespace) -> None:
+    events = beta_stream_events(
+        ({"type": "text", "text": "keep me"}, []),
+        ({"type": "text", "text": "a\ud800"}, []),
+    )
+
+    a = streamed_beta_span(events, memory)
+
+    messages = str(a["gen_ai.output.messages"])
+    messages.encode()  # the OTLP exporter does this; a lone surrogate would raise
+    assert "keep me" in messages
+    assert "\ud800" not in messages
+    assert "\ufffd" in messages
+    assert a["gen_ai.usage.output_tokens"] == 2
+    assert list(cast(Any, a["gen_ai.response.finish_reasons"])) == ["end_turn"]
+
+
 def test_lone_surrogate_does_not_discard_the_output_that_already_fit() -> None:
     implementation = cast(Any, telemetry_dev_anthropic)
     state = implementation._StreamState()
@@ -2034,6 +2097,50 @@ def test_tool_input_over_the_bound_is_caught_while_streaming() -> None:
     record({"type": "content_block_stop", "index": 0}, state)
 
     assert state.budget.truncated is True
+
+
+def _tool_stream(payloads: list[str]) -> Any:
+    implementation = cast(Any, telemetry_dev_anthropic)
+    state = implementation._StreamState()
+    record = implementation._record_stream_event
+    for index, payload in enumerate(payloads):
+        record(
+            {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {"type": "tool_use", "id": f"t{index}", "name": "calc"},
+            },
+            state,
+        )
+        record(
+            {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": payload},
+            },
+            state,
+        )
+        record({"type": "content_block_stop", "index": index}, state)
+    return state
+
+
+def test_settled_tool_input_charge_covers_what_is_still_retained() -> None:
+    payload = '{"x":1}' + " " * 40_000
+    state = _tool_stream([payload, payload])
+
+    retained = sum(len(raw) for raw in state.tool_json.values())
+
+    assert retained <= state.budget.bytes_used
+
+
+@pytest.mark.parametrize("elements", [8, 1_500, 5_000, 20_000])
+def test_settled_tool_input_agrees_with_the_final_bounded_check(elements: int) -> None:
+    implementation = cast(Any, telemetry_dev_anthropic)
+    state = _tool_stream(['{"n":[' + ",".join(["1"] * elements) + "]}"])
+
+    dropped = implementation._stream_partial(state)["output"] is None
+
+    assert dropped is state.budget.truncated
 
 
 def test_escape_heavy_text_is_charged_the_same_with_or_without_a_start_block() -> None:
@@ -2093,40 +2200,18 @@ def test_settling_a_tool_input_refunds_its_previous_reservation() -> None:
     )
     record({"type": "content_block_stop", "index": 0}, state)
 
-    settled_once = state.budget.bytes_used
+    finalized = implementation._finalize_block(0, state.blocks[0], state)
+    expected = (
+        len(json.dumps(implementation._STREAM_OUTPUT_ENVELOPE, ensure_ascii=False).encode())
+        + len(json.dumps(finalized, default=repr, ensure_ascii=False).encode())
+        + implementation._BLOCK_SEPARATOR_BYTES
+    )
+
+    assert state.budget.bytes_used == expected
     implementation._settle_tool_input(0, state)
 
-    assert state.budget.bytes_used == settled_once
+    assert state.budget.bytes_used == expected
     assert state.budget.truncated is False
-
-
-@pytest.mark.parametrize(("elements", "fits"), [(5_000, True), (20_000, False)])
-def test_tool_input_reservation_near_the_byte_limit(elements: int, fits: bool) -> None:
-    implementation = cast(Any, telemetry_dev_anthropic)
-    state = implementation._StreamState()
-    record = implementation._record_stream_event
-
-    record(
-        {
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "tool_use", "id": "t1", "name": "calc"},
-        },
-        state,
-    )
-    payload = '{"n":[' + ",".join(["1"] * elements) + "]}"
-    record(
-        {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "input_json_delta", "partial_json": payload},
-        },
-        state,
-    )
-    record({"type": "content_block_stop", "index": 0}, state)
-
-    assert state.budget.truncated is not fits
-    assert state.budget.bytes_used <= state.budget.max_bytes
 
 
 @pytest.mark.parametrize(
