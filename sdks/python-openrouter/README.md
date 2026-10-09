@@ -105,6 +105,8 @@ still execute and return their normal SDK values without exporting telemetry.
   can still be recorded after the budget is reached. A span with partial captured output includes
   `telemetry.dev.capture.truncated = true`.
 - Only the SDK methods listed above are instrumented in this version.
+- Video generation (`client.video_generation`) is not traced; submitted and polled video jobs produce
+  no spans.
 
 ## Development
 

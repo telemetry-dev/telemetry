@@ -153,7 +153,7 @@ LiteLLM's synchronous response metadata is used when available: `_hidden_params.
 
 ## Limitations
 
-- Instrumented surfaces are limited to `completion`, `acompletion`, `responses`, `aresponses`, `embedding`, `aembedding`, `rerank`, `arerank`, and the corresponding methods available on `Router` via `wrap_router`. `text_completion`, image/audio/batch APIs, and provider-specific APIs are out of scope for this package version.
+- Instrumented surfaces are limited to `completion`, `acompletion`, `responses`, `aresponses`, `embedding`, `aembedding`, `rerank`, `arerank`, and the corresponding methods available on `Router` via `wrap_router`. `text_completion`, image/audio/batch APIs, video APIs such as `video_generation` and `video_status`, and provider-specific APIs are out of scope for this package version.
 - References imported from LiteLLM before `instrument_litellm()` are not patched.
 - Internal `num_retries` retries are not separate spans; Router deployment attempts are.
 - OTel's built-in-tools scenario is not portable across LiteLLM providers and is not covered by the examples.
