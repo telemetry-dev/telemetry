@@ -122,7 +122,7 @@ Aggregate usage keys are `input_tokens`, `output_tokens`, `total_tokens`, `cache
 
 `stream=True` chat calls return a proxy around LiteLLM's `CustomStreamWrapper` that supports both sync and async iteration, context managers, `close()`, `aclose()`, and attribute delegation to the wrapped stream.
 
-The integration never mutates request arguments. It does not inject `stream_options.include_usage`. On stream completion, early close, or mid-stream error, it rebuilds the best available response with `litellm.stream_chunk_builder(...)` and ends the span once. `time_to_first_chunk_ms` is recorded on the first chunk. Stream usage is best-effort: LiteLLM aggregates usage chunks when present, otherwise it estimates usage from chunks and request messages.
+The integration never mutates request arguments. It does not inject `stream_options.include_usage`. On stream completion, early close, or mid-stream error, it rebuilds the best available response with `litellm.stream_chunk_builder(...)` and ends the span once. `time_to_first_chunk_ms` is recorded on the first chunk. Stream usage is best-effort: LiteLLM aggregates usage chunks when the provider sends them and otherwise may estimate counts from the chunks and request messages. Some LiteLLM versions instead expose zero usage for streams without provider usage, as observed with 1.104.2. When a stream produced output and its usage is zero input and zero output tokens with no other positive token count, the integration records no usage or cost instead of zero. To get the provider's own counts, pass `stream_options={"include_usage": True}` to providers that support it.
 
 ## Provider attribution
 

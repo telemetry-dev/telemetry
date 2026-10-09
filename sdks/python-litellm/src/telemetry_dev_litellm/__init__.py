@@ -216,6 +216,19 @@ def _usage(fields: Mapping[str, int | float | None]) -> dict[str, int | float] |
     return usage or None
 
 
+def _reports_tokens(usage: Mapping[str, int | float] | None) -> bool:
+    return usage is not None and any(value > 0 for value in usage.values())
+
+
+def _is_zero_usage(usage: Mapping[str, int | float] | None) -> bool:
+    return (
+        usage is not None
+        and usage.get("input_tokens") == 0
+        and usage.get("output_tokens") == 0
+        and not _reports_tokens(usage)
+    )
+
+
 def _stop_sequences(value: Any) -> list[str] | None:
     if isinstance(value, str):
         return [value]
@@ -723,6 +736,7 @@ class _InstrumentedStream:
         self._response_id: str | None = None
         self._response_model: str | None = None
         self._usage: dict[str, int | float] | None = None
+        self._saw_output = False
         self._finish_reasons: dict[int, str] = {}
 
     def __getattr__(self, name: str) -> Any:
@@ -806,7 +820,7 @@ class _InstrumentedStream:
         if self._response_model is None and response_model is not None:
             self._response_model = response_model
         usage = _usage_from(_field(chunk, "usage"))
-        if usage is not None:
+        if usage is not None and (self._usage is None or _reports_tokens(usage)):
             self._usage = usage
         has_output = False
         for fallback_index, choice in enumerate(_sequence_items(_field(chunk, "choices"))):
@@ -841,6 +855,7 @@ class _InstrumentedStream:
                     int(choice_index) if choice_index is not None else fallback_index
                 ] = finish_reason
         if has_output:
+            self._saw_output = True
             record_output_chunk = getattr(self._handle, "record_output_chunk", None)
             if callable(record_output_chunk):
                 record_output_chunk(received_at * 1000)
@@ -867,8 +882,19 @@ class _InstrumentedStream:
             rebuilt = None
         if rebuilt is not None:
             fields = _safe_response_fields(_completion_response, rebuilt)
-        if fields.get("usage") is None and self._usage is not None:
+        rebuilt_usage = fields.get("usage")
+        if self._usage is not None and (
+            rebuilt_usage is None
+            or (not _reports_tokens(rebuilt_usage) and _reports_tokens(self._usage))
+        ):
             fields["usage"] = self._usage
+            if rebuilt_usage is not None:
+                fields.pop("cost_usd", None)
+        # LiteLLM 1.104+ rebuilds 0/0 usage when the provider reported none; zero tokens
+        # for a response with output means unknown, not free.
+        if self._saw_output and _is_zero_usage(fields.get("usage")):
+            fields.pop("usage", None)
+            fields.pop("cost_usd", None)
         if fields.get("finish_reason") is None and self._finish_reasons:
             finish_reasons = [self._finish_reasons[index] for index in sorted(self._finish_reasons)]
             fields["finish_reason"] = finish_reasons[0]
