@@ -280,8 +280,153 @@ def test_streaming_accumulates_content_ttfc_and_usage(memory: SimpleNamespace) -
     ]
     assert isinstance(a["gen_ai.response.time_to_first_chunk"], float)
     assert tuple(cast(Any, a["gen_ai.response.finish_reasons"])) == ("stop",)
-    assert number_attr(a["gen_ai.usage.input_tokens"]) > 0
-    assert number_attr(a["gen_ai.usage.output_tokens"]) > 0
+    baseline = llm.stream_chunk_builder(chunks, messages=[{"role": "user", "content": "stream"}])
+    if baseline.usage.prompt_tokens or baseline.usage.completion_tokens:
+        assert a["gen_ai.usage.input_tokens"] == baseline.usage.prompt_tokens
+        assert a["gen_ai.usage.output_tokens"] == baseline.usage.completion_tokens
+    else:
+        assert not [key for key in a if key.startswith("gen_ai.usage.")]
+
+
+def _usage_namespace(
+    input_tokens: int, output_tokens: int, total_tokens: int | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        prompt_tokens=input_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens if total_tokens is None else total_tokens,
+    )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    ("content", "chunk_usage", "rebuilt_usage", "expected"),
+    [
+        pytest.param("hi", [], (0, 0), {}, id="zero-rebuilt-usage-with-output"),
+        pytest.param("x" * 70_000, [], (0, 0), {}, id="output-only-in-dropped-chunk"),
+        pytest.param("hi", [(0, 0)], None, {}, id="zero-snapshot-when-builder-fails"),
+        pytest.param(
+            "hi",
+            [],
+            (0, 0, 3),
+            {
+                "gen_ai.usage.input_tokens": 0,
+                "gen_ai.usage.output_tokens": 0,
+                "gen_ai.usage.total_tokens": 3,
+                "gen_ai.usage.cost": 0.0,
+            },
+            id="other-positive-count-is-kept",
+        ),
+        pytest.param(
+            "hi",
+            [(0, 0), (5, 2), (0, 0)],
+            (0, 0),
+            {
+                "gen_ai.usage.input_tokens": 5,
+                "gen_ai.usage.output_tokens": 2,
+                "gen_ai.usage.total_tokens": 7,
+            },
+            id="reported-usage-outranks-zeros",
+        ),
+        pytest.param(
+            None,
+            [],
+            (0, 0),
+            {
+                "gen_ai.usage.input_tokens": 0,
+                "gen_ai.usage.output_tokens": 0,
+                "gen_ai.usage.total_tokens": 0,
+                "gen_ai.usage.cost": 0.0,
+            },
+            id="zero-usage-without-output",
+        ),
+        pytest.param(
+            "hi",
+            [],
+            (0, 4),
+            {
+                "gen_ai.usage.input_tokens": 0,
+                "gen_ai.usage.output_tokens": 4,
+                "gen_ai.usage.total_tokens": 4,
+                "gen_ai.usage.cost": 0.0,
+            },
+            id="partly-zero-usage-is-kept",
+        ),
+    ],
+)
+async def test_streaming_treats_zero_usage_with_output_as_unknown(
+    memory: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    asynchronous: bool,
+    content: str | None,
+    chunk_usage: list[tuple[int, int]],
+    rebuilt_usage: tuple[int, ...] | None,
+    expected: dict[str, object],
+) -> None:
+    chunks: list[Any] = [
+        SimpleNamespace(
+            id="zero-usage-stream",
+            model="gpt-4o-mini",
+            choices=[
+                SimpleNamespace(index=0, delta=SimpleNamespace(content=content), finish_reason=None)
+            ],
+        ),
+        *(
+            SimpleNamespace(id=None, model=None, choices=[], usage=_usage_namespace(*counts))
+            for counts in chunk_usage
+        ),
+        SimpleNamespace(
+            id=None,
+            model=None,
+            choices=[
+                SimpleNamespace(index=0, delta=SimpleNamespace(content=None), finish_reason="stop")
+            ],
+        ),
+    ]
+
+    def fake_stream_chunk_builder(retained: list[Any], **kwargs: Any) -> Any:
+        if rebuilt_usage is None:
+            raise ValueError("cannot rebuild")
+        text = "".join(choice.delta.content or "" for chunk in retained for choice in chunk.choices)
+        return SimpleNamespace(
+            id="zero-usage-stream",
+            model="gpt-4o-mini",
+            choices=[
+                SimpleNamespace(
+                    index=0,
+                    message=SimpleNamespace(role="assistant", content=text or None),
+                    finish_reason="stop",
+                )
+            ],
+            usage=_usage_namespace(*rebuilt_usage),
+            _hidden_params={"response_cost": 0.0},
+        )
+
+    def fake_completion(*args: Any, **kwargs: Any) -> Any:
+        return iter(chunks)
+
+    async def fake_acompletion(*args: Any, **kwargs: Any) -> Any:
+        async def stream() -> Any:
+            for chunk in chunks:
+                yield chunk
+
+        return stream()
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "stream_chunk_builder", fake_stream_chunk_builder)
+    instrument_litellm()
+    if asynchronous:
+        stream = await llm.acompletion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+        delivered = [chunk async for chunk in stream]
+    else:
+        stream = llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+        delivered = list(stream)
+
+    assert delivered == chunks
+    a = attrs(only_span(memory))
+    assert {key: value for key, value in a.items() if key.startswith("gen_ai.usage.")} == expected
+    assert tuple(cast(Any, a["gen_ai.response.finish_reasons"])) == ("stop",)
 
 
 def test_streaming_bounds_retained_chunks_without_dropping_output(
