@@ -1722,7 +1722,7 @@ dev = [
 
 [[package]]
 name = "telemetry-dev-litellm"
-version = "0.1.4"
+version = "0.1.5"
 source = { editable = "." }
 dependencies = [
     { name = "litellm" },

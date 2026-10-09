@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/python-openrouter-v0.1.5...python-openrouter-v0.1.6) (2026-10-09)
+
+
+### Documentation
+
+* **sdk:** note that video generation isn't traced in openrouter and litellm ([#47](https://github.com/telemetry-dev/telemetry/issues/47)) ([d050cbd](https://github.com/telemetry-dev/telemetry/commit/d050cbd9d187709cfc8132fc744a8575865bcbba))
+
 ## [0.1.5](https://github.com/telemetry-dev/telemetry/compare/python-openrouter-v0.1.4...python-openrouter-v0.1.5) (2026-09-30)
 
 

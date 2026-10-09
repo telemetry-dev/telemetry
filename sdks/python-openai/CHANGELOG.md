@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/python-openai-v0.1.6...python-openai-v0.1.7) (2026-10-09)
+
+
+### Documentation
+
+* **sdk-openai:** note the openai videos api shutdown ([#44](https://github.com/telemetry-dev/telemetry/issues/44)) ([3df0536](https://github.com/telemetry-dev/telemetry/commit/3df0536c572a04566e22ee79e09075c6c768974b))
+
 ## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/python-openai-v0.1.5...python-openai-v0.1.6) (2026-10-01)
 
 
