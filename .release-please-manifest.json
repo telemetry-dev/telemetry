@@ -18,7 +18,7 @@
   "sdks/python-anthropic": "0.1.4",
   "sdks/python-bedrock": "0.1.4",
   "sdks/python-google-genai": "0.1.5",
-  "sdks/python-litellm": "0.1.4",
-  "sdks/python-openai": "0.1.6",
-  "sdks/python-openrouter": "0.1.5"
+  "sdks/python-litellm": "0.1.5",
+  "sdks/python-openai": "0.1.7",
+  "sdks/python-openrouter": "0.1.6"
 }

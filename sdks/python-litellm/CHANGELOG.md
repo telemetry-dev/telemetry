@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.5](https://github.com/telemetry-dev/telemetry/compare/python-litellm-v0.1.4...python-litellm-v0.1.5) (2026-10-09)
+
+
+### Bug Fixes
+
+* **sdk-litellm:** don't report prefix usage for truncated streams ([#43](https://github.com/telemetry-dev/telemetry/issues/43)) ([fa03361](https://github.com/telemetry-dev/telemetry/commit/fa03361318289141d6db25bbf02bbe6cf6c9d28f)), closes [#37](https://github.com/telemetry-dev/telemetry/issues/37)
+* **sdk-litellm:** omit zero usage from litellm streams with output ([#39](https://github.com/telemetry-dev/telemetry/issues/39)) ([c1933e9](https://github.com/telemetry-dev/telemetry/commit/c1933e9fae6c8e553d8a4fb5cf1636cec8cd9938))
+
+
+### Documentation
+
+* **sdk:** note that video generation isn't traced in openrouter and litellm ([#47](https://github.com/telemetry-dev/telemetry/issues/47)) ([d050cbd](https://github.com/telemetry-dev/telemetry/commit/d050cbd9d187709cfc8132fc744a8575865bcbba))
+
 ## [0.1.4](https://github.com/telemetry-dev/telemetry/compare/python-litellm-v0.1.3...python-litellm-v0.1.4) (2026-09-30)
 
 
