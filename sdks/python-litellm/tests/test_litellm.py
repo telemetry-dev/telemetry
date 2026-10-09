@@ -429,6 +429,124 @@ async def test_streaming_treats_zero_usage_with_output_as_unknown(
     assert tuple(cast(Any, a["gen_ai.response.finish_reasons"])) == ("stop",)
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    ("usage_before", "usage_after", "expected"),
+    [
+        pytest.param(None, None, {}, id="no-provider-usage"),
+        pytest.param(
+            None,
+            (7, 9_000),
+            {
+                "gen_ai.usage.input_tokens": 7,
+                "gen_ai.usage.output_tokens": 9_000,
+                "gen_ai.usage.total_tokens": 9_007,
+            },
+            id="provider-usage-after-truncation",
+        ),
+        pytest.param(
+            (7, 9_000),
+            None,
+            {
+                "gen_ai.usage.input_tokens": 7,
+                "gen_ai.usage.output_tokens": 9_000,
+                "gen_ai.usage.total_tokens": 9_007,
+                "gen_ai.usage.cost": 0.5,
+            },
+            id="provider-usage-retained-before-truncation",
+        ),
+        pytest.param(
+            (7, 3),
+            (7, 9_000),
+            {
+                "gen_ai.usage.input_tokens": 7,
+                "gen_ai.usage.output_tokens": 9_000,
+                "gen_ai.usage.total_tokens": 9_007,
+            },
+            id="later-provider-usage-replaces-retained",
+        ),
+    ],
+)
+async def test_truncated_stream_does_not_report_prefix_usage(
+    memory: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    asynchronous: bool,
+    usage_before: tuple[int, int] | None,
+    usage_after: tuple[int, int] | None,
+    expected: dict[str, object],
+) -> None:
+    def usage_chunk(counts: tuple[int, int] | None) -> list[Any]:
+        if counts is None:
+            return []
+        return [SimpleNamespace(id=None, model=None, choices=[], usage=_usage_namespace(*counts))]
+
+    def content_chunk(content: str) -> Any:
+        return SimpleNamespace(
+            id="truncated-stream",
+            model="gpt-4o-mini",
+            choices=[
+                SimpleNamespace(index=0, delta=SimpleNamespace(content=content), finish_reason=None)
+            ],
+        )
+
+    chunks: list[Any] = [
+        content_chunk("kept"),
+        *usage_chunk(usage_before),
+        content_chunk("x" * 70_000),
+        *usage_chunk(usage_after),
+        SimpleNamespace(
+            id=None,
+            model=None,
+            choices=[
+                SimpleNamespace(index=0, delta=SimpleNamespace(content=None), finish_reason="stop")
+            ],
+        ),
+    ]
+
+    def fake_stream_chunk_builder(retained: list[Any], **kwargs: Any) -> Any:
+        text = "".join(choice.delta.content or "" for chunk in retained for choice in chunk.choices)
+        reported = [chunk.usage for chunk in retained if getattr(chunk, "usage", None)]
+        return SimpleNamespace(
+            id="truncated-stream",
+            model="gpt-4o-mini",
+            choices=[
+                SimpleNamespace(
+                    index=0,
+                    message=SimpleNamespace(role="assistant", content=text),
+                    finish_reason="stop",
+                )
+            ],
+            usage=reported[-1] if reported else _usage_namespace(1, len(text)),
+            _hidden_params={"response_cost": 0.5},
+        )
+
+    def fake_completion(*args: Any, **kwargs: Any) -> Any:
+        return iter(chunks)
+
+    async def fake_acompletion(*args: Any, **kwargs: Any) -> Any:
+        async def stream() -> Any:
+            for chunk in chunks:
+                yield chunk
+
+        return stream()
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "stream_chunk_builder", fake_stream_chunk_builder)
+    instrument_litellm()
+    if asynchronous:
+        stream = await llm.acompletion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+        delivered = [chunk async for chunk in stream]
+    else:
+        stream = llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+        delivered = list(stream)
+
+    assert delivered == chunks
+    a = attrs(only_span(memory))
+    assert {key: value for key, value in a.items() if key.startswith("gen_ai.usage.")} == expected
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
 def test_streaming_bounds_retained_chunks_without_dropping_output(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
