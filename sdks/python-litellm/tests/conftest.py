@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import AsyncGenerator, Callable, Generator
 from types import SimpleNamespace
 from typing import Any
 
 import litellm
 import pytest
 import telemetry_dev
+from litellm.litellm_core_utils.logging_worker import (  # pyright: ignore[reportMissingTypeStubs]
+    GLOBAL_LOGGING_WORKER,
+)
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
 from opentelemetry.sdk.metrics import Histogram
 from opentelemetry.sdk.metrics.export import AggregationTemporality, InMemoryMetricReader
@@ -35,6 +38,16 @@ def isolate_sdk(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
     yield
     telemetry_dev_litellm.uninstrument_litellm()
     telemetry_dev.shutdown()
+
+
+@pytest.fixture(autouse=True)
+async def stop_litellm_logging_worker() -> AsyncGenerator[None]:
+    """Drain litellm's logging worker on the test's loop before pytest-asyncio closes it."""
+    yield
+    try:
+        await GLOBAL_LOGGING_WORKER.flush()
+    finally:
+        await GLOBAL_LOGGING_WORKER.stop()
 
 
 MakeClient = Callable[..., SimpleNamespace]
