@@ -890,20 +890,31 @@ class _InstrumentedStream:
             fields["usage"] = self._usage
             if rebuilt_usage is not None:
                 fields.pop("cost_usd", None)
+        # A rebuild from the retained prefix estimates usage for that prefix only.
+        if self._budget.truncated:
+            if self._usage is None:
+                fields.pop("usage", None)
+                fields.pop("cost_usd", None)
+            elif rebuilt_usage != self._usage:
+                fields["usage"] = self._usage
+                fields.pop("cost_usd", None)
         # LiteLLM 1.104+ rebuilds 0/0 usage when the provider reported none; zero tokens
         # for a response with output means unknown, not free.
         if self._saw_output and _is_zero_usage(fields.get("usage")):
             fields.pop("usage", None)
             fields.pop("cost_usd", None)
+        attributes = fields.get("attributes")
+        if not isinstance(attributes, dict):
+            attributes = {}
+        if self._budget.truncated:
+            attributes["telemetry.dev.capture.truncated"] = True
         if fields.get("finish_reason") is None and self._finish_reasons:
             finish_reasons = [self._finish_reasons[index] for index in sorted(self._finish_reasons)]
             fields["finish_reason"] = finish_reasons[0]
             if len(self._finish_reasons) > 1:
-                attributes = fields.get("attributes")
-                if not isinstance(attributes, dict):
-                    attributes = {}
-                    fields["attributes"] = attributes
                 attributes["gen_ai.response.finish_reasons"] = finish_reasons
+        if attributes:
+            fields["attributes"] = attributes
         if fields.get("response_id") is None and self._response_id is not None:
             fields["response_id"] = self._response_id
         if fields.get("response_model") is None and self._response_model is not None:
