@@ -75,7 +75,7 @@ created from the OpenAI SDK's CommonJS build. Use `wrapOpenAI()` for CommonJS cl
 - `client.embeddings.create(...)`
 - `client.images.generate(...)`, `edit(...)`, and `createVariation(...)`, including image streams
 - `client.audio.speech.create(...)`, `transcriptions.create(...)` (including streams), and `translations.create(...)`
-- `client.videos.create(...)` and `retrieve(...)` when exposed by the installed OpenAI SDK
+- `client.videos.create(...)` and `retrieve(...)` when exposed by the installed OpenAI SDK (legacy: OpenAI shut down the Videos API on 2026-09-24; kept for compatible endpoints)
 - `client.batches.create(...)`, `retrieve(...)`, and `cancel(...)`
 
 The integration maps native OpenAI request/response shapes directly into telemetry.dev fields. It does not normalize messages into another schema.

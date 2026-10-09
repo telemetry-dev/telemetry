@@ -104,5 +104,5 @@ OpenAI-compatible URLs on Groq, xAI, DeepSeek, Together, and Fireworks domains (
 - Unconsumed streams end their spans only when the stream is exhausted, errors, or is closed.
 - Binary image and audio bodies are never captured, including binary fields nested in Responses API input and output. Speech download/streaming response spans cover request creation, not later byte consumption. Transcription stream spans remain open through stream consumption and record terminal or bounded partial transcript text and usage.
 - Realtime is not wrapped: OpenAI Python 2.x exposes an async WebSocket connection (`realtime.connect`), not an event emitter with a stable listener lifecycle, so an explicit event-emitter wrapper would be misleading.
-- Videos (`client.videos`) are not instrumented yet; video create and retrieve calls produce no spans. The TypeScript integration traces them.
+- Videos (`client.videos`) are not traced because OpenAI shut down the Videos API on 2026-09-24; video create and retrieve calls produce no spans. The TypeScript integration keeps its legacy video tracing for compatible endpoints.
 - Batch list pagination is not instrumented so the SDK's synchronous `AsyncPaginator` remains directly usable with `async for`.
