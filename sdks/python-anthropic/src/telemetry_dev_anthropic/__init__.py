@@ -358,6 +358,7 @@ class _StreamState:
         self.unresolved_replacements: set[int] = set()
         self.unresolved_encrypted_content: set[int] = set()
         self.envelope_charged = False
+        self.settled_tool_blocks: set[int] = set()
 
 
 _STREAM_CAPTURE_MAX_BYTES = 48 * 1024
@@ -737,19 +738,30 @@ def _reserve_replacement(
     budget = state.budget
     if not _can_reserve_replacement(index, state, recover_unseen):
         return False
-    raw_input = state.tool_json.get(index)
-    retained = block if raw_input is None else (block, raw_input)
     held_bytes, held_items = state.block_reservations.get(index, (0, 0))
-    candidate = telemetry_dev.CaptureBudget(budget.max_bytes, budget.max_items)
-    candidate.bytes_used = budget.bytes_used - held_bytes
-    candidate.items_used = budget.items_used - held_items
-    if not candidate.accept(retained):
-        _reject_replacement(index, state, recover_unseen=recover_unseen)
-        return False
     base_bytes = budget.bytes_used - held_bytes
     base_items = budget.items_used - held_items
-    measured_bytes = candidate.bytes_used - base_bytes
-    measured_items = candidate.items_used - base_items
+    if index in state.settled_tool_blocks:
+        cost = _settled_cost(index, block, state)
+        if (
+            cost is None
+            or base_bytes + cost[0] > budget.max_bytes
+            or base_items + cost[1] > budget.max_items
+        ):
+            _reject_replacement(index, state, recover_unseen=recover_unseen)
+            return False
+        measured_bytes, measured_items = cost
+    else:
+        raw_input = state.tool_json.get(index)
+        retained = block if raw_input is None else (block, raw_input)
+        candidate = telemetry_dev.CaptureBudget(budget.max_bytes, budget.max_items)
+        candidate.bytes_used = base_bytes
+        candidate.items_used = base_items
+        if not candidate.accept(retained):
+            _reject_replacement(index, state, recover_unseen=recover_unseen)
+            return False
+        measured_bytes = candidate.bytes_used - base_bytes
+        measured_items = candidate.items_used - base_items
     budget.bytes_used = base_bytes + measured_bytes
     budget.items_used = base_items + measured_items
     state.block_reservations[index] = (measured_bytes, measured_items)
@@ -798,20 +810,30 @@ def _drop_stale_signature(index: int, state: _StreamState) -> None:
     if block is None or "signature" not in block:
         return
     stripped = {key: value for key, value in block.items() if key != "signature"}
-    raw_input = state.tool_json.get(index)
-    retained = stripped if raw_input is None else (stripped, raw_input)
     held_bytes, held_items = state.block_reservations.get(index, (0, 0))
-    candidate = telemetry_dev.CaptureBudget(state.budget.max_bytes, state.budget.max_items)
-    candidate.bytes_used = state.budget.bytes_used - held_bytes
-    candidate.items_used = state.budget.items_used - held_items
-    if candidate.accept(retained):
-        base_bytes = state.budget.bytes_used - held_bytes
-        base_items = state.budget.items_used - held_items
-        measured_bytes = candidate.bytes_used - base_bytes
-        measured_items = candidate.items_used - base_items
-        state.budget.bytes_used = base_bytes + measured_bytes
-        state.budget.items_used = base_items + measured_items
-        state.block_reservations[index] = (measured_bytes, measured_items)
+    base_bytes = state.budget.bytes_used - held_bytes
+    base_items = state.budget.items_used - held_items
+    measured: tuple[int, int] | None = None
+    if index in state.settled_tool_blocks:
+        cost = _settled_cost(index, stripped, state)
+        if (
+            cost is not None
+            and base_bytes + cost[0] <= state.budget.max_bytes
+            and base_items + cost[1] <= state.budget.max_items
+        ):
+            measured = cost
+    else:
+        raw_input = state.tool_json.get(index)
+        retained = stripped if raw_input is None else (stripped, raw_input)
+        candidate = telemetry_dev.CaptureBudget(state.budget.max_bytes, state.budget.max_items)
+        candidate.bytes_used = base_bytes
+        candidate.items_used = base_items
+        if candidate.accept(retained):
+            measured = (candidate.bytes_used - base_bytes, candidate.items_used - base_items)
+    if measured is not None:
+        state.budget.bytes_used = base_bytes + measured[0]
+        state.budget.items_used = base_items + measured[1]
+        state.block_reservations[index] = measured
     state.blocks[index] = stripped
     state.unresolved_replacements.add(index)
 
@@ -951,6 +973,22 @@ def _envelope_cost() -> tuple[int, int]:
 _ENVELOPE_BYTES, _ENVELOPE_ITEMS = _envelope_cost()
 
 
+def _settled_cost(
+    index: int, block: Mapping[str, Any], state: _StreamState
+) -> tuple[int, int] | None:
+    """Bytes and items the final bounded check counts for a block, or None if it cannot."""
+    try:
+        size = len(json.dumps(block, default=repr, ensure_ascii=False).encode())
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if any(other < index for other in state.blocks):
+        size += _BLOCK_SEPARATOR_BYTES
+    measured = telemetry_dev.CaptureBudget(state.budget.max_bytes, state.budget.max_items)
+    if not measured.accept(block):
+        return None
+    return size, measured.items_used
+
+
 def _settle_tool_input(index: int, state: _StreamState) -> None:
     """Recharge a finished tool input at what the final bounded check will measure.
 
@@ -967,30 +1005,29 @@ def _settle_tool_input(index: int, state: _StreamState) -> None:
     held_bytes, held_items = state.block_reservations.get(index, (0, 0))
     try:
         finalized = _finalize_block(index, block, state)
-        size = len(json.dumps(finalized, default=repr, ensure_ascii=False).encode())
     except (TypeError, ValueError, RecursionError):
         budget.truncated = True
         return
-    if any(other < index for other in state.blocks):
-        size += _BLOCK_SEPARATOR_BYTES
-    measured = telemetry_dev.CaptureBudget(budget.max_bytes, budget.max_items)
-    if not measured.accept(finalized):
+    cost = _settled_cost(index, finalized, state)
+    if cost is None:
         budget.truncated = True
         return
+    size, items = cost
     envelope_bytes, envelope_items = (
         (0, 0) if state.envelope_charged else (_ENVELOPE_BYTES, _ENVELOPE_ITEMS)
     )
     base_bytes = budget.bytes_used - held_bytes + envelope_bytes
     base_items = budget.items_used - held_items + envelope_items
-    if base_bytes + size > budget.max_bytes or base_items + measured.items_used > budget.max_items:
+    if base_bytes + size > budget.max_bytes or base_items + items > budget.max_items:
         budget.truncated = True
         return
     budget.bytes_used = base_bytes + size
-    budget.items_used = base_items + measured.items_used
+    budget.items_used = base_items + items
     state.envelope_charged = True
-    state.block_reservations[index] = (size, measured.items_used)
+    state.block_reservations[index] = (size, items)
     state.blocks[index] = finalized
     del state.tool_json[index]
+    state.settled_tool_blocks.add(index)
 
 
 def _stream_event_has_output(event: Any) -> bool:

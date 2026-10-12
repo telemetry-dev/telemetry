@@ -2190,6 +2190,30 @@ def test_many_small_tool_blocks_are_all_kept() -> None:
     assert len(output[0]["content"]) == 60
 
 
+@pytest.mark.parametrize(
+    "signatures", [["sig"], ["sig", "s" * 60_000]], ids=["fits", "rejected-later"]
+)
+def test_signature_after_stop_keeps_the_settled_tool_input_charge(signatures: list[str]) -> None:
+    implementation = cast(Any, telemetry_dev_anthropic)
+    # Control characters cost six bytes each once serialized, one in a structural measure.
+    state = _tool_stream([json.dumps({"x": "\x01" * 1000})])
+    for signature in signatures:
+        implementation._record_stream_event(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": signature},
+            },
+            state,
+        )
+    charged = state.budget.bytes_used
+
+    output = implementation._stream_partial(state)["output"]
+
+    assert output is not None
+    assert charged >= len(json.dumps(output, ensure_ascii=False).encode())
+
+
 def test_escape_heavy_text_is_charged_the_same_with_or_without_a_start_block() -> None:
     implementation = cast(Any, telemetry_dev_anthropic)
 
