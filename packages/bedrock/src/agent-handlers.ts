@@ -51,6 +51,8 @@ export function inlineAgentRequestFields(input: JsonRecord): SpanFields {
 export class AgentStreamState implements StreamState {
   readonly retention = new StreamRetention();
   private text = "";
+  // Trace and output-file metadata share the budget but do not make the text incomplete.
+  private textRejected = false;
   private usage: NonNullable<SpanFields["usage"]> = {};
   private traceEventCount = 0;
   private failureReason: string | undefined;
@@ -82,7 +84,10 @@ export class AgentStreamState implements StreamState {
 
     const piece = bytes === undefined ? undefined : bytesToString(bytes);
 
-    if (piece && this.retention.accept(piece)) this.text += piece;
+    if (piece) {
+      if (this.retention.accept(piece)) this.text += piece;
+      else this.textRejected = true;
+    }
     const attribution = isRecord(chunk?.attribution) ? chunk.attribution : undefined;
     const citations = arrayValue<unknown>(attribution?.citations);
 
@@ -122,7 +127,7 @@ export class AgentStreamState implements StreamState {
 
   outputTruncated(): boolean {
     // Return control replaces the text output and is retained whole.
-    return this.returnControl === undefined && this.retention.truncated;
+    return this.returnControl === undefined && this.textRejected;
   }
 
   finish(): SpanFields {

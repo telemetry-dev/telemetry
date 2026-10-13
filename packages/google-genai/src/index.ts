@@ -1036,6 +1036,8 @@ class StreamAggregator {
   private outputCaptureEntries = 0;
   private outputCaptureTruncated = false;
   private afcCaptureTruncated = false;
+  // The reconstructed AFC history holds a cut value, such as a folded model-output prefix.
+  private afcInputIncomplete = false;
 
   constructor(private readonly requestInput: unknown) {}
 
@@ -1064,6 +1066,10 @@ class StreamAggregator {
 
   get outputTruncated(): boolean {
     return this.outputCaptureTruncated;
+  }
+
+  get afcInputTruncated(): boolean {
+    return this.afcInputIncomplete;
   }
 
   private resetOutputCapture(): void {
@@ -1099,8 +1105,11 @@ class StreamAggregator {
     return this.afcHistory;
   }
 
-  private appendAfcHistory(...entries: unknown[]): void {
-    if (!captureEnabled("input")) return;
+  /** Appends whole entries that fit and returns whether any of them was appended. */
+  private appendAfcHistory(...entries: unknown[]): boolean {
+    if (!captureEnabled("input")) return false;
+
+    let appended = false;
 
     for (const entry of entries) {
       const capture = boundedTelemetryCapture([...this.ensureAfcHistory(), entry]);
@@ -1111,15 +1120,23 @@ class StreamAggregator {
       }
 
       this.afcHistory = asArray(capture.value) ?? [];
+      appended = true;
     }
 
-    if (this.outputCaptureTruncated) this.afcCaptureTruncated = true;
+    if (this.outputCaptureTruncated) {
+      this.afcCaptureTruncated = true;
+
+      if (appended) this.afcInputIncomplete = true;
+    }
+
+    return appended;
   }
 
   private replaceAfcHistory(history: unknown[]): void {
     const capture = boundedTelemetryCapture(history);
     this.afcHistory = asArray(capture.value) ?? [];
     this.afcCaptureTruncated = capture.truncated;
+    this.afcInputIncomplete = capture.truncated;
   }
 
   private foldTurn(toAfcHistory: boolean): void {
@@ -1174,7 +1191,16 @@ class StreamAggregator {
         const capturedContent = asRecord(capture.value);
         this.foldTurn(true);
 
-        if (capturedContent) this.appendAfcHistory(copyContent(capturedContent));
+        const appended =
+          capturedContent !== undefined && this.appendAfcHistory(copyContent(capturedContent));
+
+        // The fold above reset the output flag, so record a cut function response here.
+        if (capture.truncated && captureEnabled("input")) {
+          this.afcCaptureTruncated = true;
+
+          if (appended) this.afcInputIncomplete = true;
+        }
+
         continue;
       }
 
@@ -1334,12 +1360,12 @@ function createObservedStream(
       };
     }
 
-    if (
-      (span.capturePolicy ?? LEGACY_CAPTURE_POLICY).mask &&
-      (interrupted || aggregator.outputTruncated)
-    ) {
-      delete finalFields.output;
-    }
+    const masked = (span.capturePolicy ?? LEGACY_CAPTURE_POLICY).mask;
+
+    if (masked && (interrupted || aggregator.outputTruncated)) delete finalFields.output;
+
+    // Reconstructed AFC history can carry a folded, incomplete model-output prefix.
+    if (masked && aggregator.afcInputTruncated) delete finalFields.input;
 
     if (error !== undefined) finalFields.error = error;
     end(finalFields);

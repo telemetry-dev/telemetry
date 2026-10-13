@@ -404,7 +404,8 @@ class _InstrumentedStreamingBody(StreamingBody):
             return
         self._ended = True
         captured = bytes(self._captured) if complete and not self._budget.truncated else None
-        self._finish_callback(captured, error, self._budget.truncated)
+        # A body closed early, failed, or cut at the bound exports no output and is flagged.
+        self._finish_callback(captured, error, not complete or self._budget.truncated)
 
 
 def _handle_streaming_body(
@@ -428,7 +429,7 @@ def _handle_streaming_body(
             except Exception:
                 fields = base_fields
         if truncated:
-            # A body cut at the retention bound cannot be parsed, so no output is exported.
+            # An incomplete body cannot be parsed, so no output is exported.
             fields = merge_fields(fields, {"attributes": {"telemetry.dev.capture.truncated": True}})
         if error is not None:
             fields = merge_fields(fields, error_fields(error))

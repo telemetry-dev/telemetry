@@ -1162,6 +1162,53 @@ def test_invoke_model_streaming_body_bounds_capture_and_preserves_readinto(
     assert "gen_ai.output.messages" not in spans[0].attributes
 
 
+class _FailAfterFirstReadBody(StreamingBody):
+    def __init__(self, raw: bytes) -> None:
+        super().__init__(io.BytesIO(raw), len(raw))
+        self._reads = 0
+
+    def read(self, amt: int | None = None) -> bytes:
+        self._reads += 1
+        if self._reads > 1:
+            raise OSError("read failed")
+        return super().read(amt)
+
+
+@pytest.mark.parametrize("ending", ["close", "error"])
+def test_invoke_model_body_read_partially_is_flagged_below_the_bound(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, ending: str
+) -> None:
+    client = _client("bedrock-runtime")
+    raw = _body({"completion": "short answer", "stop_reason": "end_turn"})
+    source = (
+        _FailAfterFirstReadBody(raw)
+        if ending == "error"
+        else StreamingBody(io.BytesIO(raw), len(raw))
+    )
+    _stub_api_call(client, [{"body": source, "contentType": "application/json"}], monkeypatch)
+    wrap_bedrock(client)
+
+    response = client.invoke_model(  # type: ignore[attr-defined]
+        modelId="anthropic.claude-3-haiku",
+        contentType="application/json",
+        body=_body({"messages": [], "max_tokens": 10}),
+    )
+    body = response["body"]
+    assert body.read(8) == raw[:8]
+    if ending == "close":
+        body.close()
+    else:
+        with pytest.raises(OSError, match="read failed"):
+            body.read(8)
+
+    assert cast(Any, body)._budget.truncated is False
+    span = memory.span_exporter.get_finished_spans()[0]
+    assert span.attributes["telemetry.dev.capture.truncated"] is True
+    assert "gen_ai.output.messages" not in span.attributes
+    if ending == "error":
+        assert span.status.status_code.name == "ERROR"
+
+
 @pytest.mark.parametrize("max_attribute_length", [0, 100])
 def test_invoke_model_body_capture_ignores_a_small_configured_cap(
     make: Any, monkeypatch: pytest.MonkeyPatch, max_attribute_length: int
@@ -1436,6 +1483,45 @@ def test_agent_stream_keeps_return_control_after_budget_exhaustion(
     assert _json_attr(span, "gen_ai.output.messages") == {"returnControl": return_control}
     assert span.attributes["td.metadata.return_control"] == "true"
     assert span.attributes["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize("later_text", [False, True])
+def test_masked_agent_stream_withholds_text_only_when_text_was_rejected(
+    make: Any, monkeypatch: pytest.MonkeyPatch, later_text: bool
+) -> None:
+    seen: list[str] = []
+
+    def mask(value: Any, _context: Any) -> Any:
+        seen.append(json.dumps(value))
+        return value
+
+    memory = make(mask=mask)
+    events: list[dict[str, Any]] = [
+        {"chunk": {"bytes": b"Complete answer"}},
+        {"trace": {"trace": {"orchestrationTrace": {"rawResponse": "t" * 50_000}}}},
+    ]
+    if later_text:
+        events.append({"chunk": {"bytes": b" and more"}})
+    client = _client("bedrock-agent-runtime")
+    _stub_api_call(
+        client, [{"completion": FakeEventStream(events), "sessionId": "sess-1"}], monkeypatch
+    )
+    wrap_bedrock(client, capture_agent_trace=True)
+
+    response = client.invoke_agent(  # type: ignore[attr-defined]
+        agentId="agent-1", agentAliasId="alias", sessionId="sess-1", inputText="hi"
+    )
+    assert list(response["completion"]) == events
+
+    span = memory.span_exporter.get_finished_spans()[0]
+    assert span.attributes["telemetry.dev.capture.truncated"] is True
+    if later_text:
+        assert "gen_ai.output.messages" not in span.attributes
+        assert not any("Complete answer" in value for value in seen)
+    else:
+        output = _json_attr(span, "gen_ai.output.messages")
+        assert output[0]["parts"][0]["content"] == "Complete answer"
+        assert any("Complete answer" in value for value in seen)
 
 
 def test_agent_retrieve_rag_flow_and_global_instrument(

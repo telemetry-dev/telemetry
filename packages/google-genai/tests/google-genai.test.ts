@@ -1587,6 +1587,131 @@ test.each([
   },
 );
 
+test.each([false, true])(
+  "masked streaming AFC withholds history holding incomplete model output (authoritative history %s)",
+  async (authoritative) => {
+    const seen: string[] = [];
+    const spans = setupSpans({
+      mask: (value) => {
+        seen.push(JSON.stringify(value));
+
+        return value;
+      },
+    });
+
+    const history = [
+      { role: "user", parts: [{ text: "go" }] },
+      { role: "model", parts: [{ functionCall: { name: "lookup", args: {} } }] },
+      { role: "user", parts: [{ functionResponse: { name: "lookup", response: { ok: true } } }] },
+    ];
+
+    const client = wrapGoogleGenAI({
+      models: {
+        async *generateContentStream(_params: unknown) {
+          yield { candidates: [{ content: { role: "model", parts: [{ text: "kept-prefix" }] } }] };
+          yield {
+            candidates: [{ content: { role: "model", parts: [{ text: "x".repeat(60_000) }] } }],
+          };
+          yield {
+            candidates: [
+              {
+                content: {
+                  role: "user",
+                  parts: [{ functionResponse: { name: "lookup", response: { ok: true } } }],
+                },
+              },
+            ],
+          };
+          yield {
+            candidates: [
+              {
+                content: { role: "model", parts: [{ text: "final answer" }] },
+                finishReason: "STOP",
+              },
+            ],
+            ...(authoritative ? { automaticFunctionCallingHistory: history } : {}),
+          };
+        },
+      },
+    });
+
+    const stream = await Promise.resolve(
+      client.models.generateContentStream({ model: "gemini", contents: "go" }),
+    );
+
+    for await (const _chunk of stream) {
+    }
+
+    const span = await exportedSpan(spans);
+    expect(seen.some((value) => value.includes("kept-prefix"))).toBe(false);
+    expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+      { role: "model", parts: [{ text: "final answer" }] },
+    ]);
+
+    if (authoritative) {
+      expect(messagesAttr(span, "gen_ai.input.messages")).toEqual(history);
+      expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+    } else {
+      expect(String(span.attributes["gen_ai.input.messages"] ?? "")).not.toContain("kept-prefix");
+      expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    }
+  },
+);
+
+test("masked streaming AFC flags a cut function response and keeps it from the mask", async () => {
+  const seen: string[] = [];
+  const spans = setupSpans({
+    mask: (value) => {
+      seen.push(JSON.stringify(value));
+
+      return value;
+    },
+  });
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield {
+          candidates: [
+            {
+              content: {
+                role: "user",
+                parts: [
+                  {
+                    functionResponse: {
+                      name: "lookup",
+                      response: { body: `fr-start${"y".repeat(60_000)}` },
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        };
+        yield {
+          candidates: [
+            { content: { role: "model", parts: [{ text: "final answer" }] }, finishReason: "STOP" },
+          ],
+        };
+      },
+    },
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: "go" }),
+  );
+
+  for await (const _chunk of stream) {
+  }
+
+  const span = await exportedSpan(spans);
+  expect(seen.some((value) => value.includes("fr-start"))).toBe(false);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "model", parts: [{ text: "final answer" }] },
+  ]);
+});
+
 test("streaming return before first chunk ends span", async () => {
   const spans = setupSpans();
   let returned = false;

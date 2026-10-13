@@ -81,7 +81,7 @@ Tool definitions (`gen_ai.tool.definitions`, including tool descriptions and par
 
 `generateContentStream` emits one span per call. Chunks pass through unchanged. The integration aggregates text parts (merging consecutive text with the same `thought` flag), finish reasons, usage, and block/safety metadata across chunks, records `gen_ai.response.time_to_first_chunk` on the first chunk, and ends the span once when the stream completes, errors, or the consumer stops early. Streams that are never consumed do not finish their span.
 
-Streamed output is retained up to 48 KiB and 1,000 items. The configured `maxAttributeLength` does not shrink this bound; the core applies it to the exported attribute after the mask runs. A stream whose output is cut at the bound, that errors, or that the consumer stops early sets `telemetry.dev.capture.truncated`. With a mask configured, the incomplete reconstructed output is omitted because the mask cannot inspect the complete value.
+Streamed output is retained up to 48 KiB and 1,000 items. The configured `maxAttributeLength` does not shrink this bound; the core applies it to the exported attribute after the mask runs. A stream whose output is cut at the bound, that errors, or that the consumer stops early sets `telemetry.dev.capture.truncated`. With a mask configured, the incomplete reconstructed output is omitted because the mask cannot inspect the complete value. The same applies to an automatic function calling history the integration rebuilt from streamed turns when it holds a cut value, such as an earlier model turn cut at the bound; a complete `automaticFunctionCallingHistory` from the SDK replaces it and is exported.
 
 ## Chats
 

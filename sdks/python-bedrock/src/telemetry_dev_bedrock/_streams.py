@@ -408,6 +408,8 @@ class AgentStreamState(StreamState):
         self.budget = stream_capture_budget()
         self.capture_trace = capture_trace
         self.text = ""
+        # Trace metadata shares the budget but does not make the text incomplete.
+        self.text_rejected = False
         self.usage: dict[str, int] = {}
         self.trace_count = 0
         self.failure_reason: str | None = None
@@ -420,12 +422,12 @@ class AgentStreamState(StreamState):
             return
         chunk = event.get("chunk") if isinstance(event.get("chunk"), dict) else {}
         raw = chunk.get("bytes")
-        if isinstance(raw, bytes | bytearray):
-            piece = bytes(raw).decode("utf-8")
+        piece = bytes(raw).decode("utf-8") if isinstance(raw, bytes | bytearray) else raw
+        if isinstance(piece, str) and piece:
             if self.budget.accept(piece):
                 self.text += piece
-        elif isinstance(raw, str) and self.budget.accept(raw):
-            self.text += raw
+            else:
+                self.text_rejected = True
         return_control = (
             event.get("returnControl") if isinstance(event.get("returnControl"), dict) else None
         )
@@ -458,7 +460,7 @@ class AgentStreamState(StreamState):
 
     def output_truncated(self) -> bool:
         # Return control replaces the text output and is retained whole.
-        return self.return_control is None and self.budget.truncated
+        return self.return_control is None and self.text_rejected
 
     def _collect_trace(self, value: Any) -> None:
         if isinstance(value, dict):
