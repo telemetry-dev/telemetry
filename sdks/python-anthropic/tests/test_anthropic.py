@@ -2214,6 +2214,72 @@ def test_signature_after_stop_keeps_the_settled_tool_input_charge(signatures: li
     assert charged >= len(json.dumps(output, ensure_ascii=False).encode())
 
 
+@pytest.mark.parametrize(
+    "signatures", [["sig"], ["sig", "s" * 60_000]], ids=["fits", "rejected-later"]
+)
+def test_tool_input_after_the_stop_stays_charged_through_signatures(
+    signatures: list[str],
+) -> None:
+    implementation = cast(Any, telemetry_dev_anthropic)
+    record = implementation._record_stream_event
+    state = _tool_stream(['{"x":1}'])
+    for _ in range(200):
+        deltas = [{"type": "input_json_delta", "partial_json": "\x01" * 1000}] + [
+            {"type": "signature_delta", "signature": signature} for signature in signatures
+        ]
+        for delta in deltas:
+            record({"type": "content_block_delta", "index": 0, "delta": delta}, state)
+        retained = sum(len(json.dumps(raw)) - 2 for raw in state.tool_json.values()) + sum(
+            len(json.dumps(block)) for block in state.blocks.values()
+        )
+        assert retained <= state.budget.bytes_used
+
+    assert state.budget.truncated is True
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "t1", "name": "calc"},
+        },
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "compaction", "content": "summary"},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "compaction_delta", "content": "c" * 60_000},
+        },
+    ],
+    ids=["new-start", "compaction-start", "dropped"],
+)
+def test_block_after_a_settled_tool_is_charged_like_a_fresh_one(
+    replacement: dict[str, Any],
+) -> None:
+    implementation = cast(Any, telemetry_dev_anthropic)
+    record = implementation._record_stream_event
+    after_settled = _tool_stream(['{"x":1}'])
+    fresh = implementation._StreamState()
+    for state in (after_settled, fresh):
+        record(replacement, state)
+        for delta in [
+            {"type": "input_json_delta", "partial_json": "a" * 1000},
+            {"type": "signature_delta", "signature": "sig"},
+        ]:
+            record({"type": "content_block_delta", "index": 0, "delta": delta}, state)
+
+    retained = sum(len(raw) for raw in after_settled.tool_json.values()) + sum(
+        len(json.dumps(block)) for block in after_settled.blocks.values()
+    )
+    assert retained <= after_settled.budget.bytes_used
+    assert after_settled.block_reservations[0] == fresh.block_reservations[0]
+
+
 def test_escape_heavy_text_is_charged_the_same_with_or_without_a_start_block() -> None:
     implementation = cast(Any, telemetry_dev_anthropic)
 

@@ -391,6 +391,10 @@ _APPENDED_DELTA_FIELDS = {
 }
 
 
+def _escaped_text_bytes(text: str) -> int:
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8", "surrogatepass")) - 2
+
+
 def _reserve_appended_text(index: int, value: Any, state: _StreamState) -> bool:
     budget = state.budget
     if budget.truncated:
@@ -401,7 +405,7 @@ def _reserve_appended_text(index: int, value: Any, state: _StreamState) -> bool:
     if len(text) > budget.remaining_bytes:
         budget.truncated = True
         return False
-    size = len(json.dumps(text, ensure_ascii=False).encode("utf-8", "surrogatepass")) - 2
+    size = _escaped_text_bytes(text)
     if size > budget.remaining_bytes:
         budget.truncated = True
         return False
@@ -652,6 +656,7 @@ def _record_content_block_start(event: Any, state: _StreamState) -> None:
         else {"type": block_type}
     )
     if block_type == "compaction":
+        state.settled_tool_blocks.discard(block_index)
         if not _reserve_replacement(block_index, retained_block, state, recover_unseen=True):
             if _field_present(content_block, "encrypted_content"):
                 _mark_unresolved_encrypted_content(block_index, state)
@@ -663,6 +668,7 @@ def _record_content_block_start(event: Any, state: _StreamState) -> None:
         return
     if not _reserve(block_index, content_block, state):
         return
+    state.settled_tool_blocks.discard(block_index)
     if block_type == "text":
         state.blocks[block_index] = {
             "type": "text",
@@ -742,7 +748,7 @@ def _reserve_replacement(
     base_bytes = budget.bytes_used - held_bytes
     base_items = budget.items_used - held_items
     if index in state.settled_tool_blocks:
-        cost = _settled_cost(index, block, state)
+        cost = _settled_replacement_cost(index, block, state)
         if (
             cost is None
             or base_bytes + cost[0] > budget.max_bytes
@@ -815,7 +821,7 @@ def _drop_stale_signature(index: int, state: _StreamState) -> None:
     base_items = state.budget.items_used - held_items
     measured: tuple[int, int] | None = None
     if index in state.settled_tool_blocks:
-        cost = _settled_cost(index, stripped, state)
+        cost = _settled_replacement_cost(index, stripped, state)
         if (
             cost is not None
             and base_bytes + cost[0] <= state.budget.max_bytes
@@ -841,6 +847,7 @@ def _drop_stale_signature(index: int, state: _StreamState) -> None:
 def _drop_stale_compaction(index: int, state: _StreamState) -> None:
     state.blocks.pop(index, None)
     state.tool_json.pop(index, None)
+    state.settled_tool_blocks.discard(index)
     _release(index, state)
 
 
@@ -987,6 +994,17 @@ def _settled_cost(
     if not measured.accept(block):
         return None
     return size, measured.items_used
+
+
+def _settled_replacement_cost(
+    index: int, block: Mapping[str, Any], state: _StreamState
+) -> tuple[int, int] | None:
+    """Settled cost plus any raw input that arrived again, charged as it was while streaming."""
+    cost = _settled_cost(index, block, state)
+    raw_input = state.tool_json.get(index)
+    if cost is None or not raw_input:
+        return cost
+    return cost[0] + _escaped_text_bytes(raw_input), cost[1]
 
 
 def _settle_tool_input(index: int, state: _StreamState) -> None:
