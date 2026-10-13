@@ -1712,6 +1712,62 @@ test("masked streaming AFC flags a cut function response and keeps it from the m
   ]);
 });
 
+test("masked streaming AFC keeps a complete model turn when a later cut function response is dropped", async () => {
+  const seen: string[] = [];
+  const spans = setupSpans({
+    mask: (value) => {
+      seen.push(JSON.stringify(value));
+
+      return value;
+    },
+  });
+  const turn = `complete-turn${"t".repeat(30_000)}`;
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield { candidates: [{ content: { role: "model", parts: [{ text: turn }] } }] };
+        yield {
+          candidates: [
+            {
+              content: {
+                role: "user",
+                parts: [
+                  {
+                    functionResponse: {
+                      name: "lookup",
+                      // The bound drops body and keeps keep, but the cut response then no longer
+                      // fits next to the model turn and is left out of the history whole.
+                      response: { body: "x".repeat(60_000), keep: "k".repeat(30_000) },
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        };
+        yield {
+          candidates: [
+            { content: { role: "model", parts: [{ text: "final answer" }] }, finishReason: "STOP" },
+          ],
+        };
+      },
+    },
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: "go" }),
+  );
+
+  for await (const _chunk of stream) {
+  }
+
+  const span = await exportedSpan(spans);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(seen.some((value) => value.includes("complete-turn"))).toBe(true);
+  expect(String(span.attributes["gen_ai.input.messages"])).toContain("complete-turn");
+});
+
 test("streaming return before first chunk ends span", async () => {
   const spans = setupSpans();
   let returned = false;

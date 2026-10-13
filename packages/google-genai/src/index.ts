@@ -1186,15 +1186,12 @@ class StreamAggregator {
 
       if (content && hasFunctionResponse(content)) {
         const capture = boundedTelemetryCapture(copyContent(content));
-
-        if (capture.truncated) this.outputCaptureTruncated = true;
         const capturedContent = asRecord(capture.value);
         this.foldTurn(true);
 
         const appended =
           capturedContent !== undefined && this.appendAfcHistory(copyContent(capturedContent));
 
-        // The fold above reset the output flag, so record a cut function response here.
         if (capture.truncated && captureEnabled("input")) {
           this.afcCaptureTruncated = true;
 
