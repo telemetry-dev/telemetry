@@ -42,23 +42,32 @@ class _CaptureLimit(Exception):
     pass
 
 
-def _bounded_utf8_size(value: str, limit: int) -> int:
-    size = 0
-    for character in value:
-        code = ord(character)
-        if code <= 0x7F:
-            size += 1
-        elif code <= 0x7FF:
-            size += 2
-        elif 0xD800 <= code <= 0xDFFF:
-            size += 6
-        elif code <= 0xFFFF:
-            size += 3
-        else:
-            size += 4
-        if size > limit:
-            return size
-    return size
+def _core_base_item_bytes() -> int:
+    """Take the per-item cost from the core budget instead of copying its constant."""
+    probe = telemetry_dev.CaptureBudget()
+    probe.accept(None)
+    return probe.bytes_used
+
+
+_BASE_ITEM_BYTES = _core_base_item_bytes()
+
+
+def _field_bytes(name: str) -> int:
+    """Bytes the core budget charges for one named field added to an existing object."""
+    return 2 * _BASE_ITEM_BYTES + len(name.encode())
+
+
+def _structure_cost(shape: object) -> tuple[int, int]:
+    """Measure a retained shape with the core budget instead of copying its cost."""
+    probe = telemetry_dev.CaptureBudget()
+    probe.accept(shape)
+    return probe.bytes_used, probe.items_used
+
+
+_FINISH_REASON_BYTES, _FINISH_REASON_ITEMS = _structure_cost({"finish_reason": "", "index": 0})
+_TOOL_CALLS_FIELD_BYTES = _field_bytes("tool_calls")
+_CONTENT_FIELD_BYTES = _field_bytes("content")
+_FUNCTION_CALL_FIELD_BYTES = _field_bytes("function_call")
 
 
 def _field(value: Any, name: str) -> Any:
@@ -169,14 +178,19 @@ def _bounded_responses_capture(
         if isinstance(item, bytes | bytearray | memoryview):
             return _OMIT
         if item is None or isinstance(item, bool | int | float):
-            reserve(16)
+            reserve(_BASE_ITEM_BYTES)
             return item
         if isinstance(item, str):
-            reserve(16 + _bounded_utf8_size(item, budget.max_bytes - budget.bytes_used - 16))
+            reserve(
+                _BASE_ITEM_BYTES
+                + _bounded_json_string_size(
+                    item, budget.max_bytes - budget.bytes_used - _BASE_ITEM_BYTES
+                )
+            )
             return item
         item_id = id(item)
         if item_id in ancestors:
-            reserve(16)
+            reserve(_BASE_ITEM_BYTES)
             return None
         ancestors.add(item_id)
         try:
@@ -188,7 +202,7 @@ def _bounded_responses_capture(
                     cast(Mapping[Any, Any], attributes) if isinstance(attributes, Mapping) else None
                 )
             if source is not None:
-                reserve(16)
+                reserve(_BASE_ITEM_BYTES)
                 item_type = _string(source.get("type")) or parent_type
                 result: dict[str, Any] = {}
                 for raw_key, child in source.items():
@@ -219,21 +233,26 @@ def _bounded_responses_capture(
                     )
                     if binary:
                         continue
-                    reserve(16 + _bounded_utf8_size(key, budget.max_bytes - budget.bytes_used - 16))
+                    reserve(
+                        _BASE_ITEM_BYTES
+                        + _bounded_json_string_size(
+                            key, budget.max_bytes - budget.bytes_used - _BASE_ITEM_BYTES
+                        )
+                    )
                     converted = convert(child, item_type or key, depth + 1)
                     if converted is not _OMIT:
                         result[key] = converted
                 return result
             if isinstance(item, Sequence) and not isinstance(item, str | bytes | bytearray):
                 sequence = cast(Sequence[Any], item)
-                reserve(16)
+                reserve(_BASE_ITEM_BYTES)
                 list_result: list[Any] = []
                 for child in sequence:
                     converted = convert(child, parent_type, depth + 1)
                     if converted is not _OMIT:
                         list_result.append(converted)
                 return list_result
-            reserve(16)
+            reserve(_BASE_ITEM_BYTES)
             return None
         finally:
             ancestors.remove(item_id)
@@ -727,8 +746,8 @@ def _replace_finish_reason(
     held_bytes, held_items = reservations.get(index, (0, 0))
     base_bytes = budget.bytes_used - held_bytes
     base_items = budget.items_used - held_items
-    available_bytes = budget.max_bytes - base_bytes - 98
-    if available_bytes < 0 or base_items + 5 > budget.max_items:
+    available_bytes = budget.max_bytes - base_bytes - _FINISH_REASON_BYTES
+    if available_bytes < 0 or base_items + _FINISH_REASON_ITEMS > budget.max_items:
         budget.bytes_used = base_bytes
         budget.items_used = base_items
         reservations.pop(index, None)
@@ -739,7 +758,7 @@ def _replace_finish_reason(
         budget.items_used = base_items
         reservations.pop(index, None)
         return False
-    reservation = (98 + value_bytes, 5)
+    reservation = (_FINISH_REASON_BYTES + value_bytes, _FINISH_REASON_ITEMS)
     budget.bytes_used = base_bytes + reservation[0]
     budget.items_used = base_items + reservation[1]
     reservations[index] = reservation
@@ -797,7 +816,7 @@ def _capture_chat_string(
     structure_bytes = 0
     structure_items = 0
     if field_name is not None:
-        structure_bytes = 32 + len(field_name.encode())
+        structure_bytes = _field_bytes(field_name)
         structure_items = 2
     available_bytes = budget.max_bytes - budget.bytes_used - structure_bytes
     if available_bytes < 0:
@@ -820,23 +839,23 @@ def _capture_chat_string(
 def _replace_chat_scalar(
     current: str | None, value: str, budget: telemetry_dev.CaptureBudget
 ) -> bool:
-    held_bytes = 16
+    held_bytes = _BASE_ITEM_BYTES
     if current is not None:
         held_bytes += _bounded_json_string_size(current, budget.max_bytes)
     base_bytes = budget.bytes_used - held_bytes
-    available_bytes = budget.max_bytes - base_bytes - 16
+    available_bytes = budget.max_bytes - base_bytes - _BASE_ITEM_BYTES
     if available_bytes < 0:
         return False
     value_bytes = _bounded_json_string_size(value, available_bytes)
     if value_bytes > available_bytes:
         return False
-    budget.bytes_used = base_bytes + 16 + value_bytes
+    budget.bytes_used = base_bytes + _BASE_ITEM_BYTES + value_bytes
     return True
 
 
 def _release_chat_field(field_name: str, value: str, budget: telemetry_dev.CaptureBudget) -> None:
-    budget.bytes_used -= (
-        32 + len(field_name.encode()) + _bounded_json_string_size(value, budget.max_bytes)
+    budget.bytes_used -= _field_bytes(field_name) + _bounded_json_string_size(
+        value, budget.max_bytes
     )
     budget.items_used -= 2
 
@@ -881,7 +900,7 @@ def _capture_tool_call_payload(
     unresolved_name = f"{payload_key}.name"
     changed = False
     if not had_payload:
-        if not _reserve_chat_budget(budget, 32 + len(payload_key.encode()), 2):
+        if not _reserve_chat_budget(budget, _field_bytes(payload_key), 2):
             return False
         current[payload_key] = payload
         changed = True
@@ -951,13 +970,13 @@ def _capture_tool_call_delta(
 
     if tool_index not in state.tool_calls:
         first_tool_call = not state.tool_calls
-        structure_bytes = 16
+        structure_bytes = _BASE_ITEM_BYTES
         structure_items = 1
         if first_tool_call:
-            structure_bytes += 42
+            structure_bytes += _TOOL_CALLS_FIELD_BYTES
             structure_items += 2
             if state.content_fragments.tell() == 0 and state.function_call is None:
-                structure_bytes += 39
+                structure_bytes += _CONTENT_FIELD_BYTES
                 structure_items += 2
         if not _reserve_chat_budget(budget, structure_bytes, structure_items):
             return
@@ -1033,10 +1052,10 @@ def _capture_function_call_delta(
         return
     current = dict(state.function_call or {})
     if state.function_call is None:
-        structure_bytes = 45
+        structure_bytes = _FUNCTION_CALL_FIELD_BYTES
         structure_items = 2
         if state.content_fragments.tell() == 0 and not state.tool_calls:
-            structure_bytes += 39
+            structure_bytes += _CONTENT_FIELD_BYTES
             structure_items += 2
         if not _reserve_chat_budget(budget, structure_bytes, structure_items):
             return

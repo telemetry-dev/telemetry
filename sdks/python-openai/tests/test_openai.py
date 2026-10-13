@@ -5145,6 +5145,16 @@ def test_bounded_responses_capture_repeats_shared_acyclic_values(
     assert truncated is False
 
 
+@pytest.mark.parametrize("value", ["\x01" * 100, {"\x01" * 100: 1}], ids=["string", "key"])
+def test_bounded_responses_capture_charges_strings_at_their_escaped_size(value: object) -> None:
+    # Control characters cost six bytes each once escaped, one as raw UTF-8.
+    _captured, truncated = vars(telemetry_dev_openai)["_bounded_responses_capture"](
+        value, capture_enabled=True, max_bytes=200
+    )
+
+    assert truncated is True
+
+
 def test_bounded_responses_capture_normalizes_opaque_values(memory: SimpleNamespace) -> None:
     class Opaque:
         __slots__ = ()

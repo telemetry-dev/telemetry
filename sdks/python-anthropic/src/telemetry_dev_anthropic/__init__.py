@@ -7,7 +7,7 @@ import time
 import types
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
 from functools import wraps
-from typing import Any, TypeVar, cast
+from typing import Any, Final, TypeVar, cast
 
 import anthropic
 import telemetry_dev
@@ -157,8 +157,19 @@ def _number(value: Any) -> int | float | None:
     return None
 
 
+def _encodable(value: str) -> str:
+    """Match TextEncoder: surrogate pairs combine, lone surrogates become U+FFFD.
+
+    Retained text reaches the OTLP exporter, which cannot encode a lone surrogate,
+    and core truncate() raises on one once the output passes its cap.
+    """
+    if not any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        return value
+    return value.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+
+
 def _string(value: Any) -> str | None:
-    return value if isinstance(value, str) else None
+    return _encodable(value) if isinstance(value, str) else None
 
 
 def _usage(fields: dict[str, int | float | None]) -> dict[str, int | float] | None:
@@ -346,6 +357,8 @@ class _StreamState:
         self.block_reservations: dict[int, tuple[int, int]] = {}
         self.unresolved_replacements: set[int] = set()
         self.unresolved_encrypted_content: set[int] = set()
+        self.envelope_charged = False
+        self.settled_tool_blocks: set[int] = set()
 
 
 _STREAM_CAPTURE_MAX_BYTES = 48 * 1024
@@ -378,6 +391,10 @@ _APPENDED_DELTA_FIELDS = {
 }
 
 
+def _escaped_text_bytes(text: str) -> int:
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8", "surrogatepass")) - 2
+
+
 def _reserve_appended_text(index: int, value: Any, state: _StreamState) -> bool:
     budget = state.budget
     if budget.truncated:
@@ -388,7 +405,7 @@ def _reserve_appended_text(index: int, value: Any, state: _StreamState) -> bool:
     if len(text) > budget.remaining_bytes:
         budget.truncated = True
         return False
-    size = len(json.dumps(text, ensure_ascii=False).encode("utf-8", "surrogatepass")) - 2
+    size = _escaped_text_bytes(text)
     if size > budget.remaining_bytes:
         budget.truncated = True
         return False
@@ -433,6 +450,8 @@ def _bounded_stream_native(
             depth,
             seen,
         )
+    if isinstance(value, str):
+        return _encodable(value)
     namespace = _stored(value, "__dict__")
     if type(namespace) is not dict:
         return value
@@ -474,7 +493,7 @@ def _bounded_stream_mappings(
                     continue
                 seen_keys.add(key)
                 if item is not None:
-                    converted[str(key)] = _bounded_stream_native(
+                    converted[_encodable(str(key))] = _bounded_stream_native(
                         item, remaining_items, depth + 1, seen
                     )
                 else:
@@ -484,11 +503,27 @@ def _bounded_stream_mappings(
         seen.remove(source_id)
 
 
+def _encodable_json(value: Any) -> Any:
+    """Normalize the strings and keys json.loads produced from ASCII escapes."""
+    if isinstance(value, str):
+        return _encodable(value)
+    if isinstance(value, list):
+        return [_encodable_json(item) for item in cast(list[Any], value)]
+    if isinstance(value, dict):
+        return {
+            _encodable(key): _encodable_json(item)
+            for key, item in cast(dict[str, Any], value).items()
+        }
+    return value
+
+
 def _parse_tool_input(raw: str) -> Any:
     if raw == "":
         return {}
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        # partial_json is ASCII, so a lone surrogate can only appear once an escape decodes.
+        return _encodable_json(parsed) if "\\u" in raw else parsed
     except (ValueError, RecursionError):
         return raw
 
@@ -551,6 +586,8 @@ def _bounded_stream_output(
 def _stream_partial(
     state: _StreamState, *, mask_output_when_incomplete: bool = False
 ) -> dict[str, Any]:
+    for tool_index in list(state.tool_json):
+        _settle_tool_input(tool_index, state)
     output = _stream_output(state) if state.capture_output else None
     output_truncated = False
     if output is not None:
@@ -619,6 +656,7 @@ def _record_content_block_start(event: Any, state: _StreamState) -> None:
         else {"type": block_type}
     )
     if block_type == "compaction":
+        state.settled_tool_blocks.discard(block_index)
         if not _reserve_replacement(block_index, retained_block, state, recover_unseen=True):
             if _field_present(content_block, "encrypted_content"):
                 _mark_unresolved_encrypted_content(block_index, state)
@@ -630,6 +668,7 @@ def _record_content_block_start(event: Any, state: _StreamState) -> None:
         return
     if not _reserve(block_index, content_block, state):
         return
+    state.settled_tool_blocks.discard(block_index)
     if block_type == "text":
         state.blocks[block_index] = {
             "type": "text",
@@ -705,19 +744,30 @@ def _reserve_replacement(
     budget = state.budget
     if not _can_reserve_replacement(index, state, recover_unseen):
         return False
-    raw_input = state.tool_json.get(index)
-    retained = block if raw_input is None else (block, raw_input)
     held_bytes, held_items = state.block_reservations.get(index, (0, 0))
-    candidate = telemetry_dev.CaptureBudget(budget.max_bytes, budget.max_items)
-    candidate.bytes_used = budget.bytes_used - held_bytes
-    candidate.items_used = budget.items_used - held_items
-    if not candidate.accept(retained):
-        _reject_replacement(index, state, recover_unseen=recover_unseen)
-        return False
     base_bytes = budget.bytes_used - held_bytes
     base_items = budget.items_used - held_items
-    measured_bytes = candidate.bytes_used - base_bytes
-    measured_items = candidate.items_used - base_items
+    if index in state.settled_tool_blocks:
+        cost = _settled_replacement_cost(index, block, state)
+        if (
+            cost is None
+            or base_bytes + cost[0] > budget.max_bytes
+            or base_items + cost[1] > budget.max_items
+        ):
+            _reject_replacement(index, state, recover_unseen=recover_unseen)
+            return False
+        measured_bytes, measured_items = cost
+    else:
+        raw_input = state.tool_json.get(index)
+        retained = block if raw_input is None else (block, raw_input)
+        candidate = telemetry_dev.CaptureBudget(budget.max_bytes, budget.max_items)
+        candidate.bytes_used = base_bytes
+        candidate.items_used = base_items
+        if not candidate.accept(retained):
+            _reject_replacement(index, state, recover_unseen=recover_unseen)
+            return False
+        measured_bytes = candidate.bytes_used - base_bytes
+        measured_items = candidate.items_used - base_items
     budget.bytes_used = base_bytes + measured_bytes
     budget.items_used = base_items + measured_items
     state.block_reservations[index] = (measured_bytes, measured_items)
@@ -766,20 +816,30 @@ def _drop_stale_signature(index: int, state: _StreamState) -> None:
     if block is None or "signature" not in block:
         return
     stripped = {key: value for key, value in block.items() if key != "signature"}
-    raw_input = state.tool_json.get(index)
-    retained = stripped if raw_input is None else (stripped, raw_input)
     held_bytes, held_items = state.block_reservations.get(index, (0, 0))
-    candidate = telemetry_dev.CaptureBudget(state.budget.max_bytes, state.budget.max_items)
-    candidate.bytes_used = state.budget.bytes_used - held_bytes
-    candidate.items_used = state.budget.items_used - held_items
-    if candidate.accept(retained):
-        base_bytes = state.budget.bytes_used - held_bytes
-        base_items = state.budget.items_used - held_items
-        measured_bytes = candidate.bytes_used - base_bytes
-        measured_items = candidate.items_used - base_items
-        state.budget.bytes_used = base_bytes + measured_bytes
-        state.budget.items_used = base_items + measured_items
-        state.block_reservations[index] = (measured_bytes, measured_items)
+    base_bytes = state.budget.bytes_used - held_bytes
+    base_items = state.budget.items_used - held_items
+    measured: tuple[int, int] | None = None
+    if index in state.settled_tool_blocks:
+        cost = _settled_replacement_cost(index, stripped, state)
+        if (
+            cost is not None
+            and base_bytes + cost[0] <= state.budget.max_bytes
+            and base_items + cost[1] <= state.budget.max_items
+        ):
+            measured = cost
+    else:
+        raw_input = state.tool_json.get(index)
+        retained = stripped if raw_input is None else (stripped, raw_input)
+        candidate = telemetry_dev.CaptureBudget(state.budget.max_bytes, state.budget.max_items)
+        candidate.bytes_used = base_bytes
+        candidate.items_used = base_items
+        if candidate.accept(retained):
+            measured = (candidate.bytes_used - base_bytes, candidate.items_used - base_items)
+    if measured is not None:
+        state.budget.bytes_used = base_bytes + measured[0]
+        state.budget.items_used = base_items + measured[1]
+        state.block_reservations[index] = measured
     state.blocks[index] = stripped
     state.unresolved_replacements.add(index)
 
@@ -787,6 +847,7 @@ def _drop_stale_signature(index: int, state: _StreamState) -> None:
 def _drop_stale_compaction(index: int, state: _StreamState) -> None:
     state.blocks.pop(index, None)
     state.tool_json.pop(index, None)
+    state.settled_tool_blocks.discard(index)
     _release(index, state)
 
 
@@ -812,7 +873,10 @@ def _record_content_block_delta(event: Any, state: _StreamState) -> None:
             state.budget.truncated = True
         return
     if isinstance(delta, dict) and _field_present(raw_delta, "encrypted_content"):
-        delta["encrypted_content"] = _field(raw_delta, "encrypted_content")
+        raw_encrypted = _field(raw_delta, "encrypted_content")
+        delta["encrypted_content"] = (
+            _encodable(raw_encrypted) if isinstance(raw_encrypted, str) else raw_encrypted
+        )
     delta_type = _string(_field(delta, "type"))
     if delta_type in _REPLACEMENT_DELTAS:
         replaced = _replaced_block(block_index, delta, state)
@@ -837,7 +901,11 @@ def _record_content_block_delta(event: Any, state: _StreamState) -> None:
                 _drop_stale_signature(block_index, state)
         return
     appended_field = _APPENDED_DELTA_FIELDS.get(delta_type or "")
-    if appended_field is not None and block_index in state.blocks:
+    if appended_field is not None:
+        if block_index not in state.blocks and not _reserve(
+            block_index, _default_block(delta_type), state
+        ):
+            return
         if not _reserve_appended_text(block_index, _field(delta, appended_field), state):
             return
     elif not _reserve(block_index, delta, state):
@@ -889,9 +957,95 @@ def _record_stream_event(event: Any, state: _StreamState) -> dict[str, Any]:
         state.response_model = (
             _fallback_serving_model(_field(event, "usage"), state) or state.response_model
         )
+    elif event_type == "content_block_stop":
+        stop_index = _field(event, "index")
+        if isinstance(stop_index, int):
+            _settle_tool_input(stop_index, state)
     elif event_type == "message_stop":
         state.message_stopped = True
     return update
+
+
+_STREAM_OUTPUT_ENVELOPE: Final[list[dict[str, Any]]] = [{"role": "assistant", "content": []}]
+_BLOCK_SEPARATOR_BYTES: Final = 2
+
+
+def _envelope_cost() -> tuple[int, int]:
+    measured = telemetry_dev.CaptureBudget()
+    measured.accept(_STREAM_OUTPUT_ENVELOPE)
+    envelope_bytes = len(json.dumps(_STREAM_OUTPUT_ENVELOPE, ensure_ascii=False).encode())
+    return envelope_bytes, measured.items_used
+
+
+_ENVELOPE_BYTES, _ENVELOPE_ITEMS = _envelope_cost()
+
+
+def _settled_cost(
+    index: int, block: Mapping[str, Any], state: _StreamState
+) -> tuple[int, int] | None:
+    """Bytes and items the final bounded check counts for a block, or None if it cannot."""
+    try:
+        size = len(json.dumps(block, default=repr, ensure_ascii=False).encode())
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if any(other < index for other in state.blocks):
+        size += _BLOCK_SEPARATOR_BYTES
+    measured = telemetry_dev.CaptureBudget(state.budget.max_bytes, state.budget.max_items)
+    if not measured.accept(block):
+        return None
+    return size, measured.items_used
+
+
+def _settled_replacement_cost(
+    index: int, block: Mapping[str, Any], state: _StreamState
+) -> tuple[int, int] | None:
+    """Settled cost plus any raw input that arrived again, charged as it was while streaming."""
+    cost = _settled_cost(index, block, state)
+    raw_input = state.tool_json.get(index)
+    if cost is None or not raw_input:
+        return cost
+    return cost[0] + _escaped_text_bytes(raw_input), cost[1]
+
+
+def _settle_tool_input(index: int, state: _StreamState) -> None:
+    """Recharge a finished tool input at what the final bounded check will measure.
+
+    Fragments are charged as escaped source while they stream, but the input is parsed
+    before serialization, so separators and item counts can push the finished block past
+    the bound. Like the final check, the envelope is counted once per stream and the
+    separator only after the first block. A settled block keeps only its finalized form,
+    so the charge covers everything still held for it.
+    """
+    budget = state.budget
+    block = state.blocks.get(index)
+    if budget.truncated or block is None or state.tool_json.get(index) is None:
+        return
+    held_bytes, held_items = state.block_reservations.get(index, (0, 0))
+    try:
+        finalized = _finalize_block(index, block, state)
+    except (TypeError, ValueError, RecursionError):
+        budget.truncated = True
+        return
+    cost = _settled_cost(index, finalized, state)
+    if cost is None:
+        budget.truncated = True
+        return
+    size, items = cost
+    envelope_bytes, envelope_items = (
+        (0, 0) if state.envelope_charged else (_ENVELOPE_BYTES, _ENVELOPE_ITEMS)
+    )
+    base_bytes = budget.bytes_used - held_bytes + envelope_bytes
+    base_items = budget.items_used - held_items + envelope_items
+    if base_bytes + size > budget.max_bytes or base_items + items > budget.max_items:
+        budget.truncated = True
+        return
+    budget.bytes_used = base_bytes + size
+    budget.items_used = base_items + items
+    state.envelope_charged = True
+    state.block_reservations[index] = (size, items)
+    state.blocks[index] = finalized
+    del state.tool_json[index]
+    state.settled_tool_blocks.add(index)
 
 
 def _stream_event_has_output(event: Any) -> bool:
