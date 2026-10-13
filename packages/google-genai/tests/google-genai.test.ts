@@ -3026,6 +3026,37 @@ test.each([
   expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([candidate.content]);
 });
 
+test("generateContent keeps response fields when candidate content cannot be read", async () => {
+  const spy = maskSpy();
+  const spans = setupSpans({ mask: spy.mask });
+
+  const response = {
+    responseId: "resp_unreadable",
+    usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, totalTokenCount: 7 },
+    candidates: [
+      {
+        finishReason: "STOP",
+        content: {
+          role: "model",
+          get parts(): unknown {
+            throw new Error("unreadable parts");
+          },
+        },
+      },
+    ],
+  };
+
+  const client = wrapGoogleGenAI({ models: { generateContent: (_params: unknown) => response } });
+
+  client.models.generateContent({ model: "gemini", contents: "go" });
+
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.response.id"]).toBe("resp_unreadable");
+  expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(5);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(spy.keys).not.toContain("gen_ai.output.messages");
+});
+
 test.each([true, false])(
   "generateContent withholds system instructions cut to the retention bound from a mask (masked: %s)",
   async (masked) => {

@@ -328,28 +328,46 @@ function mapModalityTokens(
   }
 }
 
+// Reads like the capture walker does: own enumerable properties only.
+function ownField(value: unknown, key: string): unknown {
+  return value !== null &&
+    typeof value === "object" &&
+    Object.prototype.propertyIsEnumerable.call(value, key)
+    ? (value as Record<string, unknown>)[key]
+    : undefined;
+}
+
 // boundedCapture's default item limit; more candidates than this cannot all be kept.
 const CAPTURE_MAX_ITEMS = 1_000;
 
 function candidateOutput(response: UnknownRecord) {
   if (!captureEnabled("output")) return { value: undefined, truncated: false, contentCut: false };
   const all = asArray(response.candidates);
+  let projectionFailed = false;
   // Only candidate content is exported as output. Bounding a projection of it, rather than whole
   // candidates, keeps grounding or safety metadata from marking complete content as cut.
   const projected = all?.slice(0, CAPTURE_MAX_ITEMS + 1).map((candidate) => {
-    const content = asRecord(asRecord(candidate)?.content);
+    try {
+      const content = asRecord(ownField(candidate, "content"));
 
-    return content ? { content: { role: content.role, parts: content.parts } } : {};
+      return content
+        ? { content: { role: ownField(content, "role"), parts: ownField(content, "parts") } }
+        : {};
+    } catch {
+      projectionFailed = true;
+
+      return {};
+    }
   });
   const capture = boundedTelemetryCapture(projected);
 
   // Metadata that does not fit is still a loss for the span-level flag; both passes are bounded.
-  const truncated = capture.truncated || boundedTelemetryCapture(response.candidates).truncated;
+  const contentCut = capture.truncated || projectionFailed;
+  const truncated = contentCut || boundedTelemetryCapture(response.candidates).truncated;
 
   const candidates = asArray(capture.value);
 
-  if (!candidates || candidates.length === 0)
-    return { value: undefined, truncated, contentCut: capture.truncated };
+  if (!candidates || candidates.length === 0) return { value: undefined, truncated, contentCut };
 
   const output = candidates
     .map((candidate) => {
@@ -368,7 +386,7 @@ function candidateOutput(response: UnknownRecord) {
   return {
     value: output.length > 0 ? output : undefined,
     truncated,
-    contentCut: capture.truncated,
+    contentCut,
   };
 }
 
