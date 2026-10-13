@@ -1912,20 +1912,13 @@ def test_bounded_responses_conversion_charges_strings_at_their_escaped_size(
 def test_responses_stream_charges_appended_deltas_at_their_escaped_size(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    original_budget = telemetry_dev.CaptureBudget.from_client
-
-    def limited_budget() -> telemetry_dev.CaptureBudget:
-        budget = original_budget()
-        budget.max_bytes = 4_000
-        return budget
-
-    monkeypatch.setattr(telemetry_dev.CaptureBudget, "from_client", staticmethod(limited_budget))
-    # The second delta is 1,000 raw bytes but 6,000 once escaped.
+    # The second delta is 11,000 bytes as raw UTF-8, which fits the stream bound, and 66,000
+    # once escaped, which does not.
     events = [
         SimpleNamespace(
             type="response.output_text.delta", output_index=0, content_index=0, delta=delta
         )
-        for delta in ("kept", "\x01" * 1000)
+        for delta in ("kept", "\x01" * 11_000)
     ]
     monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
     instrument_litellm()
@@ -1934,7 +1927,7 @@ def test_responses_stream_charges_appended_deltas_at_their_escaped_size(
 
     a = attrs(only_span(memory))
     assert a["telemetry.dev.capture.truncated"] is True
-    assert "\x01" not in str(a.get("gen_ai.output.messages", ""))
+    assert json_attr(a["gen_ai.output.messages"]) == [{"type": "output_text", "text": "kept"}]
 
 
 def test_bounded_responses_conversion_normalizes_opaque_values(memory: SimpleNamespace) -> None:
