@@ -7,6 +7,7 @@ import {
   type SpanHandle,
   type StartSpanOptions,
 } from "@telemetry-dev/sdk";
+import * as telemetrySdk from "@telemetry-dev/sdk";
 import OpenAI from "openai";
 import { Stream } from "openai/core/streaming";
 import { Speech } from "openai/resources/audio/speech";
@@ -1613,18 +1614,27 @@ function withholdCutOutput(span: SpanHandle, fields: SpanFields): SpanFields {
   return { ...fields, output: undefined };
 }
 
+// Cores older than captureMasked expose no mask policy before a span starts; treat them as
+// masked, like LEGACY_CAPTURE_POLICY. A namespace read keeps them loadable without the export.
+function captureMaskedBeforeStart(): boolean {
+  const read = (telemetrySdk as { captureMasked?: () => boolean }).captureMasked;
+
+  try {
+    return typeof read === "function" ? read() : true;
+  } catch {
+    return true;
+  }
+}
+
+// The decision is made before the span starts so samplers see the same attributes as before.
 function startRequestSpan(name: string, fields: StartSpanOptions): SpanHandle {
   const cut =
     fields.input !== undefined && fields.attributes?.["telemetry.dev.capture.truncated"] === true;
 
-  if (!cut) return startSpan(name, fields);
-
-  // The mask policy is only known once the span exists, so a cut input is attached afterwards.
-  const span = startSpan(name, { ...fields, input: undefined });
-
-  if (!capturesWithMask(span)) span.update({ input: fields.input });
-
-  return span;
+  return startSpan(
+    name,
+    cut && captureMaskedBeforeStart() ? { ...fields, input: undefined } : fields,
+  );
 }
 
 function reportSpanError(span: SpanHandle, cause: unknown): void {

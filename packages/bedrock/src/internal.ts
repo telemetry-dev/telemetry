@@ -6,6 +6,7 @@ import {
   type SpanType,
   type StartSpanOptions,
 } from "@telemetry-dev/sdk";
+import * as telemetrySdk from "@telemetry-dev/sdk";
 
 export const PROVIDER = "amazon-bedrock";
 
@@ -179,15 +180,23 @@ function isCut(fields: SpanFields | undefined): boolean {
   return fields?.attributes?.["telemetry.dev.capture.truncated"] === true;
 }
 
+// Cores older than captureMasked expose no mask policy before a span starts; treat them as
+// masked, like LEGACY_CAPTURE_POLICY. A namespace read keeps them loadable without the export.
+function captureMaskedBeforeStart(): boolean {
+  const read = (telemetrySdk as { captureMasked?: () => boolean }).captureMasked;
+
+  try {
+    return typeof read === "function" ? read() : true;
+  } catch {
+    return true;
+  }
+}
+
+// The decision is made before the span starts so samplers see the same attributes as before.
 function startRequestSpan(name: string, options: StartSpanOptions): SpanHandle {
-  if (options.input === undefined || !isCut(options)) return startSpan(name, options);
+  const withheld = options.input !== undefined && isCut(options) && captureMaskedBeforeStart();
 
-  // The mask policy is only known once the span exists, so a cut input is attached afterwards.
-  const span = startSpan(name, { ...options, input: undefined });
-
-  if (!capturesWithMask(span)) updateSpan(span, { input: options.input });
-
-  return span;
+  return startSpan(name, withheld ? { ...options, input: undefined } : options);
 }
 
 /** Ends a non-streamed span, withholding output cut to the retention bound from a mask. */

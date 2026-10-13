@@ -80,7 +80,7 @@ created from the OpenAI SDK's CommonJS build. Use `wrapOpenAI()` for CommonJS cl
 
 The integration maps native OpenAI request/response shapes directly into telemetry.dev fields. It does not normalize messages into another schema.
 
-Non-streamed chat and Responses input and output, and Realtime instructions and output, are bounded to 48 KiB and 1,000 items. A value over the bound sets `telemetry.dev.capture.truncated`. Without a mask, the bounded part is kept. With a mask configured, the value is omitted because the mask cannot inspect the complete value.
+Non-streamed chat and Responses input and output, and Realtime instructions and output, are bounded to 48 KiB and 1,000 items. A value over the bound sets `telemetry.dev.capture.truncated`. Without a mask, the bounded part is kept. With a mask configured, the value is omitted because the mask cannot inspect the complete value. Input is omitted before the span starts, so a custom `sampler` sees the bounded input when no mask is configured; with an older `@telemetry-dev/sdk` that cannot report whether a mask is configured, cut input is omitted as if one were.
 
 ## Streaming
 

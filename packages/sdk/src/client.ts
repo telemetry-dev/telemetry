@@ -94,6 +94,11 @@ export function captureEnabled(kind: "input" | "output"): boolean {
   return kind === "input" ? (config?.captureInput ?? false) : (config?.captureOutput ?? false);
 }
 
+/** Whether the active client runs captured values through a mask; false before `init`. */
+export function captureMasked(): boolean {
+  return currentClient().core?.config.mask !== undefined;
+}
+
 export function flush(): Promise<void> {
   return currentClient().flush();
 }

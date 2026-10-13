@@ -4,6 +4,7 @@ import { InMemorySpanExporter, type SpanExporter } from "@opentelemetry/sdk-trac
 import { afterEach, expect, test, vi } from "vitest";
 
 import {
+  captureMasked,
   flush,
   init,
   log,
@@ -345,4 +346,17 @@ test("OTLP requests identify the calling SDK package", async () => {
   await flush();
 
   expect(requests[0]?.headers.get("x-telemetry-dev-sdk")).toBe("@telemetry-dev/cursor");
+});
+
+test("captureMasked reports whether the active client has a mask", () => {
+  expect(captureMasked()).toBe(false);
+
+  init({ apiKey: "td_live_test", logLevel: "silent" });
+  expect(captureMasked()).toBe(false);
+
+  init({ apiKey: "td_live_test", logLevel: "silent", mask: (value) => value });
+  expect(captureMasked()).toBe(true);
+
+  init({ apiKey: "td_live_test", enabled: false, mask: (value) => value, logLevel: "silent" });
+  expect(captureMasked()).toBe(false);
 });
