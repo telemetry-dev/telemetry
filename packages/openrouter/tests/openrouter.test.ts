@@ -78,7 +78,7 @@ function createFakeFetcher(...responses: Response[]) {
   return { fetcher, requests };
 }
 
-function setupSpans(mask?: MaskFn): InMemorySpanExporter {
+function setupSpans(mask?: MaskFn, maxAttributeLength?: number): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
   init(
     {
@@ -88,6 +88,7 @@ function setupSpans(mask?: MaskFn): InMemorySpanExporter {
       exportMode: "immediate",
       logLevel: "silent",
       mask,
+      ...(maxAttributeLength === undefined ? {} : { maxAttributeLength }),
       fetch: async () => new Response(null, { status: 200 }),
     },
     { spanExporter },
@@ -715,6 +716,83 @@ test("chat stream capture is bounded without dropping chunks or terminal metadat
   expect(span.attributes["gen_ai.usage.cost"]).toBe(0.04);
 });
 
+async function streamedChatSpan(
+  spans: InMemorySpanExporter,
+  events: unknown[],
+): Promise<ReadableSpan> {
+  const fake = createFakeFetcher(sseResponse(events));
+
+  const stream = await clientWith(fake.fetcher).chat.send({
+    chatRequest: {
+      model: "openai/gpt-4o",
+      messages: [{ role: "user", content: "Answer" }],
+      stream: true,
+    },
+  });
+
+  if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
+  expect(await collectStream(stream)).toHaveLength(events.length);
+
+  return exportedSpan(spans);
+}
+
+test.each([0, 100, 1024 * 1024])(
+  "chat stream past the fixed bound is flagged and withheld from a mask (maxAttributeLength %i)",
+  async (maxAttributeLength) => {
+    const seen: string[] = [];
+    const spans = setupSpans((value) => {
+      seen.push(JSON.stringify(value));
+
+      return value;
+    }, maxAttributeLength);
+    const content = "x".repeat(1024);
+
+    const span = await streamedChatSpan(spans, [
+      ...Array.from({ length: 70 }, () =>
+        chatChunk("stream_bounded", { role: "assistant", content }),
+      ),
+      chatChunk("stream_bounded", {}, { finishReason: "stop" }),
+    ]);
+
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+    expect(seen.some((value) => value.includes(content))).toBe(false);
+  },
+);
+
+test.each([
+  [1_000, false, "東".repeat(400)],
+  [1_000, true, "[redacted]"],
+  [0, false, undefined],
+] as const)(
+  "maxAttributeLength %i cuts the exported chat output after the mask, not stream retention (redact %s)",
+  async (maxAttributeLength, redact, expected) => {
+    const spans = setupSpans(
+      (value, context) =>
+        redact && context.key === "gen_ai.output.messages"
+          ? [{ role: "assistant", content: "[redacted]" }]
+          : value,
+      maxAttributeLength,
+    );
+    const content = redact ? "x".repeat(5_000) : "東".repeat(400);
+
+    const span = await streamedChatSpan(spans, [
+      chatChunk("stream_small_cap", { role: "assistant", content }),
+      chatChunk("stream_small_cap", {}, { finishReason: "stop" }),
+    ]);
+
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+
+    if (expected === undefined) {
+      expect(span.attributes["gen_ai.output.messages"] ?? "").toBe("");
+    } else {
+      expect(
+        jsonAttr<Array<{ content?: string }>>(span, "gen_ai.output.messages")[0]?.content,
+      ).toBe(expected);
+    }
+  },
+);
+
 test("chat stream chunk errors end one error span with partial output", async () => {
   const spans = setupSpans();
 
@@ -757,6 +835,7 @@ test("chat stream chunk errors end one error span with partial output", async ()
   ]);
   expect(span.events[0]?.attributes?.["exception.message"]).toContain("upstream disconnected");
   expect(span.events[0]?.attributes?.["exception.message"]).toContain("502");
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
 test("early chat stream cancellation captures partial output and ends once", async () => {
@@ -789,6 +868,41 @@ test("early chat stream cancellation captures partial output and ends once", asy
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
     { role: "assistant", content: "First" },
   ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("masked chat stream cancellation withholds partial output", async () => {
+  const seen: string[] = [];
+  const spans = setupSpans((value) => {
+    seen.push(JSON.stringify(value));
+
+    return value;
+  });
+
+  const fake = createFakeFetcher(
+    sseResponse([
+      chatChunk("stream_cancel", { role: "assistant", content: "First" }),
+      chatChunk("stream_cancel", { content: " ignored" }, { finishReason: "stop" }),
+    ]),
+  );
+
+  const stream = await clientWith(fake.fetcher).chat.send({
+    chatRequest: {
+      model: "openai/gpt-4o",
+      messages: [{ role: "user", content: "Cancel" }],
+      stream: true,
+    },
+  });
+
+  if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
+  const reader = stream.getReader();
+  expect((await reader.read()).done).toBe(false);
+  await reader.cancel("caller stopped");
+
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(seen.some((value) => value.includes("First"))).toBe(false);
 });
 
 test("early Responses stream cancellation captures final text, reasoning, summary, and refusal", async () => {
@@ -1023,9 +1137,44 @@ test.each(["response.created", "response.in_progress"])(
         },
       },
     ]);
-    expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+    // Cancelled before a terminal response, so the reconstructed output is incomplete.
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
   },
 );
+
+test("masked Responses stream cancellation withholds partial output", async () => {
+  const seen: string[] = [];
+  const spans = setupSpans((value) => {
+    seen.push(JSON.stringify(value));
+
+    return value;
+  });
+  const delta = (text: string, sequence_number: number) => ({
+    type: "response.output_text.delta",
+    sequence_number,
+    item_id: "msg_masked",
+    output_index: 0,
+    content_index: 0,
+    delta: text,
+    logprobs: [],
+  });
+
+  const cancelled = await clientWith(
+    createFakeFetcher(sseResponse([delta("partial secret", 1), delta(" more", 2)])).fetcher,
+  ).responses.send({
+    responsesRequest: { model: "openai/gpt-4o", input: "Cancel", stream: true },
+  });
+
+  if (!(cancelled instanceof ReadableStream)) throw new Error("expected a readable stream");
+  const reader = cancelled.getReader();
+  expect((await reader.read()).done).toBe(false);
+  await reader.cancel("caller stopped");
+
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(seen.some((value) => value.includes("partial secret"))).toBe(false);
+});
 
 test("terminal Responses output retains previously consumed provider events", async () => {
   const spans = setupSpans();
@@ -2057,7 +2206,8 @@ test("final Responses text replaces delta-truncated output using a fresh budget"
       content: [{ type: "output_text", text: "Final answer", annotations: [] }],
     },
   ]);
-  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  // The done event replaces the cut deltas; the flag remains because no terminal response arrived.
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
 test("final Responses text preserves provider event truncation", async () => {

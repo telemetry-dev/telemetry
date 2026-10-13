@@ -21,6 +21,14 @@ _PROVIDER = "openrouter"
 _WRAPPED_ATTR = "_telemetry_dev_openrouter_wrapped"
 _ORIGINAL_ATTR = "_telemetry_dev_openrouter_original"
 _CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated"
+# Retention uses fixed bounds, the same as the TypeScript integration; the core applies
+# max_attribute_length after the mask.
+_STREAM_CAPTURE_MAX_BYTES = 64 * 1024
+_STREAM_CAPTURE_MAX_ITEMS = 1024
+_TERMINAL_RESPONSE_EVENTS = frozenset(
+    {"response.completed", "response.failed", "response.incomplete"}
+)
+_OMIT = object()
 _ORIGINALS: list[tuple[type[Any], str, Any]] = []
 _installed = False
 _install_lock = threading.Lock()
@@ -526,18 +534,41 @@ def _chat_output(states: Mapping[int, _ChatChoice]) -> list[dict[str, Any]]:
     return output
 
 
+def _stream_capture_budget() -> telemetry_dev.CaptureBudget:
+    return telemetry_dev.CaptureBudget(_STREAM_CAPTURE_MAX_BYTES, _STREAM_CAPTURE_MAX_ITEMS)
+
+
+def _capture_masked(handle: telemetry_dev.SpanHandle) -> bool:
+    compatible = cast(Any, handle)
+    masked = getattr(compatible, "capture_masked", None)
+    if isinstance(masked, bool):
+        return masked
+    client = getattr(compatible, "_client", None)
+    return getattr(client, "mask", _OMIT) is not None if client is not None else True
+
+
+def _mark_capture_incomplete(fields: dict[str, Any], mask_output: bool) -> dict[str, Any]:
+    fields["attributes"] = {**(fields.get("attributes") or {}), _CAPTURE_TRUNCATED_ATTRIBUTE: True}
+    if mask_output:
+        fields.pop("output", None)
+    return fields
+
+
 def _chat_partial(
     states: Mapping[int, _ChatChoice],
     usage: dict[str, int | float] | None,
     cost_usd: float | None,
     budget: telemetry_dev.CaptureBudget,
+    *,
+    completed: bool = True,
+    mask_output: bool = False,
 ) -> dict[str, Any]:
     finish_reasons = [
         state.finish_reason
         for _, state in sorted(states.items())
         if state.finish_reason is not None
     ]
-    return _mark_capture_truncated(
+    fields = _mark_capture_truncated(
         {
             "output": _chat_output(states) if states else None,
             "usage": usage,
@@ -551,6 +582,9 @@ def _chat_partial(
         },
         budget,
     )
+    if budget.truncated or not completed:
+        _mark_capture_incomplete(fields, mask_output)
+    return fields
 
 
 def _mark_capture_truncated(
@@ -626,7 +660,9 @@ class _InstrumentedStream:
         self._saw_first = False
         self._consume: Iterator[Any] | None = None
         self._in_next = False
-        self._budget = telemetry_dev.CaptureBudget.from_client()
+        self._completed = False
+        self._mask_output_when_incomplete = _capture_masked(handle)
+        self._budget = _stream_capture_budget()
         _hook_response_close(inner, self._on_response_close)
 
     def _iterate(self) -> Iterator[Any]:
@@ -637,6 +673,7 @@ class _InstrumentedStream:
                     chunk = next(self._inner)
                     received_at = time.perf_counter()
                 except StopIteration:
+                    self._completed = True
                     break
                 except BaseException as exc:
                     self._end(**self._partial(), error=exc)
@@ -671,7 +708,14 @@ class _InstrumentedStream:
         self.close()
 
     def _partial(self) -> dict[str, Any]:
-        return _chat_partial(self._states, self._usage, self._cost_usd, self._budget)
+        return _chat_partial(
+            self._states,
+            self._usage,
+            self._cost_usd,
+            self._budget,
+            completed=self._completed,
+            mask_output=self._mask_output_when_incomplete,
+        )
 
     def _finish(self) -> None:
         self._end(**self._partial())
@@ -721,7 +765,9 @@ class _InstrumentedAsyncStream:
         self._saw_first = False
         self._consume: AsyncIterator[Any] | None = None
         self._in_next = False
-        self._budget = telemetry_dev.CaptureBudget.from_client()
+        self._completed = False
+        self._mask_output_when_incomplete = _capture_masked(handle)
+        self._budget = _stream_capture_budget()
         _hook_response_close(inner, self._on_response_close)
 
     async def _aiterate(self) -> AsyncIterator[Any]:
@@ -732,6 +778,7 @@ class _InstrumentedAsyncStream:
                     chunk = await self._inner.__anext__()
                     received_at = time.perf_counter()
                 except StopAsyncIteration:
+                    self._completed = True
                     break
                 except BaseException as exc:
                     self._end(**self._partial(), error=exc)
@@ -769,7 +816,14 @@ class _InstrumentedAsyncStream:
         await self.close()
 
     def _partial(self) -> dict[str, Any]:
-        return _chat_partial(self._states, self._usage, self._cost_usd, self._budget)
+        return _chat_partial(
+            self._states,
+            self._usage,
+            self._cost_usd,
+            self._budget,
+            completed=self._completed,
+            mask_output=self._mask_output_when_incomplete,
+        )
 
     def _finish(self) -> None:
         self._end(**self._partial())
@@ -811,7 +865,8 @@ class _ResponsesStreamState:
     def __init__(self) -> None:
         self.partial: dict[str, Any] = {}
         self.retained_output: Any | None = None
-        self._budget = telemetry_dev.CaptureBudget.from_client()
+        self.saw_terminal_snapshot = False
+        self._budget = _stream_capture_budget()
         self._items: dict[int, dict[str, Any]] = {}
         self._content: dict[tuple[int, int], dict[str, Any]] = {}
         self._summary: dict[tuple[int, int], dict[str, Any]] = {}
@@ -845,7 +900,7 @@ class _ResponsesStreamState:
         return candidate.accept(value)
 
     def _replace_output(self, output: Any) -> bool:
-        replacement = telemetry_dev.CaptureBudget.from_client()
+        replacement = _stream_capture_budget()
         if not replacement.accept(output):
             self._budget.truncated = True
             return False
@@ -938,7 +993,7 @@ class _ResponsesStreamState:
         if event_type in {"response.output_item.added", "response.output_item.done"}:
             raw_item = _field(event, "item")
             replacement = event_type.endswith(".done")
-            preflight = telemetry_dev.CaptureBudget.from_client() if replacement else self._budget
+            preflight = _stream_capture_budget() if replacement else self._budget
             if not self._can_accept(preflight, raw_item):
                 self._budget.truncated = True
                 return False
@@ -956,7 +1011,7 @@ class _ResponsesStreamState:
         if event_type in {"response.content_part.added", "response.content_part.done"}:
             event_part = _field(event, "part")
             replacement = event_type.endswith(".done")
-            preflight = telemetry_dev.CaptureBudget.from_client() if replacement else self._budget
+            preflight = _stream_capture_budget() if replacement else self._budget
             if not self._can_accept(preflight, event_part):
                 self._budget.truncated = True
                 return False
@@ -1069,7 +1124,7 @@ class _ResponsesStreamState:
         }:
             event_part = _field(event, "part")
             replacement = event_type.endswith(".done")
-            preflight = telemetry_dev.CaptureBudget.from_client() if replacement else self._budget
+            preflight = _stream_capture_budget() if replacement else self._budget
             if not self._can_accept(preflight, event_part):
                 self._budget.truncated = True
                 return False
@@ -1233,7 +1288,7 @@ class _ResponsesStreamState:
         response = _field(event, "response")
         if response is not None:
             fields = _responses_response(response, include_error=False, include_output=False)
-            response_budget = telemetry_dev.CaptureBudget.from_client()
+            response_budget = _stream_capture_budget()
             raw_output = _field(response, "output")
             if raw_output is not None:
                 if not self._can_accept(response_budget, raw_output):
@@ -1260,9 +1315,17 @@ class _ResponsesStreamState:
             self.partial = fields
             if self.retained_output is not None:
                 self.partial["output"] = self.retained_output
+            if _field(event, "type") in _TERMINAL_RESPONSE_EVENTS:
+                self.saw_terminal_snapshot = True
         elif self._record_event(event):
             self._sync_output()
         _mark_capture_truncated(self.partial, self._budget)
+
+    def fields(self, mask_output: bool, *, failed: bool = False) -> dict[str, Any]:
+        fields = dict(self.partial)
+        if failed or self._budget.truncated or not self.saw_terminal_snapshot:
+            _mark_capture_incomplete(fields, mask_output)
+        return fields
 
 
 class _InstrumentedResponsesStream:
@@ -1273,6 +1336,7 @@ class _InstrumentedResponsesStream:
         self._started_at = started_at
         self._saw_first = False
         self._state = _ResponsesStreamState()
+        self._mask_output_when_incomplete = _capture_masked(handle)
         self._consume: Iterator[Any] | None = None
         self._in_next = False
         _hook_response_close(inner, self._on_response_close)
@@ -1287,7 +1351,7 @@ class _InstrumentedResponsesStream:
                 except StopIteration:
                     break
                 except BaseException as exc:
-                    self._end(**self._state.partial, error=exc)
+                    self._end(**self._failed_fields(), error=exc)
                     raise
                 finally:
                     self._in_next = False
@@ -1314,11 +1378,17 @@ class _InstrumentedResponsesStream:
         self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: Any
     ) -> None:
         if exc is not None:
-            self._end(**self._state.partial, error=exc)
+            self._end(**self._failed_fields(), error=exc)
         self.close()
 
+    def _fields(self) -> dict[str, Any]:
+        return self._state.fields(self._mask_output_when_incomplete)
+
+    def _failed_fields(self) -> dict[str, Any]:
+        return self._state.fields(self._mask_output_when_incomplete, failed=True)
+
     def _finish(self) -> None:
-        self._end(**self._state.partial)
+        self._end(**self._fields())
 
     def _on_response_close(self) -> None:
         if not self._in_next:
@@ -1347,15 +1417,13 @@ class _InstrumentedResponsesStream:
         event = _response_event(event)
         event_type = _field(event, "type")
         if event_type == "response.completed":
-            self._end(**self._state.partial)
+            self._end(**self._fields())
         elif event_type == "response.failed":
-            self._end(
-                **self._state.partial, error=_response_failed_error(_field(event, "response"))
-            )
+            self._end(**self._fields(), error=_response_failed_error(_field(event, "response")))
         elif event_type == "response.incomplete":
-            self._end(**self._state.partial)
+            self._end(**self._fields())
         elif event_type == "error":
-            self._end(**self._state.partial, error=_response_stream_error(event))
+            self._end(**self._failed_fields(), error=_response_stream_error(event))
 
 
 class _InstrumentedAsyncResponsesStream:
@@ -1366,6 +1434,7 @@ class _InstrumentedAsyncResponsesStream:
         self._started_at = started_at
         self._saw_first = False
         self._state = _ResponsesStreamState()
+        self._mask_output_when_incomplete = _capture_masked(handle)
         self._consume: AsyncIterator[Any] | None = None
         self._in_next = False
         _hook_response_close(inner, self._on_response_close)
@@ -1380,7 +1449,7 @@ class _InstrumentedAsyncResponsesStream:
                 except StopAsyncIteration:
                     break
                 except BaseException as exc:
-                    self._end(**self._state.partial, error=exc)
+                    self._end(**self._failed_fields(), error=exc)
                     raise
                 finally:
                     self._in_next = False
@@ -1410,11 +1479,17 @@ class _InstrumentedAsyncResponsesStream:
         tb: Any,
     ) -> None:
         if exc is not None:
-            self._end(**self._state.partial, error=exc)
+            self._end(**self._failed_fields(), error=exc)
         await self.close()
 
+    def _fields(self) -> dict[str, Any]:
+        return self._state.fields(self._mask_output_when_incomplete)
+
+    def _failed_fields(self) -> dict[str, Any]:
+        return self._state.fields(self._mask_output_when_incomplete, failed=True)
+
     def _finish(self) -> None:
-        self._end(**self._state.partial)
+        self._end(**self._fields())
 
     def _on_response_close(self) -> None:
         if not self._in_next:
@@ -1443,15 +1518,13 @@ class _InstrumentedAsyncResponsesStream:
         event = _response_event(event)
         event_type = _field(event, "type")
         if event_type == "response.completed":
-            self._end(**self._state.partial)
+            self._end(**self._fields())
         elif event_type == "response.failed":
-            self._end(
-                **self._state.partial, error=_response_failed_error(_field(event, "response"))
-            )
+            self._end(**self._fields(), error=_response_failed_error(_field(event, "response")))
         elif event_type == "response.incomplete":
-            self._end(**self._state.partial)
+            self._end(**self._fields())
         elif event_type == "error":
-            self._end(**self._state.partial, error=_response_stream_error(event))
+            self._end(**self._failed_fields(), error=_response_stream_error(event))
 
 
 def _start_span(

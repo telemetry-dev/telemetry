@@ -17,6 +17,35 @@ const MAX_STREAM_CAPTURE_BYTES = 64 * 1024;
 const MAX_STREAM_CAPTURE_ITEMS = 1024;
 const MAX_STREAM_CAPTURE_DEPTH = 32;
 const STREAM_CAPTURE_ITEM_BYTES = 16;
+const TERMINAL_RESPONSE_EVENTS = new Set([
+  "response.completed",
+  "response.failed",
+  "response.incomplete",
+]);
+
+// Older cores enforce captureOutput and masking when the span ends but expose no policy, so
+// withhold incomplete output from their mask. Retention uses the fixed stream bounds either way;
+// maxAttributeLength is only here to satisfy the policy type.
+const LEGACY_CAPTURE_POLICY: NonNullable<SpanHandle["capturePolicy"]> = {
+  output: true,
+  mask: true,
+  maxAttributeLength: 65_536,
+};
+
+function maskOutputWhenIncomplete(span: SpanHandle): boolean {
+  return (span.capturePolicy ?? LEGACY_CAPTURE_POLICY).mask;
+}
+
+function markCaptureIncomplete(fields: SpanFields, maskOutput: boolean): SpanFields {
+  fields.attributes = {
+    ...fields.attributes,
+    [CAPTURE_TRUNCATED_ATTRIBUTE]: true,
+  };
+
+  if (maskOutput) delete fields.output;
+
+  return fields;
+}
 
 function jsonEscapedLength(codePoint: number): number {
   if (codePoint === 0x22 || codePoint === 0x5c) return 2;
@@ -632,6 +661,7 @@ function chatPartialFields(
   usage: SpanFields["usage"],
   costUsd: number | undefined,
   budget: StreamCaptureBudget,
+  capture: { completed: boolean; maskOutput: boolean } = { completed: true, maskOutput: false },
 ): SpanFields {
   const finishReasons = [...states.entries()]
     .sort(([left], [right]) => left - right)
@@ -645,12 +675,7 @@ function chatPartialFields(
     ...finishReasonFields(finishReasons),
   };
 
-  if (budget.truncated) {
-    fields.attributes = {
-      ...fields.attributes,
-      [CAPTURE_TRUNCATED_ATTRIBUTE]: true,
-    };
-  }
+  if (budget.truncated || !capture.completed) markCaptureIncomplete(fields, capture.maskOutput);
 
   return fields;
 }
@@ -726,7 +751,8 @@ function recordChatChunk<T>(
 
 interface StreamObserver {
   record(value: JsonValue, receivedAt: number): SpanFields | undefined;
-  finish(cause?: unknown): SpanFields;
+  /** `completed` is true only when the source stream reached its end. */
+  finish(cause?: unknown, completed?: boolean): SpanFields;
 }
 
 function observeStream(
@@ -758,7 +784,7 @@ function observeStream(
 
           if (result.done) {
             release();
-            end(observer.finish());
+            end(observer.finish(undefined, true));
             controller.close();
 
             return;
@@ -871,7 +897,10 @@ function createObservedChatStream(
           streamError = update.error;
 
           return {
-            ...chatPartialFields(states, usage, costUsd, budget),
+            ...chatPartialFields(states, usage, costUsd, budget, {
+              completed: false,
+              maskOutput: maskOutputWhenIncomplete(span()),
+            }),
             responseId,
             responseModel,
             error: update.error,
@@ -880,9 +909,12 @@ function createObservedChatStream(
 
         return undefined;
       },
-      finish(cause) {
+      finish(cause, completed = false) {
         const fields: SpanFields = {
-          ...chatPartialFields(states, usage, costUsd, budget),
+          ...chatPartialFields(states, usage, costUsd, budget, {
+            completed: completed && cause === undefined && streamError === undefined,
+            maskOutput: maskOutputWhenIncomplete(span()),
+          }),
           responseId,
           responseModel,
         };
@@ -1424,6 +1456,14 @@ function createObservedResponsesStream(
   const providerCapture = { truncated: false };
   let budget = new StreamCaptureBudget();
   let sawFirst = false;
+  let sawTerminalSnapshot = false;
+  const capturedFields = (incomplete: boolean): SpanFields => {
+    const fields: SpanFields = { ...partial };
+
+    return incomplete || budget.truncated || !sawTerminalSnapshot
+      ? markCaptureIncomplete(fields, maskOutputWhenIncomplete(span()))
+      : fields;
+  };
 
   return observeStream(
     source,
@@ -1483,6 +1523,10 @@ function createObservedResponsesStream(
           partial = responsesResponse(response, false);
 
           if (output !== undefined) partial.output = output;
+
+          if (typeof e.type === "string" && TERMINAL_RESPONSE_EVENTS.has(e.type)) {
+            sawTerminalSnapshot = true;
+          }
         } else if (
           recordResponsesEvent(e, outputStates, syntheticEvents, budget, providerCapture)
         ) {
@@ -1512,28 +1556,23 @@ function createObservedResponsesStream(
         if (e.type === "response.failed") {
           partial = { ...partial, error: responseFailedError(response) };
 
-          return partial;
+          return capturedFields(false);
         }
 
         if (e.type === "error") {
           partial = { ...partial, error: responseStreamError(e) };
 
-          return partial;
+          return capturedFields(true);
         }
 
-        if (e.type === "response.completed" || e.type === "response.incomplete") return partial;
+        if (e.type === "response.completed" || e.type === "response.incomplete") {
+          return capturedFields(false);
+        }
 
         return undefined;
       },
       finish(cause) {
-        const fields: SpanFields = { ...partial };
-
-        if (budget.truncated) {
-          fields.attributes = {
-            ...partial.attributes,
-            [CAPTURE_TRUNCATED_ATTRIBUTE]: true,
-          };
-        }
+        const fields = capturedFields(cause !== undefined);
 
         if (cause !== undefined) fields.error = cause as Error;
 

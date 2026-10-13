@@ -114,7 +114,8 @@ The selected value is recorded as `gen_ai.usage.cost`.
 ## Limitations
 
 - Streaming fields include only events consumed by the application. A returned stream that is never read or cancelled cannot produce a terminal span.
-- Streamed output capture is limited to 64 KiB and 1,024 retained items. When a span contains only a captured prefix, `telemetry.dev.capture.truncated` is `true`; terminal metadata and usage can still be recorded.
+- Streamed output capture is limited to 64 KiB and 1,024 retained items. The configured `maxAttributeLength` does not shrink this bound; the core applies it to the exported attribute after the mask runs. When a span contains only a captured prefix, `telemetry.dev.capture.truncated` is `true`; terminal metadata and usage can still be recorded.
+- A chat stream that is cut at the bound, cancelled, or fails, and a Responses stream that is cut at the bound, ends without a terminal response, or ends with an `error` event set `telemetry.dev.capture.truncated`. With a mask configured, the incomplete reconstructed output is omitted because the mask cannot inspect the complete value.
 - Stream reconstruction covers OpenRouter chat content, reasoning, refusal, tool-call deltas, usage, and finish reasons; it does not synthesize fields that OpenRouter did not emit.
 - Global instrumentation affects the official `@openrouter/sdk` 1.x resource classes. Standalone generated functions and other OpenRouter endpoints are not instrumented.
 - Video generation (`client.videoGeneration`) is not traced; submitted and polled video jobs produce no spans.

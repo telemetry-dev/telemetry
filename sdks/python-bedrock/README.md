@@ -125,7 +125,9 @@ InvokeModel captures provider-native JSON bodies verbatim. Non-JSON bodies are n
 - Provider is emitted as `amazon-bedrock`. This intentionally differs from the OpenTelemetry registry value `aws.bedrock` so telemetry.dev pricing keys match Bedrock model IDs exactly. The raw caller `modelId`, `modelArn`, or `foundationModel` is emitted as the model.
 - Instrumentation is fail-open. Normalization, span updates, and span endings are guarded so telemetry failures do not break caller code.
 - Requests are never modified.
-- Streams end spans exactly once. Exhaustion records full output and finish reason; early `break`, `close()`, `GeneratorExit`, or stream errors record partial output.
+- Streams end spans exactly once. Exhaustion records full output and finish reason; early `break`, `close()`, `GeneratorExit`, or stream errors record partial output and set `telemetry.dev.capture.truncated`.
+- Event-stream reconstruction retains up to 48 KiB and 1,000 items. `InvokeModel` bodies and `Rerank` inputs and results are retained up to 64 KiB and 1,024 items; a body over that bound records no output and sets `telemetry.dev.capture.truncated`. The configured `max_attribute_length` does not shrink these retention bounds; the core applies it to the exported attribute after the mask runs.
+- A stream cut at its retention bound, closed early, or failed sets `telemetry.dev.capture.truncated`. With a mask configured, its incomplete reconstructed output is omitted because the mask cannot inspect the complete value. An Agent stream that returned control still records its complete `returnControl` output.
 - boto3 has no async client. `aiobotocore` is a separate package and is out of scope.
 
 ## Coverage gaps

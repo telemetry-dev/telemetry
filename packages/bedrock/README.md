@@ -138,7 +138,9 @@ InvokeModel captures provider-native JSON bodies verbatim. Non-JSON bodies are n
 - Instrumentation is fail-open. Normalization, span updates, and span endings are guarded so telemetry failures do not break caller code.
 - Requests are never modified. This is especially important for AWS SigV4 signing and for application-level request object reuse.
 - Streams are pull-through. The wrapper does not pre-buffer chunks and therefore preserves backpressure.
-- Streams end spans exactly once. Exhaustion records full output and finish reason; early `break`, `return()`, `close()`, abort, or stream errors record partial output.
+- Streams end spans exactly once. Exhaustion records full output and finish reason; early `break`, `return()`, `close()`, abort, or stream errors record partial output and set `telemetry.dev.capture.truncated`.
+- Stream reconstruction (output, Agent trace events, and Agent output-file metadata) retains up to 48 KiB and 1,000 items; events past the bound still pass through to the caller. The configured `maxAttributeLength` does not shrink this bound; the core applies it to the exported attribute after the mask runs.
+- A stream cut at the bound, stopped early, or failed sets `telemetry.dev.capture.truncated`. With a mask configured, its incomplete reconstructed output is omitted because the mask cannot inspect the complete value. An Agent stream that returned control still records its complete `returnControl` output.
 - `AbortSignal` passed to `send(command, { abortSignal })` is forwarded untouched. Pre-response aborts end the span with the thrown abort error. Mid-stream aborts end the span with partial output and the stream error.
 - Callback-style `send(command, callback)` and `send(command, options, callback)` calls are instrumented; callbacks receive the original data/error while the span is ended before callback invocation.
 

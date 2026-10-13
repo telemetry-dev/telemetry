@@ -89,6 +89,78 @@ test("InvokeAgent aggregates trace usage and return control", async () => {
   });
 });
 
+test.each([false, true])(
+  "InvokeAgent text past the fixed bound is flagged and withheld from a mask (masked %s)",
+  async (masked) => {
+    const seen: string[] = [];
+    const spans = setup(
+      masked
+        ? {
+            mask: (value) => {
+              seen.push(JSON.stringify(value));
+
+              return value;
+            },
+          }
+        : {},
+    );
+
+    const client = wrapBedrockAgents(
+      new FakeClient([
+        {
+          completion: streamOf(
+            Array.from({ length: 1_100 }, () => ({ chunk: { bytes: bytes("x".repeat(100)) } })),
+          ),
+        },
+      ]),
+    );
+
+    const response = (await client.send(
+      new InvokeAgentCommand({ agentId: "agent-1", agentAliasId: "a", sessionId: "s" }),
+    )) as { completion: AsyncIterable<unknown> };
+
+    await collect(response.completion);
+
+    const [span] = spans.getFinishedSpans();
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+
+    if (masked) {
+      expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+      expect(seen.some((value) => value.includes("x".repeat(100)))).toBe(false);
+    } else {
+      const text = jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content as string;
+      expect(text.length).toBeGreaterThan(0);
+      expect(text.length).toBeLessThan(1_100 * 102);
+    }
+  },
+);
+
+test("masked InvokeAgent keeps complete return control after the text bound", async () => {
+  const returnControl = { invocationId: "inv-after-bound" };
+  const spans = setup({ mask: (value) => value });
+
+  const client = wrapBedrockAgents(
+    new FakeClient([
+      {
+        completion: streamOf([
+          ...Array.from({ length: 1_100 }, () => ({ chunk: { bytes: bytes("x".repeat(100)) } })),
+          { returnControl },
+        ]),
+      },
+    ]),
+  );
+
+  const response = (await client.send(
+    new InvokeAgentCommand({ agentId: "agent-1", agentAliasId: "a", sessionId: "s" }),
+  )) as { completion: AsyncIterable<unknown> };
+
+  await collect(response.completion);
+
+  const [span] = spans.getFinishedSpans();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual({ returnControl });
+});
+
 test("Rerank captures queries, sources, model, ranking, and pagination metadata", async () => {
   const spans = setup();
   const modelArn = "arn:aws:bedrock:us-west-2::foundation-model/cohere.rerank-v3-5:0";

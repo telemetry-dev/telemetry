@@ -12,6 +12,7 @@ import {
   omitUndefined,
   PROVIDER,
   stringValue,
+  StreamRetention,
   type BedrockInstrumentationOptions,
   type JsonRecord,
   type JsonValue,
@@ -48,6 +49,7 @@ export function inlineAgentRequestFields(input: JsonRecord): SpanFields {
 }
 
 export class AgentStreamState implements StreamState {
+  readonly retention = new StreamRetention();
   private text = "";
   private usage: NonNullable<SpanFields["usage"]> = {};
   private traceEventCount = 0;
@@ -78,7 +80,9 @@ export class AgentStreamState implements StreamState {
     const chunk = isRecord(raw.chunk) ? raw.chunk : undefined;
     const bytes = chunk?.bytes;
 
-    if (bytes !== undefined) this.text += bytesToString(bytes) ?? "";
+    const piece = bytes === undefined ? undefined : bytesToString(bytes);
+
+    if (piece && this.retention.accept(piece)) this.text += piece;
     const attribution = isRecord(chunk?.attribution) ? chunk.attribution : undefined;
     const citations = arrayValue<unknown>(attribution?.citations);
 
@@ -86,7 +90,11 @@ export class AgentStreamState implements StreamState {
 
     const files = isRecord(raw.files) ? arrayValue<JsonValue>(raw.files.files) : undefined;
 
-    if (files) this.outputFiles.push(...files.map(sanitizeOutputFile));
+    const sanitizedFiles = files?.map(sanitizeOutputFile);
+
+    if (sanitizedFiles && this.retention.accept(sanitizedFiles)) {
+      this.outputFiles.push(...sanitizedFiles);
+    }
 
     const returnControl = isRecord(raw.returnControl) ? raw.returnControl : undefined;
 
@@ -97,7 +105,9 @@ export class AgentStreamState implements StreamState {
     if (traceEvent) {
       this.traceEventCount += 1;
 
-      if (this.options.captureAgentTrace) this.traces.push(traceEvent);
+      if (this.options.captureAgentTrace && this.retention.accept(traceEvent)) {
+        this.traces.push(traceEvent);
+      }
       collectTrace(traceEvent, (usage) => this.addUsage(usage));
       const failure = findKey(traceEvent, "failureTrace");
 
@@ -108,6 +118,11 @@ export class AgentStreamState implements StreamState {
       if (isRecord(guardrail))
         this.guardrailAction = stringValue(guardrail.action) ?? this.guardrailAction;
     }
+  }
+
+  outputTruncated(): boolean {
+    // Return control replaces the text output and is retained whole.
+    return this.returnControl === undefined && this.retention.truncated;
   }
 
   finish(): SpanFields {
@@ -303,6 +318,7 @@ export function ragResponseFields<T>(output: T): SpanFields {
 }
 
 export class RagStreamState implements StreamState {
+  readonly retention = new StreamRetention();
   private text = "";
   private citationCount = 0;
   private guardrailAction: string | undefined;
@@ -323,7 +339,9 @@ export class RagStreamState implements StreamState {
     }
 
     const output = isRecord(raw.output) ? raw.output : undefined;
-    this.text += stringValue(output?.text) ?? "";
+    const text = stringValue(output?.text);
+
+    if (text && this.retention.accept(text)) this.text += text;
 
     if (raw.citation) this.citationCount += 1;
     const guardrail = isRecord(raw.guardrail) ? raw.guardrail : undefined;
@@ -356,6 +374,7 @@ export function flowRequestFields(input: JsonRecord): SpanFields {
 }
 
 export class FlowStreamState implements StreamState {
+  readonly retention = new StreamRetention();
   private outputs: unknown[] = [];
   private completionReason: string | undefined;
   private error: Error | undefined;
@@ -376,13 +395,15 @@ export class FlowStreamState implements StreamState {
 
     const output = isRecord(raw.flowOutputEvent) ? raw.flowOutputEvent : undefined;
 
-    if (output) this.outputs.push(output.content);
+    if (output && this.retention.accept(output.content)) this.outputs.push(output.content);
 
     const inputRequest = isRecord(raw.flowMultiTurnInputRequestEvent)
       ? raw.flowMultiTurnInputRequestEvent
       : undefined;
 
-    if (inputRequest) this.outputs.push(inputRequest.content);
+    if (inputRequest && this.retention.accept(inputRequest.content)) {
+      this.outputs.push(inputRequest.content);
+    }
     const completion = isRecord(raw.flowCompletionEvent) ? raw.flowCompletionEvent : undefined;
     this.completionReason = stringValue(completion?.completionReason) ?? this.completionReason;
   }

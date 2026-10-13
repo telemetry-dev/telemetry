@@ -43,6 +43,15 @@ function loadAls(): AlsConstructor | undefined {
 const WRAPPED = Symbol("telemetry.dev.google-genai.wrapped");
 const ORIGINAL = Symbol("telemetry.dev.google-genai.original");
 const wrappedClients = new WeakSet<object>();
+
+// Older cores enforce captureOutput and masking when the span ends but expose no policy, so
+// withhold incomplete output from their mask. Retention uses the fixed stream bounds either way;
+// maxAttributeLength is only here to satisfy the policy type.
+const LEGACY_CAPTURE_POLICY: NonNullable<SpanHandle["capturePolicy"]> = {
+  output: true,
+  mask: true,
+  maxAttributeLength: 65_536,
+};
 const usageCollectorModels = new WeakSet<object>();
 const AlsCtor = loadAls();
 
@@ -1053,6 +1062,10 @@ class StreamAggregator {
     return true;
   }
 
+  get outputTruncated(): boolean {
+    return this.outputCaptureTruncated;
+  }
+
   private resetOutputCapture(): void {
     this.priorOutput = [];
     this.outputCaptureBytes = 2;
@@ -1300,7 +1313,8 @@ function createObservedStream(
     }
   };
 
-  const finish = (error?: unknown): void => {
+  // `completed` is true only when the source stream reached its end.
+  const finish = (error?: unknown, completed = false): void => {
     if (ended) return;
     ended = true;
     let finalFields: SpanFields = {};
@@ -1309,6 +1323,22 @@ function createObservedStream(
       finalFields = aggregator.finish();
     } catch {
       finalFields = {};
+    }
+
+    const interrupted = !completed || error !== undefined;
+
+    if (interrupted) {
+      finalFields.attributes = {
+        ...finalFields.attributes,
+        "telemetry.dev.capture.truncated": true,
+      };
+    }
+
+    if (
+      (span.capturePolicy ?? LEGACY_CAPTURE_POLICY).mask &&
+      (interrupted || aggregator.outputTruncated)
+    ) {
+      delete finalFields.output;
     }
 
     if (error !== undefined) finalFields.error = error;
@@ -1324,7 +1354,7 @@ function createObservedStream(
         const step = await iterator.next(value);
         const receivedAt = performance.now();
 
-        if (step.done) finish();
+        if (step.done) finish(undefined, true);
         else recordChunk(step.value, receivedAt);
 
         return step;

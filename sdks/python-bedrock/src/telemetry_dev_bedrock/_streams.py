@@ -10,13 +10,43 @@ import telemetry_dev
 from ._fields import clean, error_fields, merge_fields, usage_from_converse
 from ._messages import normalize_content_block
 
+# Retention uses fixed bounds; the core applies max_attribute_length after the mask.
+_STREAM_CAPTURE_MAX_BYTES = 48 * 1024
+_STREAM_CAPTURE_MAX_ITEMS = 1000
+_CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated"
+_OMIT = object()
+
+
+def stream_capture_budget() -> telemetry_dev.CaptureBudget:
+    return telemetry_dev.CaptureBudget(_STREAM_CAPTURE_MAX_BYTES, _STREAM_CAPTURE_MAX_ITEMS)
+
+
+def capture_masked(handle: Any) -> bool:
+    masked = getattr(handle, "capture_masked", None)
+    if isinstance(masked, bool):
+        return masked
+    client = getattr(handle, "_client", None)
+    return getattr(client, "mask", _OMIT) is not None if client is not None else True
+
+
+def mark_capture_incomplete(fields: dict[str, Any], mask_output: bool) -> dict[str, Any]:
+    marked = merge_fields(fields, {"attributes": {_CAPTURE_TRUNCATED_ATTRIBUTE: True}})
+    if mask_output:
+        marked.pop("output", None)
+    return marked
+
 
 class StreamState:
+    budget: telemetry_dev.CaptureBudget
+
     def feed(self, event: Any) -> bool | None:
         raise NotImplementedError
 
     def finish(self, *, partial: bool) -> dict[str, Any]:
         raise NotImplementedError
+
+    def output_truncated(self) -> bool:
+        return self.budget.truncated
 
 
 def _event_has_output(event: Any) -> bool:
@@ -63,7 +93,7 @@ def _event_has_output(event: Any) -> bool:
 
 class ConverseStreamState(StreamState):
     def __init__(self) -> None:
-        self.budget = telemetry_dev.CaptureBudget.from_client()
+        self.budget = stream_capture_budget()
         self.role = "assistant"
         self.blocks: dict[int, dict[str, Any]] = {}
         self.stop_reason: str | None = None
@@ -252,7 +282,7 @@ class ConverseStreamState(StreamState):
 
 class InvokeModelStreamState(StreamState):
     def __init__(self) -> None:
-        self.budget = telemetry_dev.CaptureBudget.from_client()
+        self.budget = stream_capture_budget()
         self.chunks: list[Any] = []
         self.usage: dict[str, int] = {}
         self.finish_reason: str | None = None
@@ -375,7 +405,7 @@ class InvokeModelStreamState(StreamState):
 
 class AgentStreamState(StreamState):
     def __init__(self, *, capture_trace: bool = False) -> None:
-        self.budget = telemetry_dev.CaptureBudget.from_client()
+        self.budget = stream_capture_budget()
         self.capture_trace = capture_trace
         self.text = ""
         self.usage: dict[str, int] = {}
@@ -426,6 +456,10 @@ class AgentStreamState(StreamState):
             output = [{"role": "assistant", "parts": [{"type": "text", "content": self.text}]}]
         return clean({"output": output, "usage": self.usage or None, "metadata": metadata or None})
 
+    def output_truncated(self) -> bool:
+        # Return control replaces the text output and is retained whole.
+        return self.return_control is None and self.budget.truncated
+
     def _collect_trace(self, value: Any) -> None:
         if isinstance(value, dict):
             output = value.get("modelInvocationOutput")
@@ -469,7 +503,7 @@ class AgentStreamState(StreamState):
 
 class RagStreamState(StreamState):
     def __init__(self) -> None:
-        self.budget = telemetry_dev.CaptureBudget.from_client()
+        self.budget = stream_capture_budget()
         self.text = ""
         self.citation_count = 0
         self.guardrail_action: str | None = None
@@ -506,7 +540,7 @@ class RagStreamState(StreamState):
 
 class FlowStreamState(StreamState):
     def __init__(self) -> None:
-        self.budget = telemetry_dev.CaptureBudget.from_client()
+        self.budget = stream_capture_budget()
         self.outputs: list[Any] = []
         self.completion_reason: str | None = None
 
@@ -559,6 +593,7 @@ class InstrumentedEventStream:
         self._ended = False
         self._first = False
         self._track_output_chunks = isinstance(state, ConverseStreamState | InvokeModelStreamState)
+        self._mask_output_when_incomplete = capture_masked(handle)
 
     def __iter__(self) -> Iterator[Any]:
         completed = False
@@ -612,6 +647,11 @@ class InstrumentedEventStream:
             return
         self._ended = True
         fields = self._state.finish(partial=partial)
+        if partial or self._state.budget.truncated:
+            fields = mark_capture_incomplete(
+                fields,
+                self._mask_output_when_incomplete and (partial or self._state.output_truncated()),
+            )
         if error is not None:
             fields = merge_fields(fields, error_fields(error))
         self._finish_callback(fields)
