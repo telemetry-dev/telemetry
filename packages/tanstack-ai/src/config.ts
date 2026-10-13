@@ -48,6 +48,18 @@ export function resolveConfig(options: TelemetryDevOptions = {}): ResolvedConfig
     sampler: options.sampler,
     fetchImpl: options.fetch ?? globalThis.fetch,
     waitUntil: options.waitUntil,
-    onError: options.onError,
+    onError: options.onError ? nonThrowing(options.onError) : undefined,
+  };
+}
+
+// The callback is the user's code; a throw from it must never reach TanStack AI, which would fail
+// the activity or chat the integration observes. Every report goes through this wrapper.
+function nonThrowing(onError: (cause: unknown) => void): (cause: unknown) => void {
+  return (cause) => {
+    try {
+      onError(cause);
+    } catch {
+      // Dropped on purpose: there is nowhere left to report a failing error callback.
+    }
   };
 }
