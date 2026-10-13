@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 import threading
 import time
 import types
@@ -157,13 +158,16 @@ def _number(value: Any) -> int | float | None:
     return None
 
 
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
 def _encodable(value: str) -> str:
     """Match TextEncoder: surrogate pairs combine, lone surrogates become U+FFFD.
 
     Retained text reaches the OTLP exporter, which cannot encode a lone surrogate,
     and core truncate() raises on one once the output passes its cap.
     """
-    if not any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+    if _SURROGATE.search(value) is None:
         return value
     return value.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
 
