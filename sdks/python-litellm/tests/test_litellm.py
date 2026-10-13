@@ -1893,6 +1893,50 @@ def test_bounded_responses_conversion_repeats_shared_acyclic_values(
     assert budget.truncated is False
 
 
+@pytest.mark.parametrize("value", ["\x01" * 1000, {"\x01" * 1000: 1}], ids=["string", "key"])
+def test_bounded_responses_conversion_charges_strings_at_their_escaped_size(
+    memory: SimpleNamespace, value: object
+) -> None:
+    # Control characters cost six bytes each once escaped, one as raw UTF-8.
+    convert = vars(telemetry_dev_litellm)["_bounded_responses_native"]
+
+    rejected, small = convert({"payload": value}, budget=telemetry_dev.CaptureBudget(2048))
+    kept, large = convert({"payload": value}, budget=telemetry_dev.CaptureBudget(8192))
+
+    assert rejected is None
+    assert small.truncated is True
+    assert kept == {"payload": value}
+    assert large.bytes_used >= len(json.dumps(kept))
+
+
+def test_responses_stream_charges_appended_deltas_at_their_escaped_size(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_budget = telemetry_dev.CaptureBudget.from_client
+
+    def limited_budget() -> telemetry_dev.CaptureBudget:
+        budget = original_budget()
+        budget.max_bytes = 4_000
+        return budget
+
+    monkeypatch.setattr(telemetry_dev.CaptureBudget, "from_client", staticmethod(limited_budget))
+    # The second delta is 1,000 raw bytes but 6,000 once escaped.
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta", output_index=0, content_index=0, delta=delta
+        )
+        for delta in ("kept", "\x01" * 1000)
+    ]
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    list(llm.responses(input="hi", model="gpt-4.1-mini", stream=True))
+
+    a = attrs(only_span(memory))
+    assert a["telemetry.dev.capture.truncated"] is True
+    assert "\x01" not in str(a.get("gen_ai.output.messages", ""))
+
+
 def test_bounded_responses_conversion_normalizes_opaque_values(memory: SimpleNamespace) -> None:
     class Opaque:
         __slots__ = ()

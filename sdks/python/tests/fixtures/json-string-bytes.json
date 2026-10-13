@@ -1,0 +1,25 @@
+[
+  { "name": "empty", "value": "", "bytes": 0 },
+  { "name": "ascii", "value": "hello", "bytes": 5 },
+  { "name": "solidus is not escaped", "value": "a/b", "bytes": 3 },
+  { "name": "delete is not escaped", "value": "\u007f", "bytes": 1 },
+  { "name": "quote", "value": "\"", "bytes": 2 },
+  { "name": "backslash", "value": "\\", "bytes": 2 },
+  { "name": "short control escapes", "value": "\b\t\n\f\r", "bytes": 10 },
+  { "name": "nul", "value": "\u0000", "bytes": 6 },
+  { "name": "unit separator", "value": "\u001f", "bytes": 6 },
+  {
+    "name": "every control character",
+    "value": "\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\b\t\n\u000b\f\r\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f",
+    "bytes": 172
+  },
+  { "name": "mixed escapes", "value": "say \"hi\"\n", "bytes": 12 },
+  { "name": "two-byte", "value": "é\u07ff", "bytes": 4 },
+  { "name": "three-byte", "value": "\u0800東\ufffd", "bytes": 9 },
+  { "name": "line separator is not escaped", "value": "\u2028", "bytes": 3 },
+  { "name": "astral pair", "value": "\ud83d\ude00", "bytes": 4 },
+  { "name": "lone high surrogate", "value": "\ud800", "bytes": 6 },
+  { "name": "lone low surrogate", "value": "\udfff", "bytes": 6 },
+  { "name": "reversed surrogates", "value": "\udc00\ud800", "bytes": 12 },
+  { "name": "lone surrogate between ascii", "value": "x\ud83dy", "bytes": 8 }
+]

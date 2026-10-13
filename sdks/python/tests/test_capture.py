@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import json
 from array import array
+from pathlib import Path
+from typing import Any
+
+import pytest
 
 from telemetry_dev import CaptureBudget
 
@@ -91,3 +96,53 @@ def test_capture_budget_measures_memoryview_in_bytes() -> None:
     assert len(retained) == budget.max_bytes
     assert budget.bytes_used == budget.max_bytes
     assert budget.truncated is True
+
+
+# Shared with packages/sdk/tests/capture.test.ts so both SDKs are held to the same numbers.
+_JSON_STRING_BYTES_FIXTURE = Path(__file__).parent / "fixtures/json-string-bytes.json"
+_JSON_STRING_BYTES_CASES: list[dict[str, Any]] = json.loads(
+    _JSON_STRING_BYTES_FIXTURE.read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.parametrize(
+    "case", _JSON_STRING_BYTES_CASES, ids=[case["name"] for case in _JSON_STRING_BYTES_CASES]
+)
+def test_capture_budget_charges_strings_and_keys_at_their_json_escaped_size(
+    case: dict[str, Any],
+) -> None:
+    value: str = case["value"]
+    expected: int = case["bytes"]
+
+    assert CaptureBudget.json_string_bytes(value) == expected
+
+    as_value = CaptureBudget()
+    assert as_value.accept(value) is True
+    assert as_value.bytes_used == 16 + expected
+
+    as_key = CaptureBudget()
+    assert as_key.accept({value: None}) is True
+    assert as_key.bytes_used == 3 * 16 + expected
+
+
+def test_capture_budget_charges_each_surrogate_code_point_separately() -> None:
+    # Python can hold a high and a low surrogate as two code points. json.dumps escapes each
+    # one, so each costs six bytes; TypeScript would pair the same UTF-16 units into four.
+    assert CaptureBudget.json_string_bytes("\ud83d\ude00") == 12
+    assert CaptureBudget.json_string_bytes("\U0001f600") == 4
+
+
+def test_capture_budget_rejects_escape_heavy_strings_and_keys_over_the_limit() -> None:
+    # 1,000 raw bytes fit a 2 KiB budget, 6,000 escaped bytes do not.
+    assert CaptureBudget(max_bytes=2048).accept("\x01" * 1000) is False
+    assert CaptureBudget(max_bytes=2048).accept({"\x01" * 1000: 1}) is False
+    assert CaptureBudget(max_bytes=8192).accept({"\x01" * 1000: 1}) is True
+
+
+def test_json_string_measure_stops_once_past_the_limit() -> None:
+    # Longer than the limit in code points: rejected without a scan.
+    assert CaptureBudget.json_string_bytes("x" * 100_000, 10) == 100_000
+    # Short enough to scan but escape-heavy: counting stops before the full 30,000 bytes.
+    oversized = "\x01" * 5_000
+    assert CaptureBudget.json_string_bytes(oversized) == 30_000
+    assert 10_000 < CaptureBudget.json_string_bytes(oversized, 10_000) < 30_000
