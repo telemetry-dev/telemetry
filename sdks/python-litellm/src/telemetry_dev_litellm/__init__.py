@@ -27,6 +27,11 @@ _DROPIN_WRAPPERS: dict[str, tuple[Any, Callable[..., Any]]] = {}
 _PENDING_CLOSE_TASKS: set[asyncio.Future[Any]] = set()
 _installed = False
 _install_lock = threading.Lock()
+_OMIT = object()
+# Retention uses fixed bounds; the core applies max_attribute_length after the mask.
+_STREAM_CAPTURE_MAX_BYTES = 48 * 1024
+_STREAM_CAPTURE_MAX_ITEMS = 1000
+_CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated"
 
 
 class _CaptureLimit(Exception):
@@ -106,12 +111,35 @@ def _native(value: Any) -> Any:
     return value
 
 
+def _stream_capture_budget() -> telemetry_dev.CaptureBudget:
+    return telemetry_dev.CaptureBudget(_STREAM_CAPTURE_MAX_BYTES, _STREAM_CAPTURE_MAX_ITEMS)
+
+
+def _capture_masked(handle: telemetry_dev.SpanHandle) -> bool:
+    compatible = cast(Any, handle)
+    masked = getattr(compatible, "capture_masked", None)
+    if isinstance(masked, bool):
+        return masked
+    client = getattr(compatible, "_client", None)
+    return getattr(client, "mask", _OMIT) is not None if client is not None else True
+
+
+def _mark_capture_incomplete(fields: dict[str, Any], mask_output: bool) -> None:
+    attributes = fields.get("attributes")
+    fields["attributes"] = {
+        **(cast(dict[str, Any], attributes) if isinstance(attributes, dict) else {}),
+        _CAPTURE_TRUNCATED_ATTRIBUTE: True,
+    }
+    if mask_output:
+        fields.pop("output", None)
+
+
 def _bounded_responses_native(
     value: Any,
     parent_type: str | None = None,
     budget: telemetry_dev.CaptureBudget | None = None,
 ) -> tuple[Any | None, telemetry_dev.CaptureBudget]:
-    active_budget = budget or telemetry_dev.CaptureBudget.from_client()
+    active_budget = budget or telemetry_dev.CaptureBudget()
     ancestors: set[int] = set()
 
     def reserve(byte_count: int, item_count: int = 1) -> None:
@@ -732,7 +760,9 @@ class _InstrumentedStream:
         self._chunks: list[Any] = []
         self._saw_first = False
         self._finished = False
-        self._budget = telemetry_dev.CaptureBudget.from_client()
+        self._completed = False
+        self._mask_output_when_incomplete = _capture_masked(handle)
+        self._budget = _stream_capture_budget()
         self._response_id: str | None = None
         self._response_model: str | None = None
         self._usage: dict[str, int | float] | None = None
@@ -750,6 +780,7 @@ class _InstrumentedStream:
             chunk = next(self._inner)
             received_at = time.perf_counter()
         except StopIteration:
+            self._completed = True
             self.close()
             raise
         except BaseException as exc:
@@ -770,6 +801,7 @@ class _InstrumentedStream:
             chunk = await self._inner.__anext__()
             received_at = time.perf_counter()
         except StopAsyncIteration:
+            self._completed = True
             await self.aclose()
             raise
         except BaseException as exc:
@@ -906,8 +938,10 @@ class _InstrumentedStream:
         attributes = fields.get("attributes")
         if not isinstance(attributes, dict):
             attributes = {}
-        if self._budget.truncated:
-            attributes["telemetry.dev.capture.truncated"] = True
+        if self._budget.truncated or not self._completed:
+            attributes[_CAPTURE_TRUNCATED_ATTRIBUTE] = True
+            if self._mask_output_when_incomplete:
+                fields.pop("output", None)
         if fields.get("finish_reason") is None and self._finish_reasons:
             finish_reasons = [self._finish_reasons[index] for index in sorted(self._finish_reasons)]
             fields["finish_reason"] = finish_reasons[0]
@@ -976,7 +1010,8 @@ class _InstrumentedResponsesStream:
         self._retained_item_count = 0
         self._truncated_key_count = 0
         self._truncation_overflow = False
-        self._budget = telemetry_dev.CaptureBudget.from_client()
+        self._mask_output_when_incomplete = _capture_masked(handle)
+        self._budget = _stream_capture_budget()
         self._charges: dict[object, tuple[int, int]] = {}
         self._annotation_charge_keys: dict[object, dict[int, object]] = {}
 
@@ -1159,7 +1194,7 @@ class _InstrumentedResponsesStream:
     def _replace_charge(self, keys: list[object], value: Any, replacement_key: object) -> bool:
         removed_bytes = sum(self._charges.get(key, (0, 0))[0] for key in keys)
         removed_items = sum(self._charges.get(key, (0, 0))[1] for key in keys)
-        budget = telemetry_dev.CaptureBudget.from_client()
+        budget = telemetry_dev.CaptureBudget(self._budget.max_bytes, self._budget.max_items)
         budget.bytes_used = max(0, self._budget.bytes_used - removed_bytes)
         budget.items_used = max(0, self._budget.items_used - removed_items)
         before = (budget.bytes_used, budget.items_used)
@@ -1189,7 +1224,7 @@ class _InstrumentedResponsesStream:
     ) -> tuple[bool, Any | None]:
         removed_bytes = sum(self._charges.get(key, (0, 0))[0] for key in keys)
         removed_items = sum(self._charges.get(key, (0, 0))[1] for key in keys)
-        budget = telemetry_dev.CaptureBudget.from_client()
+        budget = telemetry_dev.CaptureBudget(self._budget.max_bytes, self._budget.max_items)
         budget.bytes_used = max(0, self._budget.bytes_used - removed_bytes)
         budget.items_used = max(0, self._budget.items_used - removed_items)
         before = (budget.bytes_used, budget.items_used)
@@ -1577,7 +1612,9 @@ class _InstrumentedResponsesStream:
             else {}
         )
         if response is not None and self._capture_output:
-            terminal_output, terminal_budget = _bounded_responses_native(_field(response, "output"))
+            terminal_output, terminal_budget = _bounded_responses_native(
+                _field(response, "output"), budget=_stream_capture_budget()
+            )
             if terminal_output is not None and not terminal_budget.truncated:
                 fields["output"] = terminal_output
                 self._budget = terminal_budget
@@ -1592,12 +1629,8 @@ class _InstrumentedResponsesStream:
             partial_output = self._partial_output()
             if partial_output:
                 fields["output"] = partial_output
-        if self._budget.truncated:
-            attributes = fields.get("attributes")
-            if not isinstance(attributes, dict):
-                attributes = {}
-                fields["attributes"] = attributes
-            attributes["telemetry.dev.capture.truncated"] = True
+        if self._budget.truncated or response is None or error is not None:
+            _mark_capture_incomplete(fields, self._mask_output_when_incomplete)
         if self._request_provider is not None:
             fields.pop("provider", None)
         if error is not None:

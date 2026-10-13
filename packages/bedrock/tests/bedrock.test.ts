@@ -9,7 +9,10 @@ import {
 } from "@aws-sdk/client-bedrock-runtime";
 import { afterEach, expect, test, vi } from "vitest";
 
+import type { MaskFn } from "@telemetry-dev/sdk";
+
 import { instrumentBedrock, uninstrumentBedrock, wrapBedrock } from "../src/index.ts";
+import { STREAM_CAPTURE_MAX_BYTES } from "../src/internal.ts";
 import { FakeClient, bytes, collect, jsonAttr, setup, streamOf, teardown } from "./helpers.ts";
 
 afterEach(async () => {
@@ -216,7 +219,116 @@ test("ConverseStream accumulates output and ends partial on early break", async 
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
     { role: "assistant", parts: [{ type: "text", content: "Hello world" }] },
   ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
+
+function textStream(text: string, repeat = 1) {
+  return streamOf([
+    { messageStart: { role: "assistant" } },
+    ...Array.from({ length: repeat }, () => ({
+      contentBlockDelta: { contentBlockIndex: 0, delta: { text } },
+    })),
+    { messageStop: { stopReason: "end_turn" } },
+  ]);
+}
+
+async function streamedConverse(stream: AsyncIterable<unknown>) {
+  const client = wrapBedrock(new FakeClient([{ stream }]));
+
+  const response = (await client.send(
+    new ConverseStreamCommand({ modelId: "anthropic.claude", messages: [] }),
+  )) as { stream: AsyncIterable<unknown> };
+
+  await collect(response.stream);
+}
+
+function recordingMask(seen: string[]): MaskFn {
+  return (value) => {
+    seen.push(JSON.stringify(value));
+
+    return value;
+  };
+}
+
+test("masked ConverseStream early break withholds partial output", async () => {
+  const seen: string[] = [];
+  const spans = setup({ mask: recordingMask(seen) });
+  const client = wrapBedrock(new FakeClient([{ stream: textStream("partial secret", 3) }]));
+
+  const response = (await client.send(
+    new ConverseStreamCommand({ modelId: "anthropic.claude", messages: [] }),
+  )) as { stream: AsyncIterable<unknown> };
+
+  await collect(response.stream, 2);
+
+  const [span] = spans.getFinishedSpans();
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(seen.some((value) => value.includes("partial secret"))).toBe(false);
+});
+
+test.each([
+  [false, 0],
+  [false, 100],
+  [false, 1024 * 1024],
+  [true, 0],
+  [true, 100],
+  [true, 1024 * 1024],
+])(
+  "ConverseStream past the fixed bound is flagged (masked %s, maxAttributeLength %i)",
+  async (masked, maxAttributeLength) => {
+    const seen: string[] = [];
+    const spans = setup({ maxAttributeLength, ...(masked ? { mask: recordingMask(seen) } : {}) });
+
+    await streamedConverse(textStream("x".repeat(100), 1_100));
+
+    const [span] = spans.getFinishedSpans();
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["end_turn"]);
+
+    if (masked) {
+      expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+      expect(seen.some((value) => value.includes("x".repeat(100)))).toBe(false);
+    } else if (maxAttributeLength > STREAM_CAPTURE_MAX_BYTES) {
+      const retained = jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content as string;
+      expect(retained.length).toBeGreaterThan(0);
+      expect(retained.length).toBeLessThan(1_100 * 100);
+      expect(retained).toBe("x".repeat(retained.length));
+    } else {
+      expect(String(span.attributes["gen_ai.output.messages"] ?? "").length).toBeLessThanOrEqual(
+        maxAttributeLength,
+      );
+    }
+  },
+);
+
+test.each([
+  [1_000, false, "東".repeat(400)],
+  [1_000, true, "[redacted]"],
+  [0, false, undefined],
+] as const)(
+  "maxAttributeLength %i cuts the exported ConverseStream output after the mask (redact %s)",
+  async (maxAttributeLength, redact, expected) => {
+    const spans = setup({
+      maxAttributeLength,
+      mask: (value, context) =>
+        redact && context.key === "gen_ai.output.messages"
+          ? [{ role: "assistant", parts: [{ type: "text", content: "[redacted]" }] }]
+          : value,
+    });
+
+    await streamedConverse(textStream(redact ? "x".repeat(5_000) : "東".repeat(400)));
+
+    const [span] = spans.getFinishedSpans();
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+
+    if (expected === undefined) {
+      expect(span.attributes["gen_ai.output.messages"] ?? "").toBe("");
+    } else {
+      expect(jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content).toBe(expected);
+    }
+  },
+);
 
 test("ConverseStream records modeled errors and non-text blocks", async () => {
   const spans = setup();
@@ -306,6 +418,7 @@ test("ConverseStream records stream errors with partial output", async () => {
   expect(span.attributes["aws.http.status_code"]).toBe(424);
   expect(span.attributes["aws.request.attempts"]).toBe(2);
   expect(jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content).toBe("partial");
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
 test("InvokeModel captures provider-native bodies and embedding spans", async () => {

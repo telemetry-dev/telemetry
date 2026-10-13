@@ -39,6 +39,10 @@ CHAT_MESSAGES: list[ChatMessagesTypedDict] = [
 ]
 
 
+def identity_mask(value: Any, _context: Any) -> Any:
+    return value
+
+
 def only_span(env: SimpleNamespace) -> ReadableSpan:
     spans = env.span_exporter.get_finished_spans()
     assert len(spans) == 1
@@ -619,6 +623,151 @@ def test_chat_stream_capture_is_bounded_without_losing_terminal_metadata(
     assert a["gen_ai.usage.cost"] == 0.04
 
 
+def _streamed_chat(memory: SimpleNamespace, events: list[dict[str, Any]]) -> tuple[Any, Any]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    stream = cast(Any, wrap_open_router(sync_client(handler)).chat.send)(
+        model="openai/gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+    )
+    assert len(list(stream)) == len(events)
+    return stream, attrs(only_span(memory))
+
+
+@pytest.mark.parametrize(
+    ("max_attribute_length", "redact", "expected"),
+    [
+        (1_000, False, "東" * 400),
+        (1_000, True, "[redacted]"),
+        (0, False, None),
+    ],
+)
+def test_configured_cap_applies_after_the_mask_not_to_stream_retention(
+    make: Any, max_attribute_length: int, redact: bool, expected: str | None
+) -> None:
+    def mask(value: Any, _context: Any) -> Any:
+        if not redact:
+            return value
+        return [{"role": "assistant", "content": "[redacted]"}]
+
+    memory = make(max_attribute_length=max_attribute_length, mask=mask)
+    text = ("東" * 400) if not redact else ("x" * 5_000)
+    events = [
+        chat_chunk({"role": "assistant", "content": text}),
+        chat_chunk({}, finish_reason="stop"),
+    ]
+
+    stream, a = _streamed_chat(memory, events)
+
+    assert stream._budget.truncated is False
+    assert stream._states[0].content == text
+    assert "telemetry.dev.capture.truncated" not in a
+    if expected is None:
+        assert a.get("gen_ai.output.messages", "") == ""
+    else:
+        assert json.loads(str(a["gen_ai.output.messages"]))[0]["content"] == expected
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("max_attribute_length", [0, 100, 1024 * 1024])
+def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
+    make: Any, masked: bool, max_attribute_length: int
+) -> None:
+    seen: list[str] = []
+
+    def mask(value: Any, _context: Any) -> Any:
+        seen.append(json.dumps(value, default=str))
+        return value
+
+    options: dict[str, Any] = {"max_attribute_length": max_attribute_length}
+    if masked:
+        options["mask"] = mask
+    memory = make(**options)
+    events = [
+        *[chat_chunk({"role": "assistant", "content": "x" * 100}) for _ in range(1_100)],
+        chat_chunk({}, finish_reason="stop"),
+    ]
+
+    stream, a = _streamed_chat(memory, events)
+
+    budget = stream._budget
+    retained = stream._states[0].content
+    assert budget.truncated is True
+    assert budget.max_bytes == telemetry_dev_openrouter._STREAM_CAPTURE_MAX_BYTES  # pyright: ignore[reportPrivateUsage]
+    assert 0 < len(retained) < 1_100 * 100
+    assert a["telemetry.dev.capture.truncated"] is True
+    if masked:
+        assert "gen_ai.output.messages" not in a
+        assert not any("x" * 100 in value for value in seen)
+    elif max_attribute_length > len(retained):
+        assert json.loads(str(a["gen_ai.output.messages"]))[0]["content"] == retained
+    else:
+        assert len(str(a.get("gen_ai.output.messages", ""))) <= max_attribute_length
+
+
+def test_masked_chat_stream_closed_early_withholds_partial_output(make: Any) -> None:
+    memory = make(mask=identity_mask)
+    events = chat_stream_events()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    stream = cast(Any, wrap_open_router(sync_client(handler)).chat.send)(
+        model="openai/gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+    )
+    next(stream)
+    stream.close()
+
+    a = attrs(only_span(memory))
+    assert "gen_ai.output.messages" not in a
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize("max_attribute_length", [0, 100, 1024 * 1024])
+def test_masked_responses_stream_beyond_the_fixed_bound_is_withheld(
+    make: Any, max_attribute_length: int
+) -> None:
+    seen: list[str] = []
+
+    def mask(value: Any, _context: Any) -> Any:
+        seen.append(json.dumps(value, default=str))
+        return value
+
+    memory = make(mask=mask, max_attribute_length=max_attribute_length)
+    events: list[dict[str, Any]] = [
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": index,
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "retained" if index == 0 else "x" * 1_024,
+            "logprobs": [],
+        }
+        for index in range(70)
+    ]
+    events.append(
+        {
+            "type": "response.completed",
+            "sequence_number": 70,
+            "response": responses_payload(text="y" * (70 * 1024)),
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
+
+    stream = cast(Any, wrap_open_router(sync_client(handler)).responses.send)(
+        model="openai/gpt-4o-mini", input="long answer", stream=True
+    )
+    assert len(list(stream)) == len(events)
+
+    a = attrs(only_span(memory))
+    assert a["telemetry.dev.capture.truncated"] is True
+    assert "gen_ai.output.messages" not in a
+    assert not any("retained" in value for value in seen)
+
+
 def test_chat_stream_choice_states_are_bounded(memory: SimpleNamespace) -> None:
     choices = [
         {
@@ -648,7 +797,7 @@ def test_chat_stream_choice_states_are_bounded(memory: SimpleNamespace) -> None:
     assert len(chunks) == 1
     a = attrs(only_span(memory))
     output = json.loads(str(a["gen_ai.output.messages"]))
-    assert len(output) == 1024
+    assert len(output) == telemetry_dev_openrouter._STREAM_CAPTURE_MAX_ITEMS  # pyright: ignore[reportPrivateUsage]
     assert output[0] == {"role": "assistant", "content": "Hi"}
     assert a["telemetry.dev.capture.truncated"] is True
 
@@ -1205,7 +1354,8 @@ def test_response_event_output_survives_responses_stream_early_close(
             },
         },
     ]
-    assert "telemetry.dev.capture.truncated" not in a
+    # Closed before a terminal response, so the reconstructed output is incomplete.
+    assert a["telemetry.dev.capture.truncated"] is True
 
 
 def test_terminal_responses_output_retains_consumed_provider_events(
@@ -1846,7 +1996,10 @@ def test_final_responses_text_replaces_delta_truncated_output_with_fresh_budget(
             "content": [{"type": "output_text", "text": "Final answer", "annotations": []}],
         }
     ]
-    assert "telemetry.dev.capture.truncated" not in a
+    # The done event resolves the cut deltas; the flag remains because no terminal
+    # response arrived.
+    assert stream._state._budget.truncated is False
+    assert a["telemetry.dev.capture.truncated"] is True
 
 
 def test_final_responses_text_preserves_provider_event_truncation(

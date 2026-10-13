@@ -43,6 +43,15 @@ function loadAls(): AlsConstructor | undefined {
 const WRAPPED = Symbol("telemetry.dev.google-genai.wrapped");
 const ORIGINAL = Symbol("telemetry.dev.google-genai.original");
 const wrappedClients = new WeakSet<object>();
+
+// Older cores enforce captureOutput and masking when the span ends but expose no policy, so
+// withhold incomplete output from their mask. Retention uses the fixed stream bounds either way;
+// maxAttributeLength is only here to satisfy the policy type.
+const LEGACY_CAPTURE_POLICY: NonNullable<SpanHandle["capturePolicy"]> = {
+  output: true,
+  mask: true,
+  maxAttributeLength: 65_536,
+};
 const usageCollectorModels = new WeakSet<object>();
 const AlsCtor = loadAls();
 
@@ -1027,6 +1036,8 @@ class StreamAggregator {
   private outputCaptureEntries = 0;
   private outputCaptureTruncated = false;
   private afcCaptureTruncated = false;
+  // The reconstructed AFC history holds a cut value, such as a folded model-output prefix.
+  private afcInputIncomplete = false;
 
   constructor(private readonly requestInput: unknown) {}
 
@@ -1051,6 +1062,14 @@ class StreamAggregator {
     this.outputCaptureItems += itemCount;
 
     return true;
+  }
+
+  get outputTruncated(): boolean {
+    return this.outputCaptureTruncated;
+  }
+
+  get afcInputTruncated(): boolean {
+    return this.afcInputIncomplete;
   }
 
   private resetOutputCapture(): void {
@@ -1086,8 +1105,11 @@ class StreamAggregator {
     return this.afcHistory;
   }
 
-  private appendAfcHistory(...entries: unknown[]): void {
-    if (!captureEnabled("input")) return;
+  /** Appends whole entries that fit and returns whether any of them was appended. */
+  private appendAfcHistory(...entries: unknown[]): boolean {
+    if (!captureEnabled("input")) return false;
+
+    let appended = false;
 
     for (const entry of entries) {
       const capture = boundedTelemetryCapture([...this.ensureAfcHistory(), entry]);
@@ -1098,15 +1120,23 @@ class StreamAggregator {
       }
 
       this.afcHistory = asArray(capture.value) ?? [];
+      appended = true;
     }
 
-    if (this.outputCaptureTruncated) this.afcCaptureTruncated = true;
+    if (this.outputCaptureTruncated) {
+      this.afcCaptureTruncated = true;
+
+      if (appended) this.afcInputIncomplete = true;
+    }
+
+    return appended;
   }
 
   private replaceAfcHistory(history: unknown[]): void {
     const capture = boundedTelemetryCapture(history);
     this.afcHistory = asArray(capture.value) ?? [];
     this.afcCaptureTruncated = capture.truncated;
+    this.afcInputIncomplete = capture.truncated;
   }
 
   private foldTurn(toAfcHistory: boolean): void {
@@ -1156,12 +1186,18 @@ class StreamAggregator {
 
       if (content && hasFunctionResponse(content)) {
         const capture = boundedTelemetryCapture(copyContent(content));
-
-        if (capture.truncated) this.outputCaptureTruncated = true;
         const capturedContent = asRecord(capture.value);
         this.foldTurn(true);
 
-        if (capturedContent) this.appendAfcHistory(copyContent(capturedContent));
+        const appended =
+          capturedContent !== undefined && this.appendAfcHistory(copyContent(capturedContent));
+
+        if (capture.truncated && captureEnabled("input")) {
+          this.afcCaptureTruncated = true;
+
+          if (appended) this.afcInputIncomplete = true;
+        }
+
         continue;
       }
 
@@ -1300,7 +1336,8 @@ function createObservedStream(
     }
   };
 
-  const finish = (error?: unknown): void => {
+  // `completed` is true only when the source stream reached its end.
+  const finish = (error?: unknown, completed = false): void => {
     if (ended) return;
     ended = true;
     let finalFields: SpanFields = {};
@@ -1310,6 +1347,22 @@ function createObservedStream(
     } catch {
       finalFields = {};
     }
+
+    const interrupted = !completed || error !== undefined;
+
+    if (interrupted) {
+      finalFields.attributes = {
+        ...finalFields.attributes,
+        "telemetry.dev.capture.truncated": true,
+      };
+    }
+
+    const masked = (span.capturePolicy ?? LEGACY_CAPTURE_POLICY).mask;
+
+    if (masked && (interrupted || aggregator.outputTruncated)) delete finalFields.output;
+
+    // Reconstructed AFC history can carry a folded, incomplete model-output prefix.
+    if (masked && aggregator.afcInputTruncated) delete finalFields.input;
 
     if (error !== undefined) finalFields.error = error;
     end(finalFields);
@@ -1324,7 +1377,7 @@ function createObservedStream(
         const step = await iterator.next(value);
         const receivedAt = performance.now();
 
-        if (step.done) finish();
+        if (step.done) finish(undefined, true);
         else recordChunk(step.value, receivedAt);
 
         return step;

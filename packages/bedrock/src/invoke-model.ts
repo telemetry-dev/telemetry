@@ -11,6 +11,7 @@ import {
   parseJson,
   PROVIDER,
   stringValue,
+  StreamRetention,
   type JsonRecord,
   type JsonValue,
   type StreamState,
@@ -251,6 +252,7 @@ function headerNumber<T>(value: T): number | undefined {
 }
 
 export class InvokeModelStreamState implements StreamState {
+  readonly retention = new StreamRetention();
   private readonly chunks: unknown[] = [];
   private text = "";
   private usage: SpanFields["usage"];
@@ -277,8 +279,10 @@ export class InvokeModelStreamState implements StreamState {
       return (typeof raw === "string" || raw instanceof Uint8Array) && raw.length > 0;
     }
 
-    this.chunks.push(parsed);
-    this.text += textFromProviderChunk(parsed);
+    if (this.retention.accept(parsed)) {
+      this.chunks.push(parsed);
+      this.text += textFromProviderChunk(parsed);
+    }
 
     if (isRecord(parsed)) {
       const delta = isRecord(parsed.delta) ? parsed.delta : undefined;

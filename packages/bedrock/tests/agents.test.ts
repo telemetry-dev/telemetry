@@ -89,6 +89,152 @@ test("InvokeAgent aggregates trace usage and return control", async () => {
   });
 });
 
+test.each([false, true])(
+  "InvokeAgent text past the fixed bound is flagged and withheld from a mask (masked %s)",
+  async (masked) => {
+    const seen: string[] = [];
+    const spans = setup(
+      masked
+        ? {
+            mask: (value) => {
+              seen.push(JSON.stringify(value));
+
+              return value;
+            },
+          }
+        : {},
+    );
+
+    const client = wrapBedrockAgents(
+      new FakeClient([
+        {
+          completion: streamOf(
+            Array.from({ length: 1_100 }, () => ({ chunk: { bytes: bytes("x".repeat(100)) } })),
+          ),
+        },
+      ]),
+    );
+
+    const response = (await client.send(
+      new InvokeAgentCommand({ agentId: "agent-1", agentAliasId: "a", sessionId: "s" }),
+    )) as { completion: AsyncIterable<unknown> };
+
+    await collect(response.completion);
+
+    const [span] = spans.getFinishedSpans();
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+
+    if (masked) {
+      expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+      expect(seen.some((value) => value.includes("x".repeat(100)))).toBe(false);
+    } else {
+      const text = jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content as string;
+      expect(text.length).toBeGreaterThan(0);
+      expect(text.length).toBeLessThan(1_100 * 102);
+    }
+  },
+);
+
+test.each([
+  ["trace", { trace: { trace: { orchestrationTrace: { rawResponse: "t".repeat(50_000) } } } }],
+  ["output file", { files: { files: [{ name: "f".repeat(50_000), type: "text/plain" }] } }],
+])(
+  "masked InvokeAgent keeps complete text when only %s metadata passed the bound",
+  async (_kind, metadataEvent) => {
+    const seen: string[] = [];
+    const spans = setup({
+      mask: (value) => {
+        seen.push(JSON.stringify(value));
+
+        return value;
+      },
+    });
+
+    const client = wrapBedrockAgents(
+      new FakeClient([
+        {
+          completion: streamOf([{ chunk: { bytes: bytes("Complete answer") } }, metadataEvent]),
+        },
+      ]),
+      { captureAgentTrace: true },
+    );
+
+    const response = (await client.send(
+      new InvokeAgentCommand({ agentId: "agent-1", agentAliasId: "a", sessionId: "s" }),
+    )) as { completion: AsyncIterable<unknown> };
+
+    await collect(response.completion);
+
+    const [span] = spans.getFinishedSpans();
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    expect(jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content).toBe(
+      JSON.stringify("Complete answer"),
+    );
+    expect(seen.some((value) => value.includes("Complete answer"))).toBe(true);
+  },
+);
+
+test("masked InvokeAgent withholds text when a chunk after the metadata bound is rejected", async () => {
+  const seen: string[] = [];
+  const spans = setup({
+    mask: (value) => {
+      seen.push(JSON.stringify(value));
+
+      return value;
+    },
+  });
+
+  const client = wrapBedrockAgents(
+    new FakeClient([
+      {
+        completion: streamOf([
+          { chunk: { bytes: bytes("Complete answer") } },
+          { trace: { trace: { orchestrationTrace: { rawResponse: "t".repeat(50_000) } } } },
+          { chunk: { bytes: bytes(" and more") } },
+        ]),
+      },
+    ]),
+    { captureAgentTrace: true },
+  );
+
+  const response = (await client.send(
+    new InvokeAgentCommand({ agentId: "agent-1", agentAliasId: "a", sessionId: "s" }),
+  )) as { completion: AsyncIterable<unknown> };
+
+  await collect(response.completion);
+
+  const [span] = spans.getFinishedSpans();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(seen.some((value) => value.includes("Complete answer"))).toBe(false);
+});
+
+test("masked InvokeAgent keeps complete return control after the text bound", async () => {
+  const returnControl = { invocationId: "inv-after-bound" };
+  const spans = setup({ mask: (value) => value });
+
+  const client = wrapBedrockAgents(
+    new FakeClient([
+      {
+        completion: streamOf([
+          ...Array.from({ length: 1_100 }, () => ({ chunk: { bytes: bytes("x".repeat(100)) } })),
+          { returnControl },
+        ]),
+      },
+    ]),
+  );
+
+  const response = (await client.send(
+    new InvokeAgentCommand({ agentId: "agent-1", agentAliasId: "a", sessionId: "s" }),
+  )) as { completion: AsyncIterable<unknown> };
+
+  await collect(response.completion);
+
+  const [span] = spans.getFinishedSpans();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual({ returnControl });
+});
+
 test("Rerank captures queries, sources, model, ranking, and pagination metadata", async () => {
   const spans = setup();
   const modelArn = "arn:aws:bedrock:us-west-2::foundation-model/cohere.rerank-v3-5:0";

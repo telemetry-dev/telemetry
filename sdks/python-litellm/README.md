@@ -116,6 +116,8 @@ Rerank spans emit `gen_ai.operation.name="rerank"`:
 
 Responses spans emit `gen_ai.operation.name="chat"` and capture request input, instructions, sampling options, metadata, response output/status/id, usage, cost, and provider. Streaming Responses events are handled separately from chat chunks; terminal failure and error events mark the span as failed, and early close records the partial output collected so far.
 
+Streamed chat chunks and Responses reconstruction are retained up to 48 KiB and 1,000 items. Non-streamed Responses input and output and rerank input and results are retained up to 64 KiB and 1,024 items. The configured `max_attribute_length` does not shrink these retention bounds; the core applies it to the exported attribute after the mask runs. A chat stream that is cut at its bound, closed early, or fails, and a Responses stream that is cut at its bound, ends without a terminal response, or ends with an `error` event set `telemetry.dev.capture.truncated`. With a mask configured, the incomplete reconstructed output is omitted because the mask cannot inspect the complete value.
+
 Aggregate usage keys are `input_tokens`, `output_tokens`, `total_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, and `reasoning_output_tokens`. The core contract also includes modality fields; Responses usage emits text, image, and audio input/output token details when LiteLLM exposes them.
 
 ## Streaming

@@ -313,12 +313,13 @@ class _InstrumentedStreamingBody(StreamingBody):
     def __init__(
         self,
         body: StreamingBody,
-        finish: Callable[[bytes | None, BaseException | None], None],
+        finish: Callable[[bytes | None, BaseException | None, bool], None],
     ) -> None:
         super().__init__(body, getattr(body, "_content_length", None))
         self._body = body
         self._finish_callback = finish
-        self._budget = telemetry_dev.CaptureBudget.from_client()
+        # Fixed retention bound; the core applies max_attribute_length after the mask.
+        self._budget = telemetry_dev.CaptureBudget()
         self._captured = bytearray()
         self._ended = False
 
@@ -403,7 +404,8 @@ class _InstrumentedStreamingBody(StreamingBody):
             return
         self._ended = True
         captured = bytes(self._captured) if complete and not self._budget.truncated else None
-        self._finish_callback(captured, error)
+        # A body closed early, failed, or cut at the bound exports no output and is flagged.
+        self._finish_callback(captured, error, not complete or self._budget.truncated)
 
 
 def _handle_streaming_body(
@@ -415,7 +417,7 @@ def _handle_streaming_body(
     body = cast(StreamingBody, response["body"])
     base_fields = metadata_fields(response)
 
-    def finish(raw: bytes | None, error: BaseException | None) -> None:
+    def finish(raw: bytes | None, error: BaseException | None, truncated: bool) -> None:
         fields = base_fields
         if raw is not None:
             parsed = parse_body(raw, response.get("contentType"))
@@ -426,6 +428,9 @@ def _handle_streaming_body(
                 )
             except Exception:
                 fields = base_fields
+        if truncated:
+            # An incomplete body cannot be parsed, so no output is exported.
+            fields = merge_fields(fields, {"attributes": {"telemetry.dev.capture.truncated": True}})
         if error is not None:
             fields = merge_fields(fields, error_fields(error))
         end(**fields)

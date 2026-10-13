@@ -1,4 +1,10 @@
-import { startSpan, type SpanFields, type SpanHandle, type SpanType } from "@telemetry-dev/sdk";
+import {
+  boundedCaptureDetails,
+  startSpan,
+  type SpanFields,
+  type SpanHandle,
+  type SpanType,
+} from "@telemetry-dev/sdk";
 
 export const PROVIDER = "amazon-bedrock";
 
@@ -306,9 +312,69 @@ export function parseJson<T>(value: T): JsonValue {
   }
 }
 
+// Retention uses fixed bounds; the core applies maxAttributeLength after the mask.
+export const STREAM_CAPTURE_MAX_BYTES = 48 * 1024;
+export const STREAM_CAPTURE_MAX_ITEMS = 1_000;
+const CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated";
+
+// Older cores enforce captureOutput and masking when the span ends but expose no policy, so
+// withhold incomplete output from their mask. Retention uses the fixed stream bounds either way;
+// maxAttributeLength is only here to satisfy the policy type.
+const LEGACY_CAPTURE_POLICY: NonNullable<SpanHandle["capturePolicy"]> = {
+  output: true,
+  mask: true,
+  maxAttributeLength: 65_536,
+};
+
+/** Tracks the fixed byte and item bound before a stream state retains a value. */
+export class StreamRetention {
+  private bytes = 0;
+  private items = 0;
+  truncated = false;
+
+  accept<T>(value: T): boolean {
+    if (this.truncated) return false;
+
+    const measured = boundedCaptureDetails(value, {
+      maxBytes: STREAM_CAPTURE_MAX_BYTES - this.bytes,
+      maxItems: STREAM_CAPTURE_MAX_ITEMS - this.items,
+    });
+
+    if (measured.truncated) {
+      this.truncated = true;
+
+      return false;
+    }
+
+    this.bytes += measured.bytes;
+    this.items += measured.items;
+
+    return true;
+  }
+}
+
 export interface StreamState {
   feed<T>(event: T): boolean | void;
   finish(partial: boolean): SpanFields;
+  readonly retention: StreamRetention;
+  /** Whether the exported output itself was cut; defaults to the retention flag. */
+  outputTruncated?(): boolean;
+}
+
+function finishStream(state: StreamState, span: SpanHandle, partial: boolean): SpanFields {
+  const fields = state.finish(partial);
+  const interrupted = partial || fields.error !== undefined;
+
+  if (!interrupted && !state.retention.truncated) return fields;
+
+  fields.attributes = { ...fields.attributes, [CAPTURE_TRUNCATED_ATTRIBUTE]: true };
+  const outputTruncated = state.outputTruncated?.() ?? state.retention.truncated;
+
+  if ((span.capturePolicy ?? LEGACY_CAPTURE_POLICY).mask && (interrupted || outputTruncated)) {
+    delete fields.output;
+  }
+
+  return fields;
 }
 
 export function wrapAsyncIterable<T>(
@@ -360,13 +426,13 @@ export function wrapAsyncIterable<T>(
       completed = true;
     } catch (error) {
       endOnce(
-        mergeFields(state.finish(true), awsMetadataFields(metadataOf(error)), {
+        mergeFields(finishStream(state, span, true), awsMetadataFields(metadataOf(error)), {
           error: asError(error),
         }),
       );
       throw error;
     } finally {
-      if (!ended) endOnce(state.finish(!completed));
+      if (!ended) endOnce(finishStream(state, span, !completed));
     }
   };
 
@@ -378,7 +444,7 @@ export function wrapAsyncIterable<T>(
     }
   }
 
-  const finishAbandoned = () => endOnce(safe(() => state.finish(true)));
+  const finishAbandoned = () => endOnce(safe(() => finishStream(state, span, true)));
   wrapped[Symbol.asyncIterator] = () => {
     const iterator = generator();
     STREAM_FINALIZER?.register(iterator, finishAbandoned, unregisterToken);

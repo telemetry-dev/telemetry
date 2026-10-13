@@ -39,6 +39,11 @@ _AFC_USAGE_STATE: contextvars.ContextVar[dict[str, Any] | None] = contextvars.Co
 )
 _MAX_PENDING_VIDEO_OPERATIONS = 1024
 _MAX_CAPTURE_DEPTH = 32
+# Retention uses fixed bounds; the core applies max_attribute_length after the mask.
+_STREAM_CAPTURE_MAX_BYTES = 48 * 1024
+_STREAM_CAPTURE_MAX_ITEMS = 1000
+_CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated"
+_OMIT = object()
 
 _BUILTIN_TOOL_FIELDS = (
     ("google_search", "googleSearch"),
@@ -694,7 +699,34 @@ class _StreamState:
         self.committed_usage: dict[str, int | float] | None = None
         self.prior_contents: list[dict[str, Any]] = []
         self.afc_history: Any = None
-        self.budget = telemetry_dev.CaptureBudget.from_client()
+        self.budget = telemetry_dev.CaptureBudget(
+            _STREAM_CAPTURE_MAX_BYTES, _STREAM_CAPTURE_MAX_ITEMS
+        )
+        self.output_truncated = False
+
+
+def _capture_masked(handle: telemetry_dev.SpanHandle) -> bool:
+    compatible = cast(Any, handle)
+    masked = getattr(compatible, "capture_masked", None)
+    if isinstance(masked, bool):
+        return masked
+    client = getattr(compatible, "_client", None)
+    return getattr(client, "mask", _OMIT) is not None if client is not None else True
+
+
+def _mark_stream_capture(
+    fields: dict[str, Any], state: _StreamState, *, completed: bool, mask_output: bool
+) -> dict[str, Any]:
+    if completed and not state.budget.truncated:
+        return fields
+    attributes = fields.get("attributes")
+    fields["attributes"] = {
+        **(cast(dict[str, Any], attributes) if isinstance(attributes, dict) else {}),
+        _CAPTURE_TRUNCATED_ATTRIBUTE: True,
+    }
+    if mask_output and (not completed or state.output_truncated):
+        fields.pop("output", None)
+    return fields
 
 
 def _append_part(parts: list[Any], native: Any) -> None:
@@ -755,6 +787,8 @@ def _record_chunk_inner(chunk: Any, state: _StreamState) -> None:
             native = _native(part)
             if state.budget.accept(native):
                 _append_part(candidate_state.parts, native)
+            else:
+                state.output_truncated = True
         finish = _enum_value(_field(candidate, "finish_reason"))
         if finish is not None:
             state.finish_reasons[candidate_index] = finish
@@ -934,9 +968,16 @@ class _ObservedStream:
         self._state = _StreamState()
         self._saw_first = False
         self._afc_usage_state = afc_usage_state
+        self._completed = False
+        self._mask_output_when_incomplete = _capture_masked(handle)
 
     def _fields(self) -> dict[str, Any]:
-        return _fields_with_afc_usage(_stream_fields(self._state), self._afc_usage_state)
+        return _mark_stream_capture(
+            _fields_with_afc_usage(_stream_fields(self._state), self._afc_usage_state),
+            self._state,
+            completed=self._completed,
+            mask_output=self._mask_output_when_incomplete,
+        )
 
     def __iter__(self) -> Iterator[Any]:
         try:
@@ -977,6 +1018,7 @@ class _ObservedStream:
             chunk = pull()
             received_at = time.perf_counter()
         except StopIteration:
+            self._completed = True
             self._end(**_clean_fields(self._fields()))
             raise
         except BaseException as exc:
@@ -1019,9 +1061,16 @@ class _ObservedAsyncStream:
         self._state = _StreamState()
         self._saw_first = False
         self._afc_usage_state = afc_usage_state
+        self._completed = False
+        self._mask_output_when_incomplete = _capture_masked(handle)
 
     def _fields(self) -> dict[str, Any]:
-        return _fields_with_afc_usage(_stream_fields(self._state), self._afc_usage_state)
+        return _mark_stream_capture(
+            _fields_with_afc_usage(_stream_fields(self._state), self._afc_usage_state),
+            self._state,
+            completed=self._completed,
+            mask_output=self._mask_output_when_incomplete,
+        )
 
     def __aiter__(self) -> AsyncIterator[Any]:
         return self._iterate()
@@ -1065,6 +1114,7 @@ class _ObservedAsyncStream:
             chunk = await pull()
             received_at = time.perf_counter()
         except StopAsyncIteration:
+            self._completed = True
             self._end(**_clean_fields(self._fields()))
             raise
         except BaseException as exc:
@@ -1377,7 +1427,8 @@ def _media_contents(kwargs: Mapping[str, Any]) -> tuple[Any, bool]:
     client = telemetry_dev.get_client()
     if client is None or not client.capture_input:
         return None, False
-    budget = telemetry_dev.CaptureBudget.from_client()
+    # Fixed retention bound; the core applies max_attribute_length after the mask.
+    budget = telemetry_dev.CaptureBudget()
     try:
         result: dict[str, Any] = {}
         prompt = kwargs.get("prompt")

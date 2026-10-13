@@ -11,6 +11,7 @@ import {
   parseJson,
   PROVIDER,
   stringValue,
+  StreamRetention,
   type JsonRecord,
   type JsonValue,
   type StreamState,
@@ -256,6 +257,7 @@ interface StreamBlock {
 }
 
 export class ConverseStreamState implements StreamState {
+  readonly retention = new StreamRetention();
   private role = "assistant";
   private readonly blocks = new Map<number, StreamBlock>();
   private stopReason: string | undefined;
@@ -282,7 +284,7 @@ export class ConverseStreamState implements StreamState {
 
     const blockStart = isRecord(event.contentBlockStart) ? event.contentBlockStart : undefined;
 
-    if (blockStart) {
+    if (blockStart && this.retention.accept(blockStart.start ?? {})) {
       const index = numberValue(blockStart.contentBlockIndex) ?? this.blocks.size;
       const start = isRecord(blockStart.start) ? blockStart.start : undefined;
       const toolUse = isRecord(start?.toolUse) ? start?.toolUse : undefined;
@@ -316,9 +318,10 @@ export class ConverseStreamState implements StreamState {
 
     const deltaEvent = isRecord(event.contentBlockDelta) ? event.contentBlockDelta : undefined;
 
-    if (deltaEvent) {
+    const delta = isRecord(deltaEvent?.delta) ? deltaEvent.delta : {};
+
+    if (deltaEvent && this.retention.accept(delta)) {
       const index = numberValue(deltaEvent.contentBlockIndex) ?? 0;
-      const delta = isRecord(deltaEvent.delta) ? deltaEvent.delta : {};
       const block = this.blocks.get(index) ?? { kind: "text", text: "" };
       const text = stringValue(delta.text);
 

@@ -10,6 +10,11 @@ import litellm
 import pytest
 import telemetry_dev
 from litellm.exceptions import MidStreamFallbackError
+from litellm.types.utils import (  # pyright: ignore[reportMissingTypeStubs]
+    Delta,
+    ModelResponseStream,
+    StreamingChoices,
+)
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import StatusCode
 
@@ -22,6 +27,10 @@ CHAT_MESSAGES: list[dict[str, str]] = [
     {"role": "system", "content": "You are helpful."},
     {"role": "user", "content": "Say hi"},
 ]
+
+
+def identity_mask(value: Any, _context: Any) -> Any:
+    return value
 
 
 def attrs(span: ReadableSpan) -> dict[str, object]:
@@ -773,6 +782,134 @@ def test_streaming_early_break_ends_span_once_with_partial_output(
     ]
 
 
+def _text_stream_chunks(text: str, *, parts: int = 4) -> list[Any]:
+    size = -(-len(text) // parts)
+    return [
+        ModelResponseStream(
+            id="text-stream",
+            model="gpt-4o-mini",
+            choices=[
+                StreamingChoices(
+                    index=0, delta=Delta(role="assistant", content=text[start : start + size])
+                )
+            ],
+        )
+        for start in range(0, len(text), size)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("max_attribute_length", "redact", "expected"),
+    [
+        (1_000, False, "東" * 400),
+        (1_000, True, "[redacted]"),
+        (0, False, None),
+    ],
+)
+def test_configured_cap_applies_after_the_mask_not_to_stream_retention(
+    make: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    max_attribute_length: int,
+    redact: bool,
+    expected: str | None,
+) -> None:
+    def mask(value: Any, _context: Any) -> Any:
+        if not redact:
+            return value
+        return [{"role": "assistant", "content": "[redacted]"}]
+
+    memory = make(max_attribute_length=max_attribute_length, mask=mask)
+    text = ("東" * 400) if not redact else ("x" * 5_000)
+    chunks = _text_stream_chunks(text)
+
+    def fake_completion(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        return iter(chunks)
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    instrument_litellm()
+    stream = llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+
+    assert list(stream) == chunks
+    assert stream._budget.truncated is False
+    assert len(stream._chunks) == len(chunks)
+    a = attrs(only_span(memory))
+    assert "telemetry.dev.capture.truncated" not in a
+    if expected is None:
+        assert a.get("gen_ai.output.messages", "") == ""
+    else:
+        assert json_attr(a["gen_ai.output.messages"])[0]["content"] == expected
+
+
+def _bulk_stream_chunks(count: int) -> list[Any]:
+    return [
+        ModelResponseStream(
+            id="bulk-stream",
+            model="gpt-4o-mini",
+            choices=[StreamingChoices(index=0, delta=Delta(role="assistant", content="x" * 100))],
+        )
+        for _ in range(count)
+    ]
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("max_attribute_length", [0, 100, 1024 * 1024])
+def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
+    make: Any, monkeypatch: pytest.MonkeyPatch, masked: bool, max_attribute_length: int
+) -> None:
+    seen: list[str] = []
+
+    def mask(value: Any, _context: Any) -> Any:
+        seen.append(json.dumps(value, default=str))
+        return value
+
+    options: dict[str, Any] = {"max_attribute_length": max_attribute_length}
+    if masked:
+        options["mask"] = mask
+    memory = make(**options)
+    chunks = _bulk_stream_chunks(1_100)
+
+    def fake_completion(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        return iter(chunks)
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    instrument_litellm()
+
+    stream = llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+    assert list(stream) == chunks
+
+    budget = stream._budget
+    assert budget.truncated is True
+    assert budget.max_bytes == telemetry_dev_litellm._STREAM_CAPTURE_MAX_BYTES  # pyright: ignore[reportPrivateUsage]
+    assert 0 < len(stream._chunks) < len(chunks)
+    a = attrs(only_span(memory))
+    assert a["telemetry.dev.capture.truncated"] is True
+    if masked:
+        assert "gen_ai.output.messages" not in a
+        assert not any("x" * 100 in value for value in seen)
+    elif max_attribute_length > budget.max_bytes:
+        retained = "x" * 100 * len(stream._chunks)
+        assert json_attr(a["gen_ai.output.messages"])[0]["content"] == retained
+    else:
+        assert len(str(a.get("gen_ai.output.messages", ""))) <= max_attribute_length
+
+
+def test_masked_stream_closed_early_withholds_partial_output(make: Any) -> None:
+    memory = make(mask=identity_mask)
+    instrument_litellm()
+    stream = llm.completion(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "stream"}],
+        stream=True,
+        mock_response="Hello world streaming",
+    )
+    next(stream)
+    stream.close()
+
+    a = attrs(only_span(memory))
+    assert "gen_ai.output.messages" not in a
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
 def test_streaming_mid_stream_error_records_error(memory: SimpleNamespace) -> None:
     instrument_litellm()
     stream = llm.completion(
@@ -1291,6 +1428,13 @@ class CancellingResponsesStream:
         raise self.failure
 
 
+def completed_without_output() -> SimpleNamespace:
+    """A terminal event that ends the stream without replacing the reconstructed output."""
+    terminal = responses_result()
+    terminal.output = None
+    return SimpleNamespace(type="response.completed", response=terminal)
+
+
 def fake_responses_stream(events: list[SimpleNamespace]) -> Any:
     def fake_responses(*args: Any, **kwargs: Any) -> ResponsesStream:
         return ResponsesStream(events)
@@ -1321,6 +1465,24 @@ def test_responses_input_strips_binary_media_and_keeps_remote_references(
     captured = str(attrs(only_span(memory))["gen_ai.input.messages"])
     assert "SECRET_AUDIO" not in captured
     assert "https://example.com/image.png" in captured
+
+
+@pytest.mark.parametrize("max_attribute_length", [0, 100])
+def test_responses_input_capture_ignores_a_small_configured_cap(
+    make: Any, monkeypatch: pytest.MonkeyPatch, max_attribute_length: int
+) -> None:
+    memory = make(max_attribute_length=max_attribute_length)
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream([completed_without_output()]))
+    instrument_litellm()
+
+    list(llm.responses(input="p" * 1_000, model="gpt-4.1-mini", stream=True))
+
+    a = attrs(only_span(memory))
+    assert "telemetry.dev.capture.truncated" not in a
+    exported = str(a.get("gen_ai.input.messages", ""))
+    assert len(exported) <= max_attribute_length
+    if max_attribute_length:
+        assert exported.endswith("...[truncated]")
 
 
 def test_responses_input_capture_disabled_does_not_traverse_input(
@@ -1638,6 +1800,58 @@ def test_responses_stream_only_buffers_bounded_output_text(
     assert a["telemetry.dev.capture.truncated"] is True
 
 
+@pytest.mark.parametrize("max_attribute_length", [0, 100, 1024 * 1024])
+def test_masked_responses_stream_beyond_the_fixed_bound_is_withheld(
+    make: Any, monkeypatch: pytest.MonkeyPatch, max_attribute_length: int
+) -> None:
+    seen: list[str] = []
+
+    def mask(value: Any, _context: Any) -> Any:
+        seen.append(json.dumps(value, default=str))
+        return value
+
+    memory = make(mask=mask, max_attribute_length=max_attribute_length)
+    terminal = responses_result()
+    terminal.output = [{"type": "output_text", "text": "y" * 100_000}]
+    events = [
+        SimpleNamespace(type="response.output_text.delta", delta="retained"),
+        SimpleNamespace(type="response.output_text.delta", delta="x" * 100_000),
+        SimpleNamespace(type="response.completed", response=terminal),
+    ]
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    list(llm.responses(input="bounded", model="gpt-4.1-mini", stream=True))
+
+    a = attrs(only_span(memory))
+    assert a["telemetry.dev.capture.truncated"] is True
+    assert "gen_ai.output.messages" not in a
+    assert not any("retained" in value for value in seen)
+
+
+def test_responses_stream_small_cap_keeps_retention_and_cuts_after_the_mask(
+    make: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory = make(max_attribute_length=100, mask=identity_mask)
+    text = "x" * 5_000
+    events = [
+        SimpleNamespace(type="response.output_text.delta", delta=text),
+        completed_without_output(),
+    ]
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+
+    stream = llm.responses(input="bounded", model="gpt-4.1-mini", stream=True)
+    list(stream)
+
+    assert stream._budget.truncated is False
+    a = attrs(only_span(memory))
+    assert "telemetry.dev.capture.truncated" not in a
+    exported = str(a["gen_ai.output.messages"])
+    assert len(exported) <= 100
+    assert exported.endswith("...[truncated]")
+
+
 def test_responses_stream_accounts_for_small_deltas_incrementally(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1662,7 +1876,7 @@ def test_responses_stream_accounts_for_small_deltas_incrementally(
             content_index=0,
             delta="x",
         )
-        for _ in range(1_000)
+        for _ in range(900)
     ]
     monkeypatch.setattr(telemetry_dev.CaptureBudget, "accept", accept)
     monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
@@ -1673,7 +1887,7 @@ def test_responses_stream_accounts_for_small_deltas_incrementally(
     assert sum(accepted_text_lengths) <= 2_000
     assert max(accepted_text_lengths) < 100
     assert json_attr(attrs(only_span(memory))["gen_ai.output.messages"]) == [
-        {"type": "output_text", "text": "x" * 1_000}
+        {"type": "output_text", "text": "x" * 900}
     ]
 
 
@@ -1692,7 +1906,7 @@ def test_responses_stream_accounts_for_annotations_without_remeasuring_text(
             )
         return original_accept(budget, cast(object, value))
 
-    text = "x" * 59_000
+    text = "x" * (telemetry_dev_litellm._STREAM_CAPTURE_MAX_BYTES - 5_000)  # pyright: ignore[reportPrivateUsage]
     events = [
         SimpleNamespace(
             type="response.output_text.delta",
@@ -1729,7 +1943,7 @@ def test_responses_stream_accounts_for_annotations_without_remeasuring_text(
 def test_responses_stream_rejected_annotation_preserves_text_and_marks_truncated(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    text = "x" * 59_000
+    text = "x" * (telemetry_dev_litellm._STREAM_CAPTURE_MAX_BYTES - 5_000)  # pyright: ignore[reportPrivateUsage]
     events = [
         SimpleNamespace(
             type="response.output_text.delta",
@@ -1950,13 +2164,6 @@ def test_responses_stream_terminal_item_preserves_truncation_overflow(
 async def test_responses_stream_terminal_items_do_not_erase_untracked_overflow(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    original_budget = telemetry_dev.CaptureBudget.from_client
-
-    def limited_budget() -> telemetry_dev.CaptureBudget:
-        budget = original_budget()
-        budget.max_items = 8
-        return budget
-
     def events() -> list[SimpleNamespace]:
         return [
             *[
@@ -1987,11 +2194,7 @@ async def test_responses_stream_terminal_items_do_not_erase_untracked_overflow(
     async def fake_aresponses(*args: Any, **kwargs: Any) -> AsyncResponsesStream:
         return async_inner
 
-    monkeypatch.setattr(
-        telemetry_dev.CaptureBudget,
-        "from_client",
-        staticmethod(limited_budget),
-    )
+    monkeypatch.setattr(telemetry_dev_litellm, "_STREAM_CAPTURE_MAX_ITEMS", 8)
     monkeypatch.setattr(litellm, "responses", fake_responses)
     monkeypatch.setattr(litellm, "aresponses", fake_aresponses)
     instrument_litellm()
@@ -2038,6 +2241,7 @@ def test_responses_stream_terminal_items_clear_multi_owner_truncation(
                 content_index=0,
                 delta="fits",
             ),
+            completed_without_output(),
         ]
     )
     monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
@@ -2224,6 +2428,7 @@ def test_responses_stream_content_done_replaces_matching_text_deltas(
             content_index=7,
             part={"type": "output_text", "text": "Hello"},
         ),
+        completed_without_output(),
     ]
 
     monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
@@ -2239,35 +2444,28 @@ def test_responses_stream_content_done_replaces_matching_text_deltas(
 def test_responses_stream_content_done_resolves_each_rejected_part(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    original_budget = telemetry_dev.CaptureBudget.from_client
-
-    def limited_budget() -> telemetry_dev.CaptureBudget:
-        budget = original_budget()
-        budget.max_bytes = 500
-        return budget
-
-    monkeypatch.setattr(
-        telemetry_dev.CaptureBudget,
-        "from_client",
-        staticmethod(limited_budget),
+    monkeypatch.setattr(telemetry_dev_litellm, "_STREAM_CAPTURE_MAX_BYTES", 500)
+    events = (
+        [
+            SimpleNamespace(
+                type="response.output_text.delta",
+                output_index=4,
+                content_index=index,
+                delta="x" * 1_000,
+            )
+            for index in range(2)
+        ]
+        + [
+            SimpleNamespace(
+                type="response.content_part.done",
+                output_index=4,
+                content_index=index,
+                part={"type": "output_text", "text": text},
+            )
+            for index, text in enumerate(("A", "B"))
+        ]
+        + [completed_without_output()]
     )
-    events = [
-        SimpleNamespace(
-            type="response.output_text.delta",
-            output_index=4,
-            content_index=index,
-            delta="x" * 1_000,
-        )
-        for index in range(2)
-    ] + [
-        SimpleNamespace(
-            type="response.content_part.done",
-            output_index=4,
-            content_index=index,
-            part={"type": "output_text", "text": text},
-        )
-        for index, text in enumerate(("A", "B"))
-    ]
     monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
     instrument_litellm()
 
@@ -2356,18 +2554,7 @@ def test_responses_stream_reconstructs_refusal_and_function_arguments(
 def test_responses_stream_replacement_resets_exhausted_partial_budget(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, replacement: str
 ) -> None:
-    original_budget = telemetry_dev.CaptureBudget.from_client
-
-    def limited_budget() -> telemetry_dev.CaptureBudget:
-        budget = original_budget()
-        budget.max_bytes = 500
-        return budget
-
-    monkeypatch.setattr(
-        telemetry_dev.CaptureBudget,
-        "from_client",
-        staticmethod(limited_budget),
-    )
+    monkeypatch.setattr(telemetry_dev_litellm, "_STREAM_CAPTURE_MAX_BYTES", 500)
     events = [
         SimpleNamespace(
             type="response.output_text.delta",
@@ -2392,6 +2579,7 @@ def test_responses_stream_replacement_resets_exhausted_partial_budget(
                 item={"id": "msg_done", "type": "message", "content": []},
             )
         )
+        events.append(completed_without_output())
     else:
         expected = [{"type": "output_text", "text": "terminal"}]
         terminal = responses_result()
@@ -2411,18 +2599,7 @@ def test_responses_stream_replacement_resets_exhausted_partial_budget(
 def test_responses_stream_oversized_terminal_retains_bounded_partial(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    original_budget = telemetry_dev.CaptureBudget.from_client
-
-    def limited_budget() -> telemetry_dev.CaptureBudget:
-        budget = original_budget()
-        budget.max_bytes = 500
-        return budget
-
-    monkeypatch.setattr(
-        telemetry_dev.CaptureBudget,
-        "from_client",
-        staticmethod(limited_budget),
-    )
+    monkeypatch.setattr(telemetry_dev_litellm, "_STREAM_CAPTURE_MAX_BYTES", 500)
     terminal = responses_result()
     terminal.output = [{"type": "output_text", "text": "x" * 1_000}]
     events = [
@@ -2450,18 +2627,7 @@ def test_responses_stream_oversized_terminal_retains_bounded_partial(
 def test_responses_stream_keeps_a_prefix_after_a_rejected_delta(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    original_budget = telemetry_dev.CaptureBudget.from_client
-
-    def limited_budget() -> telemetry_dev.CaptureBudget:
-        budget = original_budget()
-        budget.max_bytes = 500
-        return budget
-
-    monkeypatch.setattr(
-        telemetry_dev.CaptureBudget,
-        "from_client",
-        staticmethod(limited_budget),
-    )
+    monkeypatch.setattr(telemetry_dev_litellm, "_STREAM_CAPTURE_MAX_BYTES", 500)
     terminal = responses_result()
     terminal.output = [{"type": "output_text", "text": "x" * 1_000}]
     events = [

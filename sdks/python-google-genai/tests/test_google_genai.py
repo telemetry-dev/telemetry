@@ -35,6 +35,10 @@ def redact_media(_value: Any, context: telemetry_dev.MaskContext) -> str:
     return f"redacted:{context.key}"
 
 
+def identity_mask(value: Any, _context: Any) -> Any:
+    return value
+
+
 def only_span(env: SimpleNamespace) -> ReadableSpan:
     spans = env.span_exporter.get_finished_spans()
     assert len(spans) == 1
@@ -218,6 +222,29 @@ def test_generate_images_is_media_span_without_binary_capture(memory: SimpleName
     assert a["gen_ai.output.type"] == "image"
     assert a["gen_ai.provider.name"] == "gcp.vertex_ai"
     assert "AAAA" not in json.dumps(a)
+
+
+@pytest.mark.parametrize("max_attribute_length", [0, 100])
+def test_media_input_capture_ignores_a_small_configured_cap(
+    make: Any, max_attribute_length: int
+) -> None:
+    env = make(max_attribute_length=max_attribute_length)
+    client, _transport = client_with_transport([])
+
+    def generate_images(**_kwargs: Any) -> dict[str, Any]:
+        return {"generatedImages": [{"image": {"gcsUri": "gs://bucket/output.png"}}]}
+
+    client.models.generate_images = generate_images
+    wrap_google_genai(client).models.generate_images(
+        model="imagen-4.0-generate-001", prompt="p" * 1_000
+    )
+
+    a = attrs(only_span(env))
+    assert "telemetry.dev.capture.truncated" not in a
+    exported = str(a.get("gen_ai.input.messages", ""))
+    assert len(exported) <= max_attribute_length
+    if max_attribute_length:
+        assert exported.endswith("...[truncated]")
 
 
 @pytest.mark.parametrize(
@@ -1122,6 +1149,105 @@ def test_streaming_bounds_payload_without_dropping_terminal_metadata(
     assert "google_genai.response.prompt_safety_ratings" not in a
     output = json.loads(str(a["gen_ai.output.messages"]))
     assert output[0]["parts"][0]["text"] == retained_text
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def _streamed_text(memory: SimpleNamespace, texts: list[str]) -> tuple[Any, dict[str, object]]:
+    chunks: list[dict[str, Any]] = [
+        {"candidates": [{"index": 0, "content": {"role": "model", "parts": [{"text": text}]}}]}
+        for text in texts
+    ]
+    chunks.append(
+        {
+            "candidates": [
+                {"index": 0, "content": {"role": "model", "parts": []}, "finishReason": "STOP"}
+            ]
+        }
+    )
+    client, _transport = client_with_transport([chunks])
+    stream = wrap_google_genai(client).models.generate_content_stream(
+        model="gemini-2.5-flash", contents=USER_CONTENT
+    )
+    assert len(list(stream)) == len(chunks)
+    return stream._state, attrs(only_span(memory))
+
+
+@pytest.mark.parametrize(
+    ("max_attribute_length", "redact", "expected"),
+    [
+        (1_000, False, "東" * 400),
+        (1_000, True, "[redacted]"),
+        (0, False, None),
+    ],
+)
+def test_configured_cap_applies_after_the_mask_not_to_stream_retention(
+    make: Any, max_attribute_length: int, redact: bool, expected: str | None
+) -> None:
+    def mask(value: Any, context: telemetry_dev.MaskContext) -> Any:
+        if not redact or context.key != "gen_ai.output.messages":
+            return value
+        return [{"role": "model", "parts": [{"text": "[redacted]"}]}]
+
+    memory = make(max_attribute_length=max_attribute_length, mask=mask)
+    text = ("東" * 400) if not redact else ("x" * 5_000)
+
+    state, a = _streamed_text(memory, [text])
+
+    assert state.budget.truncated is False
+    assert state.candidates[0].parts == [{"text": text}]
+    assert "telemetry.dev.capture.truncated" not in a
+    if expected is None:
+        assert a.get("gen_ai.output.messages", "") == ""
+    else:
+        output = json.loads(str(a["gen_ai.output.messages"]))
+        assert output[0]["parts"][0]["text"] == expected
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("max_attribute_length", [0, 100, 1024 * 1024])
+def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
+    make: Any, masked: bool, max_attribute_length: int
+) -> None:
+    seen: list[str] = []
+
+    def mask(value: Any, _context: Any) -> Any:
+        seen.append(json.dumps(value, default=str))
+        return value
+
+    options: dict[str, Any] = {"max_attribute_length": max_attribute_length}
+    if masked:
+        options["mask"] = mask
+    memory = make(**options)
+
+    state, a = _streamed_text(memory, ["x" * 100] * 1_100)
+
+    retained = "".join(part["text"] for part in state.candidates[0].parts)
+    assert state.budget.truncated is True
+    assert state.budget.max_bytes == google_genai_instrumentation._STREAM_CAPTURE_MAX_BYTES  # pyright: ignore[reportPrivateUsage]
+    assert 0 < len(retained) < 1_100 * 100
+    assert a["telemetry.dev.capture.truncated"] is True
+    if masked:
+        assert "gen_ai.output.messages" not in a
+        assert not any("x" * 100 in value for value in seen)
+    elif max_attribute_length > len(retained):
+        output = json.loads(str(a["gen_ai.output.messages"]))
+        assert output[0]["parts"][0]["text"] == retained
+    else:
+        assert len(str(a.get("gen_ai.output.messages", ""))) <= max_attribute_length
+
+
+def test_masked_stream_closed_early_withholds_partial_output(make: Any) -> None:
+    memory = make(mask=identity_mask)
+    client, _transport = client_with_transport([stream_chunks()])
+    stream = wrap_google_genai(client).models.generate_content_stream(
+        model="gemini-2.5-flash", contents=USER_CONTENT
+    )
+    for _chunk in stream:
+        break
+
+    a = attrs(only_span(memory))
+    assert "gen_ai.output.messages" not in a
+    assert a["telemetry.dev.capture.truncated"] is True
 
 
 def test_streaming_rejects_oversized_grounding_without_dropping_terminal_metadata(
@@ -1323,9 +1449,11 @@ def test_streaming_early_break(memory: SimpleNamespace, async_mode: bool) -> Non
             assert chunk.text == "Hello"
             break
 
-    assert json.loads(str(attrs(only_span(memory))["gen_ai.output.messages"])) == [
+    a = attrs(only_span(memory))
+    assert json.loads(str(a["gen_ai.output.messages"])) == [
         {"role": "model", "parts": [{"text": "Hello"}]}
     ]
+    assert a["telemetry.dev.capture.truncated"] is True
 
 
 def test_sync_stream_early_break_closes_inner_iterator(memory: SimpleNamespace) -> None:

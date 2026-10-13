@@ -107,6 +107,7 @@ function setupSpans(
     captureInput?: boolean;
     captureOutput?: boolean;
     mask?: (value: unknown, context: { key: string }) => unknown;
+    maxAttributeLength?: number;
   } = {},
 ): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
@@ -1215,6 +1216,7 @@ test("streaming mid-stream error records error status with partial output", asyn
   expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
     { role: "model", parts: [{ text: "partial" }] },
   ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
 test.each<{ partialArgs: JsonValue[] }>([
@@ -1465,6 +1467,305 @@ test("streaming early break ends span with partial aggregate", async () => {
   expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
     { role: "model", parts: [{ text: "first" }] },
   ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("masked streaming early break withholds partial output", async () => {
+  const seen: string[] = [];
+  const spans = setupSpans({
+    mask: (value) => {
+      seen.push(JSON.stringify(value));
+
+      return value;
+    },
+  });
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield { candidates: [{ content: { role: "model", parts: [{ text: "first" }] } }] };
+        yield { candidates: [{ content: { role: "model", parts: [{ text: "second" }] } }] };
+      },
+    },
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: "go" }),
+  );
+
+  for await (const _chunk of stream) break;
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(seen.some((value) => value.includes("first"))).toBe(false);
+});
+
+test.each([0, 100, 1024 * 1024])(
+  "streaming past the fixed bound is flagged and withheld from a mask (maxAttributeLength %i)",
+  async (maxAttributeLength) => {
+    const seen: string[] = [];
+    const spans = setupSpans({
+      maxAttributeLength,
+      mask: (value) => {
+        seen.push(JSON.stringify(value));
+
+        return value;
+      },
+    });
+
+    const client = wrapGoogleGenAI({
+      models: {
+        async *generateContentStream(_params: unknown) {
+          for (let index = 0; index < 1_100; index += 1) {
+            yield {
+              candidates: [{ content: { role: "model", parts: [{ text: "x".repeat(100) }] } }],
+            };
+          }
+
+          yield { candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP" }] };
+        },
+      },
+    });
+
+    const stream = await Promise.resolve(
+      client.models.generateContentStream({ model: "gemini", contents: "go" }),
+    );
+
+    for await (const _chunk of stream) {
+    }
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+    expect(seen.some((value) => value.includes("x".repeat(100)))).toBe(false);
+  },
+);
+
+test.each([
+  [1_000, false, "東".repeat(400)],
+  [1_000, true, "[redacted]"],
+  [0, false, undefined],
+] as const)(
+  "maxAttributeLength %i cuts the exported stream output after the mask, not retention (redact %s)",
+  async (maxAttributeLength, redact, expected) => {
+    const spans = setupSpans({
+      maxAttributeLength,
+      mask: (value, context) =>
+        redact && context.key === "gen_ai.output.messages"
+          ? [{ role: "model", parts: [{ text: "[redacted]" }] }]
+          : value,
+    });
+    const text = redact ? "x".repeat(5_000) : "東".repeat(400);
+
+    const client = wrapGoogleGenAI({
+      models: {
+        async *generateContentStream(_params: unknown) {
+          yield { candidates: [{ content: { role: "model", parts: [{ text }] } }] };
+        },
+      },
+    });
+
+    const stream = await Promise.resolve(
+      client.models.generateContentStream({ model: "gemini", contents: "go" }),
+    );
+
+    for await (const _chunk of stream) {
+    }
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+
+    if (expected === undefined) {
+      expect(span.attributes["gen_ai.output.messages"] ?? "").toBe("");
+    } else {
+      const output = jsonAttr<Array<{ parts?: Array<{ text?: string }> }>>(
+        span,
+        "gen_ai.output.messages",
+      );
+      expect(output[0]?.parts?.[0]?.text).toBe(expected);
+    }
+  },
+);
+
+test.each([false, true])(
+  "masked streaming AFC withholds history holding incomplete model output (authoritative history %s)",
+  async (authoritative) => {
+    const seen: string[] = [];
+    const spans = setupSpans({
+      mask: (value) => {
+        seen.push(JSON.stringify(value));
+
+        return value;
+      },
+    });
+
+    const history = [
+      { role: "user", parts: [{ text: "go" }] },
+      { role: "model", parts: [{ functionCall: { name: "lookup", args: {} } }] },
+      { role: "user", parts: [{ functionResponse: { name: "lookup", response: { ok: true } } }] },
+    ];
+
+    const client = wrapGoogleGenAI({
+      models: {
+        async *generateContentStream(_params: unknown) {
+          yield { candidates: [{ content: { role: "model", parts: [{ text: "kept-prefix" }] } }] };
+          yield {
+            candidates: [{ content: { role: "model", parts: [{ text: "x".repeat(60_000) }] } }],
+          };
+          yield {
+            candidates: [
+              {
+                content: {
+                  role: "user",
+                  parts: [{ functionResponse: { name: "lookup", response: { ok: true } } }],
+                },
+              },
+            ],
+          };
+          yield {
+            candidates: [
+              {
+                content: { role: "model", parts: [{ text: "final answer" }] },
+                finishReason: "STOP",
+              },
+            ],
+            ...(authoritative ? { automaticFunctionCallingHistory: history } : {}),
+          };
+        },
+      },
+    });
+
+    const stream = await Promise.resolve(
+      client.models.generateContentStream({ model: "gemini", contents: "go" }),
+    );
+
+    for await (const _chunk of stream) {
+    }
+
+    const span = await exportedSpan(spans);
+    expect(seen.some((value) => value.includes("kept-prefix"))).toBe(false);
+    expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+      { role: "model", parts: [{ text: "final answer" }] },
+    ]);
+
+    if (authoritative) {
+      expect(messagesAttr(span, "gen_ai.input.messages")).toEqual(history);
+      expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+    } else {
+      expect(String(span.attributes["gen_ai.input.messages"] ?? "")).not.toContain("kept-prefix");
+      expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    }
+  },
+);
+
+test("masked streaming AFC flags a cut function response and keeps it from the mask", async () => {
+  const seen: string[] = [];
+  const spans = setupSpans({
+    mask: (value) => {
+      seen.push(JSON.stringify(value));
+
+      return value;
+    },
+  });
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield {
+          candidates: [
+            {
+              content: {
+                role: "user",
+                parts: [
+                  {
+                    functionResponse: {
+                      name: "lookup",
+                      response: { body: `fr-start${"y".repeat(60_000)}` },
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        };
+        yield {
+          candidates: [
+            { content: { role: "model", parts: [{ text: "final answer" }] }, finishReason: "STOP" },
+          ],
+        };
+      },
+    },
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: "go" }),
+  );
+
+  for await (const _chunk of stream) {
+  }
+
+  const span = await exportedSpan(spans);
+  expect(seen.some((value) => value.includes("fr-start"))).toBe(false);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "model", parts: [{ text: "final answer" }] },
+  ]);
+});
+
+test("masked streaming AFC keeps a complete model turn when a later cut function response is dropped", async () => {
+  const seen: string[] = [];
+  const spans = setupSpans({
+    mask: (value) => {
+      seen.push(JSON.stringify(value));
+
+      return value;
+    },
+  });
+  const turn = `complete-turn${"t".repeat(30_000)}`;
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield { candidates: [{ content: { role: "model", parts: [{ text: turn }] } }] };
+        yield {
+          candidates: [
+            {
+              content: {
+                role: "user",
+                parts: [
+                  {
+                    functionResponse: {
+                      name: "lookup",
+                      // The bound drops body and keeps keep, but the cut response then no longer
+                      // fits next to the model turn and is left out of the history whole.
+                      response: { body: "x".repeat(60_000), keep: "k".repeat(30_000) },
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        };
+        yield {
+          candidates: [
+            { content: { role: "model", parts: [{ text: "final answer" }] }, finishReason: "STOP" },
+          ],
+        };
+      },
+    },
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: "go" }),
+  );
+
+  for await (const _chunk of stream) {
+  }
+
+  const span = await exportedSpan(spans);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(seen.some((value) => value.includes("complete-turn"))).toBe(true);
+  expect(String(span.attributes["gen_ai.input.messages"])).toContain("complete-turn");
 });
 
 test("streaming return before first chunk ends span", async () => {

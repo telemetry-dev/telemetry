@@ -101,9 +101,13 @@ still execute and return their normal SDK values without exporting telemetry.
 ## Limitations
 
 - Unconsumed streams end their spans only when the stream is exhausted, errors, or is closed.
-- Streaming output is retained only up to the core SDK capture budget; terminal metadata and usage
-  can still be recorded after the budget is reached. A span with partial captured output includes
-  `telemetry.dev.capture.truncated = true`.
+- Streaming output is retained up to 64 KiB and 1,024 items; terminal metadata and usage can still
+  be recorded after the bound is reached. The configured `max_attribute_length` does not shrink this
+  retention bound; the core applies it to the exported attribute after the mask runs.
+- A chat stream that is cut at the bound, closed early, or fails, and a Responses stream that is cut
+  at the bound, ends without a terminal response, or ends with an `error` event set
+  `telemetry.dev.capture.truncated = true`. With a mask configured, the incomplete reconstructed
+  output is omitted because the mask cannot inspect the complete value.
 - Only the SDK methods listed above are instrumented in this version.
 - Video generation (`client.video_generation`) is not traced; submitted and polled video jobs produce
   no spans.

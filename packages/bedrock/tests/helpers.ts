@@ -1,9 +1,11 @@
 import { InMemoryLogRecordExporter } from "@opentelemetry/sdk-logs";
 import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
 
-import { init, shutdown } from "@telemetry-dev/sdk";
+import { init, shutdown, type MaskFn } from "@telemetry-dev/sdk";
 
-export function setup(): InMemorySpanExporter {
+export function setup(
+  options: { mask?: MaskFn; maxAttributeLength?: number } = {},
+): InMemorySpanExporter {
   const spans = new InMemorySpanExporter();
   init(
     {
@@ -13,6 +15,7 @@ export function setup(): InMemorySpanExporter {
       exportMode: "immediate",
       logLevel: "silent",
       fetch: async () => new Response(null, { status: 200 }),
+      ...options,
     },
     { spanExporter: spans, logRecordExporter: new InMemoryLogRecordExporter() },
   );
