@@ -72,6 +72,8 @@ interface UnknownRecord {
 interface RequestMapping {
   name: string;
   fields: SpanFields & { type: "generation" | "embedding" };
+  /** Captured fields that were cut to the retention bound. */
+  cut?: Array<"input" | "systemInstructions">;
 }
 
 interface VideoOperationTracker {
@@ -456,10 +458,16 @@ function generateRequestFields(params: UnknownRecord): RequestMapping {
 
   if (Object.keys(attributes).length > 0) fields.attributes = attributes;
 
-  return { name: `chat ${model ?? "unknown"}`, fields };
+  const cut: RequestMapping["cut"] = [];
+
+  if (input?.truncated) cut.push("input");
+
+  if (systemInstructions?.truncated) cut.push("systemInstructions");
+
+  return { name: `chat ${model ?? "unknown"}`, fields, cut };
 }
 
-function generateResponseFields(response: unknown): SpanFields {
+function generateResponseFields(response: unknown, withholdCut = false): SpanFields {
   const record = asRecord(response) ?? {};
   const candidates = asArray(record.candidates) ?? [];
 
@@ -475,7 +483,7 @@ function generateResponseFields(response: unknown): SpanFields {
     responseModel: readString(record.modelVersion),
     responseId: readString(record.responseId),
     finishReason: finishReasons[0],
-    output: output.value,
+    output: output.truncated && withholdCut ? undefined : output.value,
     usage: usageFromMetadata(record.usageMetadata),
   };
 
@@ -483,7 +491,7 @@ function generateResponseFields(response: unknown): SpanFields {
 
   if (captureEnabled("input") && afcHistory && afcHistory.length > 0) {
     const capture = boundedTelemetryCapture(afcHistory);
-    fields.input = capture.value;
+    fields.input = capture.truncated && withholdCut ? undefined : capture.value;
 
     if (capture.truncated) attributes["telemetry.dev.capture.truncated"] = true;
   }
@@ -672,6 +680,7 @@ function mediaRequestFields(
       outputType,
       attributes,
     },
+    cut: input?.truncated ? ["input"] : undefined,
   };
 }
 
@@ -776,6 +785,28 @@ function safeRequestMapping(
   }
 }
 
+// A capture cut to the retention bound keeps its truncated flag, but a mask cannot be trusted to
+// redact a value it only sees part of. Cores without a capture policy are treated as masked.
+function capturesWithMask(span: SpanHandle): boolean {
+  return span.capturePolicy?.mask ?? true;
+}
+
+function startRequestSpan(request: RequestMapping, provider: string): SpanHandle {
+  const fields = { ...request.fields, provider };
+  const cut = request.cut?.filter((key) => fields[key] !== undefined) ?? [];
+
+  if (cut.length === 0) return startSpan(request.name, fields);
+
+  // The mask policy is only known once the span exists, so cut fields are attached afterwards.
+  const withheld: SpanFields = Object.fromEntries(cut.map((key) => [key, undefined]));
+  const span = startSpan(request.name, { ...fields, ...withheld });
+
+  if (!capturesWithMask(span))
+    span.update(Object.fromEntries(cut.map((key) => [key, fields[key]])) as SpanFields);
+
+  return span;
+}
+
 function safeResponseFields(
   mapResponse: (response: unknown) => SpanFields,
   response: unknown,
@@ -842,7 +873,7 @@ function installInternalUsageCollector(models: UnknownRecord | undefined): void 
 function wrapUnary(
   original: (...args: unknown[]) => unknown,
   mapRequest: (params: UnknownRecord) => RequestMapping,
-  mapResponse: (response: unknown) => SpanFields,
+  mapResponse: (response: unknown, withholdCut?: boolean) => SpanFields,
   provider: string,
   fallback: RequestFallback,
   models?: UnknownRecord,
@@ -852,7 +883,7 @@ function wrapUnary(
   const wrapped = function (this: unknown, ...args: unknown[]) {
     const params = asRecord(args[0]) ?? {};
     const request = safeRequestMapping(params, mapRequest, fallback);
-    const span = startSpan(request.name, { ...request.fields, provider });
+    const span = startRequestSpan(request, provider);
     const end = endOnce(span);
     const usageStore = afcUsageStore;
 
@@ -862,7 +893,10 @@ function wrapUnary(
     if (internalUsage) installInternalUsageCollector(models);
 
     const finishResponse = (response: unknown) => {
-      const fields = safeResponseFields(mapResponse, response);
+      const fields = safeResponseFields(
+        (value) => mapResponse(value, capturesWithMask(span)),
+        response,
+      );
 
       if (internalUsage?.usage) fields.usage = internalUsage.usage;
       const toolUsePromptTokens = readNumber(internalUsage?.toolUsePromptTokens);
@@ -1477,7 +1511,7 @@ function wrapStream(
   const wrapped = function (this: unknown, ...args: unknown[]) {
     const params = asRecord(args[0]) ?? {};
     const request = safeRequestMapping(params, mapRequest, fallback);
-    const span = startSpan(request.name, { ...request.fields, provider });
+    const span = startRequestSpan(request, provider);
     const end = endOnce(span);
     const startedAt = Date.now();
 
@@ -1511,7 +1545,7 @@ function patchModelsMethod(
   models: UnknownRecord,
   key: string,
   mapRequest: (params: UnknownRecord) => RequestMapping,
-  mapResponse: (response: unknown) => SpanFields,
+  mapResponse: (response: unknown, withholdCut?: boolean) => SpanFields,
   provider: string,
   fallback: RequestFallback,
   streaming = false,

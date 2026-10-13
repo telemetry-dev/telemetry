@@ -32,6 +32,7 @@ import {
   stringValue,
   wrapAsyncIterable,
   endSpan,
+  endSpanWithBoundedOutput,
   type BedrockInstrumentationOptions,
 } from "./internal.ts";
 
@@ -154,7 +155,7 @@ export const AGENT_HANDLERS = {
     spanType: () => "span",
     requestFields: rerankRequestFields,
     onResult(result, span) {
-      endSpan(span, rerankResponseFields(result));
+      endSpanWithBoundedOutput(span, rerankResponseFields(result));
 
       return result;
     },

@@ -636,7 +636,7 @@ function finalizeParsedValue<T>(value: T, ctx: TracePromiseContext): T | Stream<
   }
 
   try {
-    ctx.end(ctx.mapResponse(value));
+    ctx.end(withholdCutOutput(ctx.span, ctx.mapResponse(value)));
   } catch (cause) {
     reportSpanError(ctx.span, cause);
     ctx.end({ attributes: { "telemetry.dev.capture.truncated": true } });
@@ -1596,6 +1596,37 @@ const LEGACY_CAPTURE_POLICY: NonNullable<SpanHandle["capturePolicy"]> = {
   maxAttributeLength: 65_536,
 };
 
+function capturesWithMask(span: SpanHandle): boolean {
+  return (span.capturePolicy ?? LEGACY_CAPTURE_POLICY).mask;
+}
+
+// A capture cut to the retention bound keeps its truncated flag, but a mask cannot be trusted to
+// redact a value it only sees part of, so the cut value is withheld when a mask is configured.
+function withholdCutOutput(span: SpanHandle, fields: SpanFields): SpanFields {
+  if (
+    fields.output === undefined ||
+    fields.attributes?.["telemetry.dev.capture.truncated"] !== true ||
+    !capturesWithMask(span)
+  )
+    return fields;
+
+  return { ...fields, output: undefined };
+}
+
+function startRequestSpan(name: string, fields: StartSpanOptions): SpanHandle {
+  const cut =
+    fields.input !== undefined && fields.attributes?.["telemetry.dev.capture.truncated"] === true;
+
+  if (!cut) return startSpan(name, fields);
+
+  // The mask policy is only known once the span exists, so a cut input is attached afterwards.
+  const span = startSpan(name, { ...fields, input: undefined });
+
+  if (!capturesWithMask(span)) span.update({ input: fields.input });
+
+  return span;
+}
+
 function reportSpanError(span: SpanHandle, cause: unknown): void {
   try {
     span.reportError?.(cause);
@@ -2109,7 +2140,7 @@ function wrapCreate<Fn extends (...args: never[]) => JsonValue | Promise<JsonVal
 
     const callArgs = body === originalBody ? args : [body, ...args.slice(1)];
     const request = mapRequest(body);
-    const span = startSpan(request.name, { ...request.fields, provider: provider(this) });
+    const span = startRequestSpan(request.name, { ...request.fields, provider: provider(this) });
     const end = endOnce(span);
     const startedAt = performance.now();
 
@@ -2147,7 +2178,7 @@ function wrapLifecycleMethod<Fn extends (...args: never[]) => JsonValue | Promis
 
   const wrapped = function <This>(this: This, ...args: JsonValue[]) {
     const mapping = request(args);
-    const span = startSpan(mapping.name, { ...mapping.fields, provider: provider(this) });
+    const span = startRequestSpan(mapping.name, { ...mapping.fields, provider: provider(this) });
     const end = endOnce(span);
 
     try {
@@ -2860,13 +2891,15 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
       !hasAuthoritativeOutput &&
       (partialCapture?.truncated === true || (!responseDone && partialOutput !== undefined));
 
-    trace.end({
-      ...fields,
-      output: hasAuthoritativeOutput ? fields.output : partialOutput,
-      attributes: partialTruncated
-        ? { ...fields?.attributes, "telemetry.dev.capture.truncated": true }
-        : fields?.attributes,
-    });
+    trace.end(
+      withholdCutOutput(trace.span, {
+        ...fields,
+        output: hasAuthoritativeOutput ? fields.output : partialOutput,
+        attributes: partialTruncated
+          ? { ...fields?.attributes, "telemetry.dev.capture.truncated": true }
+          : fields?.attributes,
+      }),
+    );
   };
 
   const finishAll = (error: Error) => {
@@ -3062,7 +3095,7 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
       ? sanitizeResponsesCapture(response.instructions)
       : undefined;
 
-    const span = startSpan(`chat ${model ?? "unknown"}`, {
+    const span = startRequestSpan(`chat ${model ?? "unknown"}`, {
       type: "generation",
       model,
       provider: options?.provider ?? "openai",

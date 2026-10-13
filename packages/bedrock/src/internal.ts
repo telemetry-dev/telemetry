@@ -4,6 +4,7 @@ import {
   type SpanFields,
   type SpanHandle,
   type SpanType,
+  type StartSpanOptions,
 } from "@telemetry-dev/sdk";
 
 export const PROVIDER = "amazon-bedrock";
@@ -70,7 +71,7 @@ export function createInstrumentedSend(
     const spanType = safe(() => handler.spanType(input)) ?? "span";
     const spanName = safe(() => handler.spanName(input)) ?? name ?? "bedrock";
     const fields = safe(() => handler.requestFields(input, options)) ?? {};
-    const span = startSpan(spanName, { type: spanType, ...fields });
+    const span = startRequestSpan(spanName, { type: spanType, ...fields });
     const callbackIndex = rawRest.findIndex((arg) => arg instanceof Function);
 
     if (callbackIndex !== -1) {
@@ -166,6 +167,34 @@ function withCacheInclusiveInput(fields: SpanFields | undefined): SpanFields | u
       : usage.totalTokens;
 
   return { ...fields, usage: { ...usage, inputTokens, totalTokens } };
+}
+
+// A capture cut to the retention bound keeps its truncated flag, but a mask cannot be trusted to
+// redact a value it only sees part of. Cores without a capture policy are treated as masked.
+function capturesWithMask(span: SpanHandle): boolean {
+  return span.capturePolicy?.mask ?? true;
+}
+
+function isCut(fields: SpanFields | undefined): boolean {
+  return fields?.attributes?.["telemetry.dev.capture.truncated"] === true;
+}
+
+function startRequestSpan(name: string, options: StartSpanOptions): SpanHandle {
+  if (options.input === undefined || !isCut(options)) return startSpan(name, options);
+
+  // The mask policy is only known once the span exists, so a cut input is attached afterwards.
+  const span = startSpan(name, { ...options, input: undefined });
+
+  if (!capturesWithMask(span)) updateSpan(span, { input: options.input });
+
+  return span;
+}
+
+/** Ends a non-streamed span, withholding output cut to the retention bound from a mask. */
+export function endSpanWithBoundedOutput(span: SpanHandle, fields: SpanFields): void {
+  const withheld = fields.output !== undefined && isCut(fields) && capturesWithMask(span);
+
+  endSpan(span, withheld ? { ...fields, output: undefined } : fields);
 }
 
 export function endSpan(span: SpanHandle, fields?: SpanFields): void {
