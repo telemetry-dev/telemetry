@@ -3026,36 +3026,47 @@ test.each([
   expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([candidate.content]);
 });
 
-test("generateContent keeps response fields when candidate content cannot be read", async () => {
-  const spy = maskSpy();
-  const spans = setupSpans({ mask: spy.mask });
+test.each([true, false])(
+  "generateContent keeps response fields when candidate content cannot be read (masked: %s)",
+  async (masked) => {
+    const spy = maskSpy();
+    const spans = setupSpans(masked ? { mask: spy.mask } : {});
 
-  const response = {
-    responseId: "resp_unreadable",
-    usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, totalTokenCount: 7 },
-    candidates: [
-      {
-        finishReason: "STOP",
-        content: {
-          role: "model",
-          get parts(): unknown {
-            throw new Error("unreadable parts");
+    const response = {
+      responseId: "resp_unreadable",
+      usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, totalTokenCount: 7 },
+      candidates: [
+        { index: 0, content: { role: "model", parts: [{ text: "readable answer" }] } },
+        {
+          index: 1,
+          finishReason: "STOP",
+          content: {
+            role: "model",
+            get parts(): unknown {
+              throw new Error("unreadable parts");
+            },
           },
         },
-      },
-    ],
-  };
+      ],
+    };
 
-  const client = wrapGoogleGenAI({ models: { generateContent: (_params: unknown) => response } });
+    const client = wrapGoogleGenAI({ models: { generateContent: (_params: unknown) => response } });
 
-  client.models.generateContent({ model: "gemini", contents: "go" });
+    client.models.generateContent({ model: "gemini", contents: "go" });
 
-  const span = await exportedSpan(spans);
-  expect(span.attributes["gen_ai.response.id"]).toBe("resp_unreadable");
-  expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(5);
-  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
-  expect(spy.keys).not.toContain("gen_ai.output.messages");
-});
+    const span = await exportedSpan(spans);
+    expect(span.attributes["gen_ai.response.id"]).toBe("resp_unreadable");
+    expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(5);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+
+    if (masked) {
+      expect(spy.keys).not.toContain("gen_ai.output.messages");
+      expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+    } else {
+      expect(String(span.attributes["gen_ai.output.messages"])).toContain("readable answer");
+    }
+  },
+);
 
 test.each([true, false])(
   "generateContent withholds system instructions cut to the retention bound from a mask (masked: %s)",
