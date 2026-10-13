@@ -1,4 +1,9 @@
-import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
+import {
+  InMemorySpanExporter,
+  SamplingDecision,
+  type ReadableSpan,
+  type Sampler,
+} from "@opentelemetry/sdk-trace-base";
 import {
   AggregationTemporality,
   DataPointType,
@@ -108,6 +113,7 @@ function setupSpans(
     captureOutput?: boolean;
     mask?: (value: unknown, context: { key: string }) => unknown;
     maxAttributeLength?: number;
+    sampler?: Sampler;
   } = {},
 ): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
@@ -2711,4 +2717,436 @@ test("capture traversal is bounded, cycle-aware, binary-safe, and preserves prov
   expect(String(span.attributes["gen_ai.input.messages"])).not.toContain("SECRET_BINARY");
   expect(String(span.attributes["gen_ai.input.messages"]).length).toBeLessThan(65_536);
   expect(String(span.attributes["gen_ai.output.messages"]).length).toBeLessThan(65_536);
+});
+
+const CUT_CAPTURE_SECRET = `SECRET${"x".repeat(60_000)}`;
+
+function maskSpy() {
+  const keys: string[] = [];
+
+  return {
+    keys,
+    mask: (value: unknown, context: { key: string }) => {
+      keys.push(context.key);
+
+      return value;
+    },
+  };
+}
+
+test.each([true, false])(
+  "generateContent withholds request and response captures cut to the retention bound from a mask (masked: %s)",
+  async (masked) => {
+    const spy = maskSpy();
+    const spans = setupSpans(masked ? { mask: spy.mask } : {});
+
+    const response = {
+      candidates: [
+        {
+          content: { role: "model", parts: [{ text: "kept" }, { text: CUT_CAPTURE_SECRET }] },
+          finishReason: "STOP",
+        },
+      ],
+    };
+
+    const client = wrapGoogleGenAI({ models: { generateContent: (_params: unknown) => response } });
+
+    client.models.generateContent({
+      model: "gemini",
+      contents: [{ role: "user", parts: [{ text: "kept" }, { text: CUT_CAPTURE_SECRET }] }],
+      config: { systemInstruction: "complete system instruction" },
+    });
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    expect(span.attributes["gen_ai.system_instructions"]).toContain("complete system instruction");
+
+    if (masked) {
+      expect(spy.keys).not.toContain("gen_ai.input.messages");
+      expect(spy.keys).not.toContain("gen_ai.output.messages");
+      expect(spy.keys).toContain("gen_ai.system_instructions");
+      expect(span.attributes["gen_ai.input.messages"]).toBeUndefined();
+      expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+    } else {
+      for (const key of ["gen_ai.input.messages", "gen_ai.output.messages"]) {
+        const captured = String(span.attributes[key]);
+        expect(captured).toContain("kept");
+        expect(captured).not.toContain("SECRET");
+      }
+    }
+  },
+);
+
+test("unary AFC history cut to the retention bound is withheld from a mask while complete output is kept", async () => {
+  const spy = maskSpy();
+  const spans = setupSpans({ mask: spy.mask });
+
+  const response = {
+    candidates: [{ content: { role: "model", parts: [{ text: "done" }] } }],
+    automaticFunctionCallingHistory: [
+      { role: "user", parts: [{ text: "kept" }] },
+      { role: "user", parts: [{ text: CUT_CAPTURE_SECRET }] },
+    ],
+  };
+
+  const client = wrapGoogleGenAI({ models: { generateContent: (_params: unknown) => response } });
+
+  client.models.generateContent({ model: "gemini", contents: "go" });
+
+  const span = await exportedSpan(spans);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(spy.keys.filter((key) => key === "gen_ai.input.messages")).toHaveLength(1);
+  expect(span.attributes["gen_ai.input.messages"]).toContain("go");
+  expect(span.attributes["gen_ai.input.messages"]).not.toContain("kept");
+  expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "model", parts: [{ text: "done" }] },
+  ]);
+});
+
+test.each([true, false])(
+  "generateContentStream withholds a request cut to the retention bound from a mask (masked: %s)",
+  async (masked) => {
+    const spy = maskSpy();
+    const spans = setupSpans(masked ? { mask: spy.mask } : {});
+
+    const client = wrapGoogleGenAI({
+      models: {
+        generateContentStream: async (_params: unknown) =>
+          (async function* () {
+            yield { candidates: [{ content: { role: "model", parts: [{ text: "done" }] } }] };
+          })(),
+      },
+    });
+
+    const stream = await client.models.generateContentStream({
+      model: "gemini",
+      contents: [{ role: "user", parts: [{ text: "kept" }, { text: CUT_CAPTURE_SECRET }] }],
+    });
+
+    for await (const _chunk of stream);
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+
+    if (masked) {
+      expect(spy.keys).not.toContain("gen_ai.input.messages");
+      expect(span.attributes["gen_ai.input.messages"]).toBeUndefined();
+    } else {
+      const captured = String(span.attributes["gen_ai.input.messages"]);
+      expect(captured).toContain("kept");
+      expect(captured).not.toContain("SECRET");
+    }
+  },
+);
+
+test.each([true, false])(
+  "media requests withhold input cut to the retention bound from a mask (masked: %s)",
+  async (masked) => {
+    const spy = maskSpy();
+    const spans = setupSpans(masked ? { mask: spy.mask } : {});
+
+    const client = wrapGoogleGenAI({
+      models: {
+        generateImages(_params: unknown) {
+          return { generatedImages: [{ image: { gcsUri: "gs://bucket/output.png" } }] };
+        },
+      },
+    });
+
+    client.models.generateImages({
+      model: "imagen-3",
+      prompt: CUT_CAPTURE_SECRET,
+      image: { gcsUri: "gs://bucket/kept.png", mimeType: "image/png" },
+    });
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    expect(span.attributes["gen_ai.output.messages"]).toContain("gs://bucket/output.png");
+
+    if (masked) {
+      expect(spy.keys).not.toContain("gen_ai.input.messages");
+      expect(spy.keys).toContain("gen_ai.output.messages");
+      expect(span.attributes["gen_ai.input.messages"]).toBeUndefined();
+    } else {
+      const captured = String(span.attributes["gen_ai.input.messages"]);
+      expect(captured).toContain("gs://bucket/kept.png");
+      expect(captured).not.toContain("SECRET");
+    }
+  },
+);
+
+function cutRequestAfcStream(finalChunk: object) {
+  return wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield {
+          responseId: "afc_cut_1",
+          candidates: [
+            {
+              content: { role: "model", parts: [{ functionCall: { name: "lookup", args: {} } }] },
+            },
+          ],
+        };
+        yield {
+          candidates: [
+            {
+              content: {
+                role: "user",
+                parts: [{ functionResponse: { name: "lookup", response: { ok: true } } }],
+              },
+            },
+          ],
+        };
+        yield finalChunk;
+      },
+    },
+  });
+}
+
+test.each([true, false])(
+  "streaming AFC history seeded from a cut request is withheld from a mask (masked: %s)",
+  async (masked) => {
+    const spy = maskSpy();
+    const spans = setupSpans(masked ? { mask: spy.mask } : {});
+
+    const client = cutRequestAfcStream({
+      responseId: "afc_cut_2",
+      candidates: [{ content: { role: "model", parts: [{ text: "done" }] } }],
+    });
+
+    const stream = await Promise.resolve(
+      client.models.generateContentStream({
+        model: "gemini",
+        contents: [{ role: "user", parts: [{ text: "kept" }, { text: CUT_CAPTURE_SECRET }] }],
+      }),
+    );
+
+    for await (const _chunk of stream);
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    expect(span.attributes["google_genai.automatic_function_calling"]).toBe(true);
+
+    if (masked) {
+      expect(spy.keys).not.toContain("gen_ai.input.messages");
+      expect(span.attributes["gen_ai.input.messages"]).toBeUndefined();
+    } else {
+      const captured = String(span.attributes["gen_ai.input.messages"]);
+      expect(captured).toContain("kept");
+      expect(captured).toContain("functionResponse");
+      expect(captured).not.toContain("SECRET");
+    }
+  },
+);
+
+test("authoritative streaming AFC history replaces a history seeded from a cut request", async () => {
+  const spy = maskSpy();
+  const spans = setupSpans({ mask: spy.mask });
+
+  const authoritativeHistory = [
+    { role: "user", parts: [{ text: "authoritative request" }] },
+    { role: "model", parts: [{ functionCall: { name: "lookup", args: {} } }] },
+    { role: "user", parts: [{ functionResponse: { name: "lookup", response: { ok: true } } }] },
+  ];
+
+  const client = cutRequestAfcStream({
+    responseId: "afc_cut_2",
+    automaticFunctionCallingHistory: authoritativeHistory,
+    candidates: [{ content: { role: "model", parts: [{ text: "done" }] } }],
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({
+      model: "gemini",
+      contents: [{ role: "user", parts: [{ text: "kept" }, { text: CUT_CAPTURE_SECRET }] }],
+    }),
+  );
+
+  for await (const _chunk of stream);
+
+  const span = await exportedSpan(spans);
+  expect(spy.keys).toContain("gen_ai.input.messages");
+  expect(messagesAttr(span, "gen_ai.input.messages")).toEqual(authoritativeHistory);
+});
+
+test("generateContent keeps complete text when only candidate metadata is cut", async () => {
+  const spy = maskSpy();
+  const spans = setupSpans({ mask: spy.mask });
+
+  const response = {
+    candidates: [
+      {
+        content: { role: "model", parts: [{ text: "complete answer" }] },
+        finishReason: "STOP",
+        groundingMetadata: { searchEntryPoint: { renderedContent: "g".repeat(60_000) } },
+      },
+    ],
+  };
+
+  const client = wrapGoogleGenAI({ models: { generateContent: (_params: unknown) => response } });
+
+  client.models.generateContent({ model: "gemini", contents: "go" });
+
+  const span = await exportedSpan(spans);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(spy.keys).toContain("gen_ai.output.messages");
+  expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "model", parts: [{ text: "complete answer" }] },
+  ]);
+});
+
+test.each([
+  {
+    name: "content filling the byte bound before trailing metadata",
+    candidate: {
+      content: { role: "model", parts: [{ text: "x".repeat(49_100) }] },
+      finishReason: "STOP",
+    },
+  },
+  {
+    name: "content filling the item bound before trailing metadata",
+    candidate: {
+      content: { role: "model", parts: Array.from({ length: 497 }, () => ({ text: "x" })) },
+      finishReason: "STOP",
+      index: 0,
+    },
+  },
+])("generateContent keeps $name for a mask", async ({ candidate }) => {
+  const spy = maskSpy();
+  const spans = setupSpans({ mask: spy.mask });
+
+  const client = wrapGoogleGenAI({
+    models: { generateContent: (_params: unknown) => ({ candidates: [candidate] }) },
+  });
+
+  client.models.generateContent({ model: "gemini", contents: "go" });
+
+  const span = await exportedSpan(spans);
+  expect(spy.keys).toContain("gen_ai.output.messages");
+  expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([candidate.content]);
+});
+
+test.each([true, false])(
+  "generateContent keeps response fields when candidate content cannot be read (masked: %s)",
+  async (masked) => {
+    const spy = maskSpy();
+    const spans = setupSpans(masked ? { mask: spy.mask } : {});
+
+    const response = {
+      responseId: "resp_unreadable",
+      usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, totalTokenCount: 7 },
+      candidates: [
+        { index: 0, content: { role: "model", parts: [{ text: "readable answer" }] } },
+        {
+          index: 1,
+          finishReason: "STOP",
+          content: {
+            role: "model",
+            get parts(): unknown {
+              throw new Error("unreadable parts");
+            },
+          },
+        },
+      ],
+    };
+
+    const client = wrapGoogleGenAI({ models: { generateContent: (_params: unknown) => response } });
+
+    client.models.generateContent({ model: "gemini", contents: "go" });
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["gen_ai.response.id"]).toBe("resp_unreadable");
+    expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(5);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+
+    if (masked) {
+      expect(spy.keys).not.toContain("gen_ai.output.messages");
+      expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+    } else {
+      expect(String(span.attributes["gen_ai.output.messages"])).toContain("readable answer");
+    }
+  },
+);
+
+test.each([true, false])(
+  "generateContent withholds system instructions cut to the retention bound from a mask (masked: %s)",
+  async (masked) => {
+    const spy = maskSpy();
+    const spans = setupSpans(masked ? { mask: spy.mask } : {});
+
+    const client = wrapGoogleGenAI({
+      models: {
+        generateContent: (_params: unknown) => ({
+          candidates: [{ content: { role: "model", parts: [{ text: "done" }] } }],
+        }),
+      },
+    });
+
+    client.models.generateContent({
+      model: "gemini",
+      contents: [{ role: "user", parts: [{ text: "complete request" }] }],
+      config: { systemInstruction: { parts: [{ text: "kept" }, { text: CUT_CAPTURE_SECRET }] } },
+    });
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    expect(span.attributes["gen_ai.input.messages"]).toContain("complete request");
+
+    if (masked) {
+      expect(spy.keys).not.toContain("gen_ai.system_instructions");
+      expect(spy.keys).toContain("gen_ai.input.messages");
+      expect(span.attributes["gen_ai.system_instructions"]).toBeUndefined();
+    } else {
+      const captured = String(span.attributes["gen_ai.system_instructions"]);
+      expect(captured).toContain("kept");
+      expect(captured).not.toContain("SECRET");
+    }
+  },
+);
+
+test.each([
+  ["generateContent", "contents"],
+  ["generateContent", "systemInstruction"],
+  ["generateContentStream", "contents"],
+] as const)("%s without a mask passes cut %s to the sampler", async (method, field) => {
+  const sampled: Array<Record<string, unknown>> = [];
+
+  setupSpans({
+    sampler: {
+      shouldSample(_context, _traceId, _name, _kind, attributes) {
+        sampled.push({ ...attributes });
+
+        return { decision: SamplingDecision.RECORD_AND_SAMPLED };
+      },
+      toString: () => "recording",
+    },
+  });
+
+  const response = { candidates: [{ content: { role: "model", parts: [{ text: "done" }] } }] };
+
+  const client = wrapGoogleGenAI({
+    models: {
+      generateContent: (_params: unknown) => response,
+      async *generateContentStream(_params: unknown) {
+        yield response;
+      },
+    },
+  });
+
+  const cutParts = [{ text: "kept" }, { text: CUT_CAPTURE_SECRET }];
+
+  const params = {
+    model: "gemini",
+    contents: field === "contents" ? [{ role: "user", parts: cutParts }] : "go",
+    config: field === "systemInstruction" ? { systemInstruction: { parts: cutParts } } : {},
+  };
+
+  if (method === "generateContent") client.models.generateContent(params);
+  else
+    for await (const _chunk of await Promise.resolve(client.models.generateContentStream(params)));
+
+  const key = field === "contents" ? "gen_ai.input.messages" : "gen_ai.system_instructions";
+  expect(sampled).toHaveLength(1);
+  expect(String(sampled[0]?.[key])).toContain("kept");
+  expect(sampled[0]?.["telemetry.dev.capture.truncated"]).toBe(true);
 });

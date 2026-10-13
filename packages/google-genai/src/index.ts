@@ -16,6 +16,7 @@ import {
   type SpanFields,
   type SpanHandle,
 } from "@telemetry-dev/sdk";
+import * as telemetrySdk from "@telemetry-dev/sdk";
 
 type AttributeValue = NonNullable<SpanFields["attributes"]>[string];
 
@@ -72,6 +73,8 @@ interface UnknownRecord {
 interface RequestMapping {
   name: string;
   fields: SpanFields & { type: "generation" | "embedding" };
+  /** Captured fields that were cut to the retention bound. */
+  cut?: Array<"input" | "systemInstructions">;
 }
 
 interface VideoOperationTracker {
@@ -325,13 +328,46 @@ function mapModalityTokens(
   }
 }
 
+// Reads like the capture walker does: own enumerable properties only.
+function ownField(value: unknown, key: string): unknown {
+  return value !== null &&
+    typeof value === "object" &&
+    Object.prototype.propertyIsEnumerable.call(value, key)
+    ? (value as Record<string, unknown>)[key]
+    : undefined;
+}
+
+// boundedCapture's default item limit; more candidates than this cannot all be kept.
+const CAPTURE_MAX_ITEMS = 1_000;
+
 function candidateOutput(response: UnknownRecord) {
-  if (!captureEnabled("output")) return { value: undefined, truncated: false };
-  const capture = boundedTelemetryCapture(response.candidates);
+  if (!captureEnabled("output")) return { value: undefined, truncated: false, contentCut: false };
+  const all = asArray(response.candidates);
+  let projectionFailed = false;
+  // Only candidate content is exported as output. Bounding a projection of it, rather than whole
+  // candidates, keeps grounding or safety metadata from marking complete content as cut.
+  const projected = all?.slice(0, CAPTURE_MAX_ITEMS + 1).map((candidate) => {
+    try {
+      const content = asRecord(ownField(candidate, "content"));
+
+      return content
+        ? { content: { role: ownField(content, "role"), parts: ownField(content, "parts") } }
+        : {};
+    } catch {
+      projectionFailed = true;
+
+      return {};
+    }
+  });
+  const capture = boundedTelemetryCapture(projected);
+
+  // Metadata that does not fit is still a loss for the span-level flag; both passes are bounded.
+  const contentCut = capture.truncated || projectionFailed;
+  const truncated = contentCut || boundedTelemetryCapture(response.candidates).truncated;
+
   const candidates = asArray(capture.value);
 
-  if (!candidates || candidates.length === 0)
-    return { value: undefined, truncated: capture.truncated };
+  if (!candidates || candidates.length === 0) return { value: undefined, truncated, contentCut };
 
   const output = candidates
     .map((candidate) => {
@@ -347,7 +383,11 @@ function candidateOutput(response: UnknownRecord) {
     })
     .filter((entry) => entry !== undefined);
 
-  return { value: output.length > 0 ? output : undefined, truncated: capture.truncated };
+  return {
+    value: output.length > 0 ? output : undefined,
+    truncated,
+    contentCut,
+  };
 }
 
 function responseAttributes(response: UnknownRecord) {
@@ -456,10 +496,16 @@ function generateRequestFields(params: UnknownRecord): RequestMapping {
 
   if (Object.keys(attributes).length > 0) fields.attributes = attributes;
 
-  return { name: `chat ${model ?? "unknown"}`, fields };
+  const cut: RequestMapping["cut"] = [];
+
+  if (input?.truncated) cut.push("input");
+
+  if (systemInstructions?.truncated) cut.push("systemInstructions");
+
+  return { name: `chat ${model ?? "unknown"}`, fields, cut };
 }
 
-function generateResponseFields(response: unknown): SpanFields {
+function generateResponseFields(response: unknown, withholdCut = false): SpanFields {
   const record = asRecord(response) ?? {};
   const candidates = asArray(record.candidates) ?? [];
 
@@ -475,7 +521,7 @@ function generateResponseFields(response: unknown): SpanFields {
     responseModel: readString(record.modelVersion),
     responseId: readString(record.responseId),
     finishReason: finishReasons[0],
-    output: output.value,
+    output: output.contentCut && withholdCut ? undefined : output.value,
     usage: usageFromMetadata(record.usageMetadata),
   };
 
@@ -483,7 +529,7 @@ function generateResponseFields(response: unknown): SpanFields {
 
   if (captureEnabled("input") && afcHistory && afcHistory.length > 0) {
     const capture = boundedTelemetryCapture(afcHistory);
-    fields.input = capture.value;
+    fields.input = capture.truncated && withholdCut ? undefined : capture.value;
 
     if (capture.truncated) attributes["telemetry.dev.capture.truncated"] = true;
   }
@@ -672,6 +718,7 @@ function mediaRequestFields(
       outputType,
       attributes,
     },
+    cut: input?.truncated ? ["input"] : undefined,
   };
 }
 
@@ -776,6 +823,36 @@ function safeRequestMapping(
   }
 }
 
+// A capture cut to the retention bound keeps its truncated flag, but a mask cannot be trusted to
+// redact a value it only sees part of. Cores without a capture policy are treated as masked.
+function capturesWithMask(span: SpanHandle): boolean {
+  return span.capturePolicy?.mask ?? true;
+}
+
+// Cores older than captureMasked expose no mask policy before a span starts; treat them as
+// masked, like LEGACY_CAPTURE_POLICY. A namespace read keeps them loadable without the export.
+function captureMaskedBeforeStart(): boolean {
+  const read = (telemetrySdk as { captureMasked?: () => boolean }).captureMasked;
+
+  try {
+    return typeof read === "function" ? read() : true;
+  } catch {
+    return true;
+  }
+}
+
+// The decision is made before the span starts so samplers see the same attributes as before.
+function startRequestSpan(request: RequestMapping, provider: string): SpanHandle {
+  const fields = { ...request.fields, provider };
+  const cut = request.cut?.filter((key) => fields[key] !== undefined) ?? [];
+
+  if (cut.length === 0 || !captureMaskedBeforeStart()) return startSpan(request.name, fields);
+
+  for (const key of cut) fields[key] = undefined;
+
+  return startSpan(request.name, fields);
+}
+
 function safeResponseFields(
   mapResponse: (response: unknown) => SpanFields,
   response: unknown,
@@ -842,7 +919,7 @@ function installInternalUsageCollector(models: UnknownRecord | undefined): void 
 function wrapUnary(
   original: (...args: unknown[]) => unknown,
   mapRequest: (params: UnknownRecord) => RequestMapping,
-  mapResponse: (response: unknown) => SpanFields,
+  mapResponse: (response: unknown, withholdCut?: boolean) => SpanFields,
   provider: string,
   fallback: RequestFallback,
   models?: UnknownRecord,
@@ -852,7 +929,7 @@ function wrapUnary(
   const wrapped = function (this: unknown, ...args: unknown[]) {
     const params = asRecord(args[0]) ?? {};
     const request = safeRequestMapping(params, mapRequest, fallback);
-    const span = startSpan(request.name, { ...request.fields, provider });
+    const span = startRequestSpan(request, provider);
     const end = endOnce(span);
     const usageStore = afcUsageStore;
 
@@ -862,7 +939,10 @@ function wrapUnary(
     if (internalUsage) installInternalUsageCollector(models);
 
     const finishResponse = (response: unknown) => {
-      const fields = safeResponseFields(mapResponse, response);
+      const fields = safeResponseFields(
+        (value) => mapResponse(value, capturesWithMask(span)),
+        response,
+      );
 
       if (internalUsage?.usage) fields.usage = internalUsage.usage;
       const toolUsePromptTokens = readNumber(internalUsage?.toolUsePromptTokens);
@@ -1039,7 +1119,11 @@ class StreamAggregator {
   // The reconstructed AFC history holds a cut value, such as a folded model-output prefix.
   private afcInputIncomplete = false;
 
-  constructor(private readonly requestInput: unknown) {}
+  constructor(
+    private readonly requestInput: unknown,
+    // The request input was cut to the retention bound, so history seeded from it is incomplete.
+    private readonly requestInputCut = false,
+  ) {}
 
   private currentCandidates(): unknown[] {
     return [...this.candidates.entries()]
@@ -1100,6 +1184,8 @@ class StreamAggregator {
 
     if (!this.afcHistory) {
       this.afcHistory = [...(asArray(this.requestInput) ?? [])];
+
+      if (this.requestInputCut) this.afcInputIncomplete = true;
     }
 
     return this.afcHistory;
@@ -1310,9 +1396,10 @@ function createObservedStream(
   startedAt: number,
   end: (fields?: SpanFields) => void,
   requestInput: unknown,
+  requestInputCut = false,
 ): AsyncGenerator<unknown> {
   const iterator = source[Symbol.asyncIterator]();
-  const aggregator = new StreamAggregator(requestInput);
+  const aggregator = new StreamAggregator(requestInput, requestInputCut);
   let sawFirst = false;
   let ended = false;
 
@@ -1477,7 +1564,7 @@ function wrapStream(
   const wrapped = function (this: unknown, ...args: unknown[]) {
     const params = asRecord(args[0]) ?? {};
     const request = safeRequestMapping(params, mapRequest, fallback);
-    const span = startSpan(request.name, { ...request.fields, provider });
+    const span = startRequestSpan(request, provider);
     const end = endOnce(span);
     const startedAt = Date.now();
 
@@ -1492,6 +1579,7 @@ function wrapStream(
             startedAt,
             end,
             request.fields.input,
+            request.cut?.includes("input") ?? false,
           ),
         (error) => {
           end({ error });
@@ -1511,7 +1599,7 @@ function patchModelsMethod(
   models: UnknownRecord,
   key: string,
   mapRequest: (params: UnknownRecord) => RequestMapping,
-  mapResponse: (response: unknown) => SpanFields,
+  mapResponse: (response: unknown, withholdCut?: boolean) => SpanFields,
   provider: string,
   fallback: RequestFallback,
   streaming = false,

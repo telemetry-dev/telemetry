@@ -8,6 +8,7 @@ import {
   RetrieveCommand,
   type RerankCommandInput,
 } from "@aws-sdk/client-bedrock-agent-runtime";
+import { SamplingDecision } from "@opentelemetry/sdk-trace-base";
 import { afterEach, expect, test } from "vitest";
 
 import {
@@ -349,6 +350,102 @@ test("Rerank bounds large source and result captures while preserving counts", a
   expect(JSON.stringify(output).length).toBeLessThanOrEqual(48 * 1_024);
   expect(span.attributes["td.metadata.result_count"]).toBe("2000");
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("Rerank withholds captures cut to the retention bound from a mask", async () => {
+  const keys: unknown[] = [];
+
+  const spans = setup({
+    mask: (value, context) => {
+      keys.push(context.key);
+
+      return value;
+    },
+  });
+
+  const sources = Array.from({ length: 2_000 }, (_, index) => ({
+    type: "INLINE" as const,
+    inlineDocumentSource: {
+      type: "TEXT" as const,
+      textDocument: { text: `source-${index}:${"x".repeat(1_000)}` },
+    },
+  }));
+
+  const results = Array.from({ length: 2_000 }, (_, index) => ({
+    index,
+    relevanceScore: 1 / (index + 1),
+    document: { type: "TEXT", textDocument: { text: `result-${index}:${"y".repeat(1_000)}` } },
+  }));
+
+  const client = wrapBedrockAgents(new FakeClient([{ results }]));
+
+  await client.send(
+    new RerankCommand({
+      queries: [{ type: "TEXT", textQuery: { text: "observability" } }],
+      sources,
+      rerankingConfiguration: {
+        type: "BEDROCK_RERANKING_MODEL",
+        bedrockRerankingConfiguration: {
+          modelConfiguration: {
+            modelArn: "arn:aws:bedrock:us-west-2::foundation-model/cohere.rerank-v3-5:0",
+          },
+        },
+      },
+    }),
+  );
+
+  const [span] = spans.getFinishedSpans();
+
+  expect(keys).not.toContain("gen_ai.input.messages");
+  expect(keys).not.toContain("gen_ai.output.messages");
+  expect(span.attributes["gen_ai.input.messages"]).toBeUndefined();
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["td.metadata.result_count"]).toBe("2000");
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("Rerank without a mask passes cut input to the sampler", async () => {
+  const sampled: Array<Record<string, unknown>> = [];
+
+  setup({
+    sampler: {
+      shouldSample(_context, _traceId, _name, _kind, attributes) {
+        sampled.push({ ...attributes });
+
+        return { decision: SamplingDecision.RECORD_AND_SAMPLED };
+      },
+      toString: () => "recording",
+    },
+  });
+
+  const sources = Array.from({ length: 2_000 }, (_, index) => ({
+    type: "INLINE" as const,
+    inlineDocumentSource: {
+      type: "TEXT" as const,
+      textDocument: { text: `source-${index}:${"x".repeat(1_000)}` },
+    },
+  }));
+
+  const client = wrapBedrockAgents(new FakeClient([{ results: [] }]));
+
+  await client.send(
+    new RerankCommand({
+      queries: [{ type: "TEXT", textQuery: { text: "observability" } }],
+      sources,
+      rerankingConfiguration: {
+        type: "BEDROCK_RERANKING_MODEL",
+        bedrockRerankingConfiguration: {
+          modelConfiguration: {
+            modelArn: "arn:aws:bedrock:us-west-2::foundation-model/cohere.rerank-v3-5:0",
+          },
+        },
+      },
+    }),
+  );
+
+  expect(sampled).toHaveLength(1);
+  expect(String(sampled[0]?.["gen_ai.input.messages"])).toContain("source-0");
+  expect(sampled[0]?.["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
 test("Retrieve and RetrieveAndGenerate capture outputs and citations", async () => {

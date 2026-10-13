@@ -9,6 +9,7 @@ export type {
 
 export {
   captureEnabled,
+  captureMasked,
   type ClientOverrides,
   flush,
   init,

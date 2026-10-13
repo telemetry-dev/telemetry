@@ -75,6 +75,8 @@ Span names are `chat ${model}` for content generation, `generate_content ${model
 
 `config.httpOptions` and `config.abortSignal` are never recorded. Embedding vectors are never captured as output.
 
+Unary `generateContent` input, system instructions, output, and AFC history, the `generateContentStream` request, and image and video request content are bounded to 48 KiB and 1,000 items. A value over the bound sets `telemetry.dev.capture.truncated`. Without a mask, the bounded part is kept. With a mask configured, that value is omitted because the mask cannot inspect the complete value. Request input and system instructions are omitted before the span starts, so a custom `sampler` sees the bounded values when no mask is configured; with an older `@telemetry-dev/sdk` that cannot report whether a mask is configured, they are omitted as if one were. Unary output is omitted only when candidate content was cut; cut grounding, URL-context, or safety metadata sets the attribute but keeps complete content. Streaming AFC history built on a cut request is omitted the same way unless the SDK reports a complete history.
+
 Tool definitions (`gen_ai.tool.definitions`, including tool descriptions and parameter schemas) are request attributes, not captured content: `captureInput`, the mask, and `maxAttributeLength: 0` do not remove them. They are cut only by the OpenTelemetry attribute limit (65,536 characters when `maxAttributeLength` is 0).
 
 ## Streaming

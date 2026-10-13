@@ -1,4 +1,8 @@
-import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
+import {
+  InMemorySpanExporter,
+  SamplingDecision,
+  type ReadableSpan,
+} from "@opentelemetry/sdk-trace-base";
 import {
   AggregationTemporality,
   InMemoryMetricExporter,
@@ -179,7 +183,10 @@ function createFakeFetch(...responses: Response[]): FakeFetch {
 
 function setupSpans(
   metricExporter?: PushMetricExporter,
-  options: Pick<TelemetryOptions, "captureOutput" | "mask" | "maxAttributeLength" | "onError"> = {},
+  options: Pick<
+    TelemetryOptions,
+    "captureOutput" | "mask" | "maxAttributeLength" | "onError" | "sampler"
+  > = {},
 ): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
   init(
@@ -6137,4 +6144,198 @@ test.each([
   expect(span.events.some((event) => event.attributes?.["exception.message"] === message)).toBe(
     true,
   );
+});
+
+const CUT_CAPTURE_SECRET = `SECRET${"x".repeat(60_000)}`;
+
+function maskedKeys(mask: ReturnType<typeof vi.fn>): unknown[] {
+  return mask.mock.calls.map(([, context]) => (context as { key?: unknown } | undefined)?.key);
+}
+
+test.each([
+  ["chat", true],
+  ["chat", false],
+  ["responses", true],
+  ["responses", false],
+] as const)(
+  "non-streaming %s captures cut to the retention bound are withheld from a mask (masked: %s)",
+  async (kind, masked) => {
+    const mask = vi.fn((value: unknown) => value);
+    const spans = setupSpans(undefined, masked ? { mask } : {});
+
+    const chatResult = {
+      id: "chatcmpl_cut",
+      model: "gpt-4o",
+      choices: [
+        { index: 0, finish_reason: "stop", message: { role: "assistant", content: "kept" } },
+        {
+          index: 1,
+          finish_reason: "stop",
+          message: { role: "assistant", content: CUT_CAPTURE_SECRET },
+        },
+      ],
+    };
+
+    const responsesResult = {
+      id: "resp_cut",
+      status: "completed",
+      output: [
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "kept" }] },
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: CUT_CAPTURE_SECRET }],
+        },
+      ],
+    };
+
+    const client = wrapOpenAI({
+      chat: { completions: { create: async (_params: unknown) => chatResult } },
+      responses: { create: async (_params: unknown) => responsesResult },
+      embeddings: { create() {} },
+    });
+
+    const input = [
+      { role: "user", content: "kept" },
+      { role: "user", content: CUT_CAPTURE_SECRET },
+    ];
+
+    if (kind === "chat")
+      await client.chat.completions.create({ model: "gpt-4o", messages: input } as never);
+    else await client.responses.create({ model: "gpt-4.1", input } as never);
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+
+    if (masked) {
+      expect(maskedKeys(mask)).not.toContain("gen_ai.input.messages");
+      expect(maskedKeys(mask)).not.toContain("gen_ai.output.messages");
+      expect(span.attributes["gen_ai.input.messages"]).toBeUndefined();
+      expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+    } else {
+      for (const key of ["gen_ai.input.messages", "gen_ai.output.messages"]) {
+        const captured = String(span.attributes[key]);
+        expect(captured).toContain("kept");
+        expect(captured).not.toContain("SECRET");
+      }
+    }
+  },
+);
+
+test.each([true, false])(
+  "realtime response.done output cut to the retention bound is withheld from a mask (masked: %s)",
+  async (masked) => {
+    const mask = vi.fn((value: unknown) => value);
+    const spans = setupSpans(undefined, masked ? { mask } : {});
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+    const sent: Array<{ response?: object }> = [];
+
+    const connection = {
+      send(event: unknown) {
+        sent.push(event as { response?: object });
+      },
+      close() {},
+      on(event: string, listener: (...args: unknown[]) => void) {
+        listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+      },
+      off() {},
+    };
+
+    const wrapped = wrapOpenAIRealtime(connection);
+    const emit = (value: unknown) => listeners.get("event")?.forEach((listener) => listener(value));
+
+    wrapped.send({ type: "response.create" });
+    emit({ type: "response.created", response: { id: "cut", ...sent[0]?.response } });
+    emit({
+      type: "response.done",
+      response: {
+        id: "cut",
+        status: "completed",
+        output: [
+          { type: "message", role: "assistant", content: [{ type: "output_text", text: "kept" }] },
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: CUT_CAPTURE_SECRET }],
+          },
+        ],
+      },
+    });
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+
+    if (masked) {
+      expect(maskedKeys(mask)).not.toContain("gen_ai.output.messages");
+      expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+    } else {
+      const captured = String(span.attributes["gen_ai.output.messages"]);
+      expect(captured).toContain("kept");
+      expect(captured).not.toContain("SECRET");
+    }
+
+    wrapped.close();
+  },
+);
+
+test.each(["chat", "responses"] as const)(
+  "non-streaming %s without a mask passes cut input to the sampler",
+  async (kind) => {
+    const sampled: Array<Record<string, unknown>> = [];
+
+    setupSpans(undefined, {
+      sampler: {
+        shouldSample(_context, _traceId, _name, _kind, attributes) {
+          sampled.push({ ...attributes });
+
+          return { decision: SamplingDecision.RECORD_AND_SAMPLED };
+        },
+        toString: () => "recording",
+      },
+    });
+
+    const client = wrapOpenAI({
+      chat: { completions: { create: async (_params: unknown) => ({ choices: [] }) } },
+      responses: { create: async (_params: unknown) => ({ output: [] }) },
+      embeddings: { create() {} },
+    });
+
+    const input = [
+      { role: "user", content: "kept" },
+      { role: "user", content: CUT_CAPTURE_SECRET },
+    ];
+
+    if (kind === "chat")
+      await client.chat.completions.create({ model: "gpt-4o", messages: input } as never);
+    else await client.responses.create({ model: "gpt-4.1", input } as never);
+
+    expect(sampled).toHaveLength(1);
+    expect(String(sampled[0]?.["gen_ai.input.messages"])).toContain("kept");
+    expect(sampled[0]?.["telemetry.dev.capture.truncated"]).toBe(true);
+  },
+);
+
+test("a core without captureMasked withholds cut input as if masked", async () => {
+  const spans = setupSpans();
+  vi.spyOn(telemetrySdk as { captureMasked: unknown }, "captureMasked", "get").mockReturnValue(
+    undefined,
+  );
+
+  const client = wrapOpenAI({
+    chat: { completions: { create: async (_params: unknown) => ({ choices: [] }) } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+  });
+
+  await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      { role: "user", content: "kept" },
+      { role: "user", content: CUT_CAPTURE_SECRET },
+    ],
+  } as never);
+
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.input.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });

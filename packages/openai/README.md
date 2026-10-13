@@ -80,6 +80,8 @@ created from the OpenAI SDK's CommonJS build. Use `wrapOpenAI()` for CommonJS cl
 
 The integration maps native OpenAI request/response shapes directly into telemetry.dev fields. It does not normalize messages into another schema.
 
+Non-streamed chat and Responses input and output, and Realtime instructions and output, are bounded to 48 KiB and 1,000 items. A value over the bound sets `telemetry.dev.capture.truncated`. Without a mask, the bounded part is kept. With a mask configured, the value is omitted because the mask cannot inspect the complete value. Input is omitted before the span starts, so a custom `sampler` sees the bounded input when no mask is configured; with an older `@telemetry-dev/sdk` that cannot report whether a mask is configured, cut input is omitted as if one were.
+
 ## Streaming
 
 Chat completion streams are traced. Requests are sent unchanged by default, so token usage is only captured when the caller sets `stream_options.include_usage` themselves. Pass `{ injectStreamUsage: true }` to `wrapOpenAI` or `instrumentOpenAI` to inject `stream_options.include_usage` automatically; the synthetic usage-only chunk is then hidden from the caller. Injection is opt-in because some providers reject `stream_options` — for example Azure OpenAI "on your data" (`data_sources`) returns 400 for it while plain `stream: true` works.
