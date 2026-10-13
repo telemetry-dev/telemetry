@@ -328,21 +328,20 @@ function mapModalityTokens(
   }
 }
 
-// Keeps only candidate `content.role` and `content.parts`, so cut grounding or safety metadata
-// does not mark the exported content as cut.
-const skipCandidateMetadata = (
-  key: string,
-  item: unknown,
-  parent: unknown,
-  path: readonly string[],
-) =>
-  (path.length === 0 && key !== "content") ||
-  (path.length === 1 && path[0] === "content" && key !== "role" && key !== "parts") ||
-  skipBinaryCapture(key, item, parent, path);
+// boundedCapture's default item limit; more candidates than this cannot all be kept.
+const CAPTURE_MAX_ITEMS = 1_000;
 
 function candidateOutput(response: UnknownRecord) {
   if (!captureEnabled("output")) return { value: undefined, truncated: false, contentCut: false };
-  const capture = boundedCapture(response.candidates, { skip: skipCandidateMetadata });
+  const all = asArray(response.candidates);
+  // Only candidate content is exported as output. Bounding a projection of it, rather than whole
+  // candidates, keeps grounding or safety metadata from marking complete content as cut.
+  const projected = all?.slice(0, CAPTURE_MAX_ITEMS + 1).map((candidate) => {
+    const content = asRecord(asRecord(candidate)?.content);
+
+    return content ? { content: { role: content.role, parts: content.parts } } : {};
+  });
+  const capture = boundedTelemetryCapture(projected);
 
   // Metadata that does not fit is still a loss for the span-level flag; both passes are bounded.
   const truncated = capture.truncated || boundedTelemetryCapture(response.candidates).truncated;

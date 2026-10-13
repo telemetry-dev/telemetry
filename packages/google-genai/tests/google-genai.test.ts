@@ -2995,6 +2995,37 @@ test("generateContent keeps complete text when only candidate metadata is cut", 
   ]);
 });
 
+test.each([
+  {
+    name: "content filling the byte bound before trailing metadata",
+    candidate: {
+      content: { role: "model", parts: [{ text: "x".repeat(49_100) }] },
+      finishReason: "STOP",
+    },
+  },
+  {
+    name: "content filling the item bound before trailing metadata",
+    candidate: {
+      content: { role: "model", parts: Array.from({ length: 497 }, () => ({ text: "x" })) },
+      finishReason: "STOP",
+      index: 0,
+    },
+  },
+])("generateContent keeps $name for a mask", async ({ candidate }) => {
+  const spy = maskSpy();
+  const spans = setupSpans({ mask: spy.mask });
+
+  const client = wrapGoogleGenAI({
+    models: { generateContent: (_params: unknown) => ({ candidates: [candidate] }) },
+  });
+
+  client.models.generateContent({ model: "gemini", contents: "go" });
+
+  const span = await exportedSpan(spans);
+  expect(spy.keys).toContain("gen_ai.output.messages");
+  expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([candidate.content]);
+});
+
 test.each([true, false])(
   "generateContent withholds system instructions cut to the retention bound from a mask (masked: %s)",
   async (masked) => {
