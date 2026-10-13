@@ -72,6 +72,8 @@ test.each([
         middleware: [middleware],
       }),
     name: "embeddings",
+    provider: "openai",
+    requestModel: "openai-model",
     operation: "embeddings",
     outputType: undefined,
     responseModel: undefined,
@@ -97,6 +99,8 @@ test.each([
         middleware: [middleware],
       }),
     name: "generate_content image",
+    provider: "openai",
+    requestModel: "openai-model",
     operation: "generate_content",
     outputType: "image",
     responseModel: "gpt-image-1-2025",
@@ -120,6 +124,8 @@ test.each([
         middleware: [middleware],
       }),
     name: "generate_content speech",
+    provider: "elevenlabs",
+    requestModel: "elevenlabs-model",
     operation: "generate_content",
     outputType: "speech",
     responseModel: "eleven-v3",
@@ -142,6 +148,8 @@ test.each([
         middleware: [middleware],
       }),
     name: "generate_content text",
+    provider: "openai",
+    requestModel: "openai-model",
     operation: "generate_content",
     outputType: "text",
     responseModel: "whisper-1",
@@ -164,6 +172,8 @@ test.each([
         middleware: [middleware],
       }),
     name: "summarize",
+    provider: "anthropic",
+    requestModel: "anthropic-model",
     operation: "chat",
     outputType: "text",
     responseModel: "claude-resolved",
@@ -173,7 +183,17 @@ test.each([
   },
 ])(
   "$activity emits one $operation span with provider, model, and usage",
-  async ({ run, name, operation, outputType, responseModel, input, output }) => {
+  async ({
+    run,
+    name,
+    operation,
+    outputType,
+    provider,
+    requestModel,
+    responseModel,
+    input,
+    output,
+  }) => {
     const { middleware, spans, metrics, errors } = capture();
 
     await run(middleware as never);
@@ -187,10 +207,8 @@ test.each([
     expect(span!.status.code).toBe(SpanStatusCode.UNSET);
     expect(span!.attributes["gen_ai.operation.name"]).toBe(operation);
     expect(span!.attributes["gen_ai.output.type"]).toBe(outputType);
-    expect(span!.attributes["gen_ai.provider.name"]).toBeTypeOf("string");
-    expect(span!.attributes["gen_ai.request.model"]).toBe(
-      `${String(span!.attributes["gen_ai.provider.name"])}-model`,
-    );
+    expect(span!.attributes["gen_ai.provider.name"]).toBe(provider);
+    expect(span!.attributes["gen_ai.request.model"]).toBe(requestModel);
     expect(span!.attributes["gen_ai.response.model"]).toBe(responseModel);
     expect(span!.attributes["gen_ai.usage.input_tokens"]).toBe(input);
     expect(span!.attributes["gen_ai.usage.output_tokens"]).toBe(output);
@@ -526,4 +544,64 @@ test("streaming video traces one span from job creation to completion", async ()
     "gen_ai.output.type": "video",
     "gen_ai.usage.cost": 0.4,
   });
+});
+
+test("a throwing onError cannot reject a created video job when span export fails", async () => {
+  const reported: unknown[] = [];
+
+  const middleware = telemetryDev(
+    {
+      apiKey: "td_live_test",
+      onError: (error) => {
+        reported.push(error);
+        throw new Error("onError failed");
+      },
+    },
+    {
+      sendSpans: async () => {
+        throw new Error("export failed");
+      },
+      recordDuration: () => {},
+      recordTokens: () => {},
+    },
+  );
+
+  const job = await generateVideo({
+    adapter: videoAdapter([]),
+    prompt: "x",
+    middleware: [middleware as never],
+  });
+
+  expect(job).toEqual({ jobId: "job/42", model: "sora-2-2025" });
+  expect(reported.map((error) => (error as Error).message)).toEqual(["export failed"]);
+});
+
+test("streamed video finalizes once when a later middleware's onFinish throws", async () => {
+  const { middleware, spans, metrics } = capture();
+  const failure = new Error("later middleware failed");
+
+  const chunks = [];
+
+  for await (const chunk of generateVideo({
+    adapter: videoAdapter(["completed"]),
+    prompt: "x",
+    stream: true,
+    pollingInterval: 0,
+    middleware: [
+      middleware as never,
+      {
+        name: "throws-on-finish",
+        onFinish: () => {
+          throw failure;
+        },
+      },
+    ],
+  })) {
+    chunks.push(chunk);
+  }
+
+  expect(chunks.at(-1)?.type).toBe("RUN_ERROR");
+  expect(spans).toHaveLength(1);
+  expect(spans[0]!.status.code).toBe(SpanStatusCode.UNSET);
+  expect(metrics.filter((metric) => metric.type === "duration")).toHaveLength(1);
 });

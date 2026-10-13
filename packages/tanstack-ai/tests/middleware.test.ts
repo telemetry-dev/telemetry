@@ -611,6 +611,45 @@ test("export failure reaches onError even on the waitUntil path", async () => {
   expect((errors[0] as Error).message).toBe("trace export boom");
 });
 
+test.each(["finish", "error", "abort"])(
+  "a throwing onError cannot fail the chat %s hook when span export fails",
+  async (terminal) => {
+    const reported: unknown[] = [];
+
+    const mw = telemetryDev(
+      {
+        apiKey: "td_live_test",
+        onError: (e) => {
+          reported.push(e);
+          throw new Error("onError failed");
+        },
+      },
+      {
+        sendSpans: async () => {
+          throw new Error("trace export boom");
+        },
+        recordDuration: () => {},
+        recordTokens: () => {},
+      },
+    );
+
+    const ctx = makeCtx();
+
+    await mw.onStart?.(ctx);
+    await mw.onConfig?.(ctx, chatConfig());
+
+    const hook =
+      terminal === "finish"
+        ? mw.onFinish?.(ctx, { finishReason: "stop", duration: 5, content: "ok" } as never)
+        : terminal === "error"
+          ? mw.onError?.(ctx, { error: new Error("boom"), duration: 5 } as never)
+          : mw.onAbort?.(ctx, { reason: "stop", duration: 5 } as never);
+
+    await expect(hook).resolves.toBeUndefined();
+    expect(reported.map((e) => (e as Error).message)).toEqual(["trace export boom"]);
+  },
+);
+
 test("metric export retries a transient ingest failure", async () => {
   const errors: unknown[] = [];
   let metricCalls = 0;

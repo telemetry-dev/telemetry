@@ -130,6 +130,9 @@ export function generationTelemetryDev(
   );
 
   const states = new WeakMap<object, GenerationState>();
+  // Contexts already finalized. TanStack AI can report onError for a context whose onFinish has
+  // run (a later middleware's onFinish throws inside the streamed video try block).
+  const finished = new WeakSet<object>();
 
   const attributes = (
     ctx: GenerationMiddlewareContextCompat,
@@ -191,11 +194,14 @@ export function generationTelemetryDev(
     finishUsage?: TokenUsage,
     recordDuration = true,
   ) => {
-    // A video status call that fails reports onError without onStart.
+    // A video status call that fails reports onError without onStart; a context that already
+    // finished must not get a second span.
     const state =
-      states.get(ctx as object) ?? (ctx.activity === "video" ? newState(ctx) : undefined);
+      states.get(ctx as object) ??
+      (ctx.activity === "video" && !finished.has(ctx as object) ? newState(ctx) : undefined);
 
     if (!state) return;
+    finished.add(ctx as object);
     states.delete(ctx as object);
     const duration = Math.max(info.duration, 0);
     const span = state.span ?? startSpan(ctx, state, Date.now() - duration);

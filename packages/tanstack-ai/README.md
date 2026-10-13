@@ -93,8 +93,9 @@ Each call emits one CLIENT span. Operation names follow the other telemetry.dev 
 The span records the provider, requested model, request id, the model the result reports
 (`gen_ai.response.model`, except for `embed()`), duration, errors and aborts, and the token usage
 the provider reports, including text, image, and audio token breakdowns and cost when present.
-Duration and token metrics are recorded per call. Prompts, input text, summaries, transcripts,
-and image, audio, and video payloads are never captured.
+Duration and token metrics are recorded per call. The integration does not capture prompts,
+input text, summaries, transcripts, or image, audio, and video payloads. Error messages and abort
+reasons are recorded as-is and can contain sensitive content.
 
 Video jobs are traced at the two points where TanStack AI calls middleware:
 
@@ -166,5 +167,12 @@ telemetryDev({ waitUntil: (p) => ctx.waitUntil(p) });
   Billing units that are not tokens (seconds, characters, images) are not recorded.
 - **Video:** a streamed video run that fails carries no job id, because TanStack AI does not
   pass it to middleware before completion.
+- **Summarize streams:** with `@tanstack/ai` 0.57.0, a native `summarize({ stream: true })` that
+  fails mid-stream with a `RUN_ERROR` chunk reaches the middleware's `onFinish`, not `onError`, so
+  its span records success.
+- **Non-`Error` rejections:** with `@tanstack/ai` 0.57.0, when an `embed()`, `generateSpeech()`, or
+  `generateTranscription()` adapter rejects with `null` or `undefined`, TanStack AI skips the
+  middleware error hook (the call rejects with a `TypeError` instead), so no span is ended for that
+  call.
 - Middleware hook exceptions are wrapped in `try/catch` and routed to the optional `onError`
   callback so instrumentation can never break your chat.
