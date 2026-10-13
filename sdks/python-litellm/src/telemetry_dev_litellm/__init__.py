@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
@@ -38,22 +39,14 @@ class _CaptureLimit(Exception):
     pass
 
 
-def _bounded_utf8_size(value: str, limit: int) -> int:
-    size = 0
-    for character in value:
-        code = ord(character)
-        if code <= 0x7F:
-            size += 1
-        elif code <= 0x7FF:
-            size += 2
-        elif 0xD800 <= code <= 0xDFFF:
-            return max(limit + 1, 1)
-        elif code <= 0xFFFF:
-            size += 3
-        else:
-            size += 4
-        if size > limit:
-            return size
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _bounded_json_string_size(value: str, limit: int) -> int:
+    """Measure like the core budget, but fail closed on surrogates the exporter cannot encode."""
+    size = telemetry_dev.CaptureBudget.json_string_bytes(value, limit)
+    if size <= limit and _SURROGATE.search(value) is not None:
+        return max(limit + 1, 1)
     return size
 
 
@@ -164,7 +157,9 @@ def _bounded_responses_native(
         if isinstance(item, str):
             reserve(
                 16
-                + _bounded_utf8_size(item, active_budget.max_bytes - active_budget.bytes_used - 16)
+                + _bounded_json_string_size(
+                    item, active_budget.max_bytes - active_budget.bytes_used - 16
+                )
             )
             return item
         item_id = id(item)
@@ -205,7 +200,7 @@ def _bounded_responses_native(
                         continue
                     reserve(
                         16
-                        + _bounded_utf8_size(
+                        + _bounded_json_string_size(
                             key,
                             active_budget.max_bytes - active_budget.bytes_used - 16,
                         )
@@ -1243,7 +1238,7 @@ class _InstrumentedResponsesStream:
 
     def _append_delta(self, storage_key: object, target: dict[str, Any], delta: str) -> bool:
         remaining_bytes = self._budget.max_bytes - self._budget.bytes_used
-        delta_bytes = _bounded_utf8_size(delta, remaining_bytes)
+        delta_bytes = _bounded_json_string_size(delta, remaining_bytes)
         if delta_bytes > remaining_bytes:
             self._budget.truncated = True
             return False

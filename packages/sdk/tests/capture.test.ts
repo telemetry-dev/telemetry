@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { afterEach, describe, expect, test } from "vitest";
 
 import {
@@ -8,6 +10,15 @@ import {
 } from "../src/capture.ts";
 import { flush, observe, shutdown, startSpan } from "../src/index.ts";
 import { setup } from "./helpers.ts";
+
+// Shared with the Python SDK's capture tests. Read at runtime: the JSON module loader rejects
+// the lone surrogate escapes these cases need.
+const jsonStringBytesCases = JSON.parse(
+  readFileSync(
+    new URL("../../../sdks/python/tests/fixtures/json-string-bytes.json", import.meta.url),
+    "utf8",
+  ),
+) as { name: string; value: string; bytes: number }[];
 
 afterEach(async () => {
   await shutdown();
@@ -118,6 +129,16 @@ describe("boundedCapture", () => {
       truncated: true,
     });
   });
+
+  // Shared with sdks/python/tests/test_capture.py so both SDKs are held to the same numbers.
+  test.each(jsonStringBytesCases.map((entry) => [entry.name, entry] as const))(
+    "charges %s at its JSON-escaped size as a value and as a key",
+    (_name, { value, bytes }) => {
+      expect(boundedCaptureDetails(value).bytes).toBe(bytes + 2);
+      // Braces, the quoted key, the colon, and the value 0.
+      expect(boundedCaptureDetails({ [value]: 0 }).bytes).toBe(2 + bytes + 2 + 1 + 1);
+    },
+  );
 });
 
 test.each([

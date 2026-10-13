@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import chain
 from typing import Final, cast
@@ -10,6 +11,36 @@ _DEFAULT_MAX_BYTES: Final = 64 * 1024
 _DEFAULT_MAX_ITEMS: Final = 1024
 _MAX_DEPTH: Final = 32
 _BASE_ITEM_BYTES: Final = 16
+
+# Code points whose JSON form is longer than their UTF-8 form, mapped to the extra bytes.
+_SHORT_ESCAPE_EXTRA: Final = 1  # '"', '\\', \b \t \n \f \r: 1 byte raw, 2 escaped
+_CONTROL_ESCAPE_EXTRA: Final = 5  # other code points below 0x20: 1 byte raw, 6 as \u00XX
+_SURROGATE_ESCAPE_EXTRA: Final = 3  # a surrogate code point: 3 bytes raw, 6 as \uXXXX
+_JSON_ESCAPED: Final = re.compile('["\\\\\x00-\x1f\ud800-\udfff]')
+_JSON_STRING_CHUNK: Final = 4096
+
+
+def _escape_extra(character: str) -> int:
+    code = ord(character)
+    if character in '"\\\b\t\n\f\r':
+        return _SHORT_ESCAPE_EXTRA
+    if code < 0x20:
+        return _CONTROL_ESCAPE_EXTRA
+    return _SURROGATE_ESCAPE_EXTRA
+
+
+def _json_string_bytes(value: str, limit: int | None) -> int:
+    # Every code point costs at least one byte, so a string longer than the limit needs no scan.
+    if limit is not None and len(value) > limit:
+        return len(value)
+    size = 0
+    for start in range(0, len(value), _JSON_STRING_CHUNK):
+        chunk = value[start : start + _JSON_STRING_CHUNK]
+        size += len(chunk.encode("utf-8", "surrogatepass"))
+        size += sum(_escape_extra(match.group()) for match in _JSON_ESCAPED.finditer(chunk))
+        if limit is not None and size > limit:
+            return size
+    return size
 
 
 class CaptureBudget:
@@ -31,6 +62,18 @@ class CaptureBudget:
         return cls(
             max_bytes=client.max_attribute_length if client is not None else _DEFAULT_MAX_BYTES
         )
+
+    @staticmethod
+    def json_string_bytes(value: str, limit: int | None = None) -> int:
+        """Return the UTF-8 bytes ``value`` occupies inside a JSON string, without the quotes.
+
+        Matches the TypeScript SDK's measure: ``"``, ``\\``, and ``\\b \\t \\n \\f \\r`` cost 2
+        bytes, other control characters cost 6 (``\\u00XX``), and every surrogate code point
+        costs 6 (``\\uXXXX``); anything else costs its UTF-8 width. The budget charges a string
+        this plus its per-item cost, which covers the quotes and separators. Counting stops
+        once the total passes ``limit``, so a result above ``limit`` is only a lower bound.
+        """
+        return _json_string_bytes(value, limit)
 
     @property
     def remaining_bytes(self) -> int:
@@ -98,20 +141,9 @@ class CaptureBudget:
         if value is None or isinstance(value, bool | int | float):
             return byte_count, item_count
         if isinstance(value, str):
-            for character in value:
-                codepoint = ord(character)
-                byte_count += (
-                    1
-                    if codepoint <= 0x7F
-                    else 2
-                    if codepoint <= 0x7FF
-                    else 3
-                    if codepoint <= 0xFFFF
-                    else 4
-                )
-                if byte_count > remaining_bytes:
-                    return None
-            return byte_count, item_count
+            # Mapping keys come through here too, so they are charged at their escaped size.
+            byte_count += _json_string_bytes(value, remaining_bytes - byte_count)
+            return (byte_count, item_count) if byte_count <= remaining_bytes else None
         if isinstance(value, bytes | bytearray | memoryview):
             length = value.nbytes if isinstance(value, memoryview) else len(value)
             # Structured attributes serialize binary values as base64 text.

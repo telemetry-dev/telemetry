@@ -54,7 +54,7 @@ _BASE_ITEM_BYTES = _core_base_item_bytes()
 
 def _field_bytes(name: str) -> int:
     """Bytes the core budget charges for one named field added to an existing object."""
-    return 2 * _BASE_ITEM_BYTES + len(name.encode())
+    return 2 * _BASE_ITEM_BYTES + telemetry_dev.CaptureBudget.json_string_bytes(name)
 
 
 def _structure_cost(shape: object) -> tuple[int, int]:
@@ -183,7 +183,7 @@ def _bounded_responses_capture(
         if isinstance(item, str):
             reserve(
                 _BASE_ITEM_BYTES
-                + _bounded_json_string_size(
+                + telemetry_dev.CaptureBudget.json_string_bytes(
                     item, budget.max_bytes - budget.bytes_used - _BASE_ITEM_BYTES
                 )
             )
@@ -235,7 +235,7 @@ def _bounded_responses_capture(
                         continue
                     reserve(
                         _BASE_ITEM_BYTES
-                        + _bounded_json_string_size(
+                        + telemetry_dev.CaptureBudget.json_string_bytes(
                             key, budget.max_bytes - budget.bytes_used - _BASE_ITEM_BYTES
                         )
                     )
@@ -752,7 +752,7 @@ def _replace_finish_reason(
         budget.items_used = base_items
         reservations.pop(index, None)
         return False
-    value_bytes = _bounded_json_string_size(value, available_bytes)
+    value_bytes = telemetry_dev.CaptureBudget.json_string_bytes(value, available_bytes)
     if value_bytes > available_bytes:
         budget.bytes_used = base_bytes
         budget.items_used = base_items
@@ -785,27 +785,6 @@ def _reserve_chat_budget(
     return True
 
 
-def _bounded_json_string_size(value: str, limit: int) -> int:
-    size = 0
-    for character in value:
-        code = ord(character)
-        if character in {'"', "\\"} or character in {"\b", "\t", "\n", "\f", "\r"}:
-            size += 2
-        elif code <= 0x1F or 0xD800 <= code <= 0xDFFF:
-            size += 6
-        elif code <= 0x7F:
-            size += 1
-        elif code <= 0x7FF:
-            size += 2
-        elif code <= 0xFFFF:
-            size += 3
-        else:
-            size += 4
-        if size > limit:
-            return size
-    return size
-
-
 def _capture_chat_string(
     value: str,
     budget: telemetry_dev.CaptureBudget,
@@ -823,7 +802,7 @@ def _capture_chat_string(
         if not recoverable:
             budget.truncated = True
         return False
-    value_bytes = _bounded_json_string_size(value, available_bytes)
+    value_bytes = telemetry_dev.CaptureBudget.json_string_bytes(value, available_bytes)
     if value_bytes > available_bytes:
         if not recoverable:
             budget.truncated = True
@@ -841,12 +820,12 @@ def _replace_chat_scalar(
 ) -> bool:
     held_bytes = _BASE_ITEM_BYTES
     if current is not None:
-        held_bytes += _bounded_json_string_size(current, budget.max_bytes)
+        held_bytes += telemetry_dev.CaptureBudget.json_string_bytes(current, budget.max_bytes)
     base_bytes = budget.bytes_used - held_bytes
     available_bytes = budget.max_bytes - base_bytes - _BASE_ITEM_BYTES
     if available_bytes < 0:
         return False
-    value_bytes = _bounded_json_string_size(value, available_bytes)
+    value_bytes = telemetry_dev.CaptureBudget.json_string_bytes(value, available_bytes)
     if value_bytes > available_bytes:
         return False
     budget.bytes_used = base_bytes + _BASE_ITEM_BYTES + value_bytes
@@ -854,7 +833,7 @@ def _replace_chat_scalar(
 
 
 def _release_chat_field(field_name: str, value: str, budget: telemetry_dev.CaptureBudget) -> None:
-    budget.bytes_used -= _field_bytes(field_name) + _bounded_json_string_size(
+    budget.bytes_used -= _field_bytes(field_name) + telemetry_dev.CaptureBudget.json_string_bytes(
         value, budget.max_bytes
     )
     budget.items_used -= 2

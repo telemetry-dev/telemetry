@@ -1896,7 +1896,7 @@ def test_appended_deltas_are_rejected_before_encoding(monkeypatch: pytest.Monkey
     assert implementation._reserve_appended_text(0, "é", fitting) is True
     assert fitting.budget.bytes_used == 2
     assert fitting.block_reservations[0] == (2, 0)
-    assert measured == [1]
+    assert measured == []
 
     escaped = implementation._StreamState()
     assert implementation._reserve_appended_text(0, '"\n', escaped) is True
@@ -2235,6 +2235,56 @@ def test_tool_input_after_the_stop_stays_charged_through_signatures(
         assert retained <= state.budget.bytes_used
 
     assert state.budget.truncated is True
+
+
+@pytest.mark.parametrize(
+    "signatures", [["sig"], ["sig", "s" * 60_000]], ids=["accepted", "rejected"]
+)
+def test_unsettled_tool_input_stays_charged_at_its_escaped_size_through_signatures(
+    signatures: list[str],
+) -> None:
+    implementation = cast(Any, telemetry_dev_anthropic)
+    record = implementation._record_stream_event
+    state = implementation._StreamState()
+    raw_input = "\x01" * 1000
+    record(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "t1", "name": "calc"},
+        },
+        state,
+    )
+    record(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": raw_input},
+        },
+        state,
+    )
+    streamed = state.budget.bytes_used
+    for signature in signatures:
+        record(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": signature},
+            },
+            state,
+        )
+
+    # No content_block_stop, so the replacement re-measures the raw input through the core.
+    assert 0 not in state.settled_tool_blocks
+    assert state.tool_json[0] == raw_input
+    escaped_input = len(json.dumps(raw_input)) - 2
+    assert escaped_input == 6_000
+    assert state.block_reservations[0][0] >= escaped_input + len(json.dumps(state.blocks[0]))
+    assert state.budget.bytes_used >= streamed
+    if len(signatures) > 1:
+        assert "signature" not in state.blocks[0]
+    else:
+        assert state.blocks[0]["signature"] == "sig"
 
 
 @pytest.mark.parametrize(

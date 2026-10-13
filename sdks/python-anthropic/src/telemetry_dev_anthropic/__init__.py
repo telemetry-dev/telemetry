@@ -391,10 +391,6 @@ _APPENDED_DELTA_FIELDS = {
 }
 
 
-def _escaped_text_bytes(text: str) -> int:
-    return len(json.dumps(text, ensure_ascii=False).encode("utf-8", "surrogatepass")) - 2
-
-
 def _reserve_appended_text(index: int, value: Any, state: _StreamState) -> bool:
     budget = state.budget
     if budget.truncated:
@@ -402,10 +398,7 @@ def _reserve_appended_text(index: int, value: Any, state: _StreamState) -> bool:
     text = _string(value)
     if not text:
         return True
-    if len(text) > budget.remaining_bytes:
-        budget.truncated = True
-        return False
-    size = _escaped_text_bytes(text)
+    size = telemetry_dev.CaptureBudget.json_string_bytes(text, budget.remaining_bytes)
     if size > budget.remaining_bytes:
         budget.truncated = True
         return False
@@ -1004,7 +997,7 @@ def _settled_replacement_cost(
     raw_input = state.tool_json.get(index)
     if cost is None or not raw_input:
         return cost
-    return cost[0] + _escaped_text_bytes(raw_input), cost[1]
+    return cost[0] + telemetry_dev.CaptureBudget.json_string_bytes(raw_input), cost[1]
 
 
 def _settle_tool_input(index: int, state: _StreamState) -> None:
