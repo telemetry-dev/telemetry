@@ -253,6 +253,64 @@ test.each([
   },
 );
 
+const MODALITY_ATTRS = [
+  "gen_ai.usage.text.input_tokens",
+  "gen_ai.usage.text.output_tokens",
+  "gen_ai.usage.image.input_tokens",
+  "gen_ai.usage.image.output_tokens",
+  "gen_ai.usage.audio.input_tokens",
+  "gen_ai.usage.audio.output_tokens",
+] as const;
+
+test.each([
+  {
+    name: "provider modality details",
+    details: {
+      promptTokensDetails: { textTokens: 11, imageTokens: 12, audioTokens: 13 },
+      completionTokensDetails: { textTokens: 21, imageTokens: 22, audioTokens: 23 },
+    },
+    expected: {
+      "gen_ai.usage.text.input_tokens": 11,
+      "gen_ai.usage.text.output_tokens": 21,
+      "gen_ai.usage.image.input_tokens": 12,
+      "gen_ai.usage.image.output_tokens": 22,
+      "gen_ai.usage.audio.input_tokens": 13,
+      "gen_ai.usage.audio.output_tokens": 23,
+    },
+  },
+  { name: "no modality details", details: {}, expected: {} },
+])("chat iteration records $name as usage modality attributes", async ({ details, expected }) => {
+  const { spanBatches, overrides } = makeCapture();
+  const mw = middleware(overrides);
+  const ctx = makeCtx();
+
+  await mw.onStart?.(ctx);
+  await mw.onConfig?.(ctx, chatConfig());
+  await mw.onUsage?.(ctx, {
+    promptTokens: 40,
+    completionTokens: 70,
+    totalTokens: 110,
+    ...details,
+  } as never);
+  await mw.onFinish?.(ctx, { finishReason: "stop", duration: 120, content: "hi" } as never);
+
+  const spans = spanBatches[0]!;
+  const root = spans.find((s) => s.kind === SpanKind.INTERNAL)!;
+  const iteration = spans.find((s) => s.kind === SpanKind.CLIENT)!;
+  const recorded = Object.fromEntries(
+    MODALITY_ATTRS.filter((key) => key in iteration.attributes).map((key) => [
+      key,
+      iteration.attributes[key],
+    ]),
+  );
+  expect(recorded).toEqual(expected);
+  // Per-span usage only: a root rollup would double-count in the ingest's per-trace sum.
+  for (const key of MODALITY_ATTRS) {
+    expect(root.attributes[key]).toBeUndefined();
+    expect(event(root, "generation.summary")?.attributes?.[key]).toBeUndefined();
+  }
+});
+
 test("bigint metadata IDs populate user and conversation attributes", async () => {
   const { spanBatches, overrides } = makeCapture();
   const mw = middleware(overrides);

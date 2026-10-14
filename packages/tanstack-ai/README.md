@@ -136,11 +136,12 @@ telemetryDev({ waitUntil: (p) => ctx.waitUntil(p) });
 
 ## What gets captured
 
-- **Tokens:** input/output per iteration, plus cache-read, cache-write, and reasoning token
-  breakdowns and provider-reported cost when the adapter supplies them
+- **Tokens:** input/output per iteration, plus cache-read, cache-write, reasoning, and
+  text/image/audio token breakdowns and provider-reported cost when the adapter supplies them
   (`gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_creation.input_tokens`,
-  `gen_ai.usage.reasoning.output_tokens`, `gen_ai.usage.cost`). Absent fields are omitted, never
-  zeroed. Provider-reported cost takes precedence; otherwise, the server estimates standard token cost when
+  `gen_ai.usage.reasoning.output_tokens`,
+  `gen_ai.usage.{text,image,audio}.{input_tokens,output_tokens}`, `gen_ai.usage.cost`). Absent
+  fields are omitted, never zeroed. Provider-reported cost takes precedence; otherwise, the server estimates standard token cost when
   reported usage and matching model pricing are available. Missing pricing leaves cost
   unavailable, not zero, and does not prevent tracing or token accounting.
 - **Content:** the per-iteration request messages (`gen_ai.input.messages`, exactly what the
