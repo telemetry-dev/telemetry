@@ -881,7 +881,9 @@ class _InstrumentedStream:
             choice_index = _number(_field(choice, "index"))
             key = (
                 int(choice_index)
-                if choice_index is not None and math.isfinite(choice_index)
+                # math.isfinite raises OverflowError on ints too large for a float.
+                if choice_index is not None
+                and (isinstance(choice_index, int) or math.isfinite(choice_index))
                 else fallback_index
             )
             # Finish reasons outlive the chunk budget so a long stream keeps its final reason,

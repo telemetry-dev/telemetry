@@ -1548,6 +1548,48 @@ test.each([0, 5_000])(
   },
 );
 
+test("streaming keeps candidates rejected by the index cap out of response attributes", async () => {
+  const spans = setupSpans();
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield {
+          candidates: Array.from({ length: 1_000 }, (_, index) => ({
+            index,
+            content: { role: "model", parts: [{ text: "x" }] },
+          })),
+        };
+
+        yield {
+          candidates: Array.from({ length: 5_000 }, (_, offset) => ({
+            index: 1_000 + offset,
+            content: { role: "model", parts: [{ text: "y" }] },
+            finishReason: "SAFETY",
+            safetyRatings: [{ category: "rejected-rating" }],
+            groundingMetadata: { marker: "rejected-grounding" },
+            urlContextMetadata: { marker: "rejected-url-context" },
+          })),
+        };
+      },
+    },
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: "go" }),
+  );
+
+  for await (const _chunk of stream) {
+  }
+
+  const span = await exportedSpan(spans);
+  const finishReasons = (span.attributes["gen_ai.response.finish_reasons"] ?? []) as string[];
+  expect(finishReasons.length).toBeLessThanOrEqual(1_000);
+  expect(finishReasons).not.toContain("SAFETY");
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(JSON.stringify(span.attributes)).not.toMatch(/rejected-/);
+});
+
 test("masked streaming early break withholds partial output", async () => {
   const seen: string[] = [];
   const spans = setupSpans({

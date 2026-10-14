@@ -1265,6 +1265,8 @@ class StreamAggregator {
 
     const capturesContent = captureEnabled("input") || captureEnabled("output");
     const candidates = asArray(record.candidates) ?? [];
+    // Candidates dropped by the index cap must not reach chunk attributes either.
+    const rejected = new Set<unknown>();
 
     for (const candidate of candidates) {
       const candidateRecord = asRecord(candidate) ?? {};
@@ -1295,6 +1297,7 @@ class StreamAggregator {
         // exported, so distinct indices are capped at the item bound; later ones are dropped.
         if (this.candidates.size >= CAPTURE_MAX_ITEMS) {
           this.outputCaptureTruncated = true;
+          rejected.add(candidate);
           continue;
         }
 
@@ -1354,7 +1357,11 @@ class StreamAggregator {
 
     if (chunkUsage) this.usage = chunkUsage;
 
-    const chunkAttributes = responseAttributes(record);
+    const chunkAttributes = responseAttributes(
+      rejected.size > 0
+        ? { ...record, candidates: candidates.filter((candidate) => !rejected.has(candidate)) }
+        : record,
+    );
     Object.assign(this.attributes, chunkAttributes);
   }
 
