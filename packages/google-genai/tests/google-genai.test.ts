@@ -15,6 +15,7 @@ import {
   FunctionCallingConfigMode,
   GoogleGenAI,
   Type,
+  type Content,
   type FunctionCall,
   type Part,
   type Tool,
@@ -27,6 +28,13 @@ const SPAN_STATUS_UNSET = 0;
 const SPAN_STATUS_ERROR = 2;
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+// A fake streamed chunk: only the fields the wrapper reads from a generateContentStream response.
+interface FakeStreamChunk {
+  responseId?: string;
+  candidates: Array<{ content: Content; finishReason?: string }>;
+  automaticFunctionCallingHistory?: Content[];
+}
 
 interface CapturedRequest {
   method: string | undefined;
@@ -1621,6 +1629,7 @@ test("streaming keeps candidates rejected by the index cap out of response attri
 
 test("masked streaming early break withholds partial output", async () => {
   const seen: string[] = [];
+
   const spans = setupSpans({
     mask: (value) => {
       seen.push(JSON.stringify(value));
@@ -1653,6 +1662,7 @@ test.each([0, 100, 1024 * 1024])(
   "streaming past the fixed bound is flagged and withheld from a mask (maxAttributeLength %i)",
   async (maxAttributeLength) => {
     const seen: string[] = [];
+
     const spans = setupSpans({
       maxAttributeLength,
       mask: (value) => {
@@ -1704,6 +1714,7 @@ test.each([
           ? [{ role: "model", parts: [{ text: "[redacted]" }] }]
           : value,
     });
+
     const text = redact ? "x".repeat(5_000) : "東".repeat(400);
 
     const client = wrapGoogleGenAI({
@@ -1731,6 +1742,7 @@ test.each([
         span,
         "gen_ai.output.messages",
       );
+
       expect(output[0]?.parts?.[0]?.text).toBe(expected);
     }
   },
@@ -1740,6 +1752,7 @@ test.each([false, true])(
   "masked streaming AFC withholds history holding incomplete model output (authoritative history %s)",
   async (authoritative) => {
     const seen: string[] = [];
+
     const spans = setupSpans({
       mask: (value) => {
         seen.push(JSON.stringify(value));
@@ -1771,15 +1784,19 @@ test.each([false, true])(
               },
             ],
           };
-          yield {
+
+          const finalChunk: FakeStreamChunk = {
             candidates: [
               {
                 content: { role: "model", parts: [{ text: "final answer" }] },
                 finishReason: "STOP",
               },
             ],
-            ...(authoritative ? { automaticFunctionCallingHistory: history } : {}),
           };
+
+          if (authoritative) finalChunk.automaticFunctionCallingHistory = history;
+
+          yield finalChunk;
         },
       },
     });
@@ -1809,6 +1826,7 @@ test.each([false, true])(
 
 test("masked streaming AFC flags a cut function response and keeps it from the mask", async () => {
   const seen: string[] = [];
+
   const spans = setupSpans({
     mask: (value) => {
       seen.push(JSON.stringify(value));
@@ -1863,6 +1881,7 @@ test("masked streaming AFC flags a cut function response and keeps it from the m
 
 test("masked streaming AFC keeps a complete model turn when a later cut function response is dropped", async () => {
   const seen: string[] = [];
+
   const spans = setupSpans({
     mask: (value) => {
       seen.push(JSON.stringify(value));
@@ -1870,6 +1889,7 @@ test("masked streaming AFC keeps a complete model turn when a later cut function
       return value;
     },
   });
+
   const turn = `complete-turn${"t".repeat(30_000)}`;
 
   const client = wrapGoogleGenAI({
@@ -3018,7 +3038,7 @@ test.each([true, false])(
   },
 );
 
-function cutRequestAfcStream(finalChunk: object) {
+function cutRequestAfcStream(finalChunk: FakeStreamChunk) {
   return wrapGoogleGenAI({
     models: {
       async *generateContentStream(_params: unknown) {
@@ -3252,7 +3272,7 @@ test.each([
   ["generateContent", "systemInstruction"],
   ["generateContentStream", "contents"],
 ] as const)("%s without a mask passes cut %s to the sampler", async (method, field) => {
-  const sampled: Array<Record<string, unknown>> = [];
+  const sampled: Array<ReadableSpan["attributes"]> = [];
 
   setupSpans({
     sampler: {

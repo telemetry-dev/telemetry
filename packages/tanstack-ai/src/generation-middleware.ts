@@ -56,9 +56,14 @@ interface Operation {
   outputType?: string;
 }
 
+// Keyed by TanStack AI's open `activity` string; activities without an entry get no span.
+interface OperationsByActivity {
+  [activity: string]: Operation | undefined;
+}
+
 // Operation names match the other TypeScript integrations: `embeddings` for embedding calls,
 // `generate_content` plus `gen_ai.output.type` for media, and `chat` for text generation.
-const OPERATIONS: Partial<Record<string, Operation>> = {
+const OPERATIONS: OperationsByActivity = {
   evaluate: { name: "evaluate", spanName: "evaluate" },
   embedding: { name: "embeddings", spanName: "embeddings" },
   summarize: { name: "chat", spanName: "summarize", outputType: "text" },

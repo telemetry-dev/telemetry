@@ -17,6 +17,7 @@ const MAX_STREAM_CAPTURE_BYTES = 64 * 1024;
 const MAX_STREAM_CAPTURE_ITEMS = 1024;
 const MAX_STREAM_CAPTURE_DEPTH = 32;
 const STREAM_CAPTURE_ITEM_BYTES = 16;
+
 const TERMINAL_RESPONSE_EVENTS = new Set([
   "response.completed",
   "response.failed",
@@ -1457,6 +1458,7 @@ function createObservedResponsesStream(
   let budget = new StreamCaptureBudget();
   let sawFirst = false;
   let sawTerminalSnapshot = false;
+
   const capturedFields = (incomplete: boolean): SpanFields => {
     const fields: SpanFields = { ...partial };
 

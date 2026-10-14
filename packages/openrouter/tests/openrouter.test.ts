@@ -4,7 +4,14 @@ import { Chat } from "@openrouter/sdk/sdk/chat.js";
 import { Embeddings } from "@openrouter/sdk/sdk/embeddings.js";
 import { EventStream } from "@openrouter/sdk/lib/event-streams.js";
 import { Responses } from "@openrouter/sdk/sdk/responses.js";
-import { flush, init, type MaskFn, shutdown, startActiveSpan } from "@telemetry-dev/sdk";
+import {
+  flush,
+  init,
+  type MaskFn,
+  shutdown,
+  startActiveSpan,
+  type TelemetryOptions,
+} from "@telemetry-dev/sdk";
 import { afterEach, expect, test, vi } from "vitest";
 
 import { instrumentOpenRouter, uninstrumentOpenRouter, wrapOpenRouter } from "../src/index.ts";
@@ -80,19 +87,20 @@ function createFakeFetcher(...responses: Response[]) {
 
 function setupSpans(mask?: MaskFn, maxAttributeLength?: number): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
-  init(
-    {
-      apiKey: "td_live_test",
-      serviceName: "openrouter-tests",
-      environment: "test",
-      exportMode: "immediate",
-      logLevel: "silent",
-      mask,
-      ...(maxAttributeLength === undefined ? {} : { maxAttributeLength }),
-      fetch: async () => new Response(null, { status: 200 }),
-    },
-    { spanExporter },
-  );
+
+  const options: TelemetryOptions = {
+    apiKey: "td_live_test",
+    serviceName: "openrouter-tests",
+    environment: "test",
+    exportMode: "immediate",
+    logLevel: "silent",
+    mask,
+    fetch: async () => new Response(null, { status: 200 }),
+  };
+
+  if (maxAttributeLength !== undefined) options.maxAttributeLength = maxAttributeLength;
+
+  init(options, { spanExporter });
 
   return spanExporter;
 }
@@ -740,11 +748,13 @@ test.each([0, 100, 1024 * 1024])(
   "chat stream past the fixed bound is flagged and withheld from a mask (maxAttributeLength %i)",
   async (maxAttributeLength) => {
     const seen: string[] = [];
+
     const spans = setupSpans((value) => {
       seen.push(JSON.stringify(value));
 
       return value;
     }, maxAttributeLength);
+
     const content = "x".repeat(1024);
 
     const span = await streamedChatSpan(spans, [
@@ -774,6 +784,7 @@ test.each([
           : value,
       maxAttributeLength,
     );
+
     const content = redact ? "x".repeat(5_000) : "東".repeat(400);
 
     const span = await streamedChatSpan(spans, [
@@ -873,6 +884,7 @@ test("early chat stream cancellation captures partial output and ends once", asy
 
 test("masked chat stream cancellation withholds partial output", async () => {
   const seen: string[] = [];
+
   const spans = setupSpans((value) => {
     seen.push(JSON.stringify(value));
 
@@ -1144,11 +1156,13 @@ test.each(["response.created", "response.in_progress"])(
 
 test("masked Responses stream cancellation withholds partial output", async () => {
   const seen: string[] = [];
+
   const spans = setupSpans((value) => {
     seen.push(JSON.stringify(value));
 
     return value;
   });
+
   const delta = (text: string, sequence_number: number) => ({
     type: "response.output_text.delta",
     sequence_number,

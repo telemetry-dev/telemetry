@@ -297,13 +297,15 @@ test.each([
   const spans = spanBatches[0]!;
   const root = spans.find((s) => s.kind === SpanKind.INTERNAL)!;
   const iteration = spans.find((s) => s.kind === SpanKind.CLIENT)!;
-  const recorded = Object.fromEntries(
-    MODALITY_ATTRS.filter((key) => key in iteration.attributes).map((key) => [
-      key,
-      iteration.attributes[key],
-    ]),
-  );
+
+  const recorded: Attributes = {};
+
+  for (const key of MODALITY_ATTRS) {
+    if (key in iteration.attributes) recorded[key] = iteration.attributes[key];
+  }
+
   expect(recorded).toEqual(expected);
+
   // Per-span usage only: a root rollup would double-count in the ingest's per-trace sum.
   for (const key of MODALITY_ATTRS) {
     expect(root.attributes[key]).toBeUndefined();
@@ -696,12 +698,17 @@ test.each(["finish", "error", "abort"])(
     await mw.onStart?.(ctx);
     await mw.onConfig?.(ctx, chatConfig());
 
-    const hook =
-      terminal === "finish"
-        ? mw.onFinish?.(ctx, { finishReason: "stop", duration: 5, content: "ok" } as never)
-        : terminal === "error"
-          ? mw.onError?.(ctx, { error: new Error("boom"), duration: 5 } as never)
-          : mw.onAbort?.(ctx, { reason: "stop", duration: 5 } as never);
+    const runTerminal = () => {
+      if (terminal === "finish")
+        return mw.onFinish?.(ctx, { finishReason: "stop", duration: 5, content: "ok" } as never);
+
+      if (terminal === "error")
+        return mw.onError?.(ctx, { error: new Error("boom"), duration: 5 } as never);
+
+      return mw.onAbort?.(ctx, { reason: "stop", duration: 5 } as never);
+    };
+
+    const hook = runTerminal();
 
     await expect(hook).resolves.toBeUndefined();
     expect(reported.map((e) => (e as Error).message)).toEqual(["trace export boom"]);

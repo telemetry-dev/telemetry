@@ -53,6 +53,7 @@ const LEGACY_CAPTURE_POLICY: NonNullable<SpanHandle["capturePolicy"]> = {
   mask: true,
   maxAttributeLength: 65_536,
 };
+
 const usageCollectorModels = new WeakSet<object>();
 const AlsCtor = loadAls();
 
@@ -333,7 +334,7 @@ function ownField(value: unknown, key: string): unknown {
   return value !== null &&
     typeof value === "object" &&
     Object.prototype.propertyIsEnumerable.call(value, key)
-    ? (value as Record<string, unknown>)[key]
+    ? (value as UnknownRecord)[key]
     : undefined;
 }
 
@@ -344,6 +345,7 @@ function candidateOutput(response: UnknownRecord) {
   if (!captureEnabled("output")) return { value: undefined, truncated: false, contentCut: false };
   const all = asArray(response.candidates);
   let projectionFailed = false;
+
   // Only candidate content is exported as output. Bounding a projection of it, rather than whole
   // candidates, keeps grounding or safety metadata from marking complete content as cut.
   const projected = all?.slice(0, CAPTURE_MAX_ITEMS + 1).map((candidate) => {
@@ -359,6 +361,7 @@ function candidateOutput(response: UnknownRecord) {
       return {};
     }
   });
+
   const capture = boundedTelemetryCapture(projected);
 
   // Metadata that does not fit is still a loss for the span-level flag; both passes are bounded.
@@ -1362,6 +1365,7 @@ class StreamAggregator {
         ? { ...record, candidates: candidates.filter((candidate) => !rejected.has(candidate)) }
         : record,
     );
+
     Object.assign(this.attributes, chunkAttributes);
   }
 
