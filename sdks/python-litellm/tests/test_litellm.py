@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from collections.abc import Iterator, Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any, cast
@@ -891,6 +892,183 @@ def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
         assert json_attr(a["gen_ai.output.messages"])[0]["content"] == retained
     else:
         assert len(str(a.get("gen_ai.output.messages", ""))) <= max_attribute_length
+
+
+@pytest.mark.parametrize("extra_indices", [0, 5_000])
+def test_stream_choice_indices_are_capped(
+    make: Any, monkeypatch: pytest.MonkeyPatch, extra_indices: int
+) -> None:
+    seen: list[str] = []
+
+    def mask(value: Any, _context: Any) -> Any:
+        seen.append(json.dumps(value, default=str))
+        return value
+
+    memory = make(mask=mask)
+
+    def choice(index: int, content: str | None, finish_reason: str | None) -> Any:
+        return SimpleNamespace(
+            index=index, delta=SimpleNamespace(content=content), finish_reason=finish_reason
+        )
+
+    chunks: list[Any] = [
+        SimpleNamespace(
+            id="many-choices",
+            model="gpt-4o-mini",
+            choices=[choice(0, "first", None), choice(1, "second", None)],
+        ),
+        *(
+            SimpleNamespace(
+                id=None,
+                model=None,
+                choices=[choice(index, None, "stop") for index in range(start, start + 100)],
+            )
+            for start in range(2, 2 + extra_indices, 100)
+        ),
+        SimpleNamespace(
+            id=None,
+            model=None,
+            choices=[choice(0, None, "length"), choice(1, None, "content_filter")],
+        ),
+    ]
+
+    def fake_completion(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        return iter(chunks)
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    instrument_litellm()
+    stream = llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+    assert list(stream) == chunks
+
+    a = attrs(only_span(memory))
+    finish_reasons = tuple(cast(Any, a["gen_ai.response.finish_reasons"]))
+    assert finish_reasons[:2] == ("length", "content_filter")
+    if extra_indices == 0:
+        assert finish_reasons == ("length", "content_filter")
+        return
+    max_items = telemetry_dev_litellm._STREAM_CAPTURE_MAX_ITEMS  # pyright: ignore[reportPrivateUsage]
+    assert len(stream._finish_reasons) <= max_items
+    assert len(finish_reasons) <= max_items
+    assert a["telemetry.dev.capture.truncated"] is True
+    assert "gen_ai.output.messages" not in a
+    assert not any('"first"' in value for value in seen)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    "choice_index", [10**400, math.nan, math.inf], ids=["huge-int", "nan", "inf"]
+)
+async def test_stream_out_of_range_choice_index_does_not_escape(
+    memory: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    asynchronous: bool,
+    choice_index: float,
+) -> None:
+    chunks: list[Any] = [
+        SimpleNamespace(
+            id="odd-index",
+            model="gpt-4o-mini",
+            choices=[
+                SimpleNamespace(
+                    index=choice_index, delta=SimpleNamespace(content="hi"), finish_reason=None
+                )
+            ],
+        ),
+        SimpleNamespace(
+            id=None,
+            model=None,
+            choices=[
+                SimpleNamespace(
+                    index=choice_index, delta=SimpleNamespace(content=None), finish_reason="stop"
+                )
+            ],
+        ),
+    ]
+
+    def fake_completion(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        return iter(chunks)
+
+    async def fake_acompletion(*args: Any, **kwargs: Any) -> Any:
+        async def stream() -> Any:
+            for chunk in chunks:
+                yield chunk
+
+        return stream()
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    instrument_litellm()
+    if asynchronous:
+        stream = await llm.acompletion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+        delivered = [chunk async for chunk in stream]
+    else:
+        stream = llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+        delivered = list(stream)
+
+    assert len(delivered) == len(chunks)
+    assert all(got is sent for got, sent in zip(delivered, chunks, strict=True))
+    a = attrs(only_span(memory))
+    assert "error.type" not in a
+    assert tuple(cast(Any, a["gen_ai.response.finish_reasons"])) == ("stop",)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+async def test_stream_huge_choice_index_keeps_its_own_finish_reason(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, asynchronous: bool
+) -> None:
+    # A huge index at array position zero must not collide with the real choice index 0.
+    chunks: list[Any] = [
+        SimpleNamespace(
+            id="huge-index",
+            model="gpt-4o-mini",
+            choices=[
+                SimpleNamespace(index=0, delta=SimpleNamespace(content="hi"), finish_reason=None)
+            ],
+        ),
+        SimpleNamespace(
+            id=None,
+            model=None,
+            choices=[
+                SimpleNamespace(
+                    index=0, delta=SimpleNamespace(content=None), finish_reason="length"
+                )
+            ],
+        ),
+        SimpleNamespace(
+            id=None,
+            model=None,
+            choices=[
+                SimpleNamespace(
+                    index=10**400, delta=SimpleNamespace(content=None), finish_reason="stop"
+                )
+            ],
+        ),
+    ]
+
+    def fake_completion(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        return iter(chunks)
+
+    async def fake_acompletion(*args: Any, **kwargs: Any) -> Any:
+        async def stream() -> Any:
+            for chunk in chunks:
+                yield chunk
+
+        return stream()
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    instrument_litellm()
+    if asynchronous:
+        stream = await llm.acompletion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+        delivered = [chunk async for chunk in stream]
+    else:
+        stream = llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+        delivered = list(stream)
+
+    assert len(delivered) == len(chunks)
+    a = attrs(only_span(memory))
+    assert "error.type" not in a
+    assert tuple(cast(Any, a["gen_ai.response.finish_reasons"])) == ("length", "stop")
 
 
 def test_masked_stream_closed_early_withholds_partial_output(make: Any) -> None:

@@ -236,6 +236,46 @@ test("masked InvokeAgent keeps complete return control after the text bound", as
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual({ returnControl });
 });
 
+test.each([
+  ["bytes", [{ apiInvocationInput: { actionGroup: "x".repeat(60_000) } }]],
+  ["items", Array.from({ length: 1_500 }, () => ({ function: "f" }))],
+])("masked InvokeAgent drops return control beyond its own %s bound", async (_, inputs) => {
+  const seen: string[] = [];
+
+  const spans = setup({
+    mask: (value) => {
+      seen.push(JSON.stringify(value));
+
+      return value;
+    },
+  });
+
+  const client = wrapBedrockAgents(
+    new FakeClient([
+      {
+        completion: streamOf([
+          { chunk: { bytes: bytes("Short answer") } },
+          { returnControl: { invocationId: "inv-oversized", invocationInputs: inputs } },
+        ]),
+      },
+    ]),
+  );
+
+  const response = (await client.send(
+    new InvokeAgentCommand({ agentId: "agent-1", agentAliasId: "a", sessionId: "s" }),
+  )) as { completion: AsyncIterable<unknown> };
+
+  await collect(response.completion);
+
+  const [span] = spans.getFinishedSpans();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(span.attributes["td.metadata.return_control"]).toBe("true");
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(
+    seen.some((value) => value.includes("inv-oversized") || value.includes("Short answer")),
+  ).toBe(false);
+});
+
 test("Rerank captures queries, sources, model, ranking, and pagination metadata", async () => {
   const spans = setup();
   const modelArn = "arn:aws:bedrock:us-west-2::foundation-model/cohere.rerank-v3-5:0";

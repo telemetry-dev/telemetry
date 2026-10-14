@@ -778,7 +778,15 @@ def _record_chunk_inner(chunk: Any, state: _StreamState) -> None:
         state.response_model = response_model
     for index, candidate in enumerate(_sequence_items(_field(chunk, "candidates"))):
         candidate_index = _candidate_index(candidate, index)
-        candidate_state = state.candidates.setdefault(candidate_index, _CandidateState())
+        candidate_state = state.candidates.get(candidate_index)
+        if candidate_state is None:
+            # An entry outlives the part budget so its finish reason is still exported, so
+            # distinct indices are capped at the item bound; later ones are dropped.
+            if len(state.candidates) >= _STREAM_CAPTURE_MAX_ITEMS:
+                state.budget.truncated = True
+                state.output_truncated = True
+                continue
+            candidate_state = state.candidates[candidate_index] = _CandidateState()
         content = _field(candidate, "content")
         role = _string(_field(content, "role"))
         if role:

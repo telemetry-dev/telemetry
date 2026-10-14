@@ -415,6 +415,8 @@ class AgentStreamState(StreamState):
         self.failure_reason: str | None = None
         self.guardrail_action: str | None = None
         self.return_control: Any = None
+        self.saw_return_control = False
+        self.return_control_rejected = False
         self.traces: list[Any] = []
 
     def feed(self, event: Any) -> None:
@@ -432,7 +434,16 @@ class AgentStreamState(StreamState):
             event.get("returnControl") if isinstance(event.get("returnControl"), dict) else None
         )
         if return_control is not None:
-            self.return_control = return_control
+            self.saw_return_control = True
+            # Return control replaces the text output, so it gets its own fresh bound and
+            # survives text that already spent the shared budget; one that alone does not fit
+            # is dropped and the capture is marked incomplete.
+            if stream_capture_budget().accept(return_control):
+                self.return_control = return_control
+            else:
+                self.return_control = None
+                self.return_control_rejected = True
+                self.budget.truncated = True
         trace = event.get("trace") if isinstance(event.get("trace"), dict) else None
         if trace:
             self.trace_count += 1
@@ -447,7 +458,7 @@ class AgentStreamState(StreamState):
                 "trace_event_count": self.trace_count or None,
                 "failure_reason": self.failure_reason,
                 "guardrail_action": self.guardrail_action,
-                "return_control": True if self.return_control is not None else None,
+                "return_control": True if self.saw_return_control else None,
                 "agent_trace": self.traces if self.capture_trace and self.traces else None,
             }
         )
@@ -459,8 +470,10 @@ class AgentStreamState(StreamState):
         return clean({"output": output, "usage": self.usage or None, "metadata": metadata or None})
 
     def output_truncated(self) -> bool:
-        # Return control replaces the text output and is retained whole.
-        return self.return_control is None and self.text_rejected
+        # Return control replaces the text output and is retained whole when it fits its bound.
+        if self.return_control is not None:
+            return False
+        return self.text_rejected or self.return_control_rejected
 
     def _collect_trace(self, value: Any) -> None:
         if isinstance(value, dict):

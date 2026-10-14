@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import re
 import threading
 import time
@@ -763,6 +764,8 @@ class _InstrumentedStream:
         self._usage: dict[str, int | float] | None = None
         self._saw_output = False
         self._finish_reasons: dict[int, str] = {}
+        self._choice_indices: set[int] = set()
+        self._finish_reasons_truncated = False
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -875,12 +878,24 @@ class _InstrumentedStream:
                     )
                 )
             )
+            choice_index = _number(_field(choice, "index"))
+            key = (
+                int(choice_index)
+                # math.isfinite raises OverflowError on ints too large for a float.
+                if choice_index is not None
+                and (isinstance(choice_index, int) or math.isfinite(choice_index))
+                else fallback_index
+            )
+            # Finish reasons outlive the chunk budget so a long stream keeps its final reason,
+            # but only for the first choice indices seen, capped like retained items.
+            if key not in self._choice_indices:
+                if len(self._choice_indices) >= _STREAM_CAPTURE_MAX_ITEMS:
+                    self._finish_reasons_truncated = True
+                    continue
+                self._choice_indices.add(key)
             finish_reason = _string(_field(choice, "finish_reason"))
             if finish_reason is not None:
-                choice_index = _number(_field(choice, "index"))
-                self._finish_reasons[
-                    int(choice_index) if choice_index is not None else fallback_index
-                ] = finish_reason
+                self._finish_reasons[key] = finish_reason
         if has_output:
             self._saw_output = True
             record_output_chunk = getattr(self._handle, "record_output_chunk", None)
@@ -933,7 +948,7 @@ class _InstrumentedStream:
         attributes = fields.get("attributes")
         if not isinstance(attributes, dict):
             attributes = {}
-        if self._budget.truncated or not self._completed:
+        if self._budget.truncated or self._finish_reasons_truncated or not self._completed:
             attributes[_CAPTURE_TRUNCATED_ATTRIBUTE] = True
             if self._mask_output_when_incomplete:
                 fields.pop("output", None)
