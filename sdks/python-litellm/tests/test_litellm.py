@@ -954,6 +954,45 @@ def test_stream_choice_indices_are_capped(
     assert not any('"first"' in value for value in seen)
 
 
+@pytest.mark.parametrize("spent", [False, True], ids=["within-budget", "budget-spent"])
+def test_stream_finish_reasons_are_capped_at_a_fixed_length(
+    make: Any, monkeypatch: pytest.MonkeyPatch, spent: bool
+) -> None:
+    memory = make()
+    max_length = telemetry_dev_litellm._FINISH_REASON_MAX_LENGTH  # pyright: ignore[reportPrivateUsage]
+
+    def choice(index: int, content: str | None, finish_reason: str | None) -> Any:
+        return SimpleNamespace(
+            index=index, delta=SimpleNamespace(content=content), finish_reason=finish_reason
+        )
+
+    chunks: list[Any] = [
+        *(
+            SimpleNamespace(
+                id="long-finish", model="gpt-4o-mini", choices=[choice(0, "x" * 100, None)]
+            )
+            for _ in range(600 if spent else 1)
+        ),
+        SimpleNamespace(
+            id=None, model=None, choices=[choice(0, None, "r" * 10_000), choice(1, None, "stop")]
+        ),
+    ]
+
+    def fake_completion(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        return iter(chunks)
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    instrument_litellm()
+    stream = llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+    assert list(stream) == chunks
+
+    a = attrs(only_span(memory))
+    finish_reasons = tuple(cast(Any, a["gen_ai.response.finish_reasons"]))
+    assert finish_reasons == ("r" * max_length, "stop")
+    assert all(len(reason) <= max_length for reason in stream._finish_reasons.values())
+    assert (a.get("telemetry.dev.capture.truncated") is True) is spent
+
+
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
 @pytest.mark.parametrize(
     "choice_index", [10**400, math.nan, math.inf], ids=["huge-int", "nan", "inf"]
