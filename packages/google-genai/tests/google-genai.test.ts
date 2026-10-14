@@ -1571,6 +1571,26 @@ test("streaming keeps candidates rejected by the index cap out of response attri
             urlContextMetadata: { marker: "rejected-url-context" },
           })),
         };
+
+        // A rejected new index ahead of an admitted one must not hide the admitted metadata.
+        yield {
+          candidates: [
+            {
+              index: 9_999,
+              content: { role: "model", parts: [{ text: "z" }] },
+              safetyRatings: [{ category: "rejected-late-rating" }],
+              groundingMetadata: { marker: "rejected-late-grounding" },
+              urlContextMetadata: { marker: "rejected-late-url-context" },
+            },
+            {
+              index: 0,
+              content: { role: "model", parts: [{ text: "x" }] },
+              safetyRatings: [{ category: "accepted-rating" }],
+              groundingMetadata: { marker: "accepted-grounding" },
+              urlContextMetadata: { marker: "accepted-url-context" },
+            },
+          ],
+        };
       },
     },
   });
@@ -1588,6 +1608,15 @@ test("streaming keeps candidates rejected by the index cap out of response attri
   expect(finishReasons).not.toContain("SAFETY");
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
   expect(JSON.stringify(span.attributes)).not.toMatch(/rejected-/);
+  expect(jsonAttr(span, "google_genai.response.safety_ratings")).toEqual([
+    { candidateIndex: 0, ratings: [{ category: "accepted-rating" }] },
+  ]);
+  expect(jsonAttr(span, "google_genai.response.grounding_metadata")).toEqual({
+    marker: "accepted-grounding",
+  });
+  expect(jsonAttr(span, "google_genai.response.url_context_metadata")).toEqual({
+    marker: "accepted-url-context",
+  });
 });
 
 test("masked streaming early break withholds partial output", async () => {
