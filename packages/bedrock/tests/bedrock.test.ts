@@ -278,7 +278,11 @@ test.each([
   "ConverseStream past the fixed bound is flagged (masked %s, maxAttributeLength %i)",
   async (masked, maxAttributeLength) => {
     const seen: string[] = [];
-    const spans = setup({ maxAttributeLength, ...(masked ? { mask: recordingMask(seen) } : {}) });
+    const options: NonNullable<Parameters<typeof setup>[0]> = { maxAttributeLength };
+
+    if (masked) options.mask = recordingMask(seen);
+
+    const spans = setup(options);
 
     await streamedConverse(textStream("x".repeat(100), 1_100));
 

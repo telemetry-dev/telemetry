@@ -8,6 +8,7 @@ import {
   RetrieveCommand,
   type RerankCommandInput,
 } from "@aws-sdk/client-bedrock-agent-runtime";
+import type { Attributes } from "@opentelemetry/api";
 import { SamplingDecision } from "@opentelemetry/sdk-trace-base";
 import { afterEach, expect, test } from "vitest";
 
@@ -94,6 +95,7 @@ test.each([false, true])(
   "InvokeAgent text past the fixed bound is flagged and withheld from a mask (masked %s)",
   async (masked) => {
     const seen: string[] = [];
+
     const spans = setup(
       masked
         ? {
@@ -143,6 +145,7 @@ test.each([
   "masked InvokeAgent keeps complete text when only %s metadata passed the bound",
   async (_kind, metadataEvent) => {
     const seen: string[] = [];
+
     const spans = setup({
       mask: (value) => {
         seen.push(JSON.stringify(value));
@@ -177,6 +180,7 @@ test.each([
 
 test("masked InvokeAgent withholds text when a chunk after the metadata bound is rejected", async () => {
   const seen: string[] = [];
+
   const spans = setup({
     mask: (value) => {
       seen.push(JSON.stringify(value));
@@ -445,7 +449,7 @@ test("Rerank withholds captures cut to the retention bound from a mask", async (
 });
 
 test("Rerank without a mask passes cut input to the sampler", async () => {
-  const sampled: Array<Record<string, unknown>> = [];
+  const sampled: Attributes[] = [];
 
   setup({
     sampler: {

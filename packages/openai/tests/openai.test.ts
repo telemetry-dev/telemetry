@@ -6281,7 +6281,7 @@ test.each([true, false])(
 test.each(["chat", "responses"] as const)(
   "non-streaming %s without a mask passes cut input to the sampler",
   async (kind) => {
-    const sampled: Array<Record<string, unknown>> = [];
+    const sampled: Array<ReadableSpan["attributes"]> = [];
 
     setupSpans(undefined, {
       sampler: {

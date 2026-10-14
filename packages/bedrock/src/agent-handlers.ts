@@ -90,6 +90,7 @@ export class AgentStreamState implements StreamState {
       if (this.retention.accept(piece)) this.text += piece;
       else this.textRejected = true;
     }
+
     const attribution = isRecord(chunk?.attribution) ? chunk.attribution : undefined;
     const citations = arrayValue<unknown>(attribution?.citations);
 
@@ -128,6 +129,7 @@ export class AgentStreamState implements StreamState {
       if (this.options.captureAgentTrace && this.retention.accept(traceEvent)) {
         this.traces.push(traceEvent);
       }
+
       collectTrace(traceEvent, (usage) => this.addUsage(usage));
       const failure = findKey(traceEvent, "failureTrace");
 
@@ -426,6 +428,7 @@ export class FlowStreamState implements StreamState {
     if (inputRequest && this.retention.accept(inputRequest.content)) {
       this.outputs.push(inputRequest.content);
     }
+
     const completion = isRecord(raw.flowCompletionEvent) ? raw.flowCompletionEvent : undefined;
     this.completionReason = stringValue(completion?.completionReason) ?? this.completionReason;
   }

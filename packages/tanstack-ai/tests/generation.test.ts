@@ -50,7 +50,7 @@ const usage = (promptTokens: number, completionTokens: number, extra?: Partial<T
 
 // Minimal adapters: the activities only read kind, name, model, and the one provider method.
 const adapter = <A = never>(kind: string, name: string, methods: Record<string, unknown>): A =>
-  ({ kind, name, model: `${name}-model`, "~types": {}, ...methods }) as unknown as A;
+  ({ kind, name, model: `${name}-model`, "~types": {}, ...methods }) as never;
 
 const tokenMetrics = (metrics: ReturnType<typeof capture>["metrics"]) =>
   metrics.filter((metric) => metric.type === "input" || metric.type === "output");
@@ -498,6 +498,7 @@ test("a failed video job poll flushes an error span correlated to the job", asyn
   });
 
   const job = await generateVideo({ adapter: video, prompt: "x", middleware: [middleware] });
+
   const status = await getVideoJobStatus({
     adapter: video,
     jobId: job.jobId,
