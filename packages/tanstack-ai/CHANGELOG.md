@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/tanstack-ai-v0.1.7...tanstack-ai-v0.1.8) (2026-10-14)
+
+
+### Features
+
+* **sdk-tanstack-ai:** trace generation activities besides chat and evaluate ([#50](https://github.com/telemetry-dev/telemetry/issues/50)) ([bba49a4](https://github.com/telemetry-dev/telemetry/commit/bba49a47b7069cf4348773c04dc52c21b303506f))
+
+
+### Bug Fixes
+
+* **sdk-tanstack-ai:** record modality token usage on chat spans ([#54](https://github.com/telemetry-dev/telemetry/issues/54)) ([1976ace](https://github.com/telemetry-dev/telemetry/commit/1976aceccc0b277987106a08976050e98e8ced54))
+
 ## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/tanstack-ai-v0.1.6...tanstack-ai-v0.1.7) (2026-09-30)
 
 

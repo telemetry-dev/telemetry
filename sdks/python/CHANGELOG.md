@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.9](https://github.com/telemetry-dev/telemetry/compare/python-v0.2.8...python-v0.2.9) (2026-10-14)
+
+
+### Bug Fixes
+
+* **sdk-python:** charge json escapes when CaptureBudget measures strings ([#48](https://github.com/telemetry-dev/telemetry/issues/48)) ([3d5daf5](https://github.com/telemetry-dev/telemetry/commit/3d5daf578bbcdfe4113bea62b55fceb88dd10418))
+
 ## [0.2.8](https://github.com/telemetry-dev/telemetry/compare/python-v0.2.7...python-v0.2.8) (2026-10-01)
 
 

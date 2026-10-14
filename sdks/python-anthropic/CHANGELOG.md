@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.5](https://github.com/telemetry-dev/telemetry/compare/python-anthropic-v0.1.4...python-anthropic-v0.1.5) (2026-10-14)
+
+
+### Bug Fixes
+
+* **python-anthropic:** keep raw tool input charged after a block settles ([159554d](https://github.com/telemetry-dev/telemetry/commit/159554d4ed4c6c3897678eaa8f0d2a7fc8d47af4))
+* **python-anthropic:** keep retained stream text encodable and settle against the final check ([40e850d](https://github.com/telemetry-dev/telemetry/commit/40e850d10878aac9ea4a87078d6a172d3d96cdaf)), closes [#32](https://github.com/telemetry-dev/telemetry/issues/32)
+* **python-anthropic:** keep stream capture accounting consistent with serialization ([751e5df](https://github.com/telemetry-dev/telemetry/commit/751e5df16fa016e361f05e5e24dd61acb9be3351))
+* **python-anthropic:** keep stream capture accounting consistent with serialization ([23e7f6a](https://github.com/telemetry-dev/telemetry/commit/23e7f6a5e4e408b70434719c39d9fdc23f384ba3)), closes [#32](https://github.com/telemetry-dev/telemetry/issues/32)
+* **python-anthropic:** keep the settled measure when a tool block is replaced ([284330e](https://github.com/telemetry-dev/telemetry/commit/284330e36b56af225d8a7b60c034b4e6caa0fb02)), closes [#32](https://github.com/telemetry-dev/telemetry/issues/32)
+* **python-anthropic:** settle tool blocks the way the final check counts them ([17479bd](https://github.com/telemetry-dev/telemetry/commit/17479bd0e575140db14cae3a618501726738be01)), closes [#32](https://github.com/telemetry-dev/telemetry/issues/32)
+* **sdk-python:** charge json escapes when CaptureBudget measures strings ([#48](https://github.com/telemetry-dev/telemetry/issues/48)) ([3d5daf5](https://github.com/telemetry-dev/telemetry/commit/3d5daf578bbcdfe4113bea62b55fceb88dd10418))
+
+
+### Performance Improvements
+
+* **python-anthropic:** scan stream strings for surrogates with a regex ([#51](https://github.com/telemetry-dev/telemetry/issues/51)) ([8cc0bb0](https://github.com/telemetry-dev/telemetry/commit/8cc0bb03f684643f5bf3e40e593b87147d2d3aaa))
+
 ## [0.1.4](https://github.com/telemetry-dev/telemetry/compare/python-anthropic-v0.1.3...python-anthropic-v0.1.4) (2026-10-01)
 
 

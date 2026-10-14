@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/openrouter-v0.1.7...openrouter-v0.1.8) (2026-10-14)
+
+
+### Bug Fixes
+
+* **sdk:** keep stream retention independent of max_attribute_length ([#49](https://github.com/telemetry-dev/telemetry/issues/49)) ([e4f9dec](https://github.com/telemetry-dev/telemetry/commit/e4f9dec739832d35697f64ec705f5b51d02e0904))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.1.8
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.1.8
+
 ## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/openrouter-v0.1.6...openrouter-v0.1.7) (2026-10-01)
 
 

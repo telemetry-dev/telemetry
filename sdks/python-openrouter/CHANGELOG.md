@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/python-openrouter-v0.1.5...python-openrouter-v0.1.6) (2026-10-14)
+
+
+### Bug Fixes
+
+* **sdk:** keep stream retention independent of max_attribute_length ([#49](https://github.com/telemetry-dev/telemetry/issues/49)) ([e4f9dec](https://github.com/telemetry-dev/telemetry/commit/e4f9dec739832d35697f64ec705f5b51d02e0904))
+
+
+### Documentation
+
+* **sdk:** note that video generation isn't traced in openrouter and litellm ([#47](https://github.com/telemetry-dev/telemetry/issues/47)) ([d050cbd](https://github.com/telemetry-dev/telemetry/commit/d050cbd9d187709cfc8132fc744a8575865bcbba))
+
 ## [0.1.5](https://github.com/telemetry-dev/telemetry/compare/python-openrouter-v0.1.4...python-openrouter-v0.1.5) (2026-09-30)
 
 

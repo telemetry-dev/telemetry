@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.9](https://github.com/telemetry-dev/telemetry/compare/google-genai-v0.1.8...google-genai-v0.1.9) (2026-10-14)
+
+
+### Bug Fixes
+
+* **sdk:** bound per-index stream state and bedrock returnControl ([#55](https://github.com/telemetry-dev/telemetry/issues/55)) ([d4dd31d](https://github.com/telemetry-dev/telemetry/commit/d4dd31de6742173a2ac179e2bf8d18ce62d27ed8))
+* **sdk:** keep non-streamed captures cut to the retention bound from masks ([#53](https://github.com/telemetry-dev/telemetry/issues/53)) ([60fdeb3](https://github.com/telemetry-dev/telemetry/commit/60fdeb33c564f9f80435714e8dc9382a6dc20083))
+* **sdk:** keep stream retention independent of max_attribute_length ([#49](https://github.com/telemetry-dev/telemetry/issues/49)) ([e4f9dec](https://github.com/telemetry-dev/telemetry/commit/e4f9dec739832d35697f64ec705f5b51d02e0904))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.1.8
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.1.8
+
 ## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/google-genai-v0.1.7...google-genai-v0.1.8) (2026-10-01)
 
 
