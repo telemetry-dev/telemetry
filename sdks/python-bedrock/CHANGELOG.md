@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.5](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.1.4...python-bedrock-v0.1.5) (2026-10-14)
+
+
+### Bug Fixes
+
+* **sdk:** bound per-index stream state and bedrock returnControl ([#55](https://github.com/telemetry-dev/telemetry/issues/55)) ([d4dd31d](https://github.com/telemetry-dev/telemetry/commit/d4dd31de6742173a2ac179e2bf8d18ce62d27ed8))
+* **sdk:** keep stream retention independent of max_attribute_length ([#49](https://github.com/telemetry-dev/telemetry/issues/49)) ([e4f9dec](https://github.com/telemetry-dev/telemetry/commit/e4f9dec739832d35697f64ec705f5b51d02e0904))
+
 ## [0.1.4](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.1.3...python-bedrock-v0.1.4) (2026-09-30)
 
 

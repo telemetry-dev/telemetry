@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/python-openai-v0.1.6...python-openai-v0.1.7) (2026-10-14)
+
+
+### Bug Fixes
+
+* **python-anthropic:** keep stream capture accounting consistent with serialization ([751e5df](https://github.com/telemetry-dev/telemetry/commit/751e5df16fa016e361f05e5e24dd61acb9be3351))
+* **python-openai:** derive the remaining chat structure costs from the core ([a13a9d1](https://github.com/telemetry-dev/telemetry/commit/a13a9d19bcfa7b7cd1d9c2e0accacdd3a9b8c08e)), closes [#32](https://github.com/telemetry-dev/telemetry/issues/32)
+* **python-openai:** measure captured strings one way ([6666f47](https://github.com/telemetry-dev/telemetry/commit/6666f472bcf988d4646ca4dbfc0eaed4e4c2c8e9)), closes [#32](https://github.com/telemetry-dev/telemetry/issues/32)
+* **sdk-python:** charge json escapes when CaptureBudget measures strings ([#48](https://github.com/telemetry-dev/telemetry/issues/48)) ([3d5daf5](https://github.com/telemetry-dev/telemetry/commit/3d5daf578bbcdfe4113bea62b55fceb88dd10418))
+
+
+### Documentation
+
+* **sdk-openai:** note the openai videos api shutdown ([#44](https://github.com/telemetry-dev/telemetry/issues/44)) ([3df0536](https://github.com/telemetry-dev/telemetry/commit/3df0536c572a04566e22ee79e09075c6c768974b))
+
 ## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/python-openai-v0.1.5...python-openai-v0.1.6) (2026-10-01)
 
 

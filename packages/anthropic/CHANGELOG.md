@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.10](https://github.com/telemetry-dev/telemetry/compare/anthropic-v0.1.9...anthropic-v0.1.10) (2026-10-14)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.1.8
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.1.8
+
 ## [0.1.9](https://github.com/telemetry-dev/telemetry/compare/anthropic-v0.1.8...anthropic-v0.1.9) (2026-10-01)
 
 

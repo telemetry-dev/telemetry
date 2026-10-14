@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.1.7...sdk-v0.1.8) (2026-10-14)
+
+
+### Bug Fixes
+
+* **sdk-python:** charge json escapes when CaptureBudget measures strings ([#48](https://github.com/telemetry-dev/telemetry/issues/48)) ([3d5daf5](https://github.com/telemetry-dev/telemetry/commit/3d5daf578bbcdfe4113bea62b55fceb88dd10418))
+* **sdk:** keep non-streamed captures cut to the retention bound from masks ([#53](https://github.com/telemetry-dev/telemetry/issues/53)) ([60fdeb3](https://github.com/telemetry-dev/telemetry/commit/60fdeb33c564f9f80435714e8dc9382a6dc20083))
+
 ## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.1.6...sdk-v0.1.7) (2026-10-01)
 
 

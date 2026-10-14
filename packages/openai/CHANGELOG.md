@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.10](https://github.com/telemetry-dev/telemetry/compare/openai-v0.1.9...openai-v0.1.10) (2026-10-14)
+
+
+### Bug Fixes
+
+* **sdk:** keep non-streamed captures cut to the retention bound from masks ([#53](https://github.com/telemetry-dev/telemetry/issues/53)) ([60fdeb3](https://github.com/telemetry-dev/telemetry/commit/60fdeb33c564f9f80435714e8dc9382a6dc20083))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.1.8
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.1.8
+
 ## [0.1.9](https://github.com/telemetry-dev/telemetry/compare/openai-v0.1.8...openai-v0.1.9) (2026-10-01)
 
 
