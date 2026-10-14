@@ -1291,6 +1291,13 @@ class StreamAggregator {
       let state = this.candidates.get(index);
 
       if (!state) {
+        // An entry outlives a failed output reservation so its finish reason is still
+        // exported, so distinct indices are capped at the item bound; later ones are dropped.
+        if (this.candidates.size >= CAPTURE_MAX_ITEMS) {
+          this.outputCaptureTruncated = true;
+          continue;
+        }
+
         const role = "model";
 
         const byteCount =

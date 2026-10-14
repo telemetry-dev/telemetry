@@ -1476,6 +1476,78 @@ test("streaming early break ends span with partial aggregate", async () => {
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
+test.each([0, 5_000])(
+  "streaming charges each candidate index against the bound (%i extra indices)",
+  async (extraIndices) => {
+    const seen: string[] = [];
+
+    const spans = setupSpans({
+      mask: (value) => {
+        seen.push(JSON.stringify(value));
+
+        return value;
+      },
+    });
+
+    const client = wrapGoogleGenAI({
+      models: {
+        async *generateContentStream(_params: unknown) {
+          yield {
+            candidates: [
+              { index: 0, content: { role: "model", parts: [{ text: "first" }] } },
+              { index: 1, content: { role: "model", parts: [{ text: "second" }] } },
+            ],
+          };
+
+          for (let start = 2; start < 2 + extraIndices; start += 100) {
+            yield {
+              candidates: Array.from({ length: 100 }, (_, offset) => ({
+                index: start + offset,
+                content: { role: "model", parts: [{ text: "y" }] },
+                finishReason: "SAFETY",
+              })),
+            };
+          }
+
+          yield {
+            candidates: [
+              { index: 0, content: { role: "model", parts: [] }, finishReason: "STOP" },
+              { index: 1, content: { role: "model", parts: [] }, finishReason: "MAX_TOKENS" },
+            ],
+          };
+        },
+      },
+    });
+
+    const stream = await Promise.resolve(
+      client.models.generateContentStream({ model: "gemini", contents: "go" }),
+    );
+
+    for await (const _chunk of stream) {
+    }
+
+    const span = await exportedSpan(spans);
+    const finishReasons = span.attributes["gen_ai.response.finish_reasons"] as string[];
+    expect(finishReasons.slice(0, 2)).toEqual(["STOP", "MAX_TOKENS"]);
+
+    if (extraIndices === 0) {
+      expect(finishReasons).toEqual(["STOP", "MAX_TOKENS"]);
+      expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+      expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+        { role: "model", parts: [{ text: "first" }] },
+        { role: "model", parts: [{ text: "second" }] },
+      ]);
+
+      return;
+    }
+
+    expect(finishReasons.length).toBeLessThanOrEqual(1_000);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+    expect(seen.some((value) => value.includes('"first"'))).toBe(false);
+  },
+);
+
 test("masked streaming early break withholds partial output", async () => {
   const seen: string[] = [];
   const spans = setupSpans({

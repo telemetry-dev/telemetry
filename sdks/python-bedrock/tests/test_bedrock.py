@@ -1485,6 +1485,44 @@ def test_agent_stream_keeps_return_control_after_budget_exhaustion(
     assert span.attributes["telemetry.dev.capture.truncated"] is True
 
 
+@pytest.mark.parametrize("shape", ["bytes", "items"])
+def test_masked_agent_stream_drops_return_control_beyond_its_bound(
+    make: Any, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    seen: list[str] = []
+
+    def mask(value: Any, _context: Any) -> Any:
+        seen.append(json.dumps(value))
+        return value
+
+    memory = make(mask=mask)
+    inputs: list[Any] = (
+        [{"apiInvocationInput": {"actionGroup": "x" * 60_000}}]
+        if shape == "bytes"
+        else [{"function": "f"} for _ in range(1_500)]
+    )
+    return_control = {"invocationId": "inv-oversized", "invocationInputs": inputs}
+    events = [{"chunk": {"bytes": b"Short answer"}}, {"returnControl": return_control}]
+    client = _client("bedrock-agent-runtime")
+    _stub_api_call(
+        client, [{"completion": FakeEventStream(events), "sessionId": "sess-1"}], monkeypatch
+    )
+    wrap_bedrock(client)
+
+    response = client.invoke_agent(  # type: ignore[attr-defined]
+        agentId="agent-1", agentAliasId="alias", sessionId="sess-1", inputText="hi"
+    )
+    instrumented_stream = response["completion"]
+    assert list(instrumented_stream) == events
+
+    assert cast(Any, instrumented_stream)._state.return_control is None
+    span = memory.span_exporter.get_finished_spans()[0]
+    assert span.attributes["telemetry.dev.capture.truncated"] is True
+    assert span.attributes["td.metadata.return_control"] == "true"
+    assert "gen_ai.output.messages" not in span.attributes
+    assert not any("inv-oversized" in value or "Short answer" in value for value in seen)
+
+
 @pytest.mark.parametrize("later_text", [False, True])
 def test_masked_agent_stream_withholds_text_only_when_text_was_rejected(
     make: Any, monkeypatch: pytest.MonkeyPatch, later_text: bool

@@ -1236,6 +1236,74 @@ def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
         assert len(str(a.get("gen_ai.output.messages", ""))) <= max_attribute_length
 
 
+@pytest.mark.parametrize("extra_indices", [0, 5_000])
+def test_stream_candidate_indices_are_charged_against_the_bound(
+    make: Any, extra_indices: int
+) -> None:
+    seen: list[str] = []
+
+    def mask(value: Any, _context: Any) -> Any:
+        seen.append(json.dumps(value, default=str))
+        return value
+
+    memory = make(mask=mask)
+    chunks: list[dict[str, Any]] = [
+        {
+            "candidates": [
+                {"index": 0, "content": {"role": "model", "parts": [{"text": "first"}]}},
+                {"index": 1, "content": {"role": "model", "parts": [{"text": "second"}]}},
+            ]
+        },
+        *(
+            {
+                "candidates": [
+                    {
+                        "index": index,
+                        "content": {"role": "model", "parts": [{"text": "y"}]},
+                        "finishReason": "SAFETY",
+                    }
+                    for index in range(start, start + 100)
+                ]
+            }
+            for start in range(2, 2 + extra_indices, 100)
+        ),
+        {
+            "candidates": [
+                {"index": 0, "content": {"role": "model", "parts": []}, "finishReason": "STOP"},
+                {
+                    "index": 1,
+                    "content": {"role": "model", "parts": []},
+                    "finishReason": "MAX_TOKENS",
+                },
+            ]
+        },
+    ]
+    client, _transport = client_with_transport([chunks])
+    stream = wrap_google_genai(client).models.generate_content_stream(
+        model="gemini-2.5-flash", contents=USER_CONTENT
+    )
+    assert len(list(stream)) == len(chunks)
+
+    state = stream._state
+    a = attrs(only_span(memory))
+    finish_reasons = list(cast(Any, a["gen_ai.response.finish_reasons"]))
+    assert finish_reasons[:2] == ["STOP", "MAX_TOKENS"]
+    if extra_indices == 0:
+        assert finish_reasons == ["STOP", "MAX_TOKENS"]
+        assert "telemetry.dev.capture.truncated" not in a
+        output = json.loads(str(a["gen_ai.output.messages"]))
+        assert [message["parts"][0]["text"] for message in output] == ["first", "second"]
+        return
+    max_items = google_genai_instrumentation._STREAM_CAPTURE_MAX_ITEMS  # pyright: ignore[reportPrivateUsage]
+    assert len(state.candidates) <= max_items
+    assert len(state.finish_reasons) <= len(state.candidates)
+    assert len(finish_reasons) == len(state.finish_reasons) < 2 + extra_indices
+    assert state.budget.truncated is True
+    assert a["telemetry.dev.capture.truncated"] is True
+    assert "gen_ai.output.messages" not in a
+    assert not any('"first"' in value for value in seen)
+
+
 def test_masked_stream_closed_early_withholds_partial_output(make: Any) -> None:
     memory = make(mask=identity_mask)
     client, _transport = client_with_transport([stream_chunks()])

@@ -58,6 +58,8 @@ export class AgentStreamState implements StreamState {
   private failureReason: string | undefined;
   private guardrailAction: string | undefined;
   private returnControl: unknown;
+  private sawReturnControl = false;
+  private returnControlRejected = false;
   private readonly traces: unknown[] = [];
   private error: Error | undefined;
   private errorFields: SpanFields | undefined;
@@ -103,7 +105,20 @@ export class AgentStreamState implements StreamState {
 
     const returnControl = isRecord(raw.returnControl) ? raw.returnControl : undefined;
 
-    if (returnControl) this.returnControl = returnControl;
+    if (returnControl) {
+      this.sawReturnControl = true;
+
+      // Return control replaces the text output, so it gets its own fresh bound and survives
+      // text that already spent the shared budget; one that alone does not fit is dropped and
+      // the capture is marked incomplete.
+      if (new StreamRetention().accept(returnControl)) {
+        this.returnControl = returnControl;
+      } else {
+        this.returnControl = undefined;
+        this.returnControlRejected = true;
+        this.retention.truncated = true;
+      }
+    }
 
     const traceEvent = isRecord(raw.trace) ? raw.trace : undefined;
 
@@ -126,8 +141,10 @@ export class AgentStreamState implements StreamState {
   }
 
   outputTruncated(): boolean {
-    // Return control replaces the text output and is retained whole.
-    return this.returnControl === undefined && this.textRejected;
+    // Return control replaces the text output and is retained whole when it fits its bound.
+    if (this.returnControl !== undefined) return false;
+
+    return this.textRejected || this.returnControlRejected;
   }
 
   finish(): SpanFields {
@@ -135,7 +152,7 @@ export class AgentStreamState implements StreamState {
       trace_event_count: this.traceEventCount || undefined,
       failure_reason: this.failureReason,
       guardrail_action: this.guardrailAction,
-      return_control: this.returnControl ? true : undefined,
+      return_control: this.sawReturnControl ? true : undefined,
       citation_count: this.citationCount || undefined,
       output_files: this.outputFiles.length > 0 ? this.outputFiles : undefined,
       agent_trace:
