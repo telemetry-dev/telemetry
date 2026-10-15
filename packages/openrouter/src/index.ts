@@ -17,6 +17,7 @@ const MAX_STREAM_CAPTURE_BYTES = 64 * 1024;
 const MAX_STREAM_CAPTURE_ITEMS = 1024;
 const MAX_STREAM_CAPTURE_DEPTH = 32;
 const STREAM_CAPTURE_ITEM_BYTES = 16;
+const FINISH_REASON_MAX_LENGTH = 128;
 
 const TERMINAL_RESPONSE_EVENTS = new Set([
   "response.completed",
@@ -727,7 +728,7 @@ function recordChatChunk<T>(
 
     const finishReason = readString(choiceRecord.finishReason);
 
-    if (finishReason) state.finishReason = finishReason;
+    if (finishReason) state.finishReason = finishReason.slice(0, FINISH_REASON_MAX_LENGTH);
   }
 
   const error = asRecord(c.error);

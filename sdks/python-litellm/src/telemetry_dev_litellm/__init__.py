@@ -33,6 +33,9 @@ _OMIT = object()
 # Retention uses fixed bounds; the core applies max_attribute_length after the mask.
 _STREAM_CAPTURE_MAX_BYTES = 48 * 1024
 _STREAM_CAPTURE_MAX_ITEMS = 1000
+# Retained finish reasons stay outside the output budget so a terminal one is still exported,
+# so each is capped instead.
+_FINISH_REASON_MAX_LENGTH = 128
 _CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated"
 
 
@@ -895,7 +898,7 @@ class _InstrumentedStream:
                 self._choice_indices.add(key)
             finish_reason = _string(_field(choice, "finish_reason"))
             if finish_reason is not None:
-                self._finish_reasons[key] = finish_reason
+                self._finish_reasons[key] = finish_reason[:_FINISH_REASON_MAX_LENGTH]
         if has_output:
             self._saw_output = True
             record_output_chunk = getattr(self._handle, "record_output_chunk", None)

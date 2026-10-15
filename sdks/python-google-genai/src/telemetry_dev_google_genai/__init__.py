@@ -42,6 +42,9 @@ _MAX_CAPTURE_DEPTH = 32
 # Retention uses fixed bounds; the core applies max_attribute_length after the mask.
 _STREAM_CAPTURE_MAX_BYTES = 48 * 1024
 _STREAM_CAPTURE_MAX_ITEMS = 1000
+# Retained finish reasons stay outside the output budget so a terminal one is still exported,
+# so each is capped instead. Gemini's longest is 25 characters.
+_FINISH_REASON_MAX_LENGTH = 128
 _CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated"
 _OMIT = object()
 
@@ -799,7 +802,7 @@ def _record_chunk_inner(chunk: Any, state: _StreamState) -> None:
                 state.output_truncated = True
         finish = _enum_value(_field(candidate, "finish_reason"))
         if finish is not None:
-            state.finish_reasons[candidate_index] = finish
+            state.finish_reasons[candidate_index] = finish[:_FINISH_REASON_MAX_LENGTH]
         _record_candidate_metadata(candidate, candidate_index, state.attrs, state.budget)
     usage = _generate_usage(_field(chunk, "usage_metadata"), state.attrs)
     if usage:

@@ -341,6 +341,10 @@ function ownField(value: unknown, key: string): unknown {
 // boundedCapture's default item limit; more candidates than this cannot all be kept.
 const CAPTURE_MAX_ITEMS = 1_000;
 
+// Retained finish reasons stay outside the output budget so a terminal one is still exported,
+// so each is capped instead. Gemini's longest is 25 characters.
+const FINISH_REASON_MAX_LENGTH = 128;
+
 function candidateOutput(response: UnknownRecord) {
   if (!captureEnabled("output")) return { value: undefined, truncated: false, contentCut: false };
   const all = asArray(response.candidates);
@@ -1353,7 +1357,7 @@ class StreamAggregator {
 
       const finishReason = readString(candidateRecord.finishReason);
 
-      if (finishReason) state.finishReason = finishReason;
+      if (finishReason) state.finishReason = finishReason.slice(0, FINISH_REASON_MAX_LENGTH);
     }
 
     const chunkUsage = usageFromMetadata(record.usageMetadata);
@@ -1366,6 +1370,9 @@ class StreamAggregator {
         : record,
     );
 
+    // A chunk can repeat an index, so its own list would keep uncapped reasons; finish() builds
+    // the list from the capped per-index state instead.
+    delete chunkAttributes["gen_ai.response.finish_reasons"];
     Object.assign(this.attributes, chunkAttributes);
   }
 

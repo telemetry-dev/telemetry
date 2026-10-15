@@ -2009,6 +2009,31 @@ test("chat streams bound choice-state creation without dropping chunks", async (
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
+test.each([false, true])(
+  "chat streams cap retained finish reasons at a fixed length (output budget spent: %s)",
+  async (spent) => {
+    const spans = setupSpans();
+    const content = spent ? "x".repeat(1024) : "Hi";
+    const finishChunk = chatChunk("stream_finish", {});
+
+    const span = await streamedChatSpan(spans, [
+      ...Array.from({ length: spent ? 70 : 1 }, () =>
+        chatChunk("stream_finish", { role: "assistant", content }),
+      ),
+      {
+        ...finishChunk,
+        choices: [
+          { index: 0, delta: {}, finish_reason: "r".repeat(10_000) },
+          { index: 1, delta: {}, finish_reason: "stop" },
+        ],
+      },
+    ]);
+
+    expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["r".repeat(128), "stop"]);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(spent ? true : undefined);
+  },
+);
+
 test("multi-choice chat streams reconstruct every choice", async () => {
   const spans = setupSpans();
 

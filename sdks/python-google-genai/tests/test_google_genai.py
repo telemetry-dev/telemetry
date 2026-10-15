@@ -1304,6 +1304,47 @@ def test_stream_candidate_indices_are_charged_against_the_bound(
     assert not any('"first"' in value for value in seen)
 
 
+@pytest.mark.filterwarnings("ignore:.* is not a valid FinishReason:UserWarning")
+@pytest.mark.parametrize("spent", [False, True], ids=["within-budget", "budget-spent"])
+def test_stream_finish_reasons_are_capped_at_a_fixed_length(make: Any, spent: bool) -> None:
+    memory = make()
+    max_length = 128
+    chunks: list[dict[str, Any]] = [
+        {
+            "candidates": [
+                {
+                    "index": 0,
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "x" * (60_000 if spent else 10)}],
+                    },
+                },
+                {"index": 1, "content": {"role": "model", "parts": [{"text": "second"}]}},
+            ]
+        },
+        {
+            "candidates": [
+                {
+                    "index": 0,
+                    "content": {"role": "model", "parts": []},
+                    "finishReason": "R" * 10_000,
+                },
+                {"index": 1, "content": {"role": "model", "parts": []}, "finishReason": "STOP"},
+            ]
+        },
+    ]
+    client, _transport = client_with_transport([chunks])
+    stream = wrap_google_genai(client).models.generate_content_stream(
+        model="gemini-2.5-flash", contents=USER_CONTENT
+    )
+    assert len(list(stream)) == len(chunks)
+
+    a = attrs(only_span(memory))
+    assert list(cast(Any, a["gen_ai.response.finish_reasons"])) == ["R" * max_length, "STOP"]
+    assert all(len(reason) <= max_length for reason in stream._state.finish_reasons.values())
+    assert (a.get("telemetry.dev.capture.truncated") is True) is spent
+
+
 def test_masked_stream_closed_early_withholds_partial_output(make: Any) -> None:
     memory = make(mask=identity_mask)
     client, _transport = client_with_transport([stream_chunks()])
