@@ -397,7 +397,63 @@ function candidateOutput(response: UnknownRecord) {
   };
 }
 
-function responseAttributes(response: UnknownRecord) {
+/** A number, one of a closed set of strings, a list, or an object with only the listed keys. */
+type StructureShape = "number" | ReadonlySet<string> | readonly [StructureShape] | StructureObject;
+
+interface StructureObject {
+  readonly [key: string]: StructureShape;
+}
+
+// Grounding and URL-context metadata are raw attributes, which skip captureOutput and the mask.
+// Without raw output capture only these fields are kept; segment text, retrieved document text,
+// titles, URIs, search queries and the search widget are output content. Keep in sync with Python.
+const GROUNDING_STRUCTURE: StructureShape = {
+  groundingChunks: [{ web: {}, retrievedContext: {}, maps: {}, image: {} }],
+  groundingSupports: [
+    {
+      segment: { startIndex: "number", endIndex: "number", partIndex: "number" },
+      groundingChunkIndices: ["number"],
+      confidenceScores: ["number"],
+    },
+  ],
+  retrievalMetadata: { googleSearchDynamicRetrievalScore: "number" },
+};
+
+const URL_RETRIEVAL_STATUSES: ReadonlySet<string> = new Set([
+  "URL_RETRIEVAL_STATUS_UNSPECIFIED",
+  "URL_RETRIEVAL_STATUS_SUCCESS",
+  "URL_RETRIEVAL_STATUS_ERROR",
+  "URL_RETRIEVAL_STATUS_PAYWALL",
+  "URL_RETRIEVAL_STATUS_UNSAFE",
+]);
+
+const URL_CONTEXT_STRUCTURE: StructureShape = {
+  urlMetadata: [{ urlRetrievalStatus: URL_RETRIEVAL_STATUSES }],
+};
+
+function projectStructure(value: unknown, shape: StructureShape): unknown {
+  if (shape === "number") return readNumber(value);
+
+  if (shape instanceof Set)
+    return typeof value === "string" && shape.has(value) ? value : undefined;
+
+  if (Array.isArray(shape)) return asArray(value)?.map((item) => projectStructure(item, shape[0]));
+  const record = asRecord(value);
+
+  if (!record || Array.isArray(record)) return undefined;
+  const projected: UnknownRecord = {};
+
+  for (const [key, nested] of Object.entries(shape as StructureObject)) {
+    const field = projectStructure(record[key], nested);
+
+    if (field !== undefined) projected[key] = field;
+  }
+
+  return projected;
+}
+
+/** `metadataContent` keeps grounding and URL-context metadata whole instead of its structure. */
+function responseAttributes(response: UnknownRecord, metadataContent: boolean) {
   const attributes: Record<string, AttributeValue> = {};
   const candidates = asArray(response.candidates) ?? [];
   const promptFeedback = asRecord(response.promptFeedback);
@@ -452,7 +508,9 @@ function responseAttributes(response: UnknownRecord) {
     setJsonAttribute(
       attributes,
       "google_genai.response.grounding_metadata",
-      firstCandidate.groundingMetadata,
+      metadataContent
+        ? firstCandidate.groundingMetadata
+        : projectStructure(firstCandidate.groundingMetadata, GROUNDING_STRUCTURE),
     );
   }
 
@@ -460,7 +518,9 @@ function responseAttributes(response: UnknownRecord) {
     setJsonAttribute(
       attributes,
       "google_genai.response.url_context_metadata",
-      firstCandidate.urlContextMetadata,
+      metadataContent
+        ? firstCandidate.urlContextMetadata
+        : projectStructure(firstCandidate.urlContextMetadata, URL_CONTEXT_STRUCTURE),
     );
   }
 
@@ -512,7 +572,7 @@ function generateRequestFields(params: UnknownRecord): RequestMapping {
   return { name: `chat ${model ?? "unknown"}`, fields, cut };
 }
 
-function generateResponseFields(response: unknown, withholdCut = false): SpanFields {
+function generateResponseFields(response: unknown, masked = false): SpanFields {
   const record = asRecord(response) ?? {};
   const candidates = asArray(record.candidates) ?? [];
 
@@ -520,7 +580,7 @@ function generateResponseFields(response: unknown, withholdCut = false): SpanFie
     .map((candidate) => readString(asRecord(candidate)?.finishReason))
     .filter((reason): reason is string => reason !== undefined);
 
-  const attributes = responseAttributes(record);
+  const attributes = responseAttributes(record, captureEnabled("output") && !masked);
   const afcHistory = asArray(record.automaticFunctionCallingHistory);
   const output = candidateOutput(record);
 
@@ -528,7 +588,7 @@ function generateResponseFields(response: unknown, withholdCut = false): SpanFie
     responseModel: readString(record.modelVersion),
     responseId: readString(record.responseId),
     finishReason: finishReasons[0],
-    output: output.contentCut && withholdCut ? undefined : output.value,
+    output: output.contentCut && masked ? undefined : output.value,
     usage: usageFromMetadata(record.usageMetadata),
   };
 
@@ -536,7 +596,7 @@ function generateResponseFields(response: unknown, withholdCut = false): SpanFie
 
   if (captureEnabled("input") && afcHistory && afcHistory.length > 0) {
     const capture = boundedTelemetryCapture(afcHistory);
-    fields.input = capture.truncated && withholdCut ? undefined : capture.value;
+    fields.input = capture.truncated && masked ? undefined : capture.value;
 
     if (capture.truncated) attributes["telemetry.dev.capture.truncated"] = true;
   }
@@ -926,7 +986,7 @@ function installInternalUsageCollector(models: UnknownRecord | undefined): void 
 function wrapUnary(
   original: (...args: unknown[]) => unknown,
   mapRequest: (params: UnknownRecord) => RequestMapping,
-  mapResponse: (response: unknown, withholdCut?: boolean) => SpanFields,
+  mapResponse: (response: unknown, masked?: boolean) => SpanFields,
   provider: string,
   fallback: RequestFallback,
   models?: UnknownRecord,
@@ -1129,7 +1189,8 @@ class StreamAggregator {
   constructor(
     private readonly requestInput: unknown,
     // The request input was cut to the retention bound, so history seeded from it is incomplete.
-    private readonly requestInputCut = false,
+    private readonly requestInputCut: boolean,
+    private readonly masked: boolean,
   ) {}
 
   private currentCandidates(): unknown[] {
@@ -1368,6 +1429,7 @@ class StreamAggregator {
       rejected.size > 0
         ? { ...record, candidates: candidates.filter((candidate) => !rejected.has(candidate)) }
         : record,
+      captureEnabled("output") && !this.masked,
     );
 
     // A chunk can repeat an index, so its own list would keep uncapped reasons; finish() builds
@@ -1424,7 +1486,8 @@ function createObservedStream(
   requestInputCut = false,
 ): AsyncGenerator<unknown> {
   const iterator = source[Symbol.asyncIterator]();
-  const aggregator = new StreamAggregator(requestInput, requestInputCut);
+  const masked = (span.capturePolicy ?? LEGACY_CAPTURE_POLICY).mask;
+  const aggregator = new StreamAggregator(requestInput, requestInputCut, masked);
   let sawFirst = false;
   let ended = false;
 
@@ -1468,8 +1531,6 @@ function createObservedStream(
         "telemetry.dev.capture.truncated": true,
       };
     }
-
-    const masked = (span.capturePolicy ?? LEGACY_CAPTURE_POLICY).mask;
 
     if (masked && (interrupted || aggregator.outputTruncated)) delete finalFields.output;
 
@@ -1624,7 +1685,7 @@ function patchModelsMethod(
   models: UnknownRecord,
   key: string,
   mapRequest: (params: UnknownRecord) => RequestMapping,
-  mapResponse: (response: unknown, withholdCut?: boolean) => SpanFields,
+  mapResponse: (response: unknown, masked?: boolean) => SpanFields,
   provider: string,
   fallback: RequestFallback,
   streaming = false,

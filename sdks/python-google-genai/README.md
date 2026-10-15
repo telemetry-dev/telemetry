@@ -91,6 +91,8 @@ operation, the submission span ends with an error instead of remaining open.
 
 The integration maps native Gemini request/response shapes directly. It never mutates caller requests.
 
+Grounding and URL-context metadata are raw attributes, which the core's `capture_output` check and mask never see. Grounding metadata repeats the answer text segment by segment and can carry retrieved document text, source titles and URIs, and search queries; URL-context metadata lists the retrieved URLs. Both attributes are recorded whole only when output is captured and no mask is configured. Otherwise they keep only their structure: each grounding chunk's source type (such as `{"web": {}}`), segment offsets, chunk indices, confidence scores, the dynamic retrieval score, and each URL's retrieval status.
+
 Tool definitions (`gen_ai.tool.definitions`, including tool descriptions and parameter schemas) are request attributes, not captured content: `capture_input`, the mask, and `max_attribute_length=0` do not remove them. They are cut only by the OpenTelemetry attribute limit (65,536 characters when `max_attribute_length` is 0).
 
 ## Streaming

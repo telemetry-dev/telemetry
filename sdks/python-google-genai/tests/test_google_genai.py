@@ -1398,6 +1398,124 @@ def test_streaming_rejects_oversized_grounding_without_dropping_terminal_metadat
     assert "google_genai.response.grounding_metadata" not in a
 
 
+# Every content string carries "private" or the answer's "Grounded" so a leak is easy to spot.
+GROUNDING_METADATA: dict[str, Any] = {
+    "webSearchQueries": ["private query"],
+    "searchEntryPoint": {"renderedContent": "<div>private query</div>"},
+    "groundingChunks": [
+        {
+            "web": {
+                "uri": "https://private.example/page",
+                "title": "private page",
+                "domain": "private.example",
+            }
+        },
+        {
+            "retrievedContext": {
+                "uri": "gs://private/doc.pdf",
+                "title": "private doc",
+                "text": "private retrieved text",
+                "ragChunk": {
+                    "text": "private rag text",
+                    "pageSpan": {"firstPage": 1, "lastPage": 2},
+                },
+            }
+        },
+    ],
+    "groundingSupports": [
+        {
+            "segment": {"startIndex": 0, "endIndex": 15, "partIndex": 0, "text": "Grounded answer"},
+            "groundingChunkIndices": [1, 0],
+            "confidenceScores": [0.9, 0.4],
+        }
+    ],
+    "retrievalMetadata": {"googleSearchDynamicRetrievalScore": 0.7},
+}
+URL_CONTEXT_METADATA: dict[str, Any] = {
+    "urlMetadata": [
+        {
+            "retrievedUrl": "https://private.example/url",
+            "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_SUCCESS",
+        },
+        {"retrievedUrl": "https://private.example/other", "urlRetrievalStatus": "private status"},
+    ]
+}
+
+
+def redact_grounded(value: Any, _context: Any) -> Any:
+    return json.loads(json.dumps(value).replace("Grounded", "REDACTED"))
+
+
+@pytest.mark.filterwarnings("ignore:private status is not a valid UrlRetrievalStatus")
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("capture", ["off", "masked", "on"])
+async def test_grounding_content_is_kept_only_when_output_is_captured_unmasked(
+    make: Any, is_async: bool, stream: bool, capture: str
+) -> None:
+    options: dict[str, Any] = {
+        "off": {"capture_output": False},
+        "masked": {"mask": redact_grounded},
+        "on": {},
+    }[capture]
+    memory = make(**options)
+    content = {"role": "model", "parts": [{"text": "Grounded answer."}]}
+    metadata = {
+        "finishReason": "STOP",
+        "groundingMetadata": GROUNDING_METADATA,
+        "urlContextMetadata": URL_CONTEXT_METADATA,
+    }
+    response: Any = (
+        [
+            {"candidates": [{"index": 0, "content": content}]},
+            {"candidates": [{"index": 0, **metadata}]},
+        ]
+        if stream
+        else {"candidates": [{"index": 0, "content": content, **metadata}]}
+    )
+    client, _transport = client_with_transport([response])
+    wrapped = wrap_google_genai(client)
+    request = {"model": "gemini-2.5-flash", "contents": "go"}
+    if is_async and stream:
+        async for _chunk in await wrapped.aio.models.generate_content_stream(**request):
+            pass
+    elif is_async:
+        await wrapped.aio.models.generate_content(**request)
+    elif stream:
+        list(wrapped.models.generate_content_stream(**request))
+    else:
+        wrapped.models.generate_content(**request)
+
+    a = attrs(only_span(memory))
+    grounding = json.loads(cast(str, a["google_genai.response.grounding_metadata"]))
+    url_context = json.loads(cast(str, a["google_genai.response.url_context_metadata"]))
+    if capture == "on":
+        assert grounding == GROUNDING_METADATA
+        assert url_context == URL_CONTEXT_METADATA
+        return
+
+    assert "private" not in json.dumps(a)
+    assert "Grounded" not in json.dumps(a)
+    assert grounding == {
+        "groundingChunks": [{"web": {}}, {"retrievedContext": {}}],
+        "groundingSupports": [
+            {
+                "segment": {"startIndex": 0, "endIndex": 15, "partIndex": 0},
+                "groundingChunkIndices": [1, 0],
+                "confidenceScores": [0.9, 0.4],
+            }
+        ],
+        "retrievalMetadata": {"googleSearchDynamicRetrievalScore": 0.7},
+    }
+    assert url_context == {
+        "urlMetadata": [{"urlRetrievalStatus": "URL_RETRIEVAL_STATUS_SUCCESS"}, {}]
+    }
+    if capture == "masked":
+        assert json.loads(cast(str, a["gen_ai.output.messages"])) == [
+            {"role": "model", "parts": [{"text": "REDACTED answer."}]}
+        ]
+
+
 def test_streaming_budgets_inline_data_at_native_size(memory: SimpleNamespace) -> None:
     encoded_data = "eHh4" * 16_400
     chunks = [
