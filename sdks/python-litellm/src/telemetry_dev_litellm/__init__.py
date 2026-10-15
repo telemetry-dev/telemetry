@@ -345,8 +345,36 @@ def _metadata(value: Any) -> Mapping[str, Any] | None:
     return cast(Mapping[str, Any], value) if isinstance(value, Mapping) else None
 
 
+# LiteLLM's proxy writes the incoming request (headers, client IP, user agent, URL) and the
+# authenticated key, user, team and end user into the same metadata argument it passes to
+# LiteLLM; requester_metadata is its copy of the client's metadata and includes the headers.
+# The proxy strips client-supplied keys with the user_api_key prefix, so that prefix is its own.
+# On a retry or fallback the Router adds previous_models: copies of earlier calls' arguments and
+# metadata, kept on the Router across requests, so it can carry another request's headers.
+_PROXY_REQUEST_METADATA_KEYS = frozenset(
+    {
+        "headers",
+        "requester_metadata",
+        "requester_ip_address",
+        "user_agent",
+        "endpoint",
+        "user_api_end_user_max_budget",
+        "previous_models",
+    }
+)
+_PROXY_AUTH_METADATA_PREFIX = "user_api_key"
+
+
 def _request_metadata(kwargs: Mapping[str, Any]) -> Mapping[str, Any] | None:
-    return _metadata(kwargs.get("litellm_metadata")) or _metadata(kwargs.get("metadata"))
+    metadata = _metadata(kwargs.get("litellm_metadata")) or _metadata(kwargs.get("metadata"))
+    if metadata is None:
+        return None
+    return {
+        key: value
+        for key, value in metadata.items()
+        if str(key) not in _PROXY_REQUEST_METADATA_KEYS
+        and not str(key).startswith(_PROXY_AUTH_METADATA_PREFIX)
+    }
 
 
 def _output_type(response_format: Any) -> str | None:

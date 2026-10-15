@@ -100,7 +100,7 @@ Chat spans use `type="generation"` and emit `gen_ai.operation.name="chat"`:
 - request model, provider, messages, sampling parameters (including `top_k`), stop sequences, seed, frequency and presence penalties
 - `response_format` as `gen_ai.output.type` (`json` for `json_object`/`json_schema`/pydantic models)
 - response model, response id, output messages, finish reasons, usage, cost when available
-- `metadata={...}` passed to LiteLLM as `td.metadata.*`
+- `metadata={...}` passed to LiteLLM as `td.metadata.*` (see [Metadata](#metadata))
 - errors via the core SDK's `error.type` and exception event mapping
 
 Embedding spans use `type="embedding"` and emit `gen_ai.operation.name="embeddings"`:
@@ -119,6 +119,20 @@ Responses spans emit `gen_ai.operation.name="chat"` and capture request input, i
 Streamed chat chunks and Responses reconstruction are retained up to 48 KiB and 1,000 items. Non-streamed Responses input and output and rerank input and results are retained up to 64 KiB and 1,024 items. The configured `max_attribute_length` does not shrink these retention bounds; the core applies it to the exported attribute after the mask runs. A chat stream that is cut at its bound, closed early, or fails, and a Responses stream that is cut at its bound, ends without a terminal response, or ends with an `error` event set `telemetry.dev.capture.truncated`. With a mask configured, the incomplete reconstructed output is omitted because the mask cannot inspect the complete value.
 
 Aggregate usage keys are `input_tokens`, `output_tokens`, `total_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, and `reasoning_output_tokens`. The core contract also includes modality fields; Responses usage emits text, image, and audio input/output token details when LiteLLM exposes them.
+
+## Metadata
+
+Each key of the call's `litellm_metadata` argument, or of `metadata` when `litellm_metadata` is absent or empty, is exported as `td.metadata.<key>`, except the keys listed below. That includes keys LiteLLM's Router adds to the argument, such as `model_group`, `deployment`, `model_info` and `api_base`. Rerank spans also add `result_count` and `search_units`.
+
+Strings, numbers, booleans and non-empty sequences of only strings, only booleans or only numbers are exported as they are; other values, including empty sequences, are JSON-encoded. Each string, including each string in a sequence, and each JSON value is truncated to `max_attribute_length`. Metadata values are not passed to the `mask` callback.
+
+Metadata is exported whatever `capture_input` and `capture_output` are set to. These top-level keys are dropped:
+
+- `headers`, `requester_metadata`, `requester_ip_address`, `user_agent`, `endpoint`, `user_api_end_user_max_budget`, and every key that starts with `user_api_key`. LiteLLM's proxy stores the incoming request's headers, client IP address, user agent and URL under these names, along with the authenticated key, user, team and end user, including the user's email and JWT claims.
+- `previous_models`, where the Router keeps copies of the arguments and metadata of earlier failed calls on a retry or fallback.
+
+Don't use these names for your own metadata. Other keys, including nested values, are exported as they are, so don't put credentials or personal data in metadata.
+- `userId`, `sessionId`, `user_id` and `session_id`, which the core SDK reserves. Use `propagate_attributes(user_id=..., session_id=...)` instead.
 
 ## Streaming
 
