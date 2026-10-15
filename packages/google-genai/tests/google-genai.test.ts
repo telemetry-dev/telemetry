@@ -1668,6 +1668,38 @@ const URL_CONTEXT_METADATA = {
   ],
 };
 
+const SAFETY_RATINGS = [
+  {
+    category: "HARM_CATEGORY_HARASSMENT",
+    probability: "NEGLIGIBLE",
+    probabilityScore: 0.1,
+    severity: "HARM_SEVERITY_LOW",
+    severityScore: 0.2,
+    blocked: false,
+    overwrittenThreshold: "BLOCK_ONLY_HIGH",
+  },
+  {
+    category: "private category",
+    probability: "LOW",
+    severity: "private severity",
+    note: "private note",
+  },
+  { category: "HARM_CATEGORY_NOT_YET_DEFINED" },
+];
+
+const SAFETY_RATINGS_STRUCTURE = [SAFETY_RATINGS[0], { probability: "LOW" }, SAFETY_RATINGS[2]];
+
+function captureOptions(capture: "off" | "masked" | "on") {
+  if (capture === "off") return { captureOutput: false };
+
+  if (capture === "on") return {};
+
+  return {
+    mask: (value: unknown) =>
+      JSON.parse(JSON.stringify(value).replaceAll("Grounded", "REDACTED")) as unknown,
+  };
+}
+
 test.each([
   { name: "generateContent with captureOutput off", stream: false, capture: "off" },
   { name: "generateContent with a mask", stream: false, capture: "masked" },
@@ -1678,18 +1710,11 @@ test.each([
 ] as const)(
   "$name keeps grounding content only when output is captured unmasked",
   async ({ stream, capture }) => {
-    const spans = setupSpans(
-      capture === "off"
-        ? { captureOutput: false }
-        : capture === "masked"
-          ? {
-              mask: (value) => JSON.parse(JSON.stringify(value).replaceAll("Grounded", "REDACTED")),
-            }
-          : {},
-    );
+    const spans = setupSpans(captureOptions(capture));
 
     const metadata = {
       finishReason: "STOP",
+      safetyRatings: SAFETY_RATINGS,
       groundingMetadata: GROUNDING_METADATA,
       urlContextMetadata: URL_CONTEXT_METADATA,
     };
@@ -1719,10 +1744,12 @@ test.each([
     const span = await exportedSpan(spans);
     const grounding = jsonAttr(span, "google_genai.response.grounding_metadata");
     const urlContext = jsonAttr(span, "google_genai.response.url_context_metadata");
+    const safetyRatings = jsonAttr(span, "google_genai.response.safety_ratings");
 
     if (capture === "on") {
       expect(grounding).toEqual(GROUNDING_METADATA);
       expect(urlContext).toEqual(URL_CONTEXT_METADATA);
+      expect(safetyRatings).toEqual([{ candidateIndex: 0, ratings: SAFETY_RATINGS }]);
 
       return;
     }
@@ -1742,12 +1769,72 @@ test.each([
     expect(urlContext).toEqual({
       urlMetadata: [{ urlRetrievalStatus: "URL_RETRIEVAL_STATUS_SUCCESS" }, {}],
     });
+    expect(safetyRatings).toEqual([{ candidateIndex: 0, ratings: SAFETY_RATINGS_STRUCTURE }]);
 
     if (capture === "masked") {
       expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
         { role: "model", parts: [{ text: "REDACTED answer." }] },
       ]);
     }
+  },
+);
+
+test.each([
+  { name: "generateContent with captureOutput off", stream: false, capture: "off" },
+  { name: "generateContent with a mask", stream: false, capture: "masked" },
+  { name: "generateContent capturing output", stream: false, capture: "on" },
+  { name: "generateContentStream with captureOutput off", stream: true, capture: "off" },
+  { name: "generateContentStream with a mask", stream: true, capture: "masked" },
+  { name: "generateContentStream capturing output", stream: true, capture: "on" },
+] as const)(
+  "$name keeps prompt feedback text only when output is captured unmasked",
+  async ({ stream, capture }) => {
+    const spans = setupSpans(captureOptions(capture));
+
+    const response = {
+      promptFeedback: {
+        blockReason: "SAFETY",
+        blockReasonMessage: "private block message",
+        safetyRatings: SAFETY_RATINGS,
+      },
+    };
+
+    const client = wrapGoogleGenAI({
+      models: {
+        generateContent: (_params: unknown) => response,
+        async *generateContentStream(_params: unknown) {
+          yield response;
+        },
+      },
+    });
+
+    if (stream) {
+      const chunks = await Promise.resolve(
+        client.models.generateContentStream({ model: "gemini", contents: "go" }),
+      );
+
+      for await (const _chunk of chunks);
+    } else {
+      client.models.generateContent({ model: "gemini", contents: "go" });
+    }
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["google_genai.response.block_reason"]).toBe("SAFETY");
+
+    if (capture === "on") {
+      expect(span.attributes["google_genai.response.block_reason_message"]).toBe(
+        "private block message",
+      );
+      expect(jsonAttr(span, "google_genai.response.prompt_safety_ratings")).toEqual(SAFETY_RATINGS);
+
+      return;
+    }
+
+    expect(JSON.stringify(span.attributes)).not.toMatch(/private/);
+    expect(span.attributes["google_genai.response.block_reason_message"]).toBeUndefined();
+    expect(jsonAttr(span, "google_genai.response.prompt_safety_ratings")).toEqual(
+      SAFETY_RATINGS_STRUCTURE,
+    );
   },
 );
 

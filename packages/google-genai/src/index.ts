@@ -397,16 +397,26 @@ function candidateOutput(response: UnknownRecord) {
   };
 }
 
-/** A number, one of a closed set of strings, a list, or an object with only the listed keys. */
-type StructureShape = "number" | ReadonlySet<string> | readonly [StructureShape] | StructureObject;
+/**
+ * A number, a boolean, an enum-style identifier, one of a closed set of strings, a list, or an
+ * object with only the listed keys.
+ */
+type StructureShape =
+  | "number"
+  | "boolean"
+  | "enum"
+  | ReadonlySet<string>
+  | readonly [StructureShape]
+  | StructureObject;
 
 interface StructureObject {
   readonly [key: string]: StructureShape;
 }
 
-// Grounding and URL-context metadata are raw attributes, which skip captureOutput and the mask.
-// Without raw output capture only these fields are kept; segment text, retrieved document text,
-// titles, URIs, search queries and the search widget are output content. Keep in sync with Python.
+// Response metadata is written as raw attributes, which skip captureOutput and the mask. Without
+// raw output capture only these fields are kept; segment text, retrieved document text, titles,
+// URIs, search queries, the search widget and block reason messages are output content. Keep in
+// sync with Python.
 const GROUNDING_STRUCTURE: StructureShape = {
   groundingChunks: [{ web: {}, retrievedContext: {}, maps: {}, image: {} }],
   groundingSupports: [
@@ -431,8 +441,28 @@ const URL_CONTEXT_STRUCTURE: StructureShape = {
   urlMetadata: [{ urlRetrievalStatus: URL_RETRIEVAL_STATUSES }],
 };
 
+// Harm categories gain values often, so enum fields keep any identifier-shaped value.
+const SAFETY_RATINGS_STRUCTURE: StructureShape = [
+  {
+    category: "enum",
+    probability: "enum",
+    probabilityScore: "number",
+    severity: "enum",
+    severityScore: "number",
+    blocked: "boolean",
+    overwrittenThreshold: "enum",
+  },
+];
+
+const ENUM_VALUE = /^[A-Z][A-Z0-9_]{0,127}$/;
+
 function projectStructure(value: unknown, shape: StructureShape): unknown {
   if (shape === "number") return readNumber(value);
+
+  if (shape === "boolean") return typeof value === "boolean" ? value : undefined;
+
+  if (shape === "enum")
+    return typeof value === "string" && ENUM_VALUE.test(value) ? value : undefined;
 
   if (shape instanceof Set)
     return typeof value === "string" && shape.has(value) ? value : undefined;
@@ -452,8 +482,11 @@ function projectStructure(value: unknown, shape: StructureShape): unknown {
   return projected;
 }
 
-/** `metadataContent` keeps grounding and URL-context metadata whole instead of its structure. */
+/** `metadataContent` keeps response metadata whole instead of its structure. */
 function responseAttributes(response: UnknownRecord, metadataContent: boolean) {
+  const metadata = (value: unknown, shape: StructureShape) =>
+    metadataContent ? value : projectStructure(value, shape);
+
   const attributes: Record<string, AttributeValue> = {};
   const candidates = asArray(response.candidates) ?? [];
   const promptFeedback = asRecord(response.promptFeedback);
@@ -462,7 +495,7 @@ function responseAttributes(response: UnknownRecord, metadataContent: boolean) {
   if (blockReason) attributes["google_genai.response.block_reason"] = blockReason;
   const blockReasonMessage = readString(promptFeedback?.blockReasonMessage);
 
-  if (blockReasonMessage)
+  if (blockReasonMessage && metadataContent)
     attributes["google_genai.response.block_reason_message"] = blockReasonMessage;
   const promptSafetyRatings = asArray(promptFeedback?.safetyRatings);
 
@@ -470,7 +503,7 @@ function responseAttributes(response: UnknownRecord, metadataContent: boolean) {
     setJsonAttribute(
       attributes,
       "google_genai.response.prompt_safety_ratings",
-      promptSafetyRatings,
+      metadata(promptSafetyRatings, SAFETY_RATINGS_STRUCTURE),
     );
   }
 
@@ -494,7 +527,10 @@ function responseAttributes(response: UnknownRecord, metadataContent: boolean) {
 
       if (!ratings || ratings.length === 0) return undefined;
 
-      return { candidateIndex: readNumber(record?.index) ?? index, ratings };
+      return {
+        candidateIndex: readNumber(record?.index) ?? index,
+        ratings: metadata(ratings, SAFETY_RATINGS_STRUCTURE),
+      };
     })
     .filter((entry) => entry !== undefined);
 
@@ -508,9 +544,7 @@ function responseAttributes(response: UnknownRecord, metadataContent: boolean) {
     setJsonAttribute(
       attributes,
       "google_genai.response.grounding_metadata",
-      metadataContent
-        ? firstCandidate.groundingMetadata
-        : projectStructure(firstCandidate.groundingMetadata, GROUNDING_STRUCTURE),
+      metadata(firstCandidate.groundingMetadata, GROUNDING_STRUCTURE),
     );
   }
 
@@ -518,9 +552,7 @@ function responseAttributes(response: UnknownRecord, metadataContent: boolean) {
     setJsonAttribute(
       attributes,
       "google_genai.response.url_context_metadata",
-      metadataContent
-        ? firstCandidate.urlContextMetadata
-        : projectStructure(firstCandidate.urlContextMetadata, URL_CONTEXT_STRUCTURE),
+      metadata(firstCandidate.urlContextMetadata, URL_CONTEXT_STRUCTURE),
     );
   }
 
