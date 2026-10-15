@@ -95,6 +95,12 @@ These values obey the telemetry.dev SDK `captureInput` and `captureOutput` setti
 `true`. Use `mask` to remove values before capture. Use `maxAttributeLength` to limit serialized
 attributes.
 
+A failed tool's result text is also used as the exception message, but only when `captureOutput` is
+on and no `mask` is set. Otherwise the exception message is `tool <name> failed`, and the result text
+stays in the tool output, which follows `captureOutput` and `mask`. A failed assistant message's
+`errorMessage` is a provider diagnostic, not tool output: chat and agent spans use it as the exception
+message regardless of `captureOutput` and `mask`.
+
 ## Limitations
 
 - Chat input uses each provider's request shape, not pi's raw session messages. Pi's public hooks do

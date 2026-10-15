@@ -398,28 +398,49 @@ test("tool execution produces an execute_tool span with arguments and result", a
   expect(span.status.code).not.toBe(SpanStatusCode.ERROR);
 });
 
-test("failing tool execution marks the execute_tool span as an error", async () => {
-  const harness = makeHarness();
-  await harness.emit({ type: "agent_start" });
-  await harness.emit({
-    type: "tool_execution_start",
-    toolCallId: "call-2",
-    toolName: "bash",
-    args: { command: "false" },
-  });
-  await harness.emit({
-    type: "tool_execution_end",
-    toolCallId: "call-2",
-    toolName: "bash",
-    result: { content: [{ type: "text", text: "command failed" }] },
-    isError: true,
-  });
-  await flush();
+test.each([
+  { name: "default capture", options: {}, message: "grep: .env:\nTOKEN=private-tool-output" },
+  { name: "captureOutput: false", options: { captureOutput: false }, message: "tool bash failed" },
+  {
+    name: "a mask",
+    options: {
+      mask: (value: unknown) =>
+        JSON.parse(JSON.stringify(value).replaceAll("private-tool-output", "[redacted]")),
+    },
+    message: "tool bash failed",
+  },
+])(
+  "failing tool execution marks the execute_tool span as an error ($name)",
+  async ({ options, message }) => {
+    const harness = makeHarness(options);
+    await harness.emit({ type: "agent_start" });
+    await harness.emit({
+      type: "tool_execution_start",
+      toolCallId: "call-2",
+      toolName: "bash",
+      args: { command: "grep TOKEN .env" },
+    });
+    await harness.emit({
+      type: "tool_execution_end",
+      toolCallId: "call-2",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: "grep: .env:\nTOKEN=private-tool-output" }] },
+      isError: true,
+    });
+    await flush();
 
-  const span = spanByName(harness.exporters, "execute_tool bash");
-  expect(span.status.code).toBe(SpanStatusCode.ERROR);
-  expect(span.attributes["error.type"]).toBe("ToolExecutionError");
-});
+    const span = spanByName(harness.exporters, "execute_tool bash");
+    const exception = span.events.find((event) => event.name === "exception")?.attributes;
+    expect(span.status.code).toBe(SpanStatusCode.ERROR);
+    expect(span.attributes["error.type"]).toBe("ToolExecutionError");
+    expect(exception?.["exception.type"]).toBe("ToolExecutionError");
+    // Failed tool output is tool output: only captured, unmasked output may reach the exception.
+    expect(exception?.["exception.message"]).toBe(message);
+    const stack = String(exception?.["exception.stacktrace"]);
+    expect(stack.startsWith(`ToolExecutionError: ${message}\n`)).toBe(true);
+    expect(stack.includes("private-tool-output")).toBe(message.includes("private-tool-output"));
+  },
+);
 
 test("dangling tool spans are closed when the agent loop ends", async () => {
   const harness = makeHarness();

@@ -377,10 +377,16 @@ export function telemetryDevExtension(
 
         if (!span) return;
         toolSpans.delete(event.toolCallId);
-        const resultText = textContent(asRecord(event.result)?.content);
+        // The SDK exports error messages without the capture check or mask
+        // that `output` gets, and a failed tool's result is its output.
+        const policy = span.capturePolicy;
+        const message =
+          policy?.output && !policy.mask
+            ? textContent(asRecord(event.result)?.content)
+            : `tool ${event.toolName} failed`;
         span.end({
           output: event.result,
-          error: event.isError ? failureError("ToolExecutionError", resultText) : undefined,
+          error: event.isError ? failureError("ToolExecutionError", message) : undefined,
         });
       },
     );

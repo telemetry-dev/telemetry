@@ -1,4 +1,5 @@
 import {
+  captureEnabled,
   flush,
   log,
   startSpan,
@@ -105,6 +106,32 @@ function failureError(name: string, message: string | undefined): Error {
   return error;
 }
 
+/**
+ * Host error text can be tool output that the host also sends to the model,
+ * and the SDK exports exception messages without the capture check or mask
+ * that `output` gets, so the text is used only where the span captures output
+ * unmasked.
+ */
+function hostError(
+  span: SpanHandle,
+  name: string,
+  text: string | undefined,
+  fallback: string,
+): Error {
+  const policy = span.capturePolicy;
+
+  return failureError(name, (policy?.output && !policy.mask ? text : undefined) ?? fallback);
+}
+
+interface SessionFailure {
+  name: string;
+  message: string | undefined;
+}
+
+function sessionError(span: SpanHandle, failure: SessionFailure | undefined): Error | undefined {
+  return failure && hostError(span, failure.name, failure.message, "session error");
+}
+
 function usageFields(message: JsonObject): TokenUsage {
   const tokens = asJsonObject(message.tokens);
   const cache = asJsonObject(tokens?.cache);
@@ -178,7 +205,7 @@ export function telemetryDevPlugin(
     const toolCallByPart = new Map<string, Map<string, string>>();
     const completedMessages = new Set<string>();
     /** Latest session.error per session, applied when the session settles. */
-    const pendingErrors = new Map<string, Error>();
+    const pendingErrors = new Map<string, SessionFailure>();
 
     function conversationAttributes(sessionID: string | undefined): Record<string, string> {
       return sessionID ? { "gen_ai.conversation.id": sessionID } : {};
@@ -203,10 +230,13 @@ export function telemetryDevPlugin(
     }
 
     /** Closes a session's open chat spans when the session settles without completing them. */
-    function endOpenChats(sessionID: string, error?: Error): void {
+    function endOpenChats(sessionID: string, failure?: SessionFailure): void {
       for (const [messageID, open] of openChats) {
         if (open.sessionID !== sessionID) continue;
-        open.span.end({ error, finishReason: error ? undefined : "incomplete" });
+        open.span.end({
+          error: sessionError(open.span, failure),
+          finishReason: failure ? undefined : "incomplete",
+        });
         openChats.delete(messageID);
       }
 
@@ -218,7 +248,7 @@ export function telemetryDevPlugin(
      * The missing-agent synthetic Task path throws after tool.execute.before,
      * so neither tool.execute.after nor an error-state tool part ever arrives.
      */
-    function endPendingTools(sessionID: string, error: Error): void {
+    function endPendingTools(sessionID: string, failure: SessionFailure): void {
       for (const [key, pending] of pendingTools) {
         if (pending.sessionID !== sessionID) continue;
         pendingTools.delete(key);
@@ -233,7 +263,7 @@ export function telemetryDevPlugin(
           attributes: conversationAttributes(sessionID),
         });
 
-        span.end({ error });
+        span.end({ error: sessionError(span, failure) });
       }
     }
 
@@ -241,15 +271,15 @@ export function telemetryDevPlugin(
     function settleSession(sessionID: string | undefined): void {
       if (sessionID) {
         toolCallByPart.delete(sessionID);
-        const error = pendingErrors.get(sessionID);
+        const failure = pendingErrors.get(sessionID);
         pendingErrors.delete(sessionID);
 
-        if (error) endPendingTools(sessionID, error);
-        endOpenChats(sessionID, error);
+        if (failure) endPendingTools(sessionID, failure);
+        endOpenChats(sessionID, failure);
         const span = agentSpans.get(sessionID);
 
         if (span) {
-          span.end({ error });
+          span.end({ error: sessionError(span, failure) });
           agentSpans.delete(sessionID);
         }
       }
@@ -396,9 +426,11 @@ export function telemetryDevPlugin(
 
               span.end({
                 endTime: numberField(timing, "end"),
-                error: failureError(
+                error: hostError(
+                  span,
                   "ToolExecutionError",
-                  stringField(state, "error") ?? "tool execution failed",
+                  stringField(state, "error"),
+                  `tool ${tool} failed`,
                 ),
               });
 
@@ -430,14 +462,18 @@ export function telemetryDevPlugin(
               const errorMessage = stringField(errorData, "message");
               const attributes = { "opencode.error.name": errorName };
 
-              if (errorMessage)
+              // A failed prompt attachment read publishes the Read tool's
+              // error text here. Log attributes go through the mask but not
+              // the output capture check.
+              if (errorMessage && captureEnabled("output"))
                 Object.assign(attributes, { "opencode.error.message": errorMessage });
               emit("session.error", sessionID, "error", "Session error", attributes);
 
               // Not always terminal: a context overflow publishes this event,
               // then compacts and continues the same prompt. Record the error
               // and apply it when the session settles.
-              if (sessionID) pendingErrors.set(sessionID, failureError(errorName, errorMessage));
+              if (sessionID)
+                pendingErrors.set(sessionID, { name: errorName, message: errorMessage });
 
               return;
             }
@@ -526,19 +562,25 @@ export function telemetryDevPlugin(
         try {
           // Disposal is not gated on session idle; apply each session's
           // deferred session.error instead of ending spans as merely incomplete.
-          for (const [sessionID, error] of pendingErrors) endPendingTools(sessionID, error);
+          for (const [sessionID, failure] of pendingErrors) endPendingTools(sessionID, failure);
 
           for (const [messageID, open] of openChats) {
-            const error = pendingErrors.get(open.sessionID);
-            open.span.end({ error, finishReason: error ? undefined : "incomplete" });
+            const failure = pendingErrors.get(open.sessionID);
+            open.span.end({
+              error: sessionError(open.span, failure),
+              finishReason: failure ? undefined : "incomplete",
+            });
             openChats.delete(messageID);
           }
 
           chatBySession.clear();
 
           for (const [sessionID, span] of agentSpans) {
-            const error = pendingErrors.get(sessionID);
-            span.end({ error, finishReason: error ? undefined : "incomplete" });
+            const failure = pendingErrors.get(sessionID);
+            span.end({
+              error: sessionError(span, failure),
+              finishReason: failure ? undefined : "incomplete",
+            });
           }
 
           agentSpans.clear();

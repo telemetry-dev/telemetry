@@ -209,13 +209,24 @@ test("tool before and after create an execute_tool span with arguments, result, 
   expect(span.startTime[0]).toBe(1_700_000_010);
 });
 
-test("message.part.updated reconstructs tool error spans", async () => {
-  const harness = await makeHarness();
+test.each([
+  { name: "default capture", options: {}, message: "grep: .env:\nTOKEN=private-tool-output" },
+  { name: "captureOutput: false", options: { captureOutput: false }, message: "tool bash failed" },
+  {
+    name: "a mask",
+    options: {
+      mask: (value: unknown) =>
+        JSON.parse(JSON.stringify(value).replaceAll("private-tool-output", "[redacted]")),
+    },
+    message: "tool bash failed",
+  },
+])("message.part.updated reconstructs tool error spans ($name)", async ({ options, message }) => {
+  const harness = await makeHarness(options);
   await chatMessage(harness.hooks);
   vi.spyOn(Date, "now").mockReturnValue(1_700_000_020_000);
   await harness.hooks["tool.execute.before"]?.(
     { callID: "call-2", sessionID: "session-1", tool: "bash" },
-    { args: { command: "false" } },
+    { args: { command: "grep TOKEN .env" } },
   );
 
   await event(harness.hooks, "message.part.updated", {
@@ -226,8 +237,8 @@ test("message.part.updated reconstructs tool error spans", async () => {
       tool: "bash",
       state: {
         status: "error",
-        input: { command: "false" },
-        error: "command failed",
+        input: { command: "grep TOKEN .env" },
+        error: "grep: .env:\nTOKEN=private-tool-output",
         time: { start: 1_700_000_020_000, end: 1_700_000_021_000 },
       },
     },
@@ -236,12 +247,19 @@ test("message.part.updated reconstructs tool error spans", async () => {
   await flush();
 
   const span = spanByName(harness.exporters, "execute_tool bash");
+  const exception = span.events.find((entry) => entry.name === "exception")?.attributes;
   expect(span.status.code).toBe(SpanStatusCode.ERROR);
   expect(span.attributes).toMatchObject({
     "error.type": "ToolExecutionError",
-    "gen_ai.tool.call.arguments": JSON.stringify({ command: "false" }),
+    "gen_ai.tool.call.arguments": JSON.stringify({ command: "grep TOKEN .env" }),
     "gen_ai.tool.call.id": "call-2",
   });
+  expect(exception?.["exception.type"]).toBe("ToolExecutionError");
+  // The host error text is the tool result: only captured, unmasked output may reach the exception.
+  expect(exception?.["exception.message"]).toBe(message);
+  const stack = String(exception?.["exception.stacktrace"]);
+  expect(stack.startsWith(`ToolExecutionError: ${message}\n`)).toBe(true);
+  expect(stack.includes("private-tool-output")).toBe(message.includes("private-tool-output"));
   expect(span.startTime[0]).toBe(1_700_000_020);
   expect(span.endTime[0]).toBe(1_700_000_021);
 });
@@ -304,6 +322,72 @@ test("dispose applies a deferred session.error instead of ending the span as inc
   expect(span.status.code).toBe(SpanStatusCode.ERROR);
   expect(span.attributes["error.type"]).toBe("ApiError");
   expect(span.attributes["gen_ai.response.finish_reasons"]).toBeUndefined();
+});
+
+describe.each([
+  {
+    name: "default capture",
+    options: {},
+    message: "File not found: a.ts\nprivate-attachment-listing",
+    logMessage: "File not found: a.ts\nprivate-attachment-listing",
+  },
+  {
+    name: "captureOutput: false",
+    options: { captureOutput: false },
+    message: "session error",
+    logMessage: undefined,
+  },
+  {
+    name: "a mask",
+    options: {
+      mask: (value: unknown) =>
+        JSON.parse(JSON.stringify(value).replaceAll("private-attachment-listing", "[redacted]")),
+    },
+    message: "session error",
+    logMessage: "File not found: a.ts\n[redacted]",
+  },
+])("session.error text follows output capture ($name)", ({ options, message, logMessage }) => {
+  test.each(["settle", "dispose"])("on %s", async (ending) => {
+    const harness = await makeHarness(options);
+    await chatMessage(harness.hooks);
+    await event(harness.hooks, "message.updated", {
+      info: assistantMessage({ time: { created: 1_700_000_000_000 } }),
+    });
+    await harness.hooks["tool.execute.before"]?.(
+      { callID: "call-5", sessionID: "session-1", tool: "task" },
+      { args: { description: "run subtask" } },
+    );
+    // A failed prompt file attachment publishes the Read tool's error text.
+    await event(harness.hooks, "session.error", {
+      sessionID: "session-1",
+      error: {
+        name: "UnknownError",
+        data: { message: "File not found: a.ts\nprivate-attachment-listing" },
+      },
+    });
+
+    if (ending === "settle") {
+      await event(harness.hooks, "session.idle", { sessionID: "session-1" });
+      await flush();
+    } else {
+      await harness.hooks.dispose?.();
+    }
+
+    for (const name of ["invoke_agent", "chat claude-sonnet-4-5", "execute_tool task"]) {
+      const span = spanByName(harness.exporters, name);
+      const exception = span.events.find((entry) => entry.name === "exception")?.attributes;
+      expect(span.status.code, name).toBe(SpanStatusCode.ERROR);
+      expect(span.attributes["error.type"], name).toBe("UnknownError");
+      expect(exception?.["exception.message"], name).toBe(message);
+      const stack = String(exception?.["exception.stacktrace"]);
+      expect(stack.startsWith(`UnknownError: ${message}\n`), name).toBe(true);
+      expect(stack.includes("private-attachment-listing"), name).toBe(message !== "session error");
+    }
+
+    const records = harness.exporters.logs.getFinishedLogRecords();
+    expect(records[0]?.attributes["opencode.error.name"]).toBe("UnknownError");
+    expect(records[0]?.attributes["opencode.error.message"]).toBe(logMessage);
+  });
 });
 
 describe("synthetic Task correlation", () => {

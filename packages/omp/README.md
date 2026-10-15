@@ -85,6 +85,12 @@ Prompt input, assistant text output, tool arguments, and tool results follow the
 `captureInput` and `captureOutput` settings. Both default to `true`. Use `mask` to redact values
 before capture and `maxAttributeLength` to bound serialized attributes.
 
+A failed tool's result text is also used as the exception message, but only when `captureOutput` is
+on and no `mask` is set. Otherwise the exception message is `tool <name> failed`, and the result text
+stays in the tool output, which follows `captureOutput` and `mask`. A failed assistant message's
+`errorMessage` is a provider diagnostic, not tool output: chat and agent spans use it as the exception
+message regardless of `captureOutput` and `mask`.
+
 Thinking and tool-call content blocks are not copied into assistant output; only text blocks are
 joined. Usage metadata still includes reasoning-token counts when omp reports them.
 
