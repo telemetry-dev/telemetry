@@ -551,10 +551,68 @@ def _candidate_index(candidate: Any, fallback: int) -> int:
     return int(index) if index is not None else fallback
 
 
+# Grounding and URL-context metadata are raw attributes, which skip capture_output and the mask.
+# Without raw output capture only these fields are kept; segment text, retrieved document text,
+# titles, URIs, search queries and the search widget are output content. Keep in sync with
+# TypeScript.
+_GROUNDING_STRUCTURE: Any = {
+    "groundingChunks": [{"web": {}, "retrievedContext": {}, "maps": {}, "image": {}}],
+    "groundingSupports": [
+        {
+            "segment": {"startIndex": "number", "endIndex": "number", "partIndex": "number"},
+            "groundingChunkIndices": ["number"],
+            "confidenceScores": ["number"],
+        }
+    ],
+    "retrievalMetadata": {"googleSearchDynamicRetrievalScore": "number"},
+}
+_URL_RETRIEVAL_STATUSES = frozenset(
+    {
+        "URL_RETRIEVAL_STATUS_UNSPECIFIED",
+        "URL_RETRIEVAL_STATUS_SUCCESS",
+        "URL_RETRIEVAL_STATUS_ERROR",
+        "URL_RETRIEVAL_STATUS_PAYWALL",
+        "URL_RETRIEVAL_STATUS_UNSAFE",
+    }
+)
+_URL_CONTEXT_STRUCTURE: Any = {"urlMetadata": [{"urlRetrievalStatus": _URL_RETRIEVAL_STATUSES}]}
+
+
+# A shape is "number", a frozenset of allowed strings, a one-item list, or a dict of listed keys.
+def _project_structure(value: Any, shape: Any) -> Any:
+    if shape == "number":
+        return _number(value)
+    if isinstance(shape, frozenset):
+        return value if isinstance(value, str) and value in shape else None
+    if isinstance(shape, list):
+        return (
+            [_project_structure(item, shape[0]) for item in value]
+            if isinstance(value, list)
+            else None
+        )
+    if not isinstance(value, dict):
+        return None
+    projected: dict[str, Any] = {}
+    for key, nested in shape.items():
+        field = _project_structure(value.get(key), nested)
+        if field is not None:
+            projected[key] = field
+    return projected
+
+
+def _metadata_attr(value: Any, shape: Any, metadata_content: bool) -> str | None:
+    if metadata_content:
+        return _json_attr(value)
+    projected = _project_structure(_native(value), shape)
+    return None if projected is None else _json_attr(projected)
+
+
+# metadata_content keeps grounding and URL-context metadata whole instead of its structure.
 def _record_candidate_metadata(
     candidate: Any,
     index: int,
     attrs: dict[str, Any],
+    metadata_content: bool,
     budget: telemetry_dev.CaptureBudget | None = None,
 ) -> None:
     ratings = _field(candidate, "safety_ratings")
@@ -576,17 +634,17 @@ def _record_candidate_metadata(
     if index == 0:
         grounding = _field(candidate, "grounding_metadata")
         if grounding is not None:
-            encoded = _json_attr(grounding)
+            encoded = _metadata_attr(grounding, _GROUNDING_STRUCTURE, metadata_content)
             if encoded is not None and (budget is None or budget.accept(encoded)):
                 attrs["google_genai.response.grounding_metadata"] = encoded
         url_context = _field(candidate, "url_context_metadata")
         if url_context is not None:
-            encoded = _json_attr(url_context)
+            encoded = _metadata_attr(url_context, _URL_CONTEXT_STRUCTURE, metadata_content)
             if encoded is not None and (budget is None or budget.accept(encoded)):
                 attrs["google_genai.response.url_context_metadata"] = encoded
 
 
-def _generate_response_fields(response: Any) -> dict[str, Any]:
+def _generate_response_fields(response: Any, metadata_content: bool = False) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     attrs: dict[str, Any] = {}
     response_model = _string(_field(response, "model_version"))
@@ -606,7 +664,7 @@ def _generate_response_fields(response: Any) -> dict[str, Any]:
         content_output = _content_output(_field(candidate, "content"))
         if content_output is not None:
             output.append(content_output)
-        _record_candidate_metadata(candidate, candidate_index, attrs)
+        _record_candidate_metadata(candidate, candidate_index, attrs, metadata_content)
     if finish_reasons:
         fields["finish_reason"] = finish_reasons[0]
         if len(finish_reasons) > 1:
@@ -692,7 +750,8 @@ class _CandidateState:
 
 
 class _StreamState:
-    def __init__(self) -> None:
+    def __init__(self, metadata_content: bool = False) -> None:
+        self.metadata_content = metadata_content
         self.candidates: dict[int, _CandidateState] = {}
         self.finish_reasons: dict[int, str] = {}
         self.usage: dict[str, int | float] | None = None
@@ -715,6 +774,14 @@ def _capture_masked(handle: telemetry_dev.SpanHandle) -> bool:
         return masked
     client = getattr(compatible, "_client", None)
     return getattr(client, "mask", _OMIT) is not None if client is not None else True
+
+
+def _capture_metadata_content(handle: telemetry_dev.SpanHandle) -> bool:
+    compatible = cast(Any, handle)
+    capture_output = getattr(compatible, "capture_output", None)
+    if not isinstance(capture_output, bool):
+        capture_output = getattr(getattr(compatible, "_state", None), "capture_output", False)
+    return capture_output is True and not _capture_masked(handle)
 
 
 def _mark_stream_capture(
@@ -803,7 +870,9 @@ def _record_chunk_inner(chunk: Any, state: _StreamState) -> None:
         finish = _enum_value(_field(candidate, "finish_reason"))
         if finish is not None:
             state.finish_reasons[candidate_index] = finish[:_FINISH_REASON_MAX_LENGTH]
-        _record_candidate_metadata(candidate, candidate_index, state.attrs, state.budget)
+        _record_candidate_metadata(
+            candidate, candidate_index, state.attrs, state.metadata_content, state.budget
+        )
     usage = _generate_usage(_field(chunk, "usage_metadata"), state.attrs)
     if usage:
         state.usage = usage
@@ -976,7 +1045,7 @@ class _ObservedStream:
         self._handle = handle
         self._end = end
         self._started_at = started_at
-        self._state = _StreamState()
+        self._state = _StreamState(_capture_metadata_content(handle))
         self._saw_first = False
         self._afc_usage_state = afc_usage_state
         self._completed = False
@@ -1069,7 +1138,7 @@ class _ObservedAsyncStream:
         self._handle = handle
         self._end = end
         self._started_at = started_at
-        self._state = _StreamState()
+        self._state = _StreamState(_capture_metadata_content(handle))
         self._saw_first = False
         self._afc_usage_state = afc_usage_state
         self._completed = False
@@ -1213,7 +1282,7 @@ def _wrap_sync_generate(
     @wraps(original)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         resource = args[0] if args else None
-        _handle, end, _started_at = _start_generate_span(
+        handle, end, _started_at = _start_generate_span(
             kwargs.get("model"),
             kwargs.get("contents"),
             kwargs.get("config"),
@@ -1229,7 +1298,11 @@ def _wrap_sync_generate(
         finally:
             if token is not None:
                 _AFC_USAGE_STATE.reset(token)
-        end(**_fields_with_afc_usage(_safe_fields(_generate_response_fields, result), afc_state))
+        metadata_content = _capture_metadata_content(handle)
+        fields = _safe_fields(
+            lambda response: _generate_response_fields(response, metadata_content), result
+        )
+        end(**_fields_with_afc_usage(fields, afc_state))
         return result
 
     setattr(wrapper, _WRAPPED_ATTR, True)
@@ -1293,7 +1366,7 @@ def _wrap_async_generate(
     @wraps(original)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         resource = args[0] if args else None
-        _handle, end, _started_at = _start_generate_span(
+        handle, end, _started_at = _start_generate_span(
             kwargs.get("model"),
             kwargs.get("contents"),
             kwargs.get("config"),
@@ -1309,7 +1382,11 @@ def _wrap_async_generate(
         finally:
             if token is not None:
                 _AFC_USAGE_STATE.reset(token)
-        end(**_fields_with_afc_usage(_safe_fields(_generate_response_fields, result), afc_state))
+        metadata_content = _capture_metadata_content(handle)
+        fields = _safe_fields(
+            lambda response: _generate_response_fields(response, metadata_content), result
+        )
+        end(**_fields_with_afc_usage(fields, afc_state))
         return result
 
     setattr(wrapper, _WRAPPED_ATTR, True)

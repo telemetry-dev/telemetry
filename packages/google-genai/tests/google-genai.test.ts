@@ -1627,6 +1627,130 @@ test("streaming keeps candidates rejected by the index cap out of response attri
   });
 });
 
+// Every content string carries "private" or the answer's "Grounded" so a leak is easy to spot.
+const GROUNDING_METADATA = {
+  webSearchQueries: ["private query"],
+  searchEntryPoint: { renderedContent: "<div>private query</div>" },
+  groundingChunks: [
+    {
+      web: {
+        uri: "https://private.example/page",
+        title: "private page",
+        domain: "private.example",
+      },
+    },
+    {
+      retrievedContext: {
+        uri: "gs://private/doc.pdf",
+        title: "private doc",
+        text: "private retrieved text",
+        ragChunk: { text: "private rag text", pageSpan: { firstPage: 1, lastPage: 2 } },
+      },
+    },
+  ],
+  groundingSupports: [
+    {
+      segment: { startIndex: 0, endIndex: 15, partIndex: 0, text: "Grounded answer" },
+      groundingChunkIndices: [1, 0],
+      confidenceScores: [0.9, 0.4],
+    },
+  ],
+  retrievalMetadata: { googleSearchDynamicRetrievalScore: 0.7 },
+};
+
+const URL_CONTEXT_METADATA = {
+  urlMetadata: [
+    {
+      retrievedUrl: "https://private.example/url",
+      urlRetrievalStatus: "URL_RETRIEVAL_STATUS_SUCCESS",
+    },
+    { retrievedUrl: "https://private.example/other", urlRetrievalStatus: "private status" },
+  ],
+};
+
+test.each([
+  { name: "generateContent with captureOutput off", stream: false, capture: "off" },
+  { name: "generateContent with a mask", stream: false, capture: "masked" },
+  { name: "generateContent capturing output", stream: false, capture: "on" },
+  { name: "generateContentStream with captureOutput off", stream: true, capture: "off" },
+  { name: "generateContentStream with a mask", stream: true, capture: "masked" },
+  { name: "generateContentStream capturing output", stream: true, capture: "on" },
+] as const)(
+  "$name keeps grounding content only when output is captured unmasked",
+  async ({ stream, capture }) => {
+    const spans = setupSpans(
+      capture === "off"
+        ? { captureOutput: false }
+        : capture === "masked"
+          ? {
+              mask: (value) => JSON.parse(JSON.stringify(value).replaceAll("Grounded", "REDACTED")),
+            }
+          : {},
+    );
+
+    const metadata = {
+      finishReason: "STOP",
+      groundingMetadata: GROUNDING_METADATA,
+      urlContextMetadata: URL_CONTEXT_METADATA,
+    };
+
+    const content = { role: "model", parts: [{ text: "Grounded answer." }] };
+
+    const client = wrapGoogleGenAI({
+      models: {
+        generateContent: (_params: unknown) => ({ candidates: [{ content, ...metadata }] }),
+        async *generateContentStream(_params: unknown) {
+          yield { candidates: [{ index: 0, content }] };
+          yield { candidates: [{ index: 0, ...metadata }] };
+        },
+      },
+    });
+
+    if (stream) {
+      const chunks = await Promise.resolve(
+        client.models.generateContentStream({ model: "gemini", contents: "go" }),
+      );
+
+      for await (const _chunk of chunks);
+    } else {
+      client.models.generateContent({ model: "gemini", contents: "go" });
+    }
+
+    const span = await exportedSpan(spans);
+    const grounding = jsonAttr(span, "google_genai.response.grounding_metadata");
+    const urlContext = jsonAttr(span, "google_genai.response.url_context_metadata");
+
+    if (capture === "on") {
+      expect(grounding).toEqual(GROUNDING_METADATA);
+      expect(urlContext).toEqual(URL_CONTEXT_METADATA);
+
+      return;
+    }
+
+    expect(JSON.stringify(span.attributes)).not.toMatch(/private|Grounded/);
+    expect(grounding).toEqual({
+      groundingChunks: [{ web: {} }, { retrievedContext: {} }],
+      groundingSupports: [
+        {
+          segment: { startIndex: 0, endIndex: 15, partIndex: 0 },
+          groundingChunkIndices: [1, 0],
+          confidenceScores: [0.9, 0.4],
+        },
+      ],
+      retrievalMetadata: { googleSearchDynamicRetrievalScore: 0.7 },
+    });
+    expect(urlContext).toEqual({
+      urlMetadata: [{ urlRetrievalStatus: "URL_RETRIEVAL_STATUS_SUCCESS" }, {}],
+    });
+
+    if (capture === "masked") {
+      expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+        { role: "model", parts: [{ text: "REDACTED answer." }] },
+      ]);
+    }
+  },
+);
+
 test.each([false, true])(
   "streaming caps retained finish reasons at a fixed length (output budget spent: %s)",
   async (spent) => {
