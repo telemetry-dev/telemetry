@@ -166,6 +166,103 @@ def test_completion_litellm_metadata_maps_to_td_metadata(memory: SimpleNamespace
     assert attrs(only_span(memory))["td.metadata.tenant"] == "acme"
 
 
+def test_router_call_from_litellm_proxy_drops_request_and_auth_metadata(
+    memory: SimpleNamespace,
+) -> None:
+    # Shape of the metadata LiteLLM 1.90.2's proxy passes to its Router for a client
+    # that authenticates with x-litellm-api-key and also sends an Anthropic OAuth token.
+    headers = {
+        "host": "proxy.internal",
+        "authorization": "Bearer sk-ant-oat01-oauth-secret",
+        "cookie": "session=cookie-secret",
+        "x-internal-tenant-token": "custom-header-secret",
+        "user-agent": "client/1.0",
+    }
+    secrets = (
+        "oauth-secret",
+        "cookie-secret",
+        "custom-header-secret",
+        "203.0.113.7",
+        "jwt-subject",
+        "user@example.com",
+    )
+    instrument_litellm()
+    router = llm.Router(
+        model_list=[
+            {
+                "model_name": "gpt-4o-mini",
+                "litellm_params": {"model": "gpt-4o-mini", "mock_response": "routed"},
+            }
+        ]
+    )
+    router.completion(
+        model="gpt-4o-mini",
+        messages=CHAT_MESSAGES,
+        metadata={
+            "tenant": "acme",
+            "headers": headers,
+            "requester_metadata": {"tenant": "acme", "headers": headers},
+            "requester_ip_address": "203.0.113.7",
+            "user_agent": "client/1.0",
+            "endpoint": "http://proxy.internal/v1/chat/completions",
+            "litellm_api_version": "1.90.2",
+            "user_api_key": "hashed-key",
+            "user_api_key_hash": "hashed-key",
+            "user_api_key_user_email": "user@example.com",
+            "user_api_key_auth": {
+                "user_email": "user@example.com",
+                "jwt_claims": {"sub": "jwt-subject"},
+            },
+        },
+    )
+
+    a = attrs(only_span(memory))
+    assert a["td.metadata.tenant"] == "acme"
+    assert a["td.metadata.model_group"] == "gpt-4o-mini"
+    assert a["td.metadata.litellm_api_version"] == "1.90.2"
+    exported = {key.removeprefix("td.metadata.") for key in a if key.startswith("td.metadata.")}
+    assert exported.isdisjoint(
+        {"headers", "requester_metadata", "requester_ip_address", "user_agent", "endpoint"}
+    )
+    assert not any(key.startswith("user_api_key") for key in exported)
+    leaked = [secret for secret in secrets for value in a.values() if secret in str(value)]
+    assert leaked == []
+
+
+def test_router_fallback_drops_the_failed_call_history(memory: SimpleNamespace) -> None:
+    instrument_litellm()
+    router = llm.Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": {"model": "gpt-4o-mini", "mock_response": Exception("down")},
+            },
+            {
+                "model_name": "backup",
+                "litellm_params": {"model": "gpt-4o-mini", "mock_response": "routed"},
+            },
+        ],
+        fallbacks=[{"primary": ["backup"]}],
+    )
+    router.completion(
+        model="primary",
+        messages=CHAT_MESSAGES,
+        metadata={"tenant": "acme", "headers": {"cookie": "session=cookie-secret"}},
+    )
+
+    spans = memory.span_exporter.get_finished_spans()
+    statuses = [span.status.status_code for span in spans]
+    assert StatusCode.ERROR in statuses
+    assert statuses[-1] == StatusCode.UNSET
+    attribute_sets: list[dict[str, object]] = [attrs(span) for span in spans] + [
+        dict(event.attributes or {}) for span in spans for event in span.events
+    ]
+    exported = [(key, str(value)) for found in attribute_sets for key, value in found.items()]
+    assert ("td.metadata.tenant", "acme") in exported
+    assert [key for key, _ in exported if key == "td.metadata.previous_models"] == []
+    assert [key for key, value in exported if "cookie-secret" in value] == []
+
+
 def test_completion_cache_write_tokens_map_to_cache_creation(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
