@@ -182,7 +182,7 @@ function isCut(fields: SpanFields | undefined): boolean {
 
 // Cores older than captureMasked expose no mask policy before a span starts; treat them as
 // masked, like LEGACY_CAPTURE_POLICY. A namespace read keeps them loadable without the export.
-function captureMaskedBeforeStart(): boolean {
+export function captureMaskedBeforeStart(): boolean {
   const read = (telemetrySdk as { captureMasked?: () => boolean }).captureMasked;
 
   try {

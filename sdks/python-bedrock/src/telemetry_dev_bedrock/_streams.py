@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable, Iterator
-from typing import Any
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, cast
 
 import telemetry_dev
 
@@ -412,12 +414,22 @@ class AgentStreamState(StreamState):
         self.text_rejected = False
         self.usage: dict[str, int] = {}
         self.trace_count = 0
+        self.failed = False
+        self.failure_code: int | None = None
         self.failure_reason: str | None = None
         self.guardrail_action: str | None = None
         self.return_control: Any = None
         self.saw_return_control = False
         self.return_control_rejected = False
         self.traces: list[Any] = []
+        # Metadata bypasses the capture flags and the mask, so trace content is filtered here,
+        # and a mask that cannot see it withholds it.
+        client = telemetry_dev.get_client()
+        masked = client is None or getattr(client, "mask", _OMIT) is not None
+        self.trace_capture = {
+            "input": client is not None and client.capture_input and not masked,
+            "output": client is not None and client.capture_output and not masked,
+        }
 
     def feed(self, event: Any) -> None:
         if not isinstance(event, dict):
@@ -447,8 +459,10 @@ class AgentStreamState(StreamState):
         trace = event.get("trace") if isinstance(event.get("trace"), dict) else None
         if trace:
             self.trace_count += 1
-            if self.capture_trace and self.budget.accept(trace):
-                self.traces.append(trace)
+            if self.capture_trace:
+                retained = _project_trace(trace, _TRACE_PART, self.trace_capture)
+                if self.budget.accept(retained):
+                    self.traces.append(retained)
             self._collect_trace(trace)
 
     def finish(self, *, partial: bool) -> dict[str, Any]:
@@ -456,6 +470,8 @@ class AgentStreamState(StreamState):
         metadata = clean(
             {
                 "trace_event_count": self.trace_count or None,
+                "failure": True if self.failed else None,
+                "failure_code": self.failure_code,
                 "failure_reason": self.failure_reason,
                 "guardrail_action": self.guardrail_action,
                 "return_control": True if self.saw_return_control else None,
@@ -475,45 +491,50 @@ class AgentStreamState(StreamState):
             return False
         return self.text_rejected or self.return_control_rejected
 
-    def _collect_trace(self, value: Any) -> None:
-        if isinstance(value, dict):
-            output = value.get("modelInvocationOutput")
-            if isinstance(output, dict):
-                metadata = (
-                    output.get("metadata") if isinstance(output.get("metadata"), dict) else {}
-                )
-                usage = metadata.get("usage") if isinstance(metadata.get("usage"), dict) else None
-                if usage:
-                    input_tokens = _int_value(usage.get("inputTokens"))
-                    output_tokens = _int_value(usage.get("outputTokens"))
-                    total_tokens = _int_value(usage.get("totalTokens"))
-                    if input_tokens is not None:
-                        self.usage["input_tokens"] = (
-                            self.usage.get("input_tokens", 0) + input_tokens
-                        )
-                    if output_tokens is not None:
-                        self.usage["output_tokens"] = (
-                            self.usage.get("output_tokens", 0) + output_tokens
-                        )
-                    if total_tokens is not None:
-                        self.usage["total_tokens"] = (
-                            self.usage.get("total_tokens", 0) + total_tokens
-                        )
-                    elif input_tokens is not None or output_tokens is not None:
-                        self.usage["total_tokens"] = self.usage.get(
-                            "input_tokens", 0
-                        ) + self.usage.get("output_tokens", 0)
-            failure = value.get("failureTrace")
-            if isinstance(failure, dict) and isinstance(failure.get("failureReason"), str):
-                self.failure_reason = failure["failureReason"]
-            guard = value.get("guardrailTrace")
-            if isinstance(guard, dict) and isinstance(guard.get("action"), str):
-                self.guardrail_action = guard["action"]
-            for child in value.values():
-                self._collect_trace(child)
-        elif isinstance(value, list):
-            for child in value:
-                self._collect_trace(child)
+    def _collect_trace(self, value: dict[str, Any]) -> None:
+        # Summaries are read only where the API puts them, so content and unknown branches can't
+        # feed them.
+        trace_value = value.get("trace")
+        trace = cast(dict[str, Any], trace_value) if isinstance(trace_value, dict) else {}
+        for step in _MODEL_INVOCATION_STEPS:
+            member = trace.get(step) if isinstance(trace.get(step), dict) else {}
+            output = (
+                member.get("modelInvocationOutput")
+                if isinstance(member.get("modelInvocationOutput"), dict)
+                else {}
+            )
+            metadata = output.get("metadata") if isinstance(output.get("metadata"), dict) else {}
+            usage = metadata.get("usage") if isinstance(metadata.get("usage"), dict) else None
+            if usage:
+                self._add_usage(usage)
+        failure = trace.get("failureTrace")
+        if isinstance(failure, dict):
+            self.failed = True
+            code = failure.get("failureCode")
+            if isinstance(code, int) and not isinstance(code, bool):
+                self.failure_code = code
+            reason = failure.get("failureReason")
+            # The reason is free-form text that can quote the prompt or a tool result.
+            if isinstance(reason, str) and all(self.trace_capture.values()):
+                self.failure_reason = reason
+        guard = trace.get("guardrailTrace")
+        if isinstance(guard, dict) and isinstance(guard.get("action"), str):
+            self.guardrail_action = guard["action"]
+
+    def _add_usage(self, usage: dict[str, Any]) -> None:
+        input_tokens = _int_value(usage.get("inputTokens"))
+        output_tokens = _int_value(usage.get("outputTokens"))
+        total_tokens = _int_value(usage.get("totalTokens"))
+        if input_tokens is not None:
+            self.usage["input_tokens"] = self.usage.get("input_tokens", 0) + input_tokens
+        if output_tokens is not None:
+            self.usage["output_tokens"] = self.usage.get("output_tokens", 0) + output_tokens
+        if total_tokens is not None:
+            self.usage["total_tokens"] = self.usage.get("total_tokens", 0) + total_tokens
+        elif input_tokens is not None or output_tokens is not None:
+            self.usage["total_tokens"] = self.usage.get("input_tokens", 0) + self.usage.get(
+                "output_tokens", 0
+            )
 
 
 class RagStreamState(StreamState):
@@ -670,6 +691,113 @@ class InstrumentedEventStream:
         if error is not None:
             fields = merge_fields(fields, error_fields(error))
         self._finish_callback(fields)
+
+
+@dataclass(frozen=True)
+class _TraceContent:
+    """Content kept as received when every listed capture is on; otherwise reduced to `withheld`."""
+
+    needs: tuple[str, ...]
+    withheld: Any = None
+
+
+_SCALAR = "scalar"
+
+# A dict shape lists the only fields kept; a one-item list shape is a list of that shape.
+_TRACE_METADATA: dict[str, Any] = {
+    "usage": {"inputTokens": _SCALAR, "outputTokens": _SCALAR},
+    "startTime": _SCALAR,
+    "endTime": _SCALAR,
+    "totalTimeMs": _SCALAR,
+    "operationTotalTimeMs": _SCALAR,
+    "clientRequestId": _SCALAR,
+}
+
+# What the agent sends to a model, tool, or guardrail is input content; what comes back is output.
+_MODEL_INVOCATION_INPUT = _TraceContent(
+    ("input",), {"traceId": _SCALAR, "type": _SCALAR, "foundationModel": _SCALAR}
+)
+_INVOCATION_INPUT = _TraceContent(("input",), {"traceId": _SCALAR, "invocationType": _SCALAR})
+_MODEL_INVOCATION_OUTPUT = _TraceContent(
+    ("output",), {"traceId": _SCALAR, "metadata": _TRACE_METADATA}
+)
+_OBSERVATION = _TraceContent(("output",), {"traceId": _SCALAR, "type": _SCALAR})
+_MODEL_INVOCATION_STEPS = (
+    "preProcessingTrace",
+    "orchestrationTrace",
+    "postProcessingTrace",
+    "routingClassifierTrace",
+)
+_PROCESSING_TRACE: dict[str, Any] = {
+    "modelInvocationInput": _MODEL_INVOCATION_INPUT,
+    "modelInvocationOutput": _MODEL_INVOCATION_OUTPUT,
+}
+
+# Mirrors TracePart and the Trace union in the Bedrock Agent Runtime API; anything else is dropped
+# because nothing says what it holds.
+_TRACE_PART: dict[str, Any] = {
+    "agentId": _SCALAR,
+    "agentAliasId": _SCALAR,
+    "agentVersion": _SCALAR,
+    "sessionId": _SCALAR,
+    "collaboratorName": _SCALAR,
+    "eventTime": _SCALAR,
+    "callerChain": [{"agentAliasArn": _SCALAR}],
+    "trace": {
+        "preProcessingTrace": _PROCESSING_TRACE,
+        "postProcessingTrace": _PROCESSING_TRACE,
+        "orchestrationTrace": {
+            "modelInvocationInput": _MODEL_INVOCATION_INPUT,
+            "invocationInput": _INVOCATION_INPUT,
+            "modelInvocationOutput": _MODEL_INVOCATION_OUTPUT,
+            "rationale": _TraceContent(("output",), {"traceId": _SCALAR}),
+            "observation": _OBSERVATION,
+        },
+        "routingClassifierTrace": {
+            "modelInvocationInput": _MODEL_INVOCATION_INPUT,
+            "invocationInput": _INVOCATION_INPUT,
+            "modelInvocationOutput": _MODEL_INVOCATION_OUTPUT,
+            "observation": _OBSERVATION,
+        },
+        "customOrchestrationTrace": {"traceId": _SCALAR, "event": _TraceContent(("output",))},
+        "guardrailTrace": {
+            "traceId": _SCALAR,
+            "action": _SCALAR,
+            "metadata": _TRACE_METADATA,
+            "inputAssessments": _TraceContent(("input",)),
+            "outputAssessments": _TraceContent(("output",)),
+        },
+        "failureTrace": {
+            "traceId": _SCALAR,
+            "failureCode": _SCALAR,
+            "metadata": _TRACE_METADATA,
+            # Free-form text that can quote either the prompt or a tool result.
+            "failureReason": _TraceContent(("input", "output")),
+        },
+    },
+}
+
+
+def _project_trace(value: Any, shape: Any, capture: dict[str, bool]) -> Any:
+    if isinstance(shape, _TraceContent):
+        if all(capture[kind] for kind in shape.needs):
+            return value
+        return None if shape.withheld is None else _project_trace(value, shape.withheld, capture)
+    if shape == _SCALAR:
+        return value if isinstance(value, str | int | float | bool | datetime) else None
+    if isinstance(shape, list):
+        if not isinstance(value, list):
+            return None
+        items = (_project_trace(item, shape[0], capture) for item in cast(list[Any], value))
+        return [item for item in items if item is not None]
+    if not isinstance(value, dict):
+        return None
+    record = cast(dict[str, Any], value)
+    projected = {
+        field: _project_trace(record.get(field), child, capture)
+        for field, child in cast(dict[str, Any], shape).items()
+    }
+    return {field: item for field, item in projected.items() if item is not None}
 
 
 def _int_value(value: Any) -> int | None:

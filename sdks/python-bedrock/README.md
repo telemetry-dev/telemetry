@@ -75,7 +75,18 @@ Global instrumentation wraps `botocore.client.BaseClient._make_api_call` and fil
 
 | Option | Default | Applies to | Notes |
 | --- | --- | --- | --- |
-| `capture_agent_trace` | `False` | Agent Runtime streams | Aggregates trace usage and counts by default. When enabled, also attaches raw trace events as `td.metadata.agent_trace` after SDK masking/truncation. |
+| `capture_agent_trace` | `False` | Agent Runtime streams | Aggregates trace usage and counts by default. When enabled, also attaches trace events as `td.metadata.agent_trace`, filtered as described below. |
+
+`td.metadata.agent_trace` is truncated but never passed to your `mask`, so each trace event is rebuilt from an explicit allowlist instead:
+
+- Envelope fields: `agentId`, `agentAliasId`, `agentVersion`, `sessionId`, `collaboratorName`, `eventTime`, and the alias ARNs in `callerChain`.
+- Content the agent sends to a model, tool, or guardrail (`modelInvocationInput`, `invocationInput`, `inputAssessments`) is kept as received when `capture_input` is on.
+- Content that comes back (`modelInvocationOutput`, `rationale`, `observation`, `outputAssessments`, custom orchestration `event`) is kept as received when `capture_output` is on.
+- A failure reason (`failureTrace.failureReason`, and `td.metadata.failure_reason`) is free-form text, so it is kept only when both are on. `td.metadata.failure` always records that the invocation failed, with `td.metadata.failure_code` when AWS sends one.
+- When a `mask` is set, all of this content is withheld.
+- Withheld content and the trace structure around it keep only trace ids, step types, the foundation model, guardrail action, failure code, and the usage, timings, and `clientRequestId` from AWS's trace `metadata`.
+
+Any other field, including unknown trace types and the AWS SDK's `$unknown` union member, is omitted even when both capture options are on; a content part that is kept is exported whole, including any fields inside it that are not listed here. Errors are not covered by this filtering: AWS exceptions, including errors raised inside the stream, still record the provider's error message on the span.
 
 ```py
 agent = wrap_bedrock(

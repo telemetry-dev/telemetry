@@ -8,7 +8,13 @@ import {
 import { init, shutdown, type MaskFn } from "@telemetry-dev/sdk";
 
 export function setup(
-  options: { mask?: MaskFn; maxAttributeLength?: number; sampler?: Sampler } = {},
+  options: {
+    mask?: MaskFn;
+    maxAttributeLength?: number;
+    sampler?: Sampler;
+    captureInput?: boolean;
+    captureOutput?: boolean;
+  } = {},
 ): InMemorySpanExporter {
   const spans = new InMemorySpanExporter();
   init(
