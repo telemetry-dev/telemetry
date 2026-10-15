@@ -630,6 +630,49 @@ test("tool executions produce successful and failed execute_tool spans", async (
   expect(spans[1]?.attributes["error.type"]).toBe("ToolExecutionError");
 });
 
+test.each([
+  { name: "default capture", options: {}, message: "grep: .env:\nTOKEN=private-tool-output" },
+  { name: "captureOutput: false", options: { captureOutput: false }, message: "tool bash failed" },
+  {
+    name: "a mask",
+    options: {
+      mask: (value: unknown) =>
+        JSON.parse(JSON.stringify(value).replaceAll("private-tool-output", "[redacted]")),
+    },
+    message: "tool bash failed",
+  },
+])(
+  "failed tool output reaches the exception only when captured unmasked ($name)",
+  async ({ options, message }) => {
+    const harness = makeHarness(options);
+    await harness.emit({ type: "agent_start" });
+    await harness.emit({
+      type: "tool_execution_start",
+      toolCallId: "call-1",
+      toolName: "bash",
+      args: { command: "grep TOKEN .env" },
+    });
+    await harness.emit({
+      type: "tool_execution_end",
+      toolCallId: "call-1",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: "grep: .env:\nTOKEN=private-tool-output" }] },
+      isError: true,
+    });
+    await flush();
+
+    const span = spanByName(harness.exporters, "execute_tool bash");
+    const exception = span.events.find((event) => event.name === "exception")?.attributes;
+    expect(span.status.code).toBe(SpanStatusCode.ERROR);
+    expect(span.attributes["error.type"]).toBe("ToolExecutionError");
+    expect(exception?.["exception.type"]).toBe("ToolExecutionError");
+    expect(exception?.["exception.message"]).toBe(message);
+    const stack = String(exception?.["exception.stacktrace"]);
+    expect(stack.startsWith(`ToolExecutionError: ${message}\n`)).toBe(true);
+    expect(stack.includes("private-tool-output")).toBe(message.includes("private-tool-output"));
+  },
+);
+
 test("dangling tool spans are closed when the agent loop ends", async () => {
   const harness = makeHarness();
   await harness.emit({ type: "agent_start" });
