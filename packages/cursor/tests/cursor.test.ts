@@ -1,5 +1,6 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -17,11 +18,11 @@ import { SpanStatusCode } from "@opentelemetry/api";
 import { InMemoryLogRecordExporter } from "@opentelemetry/sdk-logs";
 import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import { flush, type ClientOverrides } from "@telemetry-dev/sdk";
-import { afterEach, describe, expect, expectTypeOf, test, vi } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, onTestFinished, test, vi } from "vitest";
 import { sessionSpanContext } from "../../otel/src/index.ts";
 
 import { fileConfig, resetForTesting, type TelemetryDevCursorOptions } from "../src/config.ts";
-import { listen } from "../src/daemon.ts";
+import { listen, tryLock, unlock } from "../src/daemon.ts";
 import { runInstall, runUninstall } from "../src/install.ts";
 import { createCursorTelemetry, type CursorTelemetry } from "../src/telemetry.ts";
 import { createTitleLookup } from "../src/titles.ts";
@@ -847,6 +848,70 @@ describe("titles", () => {
       rmSync(chats, { recursive: true, force: true });
     }
   });
+
+  test.each([
+    {
+      captureInput: true,
+      turnName: "secret prompt",
+      subName: "secret title",
+      message: "secret task",
+    },
+    {
+      captureInput: false,
+      turnName: "invoke_agent cursor",
+      subName: "invoke_agent explore",
+      message: "SubagentError",
+    },
+  ])(
+    "captureInput $captureInput governs prompt, task and title text in span names and errors",
+    async ({ captureInput, turnName, subName, message }) => {
+      // Only the subagent has a title, so the parent turn exercises the prompt fallback.
+      const chats = mkdtempSync(join(tmpdir(), "cursor-chats-"));
+      mkdirSync(join(chats, "hash1", "sub-1"), { recursive: true });
+      writeFileSync(
+        join(chats, "hash1", "sub-1", "meta.json"),
+        JSON.stringify({ schemaVersion: 1, title: "secret title" }),
+      );
+      onTestFinished(() => rmSync(chats, { recursive: true, force: true }));
+      const { spans, logs, telemetry } = makeHarness({ captureInput, chatsDir: chats });
+      telemetry.handle(event("beforeSubmitPrompt", { prompt: "secret prompt" }));
+      telemetry.handle(
+        event("subagentStart", {
+          subagent_id: "sub-1",
+          parent_conversation_id: "conv-1",
+          subagent_type: "explore",
+          task: "secret task",
+        }),
+      );
+      telemetry.handle(event("afterAgentResponse", { conversation_id: "sub-1", text: "ok" }));
+      telemetry.handle(
+        event("subagentStop", {
+          subagent_type: "explore",
+          status: "error",
+          task: "secret task",
+          agent_transcript_path: "/tmp/cursor/sub-1/transcript.txt",
+        }),
+      );
+      telemetry.handle(event("stop", { status: "completed" }));
+      await flush();
+
+      expect(agentSpans(spans, "cursor").map((s) => s.name)).toEqual([turnName]);
+      const sub = agentSpans(spans, "explore");
+      expect(sub.map((s) => s.name)).toEqual([subName]);
+      const exception = sub[0]!.events.find((e) => e.name === "exception");
+      expect(exception?.attributes?.["exception.type"]).toBe("SubagentError");
+      expect(exception?.attributes?.["exception.message"]).toBe(message);
+
+      if (!captureInput) {
+        const exported = JSON.stringify([
+          finished(spans).map((s) => [s.name, s.attributes, s.events]),
+          logs.getFinishedLogRecords().map((r) => [r.body, r.attributes]),
+        ]);
+        expect(exported).toContain("Subagent started");
+        expect(exported).not.toContain("secret");
+      }
+    },
+  );
   test("title lookup rejects path escapes and dot segments", () => {
     const cases = [
       { conversationId: ".", metaDir: ["hash1"] },
@@ -949,14 +1014,109 @@ describe("settle", () => {
 });
 
 describe("fileConfig", () => {
-  test("a malformed config file yields empty options instead of a crash", () => {
+  test("a missing file yields defaults; an unreadable or non-object file disables telemetry", () => {
     const home = mkdtempSync(join(tmpdir(), "cursor-cfg-"));
-    mkdirSync(join(home, ".cursor"));
-    writeFileSync(join(home, ".cursor", "telemetry-dev.json"), "{not json");
     const restoreHome = setHome(home);
+    const file = join(home, ".cursor", "telemetry-dev.json");
 
     try {
       expect(fileConfig()).toEqual({});
+      mkdirSync(join(home, ".cursor"));
+
+      for (const content of ["{not json", '["captureInput", false]', '"text"', "null"]) {
+        writeFileSync(file, content);
+        expect(fileConfig(), content).toEqual({ enabled: false });
+      }
+
+      // A non-string value is ignored rather than coerced, which could throw.
+      vi.stubEnv("OTEL_SERVICE_NAME", undefined);
+      vi.stubEnv("TELEMETRY_DEV_ENVIRONMENT", undefined);
+      writeFileSync(
+        file,
+        JSON.stringify({ serviceName: { toString: null }, environment: "staging" }),
+      );
+      expect(fileConfig()).toMatchObject({ serviceName: undefined, environment: "staging" });
+    } finally {
+      vi.unstubAllEnvs();
+      restoreHome();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    { content: '{"captureOutput":false}', exported: true },
+    { content: '{"enabled":false}', exported: false },
+    { content: "{not json", exported: false },
+    { content: '["captureOutput", false]', exported: false },
+    // Creating symlinks on Windows needs extra privileges.
+    ...(process.platform === "win32" ? [] : [{ content: "dangling symlink", exported: false }]),
+  ])(
+    "with an env api key, config file $content governs what is exported",
+    async ({ content, exported }) => {
+      const home = mkdtempSync(join(tmpdir(), "cursor-cfg-"));
+      mkdirSync(join(home, ".cursor"));
+      const file = join(home, ".cursor", "telemetry-dev.json");
+
+      if (content === "dangling symlink") symlinkSync(join(home, "gone.json"), file);
+      else writeFileSync(file, content);
+      const restoreHome = setHome(home);
+      const previousKey = process.env.TELEMETRY_DEV_API_KEY;
+      process.env.TELEMETRY_DEV_API_KEY = apiKey;
+
+      try {
+        const { spans, logs, telemetry } = makeHarness({ apiKey: undefined, ...fileConfig() });
+        telemetry.handle(event("sessionStart", { session_id: "s-1" }));
+        telemetry.handle(event("beforeSubmitPrompt", { prompt: "the prompt" }));
+        telemetry.handle(event("afterAgentResponse", { text: "the response" }));
+        telemetry.handle(event("stop", { status: "completed" }));
+        await flush();
+
+        if (!exported) {
+          expect(finished(spans)).toEqual([]);
+          expect(logs.getFinishedLogRecords()).toEqual([]);
+
+          return;
+        }
+
+        const turn = agentSpans(spans, "cursor")[0]!;
+        expect(turn.attributes["gen_ai.input.messages"]).toContain("the prompt");
+        expect(JSON.stringify(finished(spans).map((s) => s.attributes))).not.toContain(
+          "the response",
+        );
+      } finally {
+        if (previousKey === undefined) delete process.env.TELEMETRY_DEV_API_KEY;
+        else process.env.TELEMETRY_DEV_API_KEY = previousKey;
+        restoreHome();
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("capture and enabled keys are read, and non-boolean values count as false", () => {
+    const home = mkdtempSync(join(tmpdir(), "cursor-cfg-"));
+    mkdirSync(join(home, ".cursor"));
+    const file = join(home, ".cursor", "telemetry-dev.json");
+    const restoreHome = setHome(home);
+
+    try {
+      writeFileSync(
+        file,
+        JSON.stringify({ captureInput: "false", captureOutput: true, enabled: 0 }),
+      );
+      expect(fileConfig()).toMatchObject({
+        captureInput: false,
+        captureOutput: true,
+        enabled: false,
+      });
+
+      // Absent keys stay unset so the SDK defaults (all true) apply.
+      writeFileSync(file, JSON.stringify({ apiKey: "td_live_x" }));
+      const config = fileConfig();
+      expect([config.captureInput, config.captureOutput, config.enabled]).toEqual([
+        undefined,
+        undefined,
+        undefined,
+      ]);
     } finally {
       restoreHome();
       rmSync(home, { recursive: true, force: true });
@@ -1260,6 +1420,124 @@ describe("install and uninstall", () => {
     }
   });
 
+  test("install sets capture options, keeps them on reinstall, and leaves both files alone on bad input", async () => {
+    const home = mkdtempSync(join(tmpdir(), "cursor-home-"));
+    const restoreHome = setHome(home);
+    const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => {
+      throw new Error("exit(1)");
+    }) as never);
+
+    const configFile = join(home, ".cursor", "telemetry-dev.json");
+    const hooksFile = join(home, ".cursor", "hooks.json");
+    const readConfig = () => JSON.parse(readFileSync(configFile, "utf8")) as JsonRecord;
+    const snapshot = () => [readFileSync(configFile, "utf8"), readFileSync(hooksFile, "utf8")];
+
+    try {
+      await runInstall("/opt/telemetry/cli.js", [
+        "--api-key",
+        "td_live_test",
+        "--capture-input",
+        "false",
+        "--capture-output",
+        "true",
+      ]);
+      expect(readConfig()).toMatchObject({ captureInput: false, captureOutput: true });
+
+      await runInstall("/opt/telemetry/cli.js", ["--api-key", "td_live_rotated"]);
+      expect(readConfig()).toMatchObject({
+        apiKey: "td_live_rotated",
+        captureInput: false,
+        captureOutput: true,
+      });
+
+      const installed = snapshot();
+      await expect(
+        runInstall("/opt/telemetry/cli.js", ["--api-key", "td_live_x", "--capture-output", "no"]),
+      ).rejects.toThrow("exit(1)");
+      expect(stderr).toHaveBeenCalledWith("--capture-output must be true or false.\n");
+      expect(snapshot()).toEqual(installed);
+
+      for (const content of ['{"captureInput":false', '[{"captureInput":false}]']) {
+        writeFileSync(configFile, content);
+        const before = snapshot();
+        await expect(
+          runInstall("/opt/telemetry/cli.js", ["--api-key", "td_live_x"]),
+        ).rejects.toThrow("exit(1)");
+        expect(snapshot(), content).toEqual(before);
+        expect(existsSync(`${configFile}.lock`)).toBe(false);
+      }
+
+      if (process.platform !== "win32") {
+        rmSync(configFile);
+        symlinkSync(join(home, "gone.json"), configFile);
+        const hooks = readFileSync(hooksFile, "utf8");
+        await expect(
+          runInstall("/opt/telemetry/cli.js", ["--api-key", "td_live_x"]),
+        ).rejects.toThrow("exit(1)");
+        expect(lstatSync(configFile).isSymbolicLink()).toBe(true);
+        expect(readFileSync(hooksFile, "utf8")).toBe(hooks);
+      }
+    } finally {
+      exit.mockRestore();
+      stderr.mockRestore();
+      stdout.mockRestore();
+      restoreHome();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("install waits for an overlapping install before it reads the config", async () => {
+    const home = mkdtempSync(join(tmpdir(), "cursor-home-"));
+    const restoreHome = setHome(home);
+    const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    const configFile = join(home, ".cursor", "telemetry-dev.json");
+
+    try {
+      mkdirSync(join(home, ".cursor"), { recursive: true });
+      writeFileSync(configFile, JSON.stringify({ apiKey: "td_live_old" }));
+      // Held by a live process and older than the stale age, like a stalled install.
+      const owner = tryLock(configFile)!;
+      utimesSync(join(`${configFile}.lock`, owner), 0, 0);
+      const rotate = runInstall("/opt/telemetry/cli.js", ["--api-key", "td_live_rotated"]);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(JSON.parse(readFileSync(configFile, "utf8"))).toEqual({ apiKey: "td_live_old" });
+      // The overlapping install finishes: it turned input capture off.
+      writeFileSync(configFile, JSON.stringify({ apiKey: "td_live_old", captureInput: false }));
+      unlock(configFile, owner);
+      await rotate;
+
+      expect(JSON.parse(readFileSync(configFile, "utf8"))).toMatchObject({
+        apiKey: "td_live_rotated",
+        captureInput: false,
+      });
+      expect(existsSync(`${configFile}.lock`)).toBe(false);
+
+      // Only an old lock whose owner PID has exited may be broken.
+      const lock = `${configFile}.lock`;
+      const exited = spawnSync(process.execPath, ["-e", ""]).pid;
+
+      for (const [entry, breaks] of [
+        [`${exited}-crashed`, true],
+        [`${exited}`, false],
+        [`${process.pid}-stalled`, false],
+      ] as const) {
+        mkdirSync(lock);
+        writeFileSync(join(lock, entry), "");
+        utimesSync(join(lock, entry), 0, 0);
+        const next = tryLock(configFile, true);
+        expect(next !== undefined, entry).toBe(breaks);
+        rmSync(lock, { recursive: true, force: true });
+      }
+    } finally {
+      stdout.mockRestore();
+      restoreHome();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test("uninstall removes only our entries", async () => {
     const home = mkdtempSync(join(tmpdir(), "cursor-home-"));
     const restoreHome = setHome(home);
@@ -1339,13 +1617,13 @@ describe("install and uninstall", () => {
         const cursorDir = join(home, ".cursor");
         const target = join(home, "target.json");
         mkdirSync(cursorDir, { recursive: true });
-        writeFileSync(target, "keep");
+        writeFileSync(target, '{"apiKey":"keep"}');
         symlinkSync(target, join(cursorDir, "telemetry-dev.json"));
 
         await expect(
           runInstall("/opt/telemetry/cli.js", ["--api-key", "td_live_test"]),
         ).rejects.toThrow(/regular file/);
-        expect(readFileSync(target, "utf8")).toBe("keep");
+        expect(readFileSync(target, "utf8")).toBe('{"apiKey":"keep"}');
         expect(lstatSync(join(cursorDir, "telemetry-dev.json")).isSymbolicLink()).toBe(true);
       } finally {
         restoreHome();

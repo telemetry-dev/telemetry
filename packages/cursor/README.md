@@ -42,14 +42,37 @@ parts:
 ## Configuration
 
 The `install` command writes `~/.cursor/telemetry-dev.json`. Env vars have
-priority over the file:
+priority over the file. The last three settings exist only as keys in the
+file:
 
-| Variable / key              | Required | Default                        | Notes                                                                     |
-| --------------------------- | -------- | ------------------------------ | ------------------------------------------------------------------------- |
-| `TELEMETRY_DEV_API_KEY`     | yes      | —                              | Ingest key (`td_live_…`). Without a key, the integration is a full no-op. |
-| `TELEMETRY_DEV_BASE_URL`    | no       | `https://ingest.telemetry.dev` | The integration removes trailing slashes.                                 |
-| `TELEMETRY_DEV_ENVIRONMENT` | no       | `production`                   | Environment label on each trace and log.                                  |
-| `OTEL_SERVICE_NAME`         | no       | `cursor`                       | OpenTelemetry service name.                                               |
+| Variable / key                              | Required | Default                        | Notes                                                                                        |
+| ------------------------------------------- | -------- | ------------------------------ | -------------------------------------------------------------------------------------------- |
+| `TELEMETRY_DEV_API_KEY` / `apiKey`          | yes      | —                              | Ingest key (`td_live_…`). Without a key, the integration is a full no-op.                    |
+| `TELEMETRY_DEV_BASE_URL` / `baseUrl`        | no       | `https://ingest.telemetry.dev` | The integration removes trailing slashes.                                                    |
+| `TELEMETRY_DEV_ENVIRONMENT` / `environment` | no       | `production`                   | Environment label on each trace and log.                                                     |
+| `OTEL_SERVICE_NAME` / `serviceName`         | no       | `cursor`                       | OpenTelemetry service name.                                                                  |
+| `captureInput`                              | no       | `true`                         | Export prompts, subagent tasks, and tool arguments. See [Content capture](#content-capture). |
+| `captureOutput`                             | no       | `true`                         | Export assistant and thinking text and tool results.                                         |
+| `enabled`                                   | no       | `true`                         | `false` stops all export. The hooks and the daemon still run.                                |
+
+The three boolean keys must be JSON `true` or `false`. Any other value, such
+as the string `"false"`, counts as `false`. If the file exists but is not a
+readable JSON object, the daemon exports nothing, and `install` stops without
+changing any file.
+
+Set the capture keys at install time with `--capture-input false` and
+`--capture-output false`. A later `install` without these flags keeps the
+values of `captureInput`, `captureOutput`, and `enabled` that are already in
+the file. The daemon reads the file only when it starts, so a manual edit
+takes effect only after the daemon restarts. To apply an edit to these keys,
+run `install` again: it keeps them and stops the daemon, and the next hook
+event starts it with the new settings. `install` rewrites the other keys, so
+pass `--api-key` and any `--base-url` or `--environment` again (or set their
+env vars). It does not keep `serviceName`.
+
+Overlapping `install` and `uninstall` runs wait for each other, so a
+reinstall never writes back capture settings that another `install` has just
+changed. A manual edit made while `install` runs can be overwritten.
 
 ## Trace shape
 
@@ -73,7 +96,8 @@ invoke_agent cursor               (prompt input, last assistant text output)
   its name. This also applies to subagent chats. Agent CLI sessions get no
   title from Cursor, so a turn without one takes the first line of the user
   prompt (or the subagent task) as its name, shortened to 60 characters. A
-  turn with no title and no prompt keeps the `invoke_agent …` name.
+  turn with no title and no prompt keeps the `invoke_agent …` name, and so
+  does every turn when `captureInput` is `false`.
 - The events `sessionStart`, `sessionEnd`, `afterFileEdit`, `subagentStart`,
   and `preCompact` become logs with the hook event as `eventName`.
 - Each span and log contains `gen_ai.conversation.id` (the `conversation_id`
@@ -100,7 +124,24 @@ invoke_agent cursor               (prompt input, last assistant text output)
 
 Prompt input, assistant and thinking text, tool arguments, and tool results
 obey the SDK settings `captureInput` and `captureOutput`. The default for the
-two settings is `true`.
+two settings is `true`. When `captureInput` is `false`, turn spans keep the
+`invoke_agent …` name instead of the chat title or a name from the prompt or
+task, because Cursor generates chat titles from the prompt. A subagent that
+`subagentStop` reports with status `error` then records `SubagentError`
+without its task text.
+
+The two settings do not cover these values, which are always exported:
+
+- The user email, workspace and file paths, and conversation, generation,
+  subagent, and tool call ids.
+- Model, tool, and subagent names, and lifecycle metadata such as statuses,
+  durations, compaction counts, and edit counts.
+- Error messages from Cursor and exception stack traces. The `error_message`
+  of `sessionEnd` goes to the `cursor.error.message` log attribute and to a
+  `SessionError` exception. The `error_message` of a failed tool or `Task`
+  call becomes the exception message of its span.
+
+To export none of this, set `enabled` to `false`.
 
 ## Limitations
 

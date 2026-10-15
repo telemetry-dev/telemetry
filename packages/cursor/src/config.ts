@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -31,31 +31,63 @@ export function configPath(): string {
  * Reads ~/.cursor/telemetry-dev.json. Cursor launched from the macOS dock does
  * not inherit shell env vars, so the api key usually has to live in this file.
  * Keys with a set env var are omitted: the SDK falls back to env for absent
- * options, which keeps the documented env-over-file precedence.
+ * options, which keeps the documented env-over-file precedence. Never throws:
+ * a file that exists but cannot be read as a JSON object disables telemetry,
+ * because it may be the file that turned content capture off.
  */
 export function fileConfig(): TelemetryDevCursorOptions {
-  let parsed: unknown;
+  let record: JsonRecord | undefined;
 
   try {
-    parsed = JSON.parse(readFileSync(configPath(), "utf8"));
+    record = readConfigFile();
   } catch {
-    // A missing or malformed file must never crash the daemon.
-    return {};
+    return { enabled: false };
   }
-
-  const record = asRecord(parsed);
 
   if (!record) return {};
 
   const pick = (key: string, envVar: string): string | undefined =>
     process.env[envVar] === undefined ? readString(record[key]) : undefined;
 
+  // Any value other than `true` counts as false, so a mistyped "false" turns
+  // content capture off instead of silently leaving it on.
+  const bool = (key: string): boolean | undefined =>
+    record[key] === undefined ? undefined : record[key] === true;
+
   return {
     apiKey: pick("apiKey", "TELEMETRY_DEV_API_KEY"),
     baseUrl: pick("baseUrl", "TELEMETRY_DEV_BASE_URL"),
     environment: pick("environment", "TELEMETRY_DEV_ENVIRONMENT"),
     serviceName: pick("serviceName", "OTEL_SERVICE_NAME"),
+    enabled: bool("enabled"),
+    captureInput: bool("captureInput"),
+    captureOutput: bool("captureOutput"),
   };
+}
+
+/**
+ * Returns the parsed config file, or undefined when it does not exist. Throws
+ * when it cannot be read or is not a JSON object; a symlink whose target is
+ * gone counts as unreadable, not absent.
+ */
+export function readConfigFile(): JsonRecord | undefined {
+  const path = configPath();
+  let text: string;
+
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    const missing = error instanceof Error && "code" in error && error.code === "ENOENT";
+
+    if (missing && !lstatSync(path, { throwIfNoEntry: false })) return undefined;
+    throw error;
+  }
+
+  const record = asRecord(JSON.parse(text));
+
+  if (!record || Array.isArray(record)) throw new Error("not a JSON object");
+
+  return record;
 }
 
 let initialized = false;
@@ -92,7 +124,5 @@ function asRecord<T>(value: T): JsonRecord | undefined {
 }
 
 function readString<T>(value: T): string | undefined {
-  const raw: unknown = value;
-
-  return String(raw) === raw ? raw : undefined;
+  return typeof value === "string" ? value : undefined;
 }

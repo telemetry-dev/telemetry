@@ -1,4 +1,11 @@
-import { flush, log, startSpan, type LogLevel, type SpanHandle } from "@telemetry-dev/sdk";
+import {
+  captureEnabled,
+  flush,
+  log,
+  startSpan,
+  type LogLevel,
+  type SpanHandle,
+} from "@telemetry-dev/sdk";
 
 import { ensureInit, type ClientOverrides, type TelemetryDevCursorOptions } from "./config.ts";
 import { createTitleLookup } from "./titles.ts";
@@ -226,7 +233,11 @@ export function createCursorTelemetry(
       endTurn(childId, { finishReason: "incomplete", endTime: child?.lastEvent });
     }
 
-    turn.span.end({ name: titleFor(conversationId) ?? turn.fallbackName, ...fields });
+    // Cursor derives chat titles from the prompt, so they count as input too.
+    const name = captureEnabled("input")
+      ? (titleFor(conversationId) ?? turn.fallbackName)
+      : undefined;
+    turn.span.end({ name, ...fields });
   }
 
   /**
@@ -565,7 +576,12 @@ export function createCursorTelemetry(
         const status = str(event, "status");
 
         const error =
-          status === "error" ? failureError("SubagentError", str(event, "task")) : undefined;
+          status === "error"
+            ? failureError(
+                "SubagentError",
+                captureEnabled("input") ? str(event, "task") : undefined,
+              )
+            : undefined;
 
         const subagentId = resolveSubagent(event);
         const link = subagentId ? subagents.get(subagentId) : undefined;
