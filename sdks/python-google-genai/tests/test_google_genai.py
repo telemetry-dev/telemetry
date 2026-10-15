@@ -1442,37 +1442,35 @@ URL_CONTEXT_METADATA: dict[str, Any] = {
 }
 
 
+SAFETY_RATINGS: list[dict[str, Any]] = [
+    {
+        "category": "HARM_CATEGORY_HARASSMENT",
+        "probability": "NEGLIGIBLE",
+        "probabilityScore": 0.1,
+        "severity": "HARM_SEVERITY_LOW",
+        "severityScore": 0.2,
+        "blocked": False,
+        "overwrittenThreshold": "BLOCK_ONLY_HIGH",
+    },
+    {"category": "private category", "probability": "LOW", "severity": "private severity"},
+    {"category": "HARM_CATEGORY_NOT_YET_DEFINED"},
+]
+SAFETY_RATINGS_STRUCTURE = [SAFETY_RATINGS[0], {"probability": "LOW"}, SAFETY_RATINGS[2]]
+
+
 def redact_grounded(value: Any, _context: Any) -> Any:
     return json.loads(json.dumps(value).replace("Grounded", "REDACTED"))
 
 
-@pytest.mark.filterwarnings("ignore:private status is not a valid UrlRetrievalStatus")
-@pytest.mark.parametrize("is_async", [False, True])
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("capture", ["off", "masked", "on"])
-async def test_grounding_content_is_kept_only_when_output_is_captured_unmasked(
-    make: Any, is_async: bool, stream: bool, capture: str
-) -> None:
-    options: dict[str, Any] = {
+def capture_options(capture: str) -> dict[str, Any]:
+    return {
         "off": {"capture_output": False},
         "masked": {"mask": redact_grounded},
         "on": {},
     }[capture]
-    memory = make(**options)
-    content = {"role": "model", "parts": [{"text": "Grounded answer."}]}
-    metadata = {
-        "finishReason": "STOP",
-        "groundingMetadata": GROUNDING_METADATA,
-        "urlContextMetadata": URL_CONTEXT_METADATA,
-    }
-    response: Any = (
-        [
-            {"candidates": [{"index": 0, "content": content}]},
-            {"candidates": [{"index": 0, **metadata}]},
-        ]
-        if stream
-        else {"candidates": [{"index": 0, "content": content, **metadata}]}
-    )
+
+
+async def generate(response: Any, *, is_async: bool, stream: bool) -> None:
     client, _transport = client_with_transport([response])
     wrapped = wrap_google_genai(client)
     request = {"model": "gemini-2.5-flash", "contents": "go"}
@@ -1486,12 +1484,40 @@ async def test_grounding_content_is_kept_only_when_output_is_captured_unmasked(
     else:
         wrapped.models.generate_content(**request)
 
+
+@pytest.mark.filterwarnings("ignore:.* is not a valid")
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("capture", ["off", "masked", "on"])
+async def test_grounding_content_is_kept_only_when_output_is_captured_unmasked(
+    make: Any, is_async: bool, stream: bool, capture: str
+) -> None:
+    memory = make(**capture_options(capture))
+    content = {"role": "model", "parts": [{"text": "Grounded answer."}]}
+    metadata = {
+        "finishReason": "STOP",
+        "safetyRatings": SAFETY_RATINGS,
+        "groundingMetadata": GROUNDING_METADATA,
+        "urlContextMetadata": URL_CONTEXT_METADATA,
+    }
+    response: Any = (
+        [
+            {"candidates": [{"index": 0, "content": content}]},
+            {"candidates": [{"index": 0, **metadata}]},
+        ]
+        if stream
+        else {"candidates": [{"index": 0, "content": content, **metadata}]}
+    )
+    await generate(response, is_async=is_async, stream=stream)
+
     a = attrs(only_span(memory))
     grounding = json.loads(cast(str, a["google_genai.response.grounding_metadata"]))
     url_context = json.loads(cast(str, a["google_genai.response.url_context_metadata"]))
+    safety_ratings = json.loads(cast(str, a["google_genai.response.safety_ratings"]))
     if capture == "on":
         assert grounding == GROUNDING_METADATA
         assert url_context == URL_CONTEXT_METADATA
+        assert safety_ratings == [{"candidateIndex": 0, "ratings": SAFETY_RATINGS}]
         return
 
     assert "private" not in json.dumps(a)
@@ -1510,10 +1536,41 @@ async def test_grounding_content_is_kept_only_when_output_is_captured_unmasked(
     assert url_context == {
         "urlMetadata": [{"urlRetrievalStatus": "URL_RETRIEVAL_STATUS_SUCCESS"}, {}]
     }
+    assert safety_ratings == [{"candidateIndex": 0, "ratings": SAFETY_RATINGS_STRUCTURE}]
     if capture == "masked":
         assert json.loads(cast(str, a["gen_ai.output.messages"])) == [
             {"role": "model", "parts": [{"text": "REDACTED answer."}]}
         ]
+
+
+@pytest.mark.filterwarnings("ignore:.* is not a valid")
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("capture", ["off", "masked", "on"])
+async def test_prompt_feedback_text_is_kept_only_when_output_is_captured_unmasked(
+    make: Any, is_async: bool, stream: bool, capture: str
+) -> None:
+    memory = make(**capture_options(capture))
+    response = {
+        "promptFeedback": {
+            "blockReason": "SAFETY",
+            "blockReasonMessage": "private block message",
+            "safetyRatings": SAFETY_RATINGS,
+        }
+    }
+    await generate([response] if stream else response, is_async=is_async, stream=stream)
+
+    a = attrs(only_span(memory))
+    assert a["google_genai.response.block_reason"] == "SAFETY"
+    prompt_ratings = json.loads(cast(str, a["google_genai.response.prompt_safety_ratings"]))
+    if capture == "on":
+        assert a["google_genai.response.block_reason_message"] == "private block message"
+        assert prompt_ratings == SAFETY_RATINGS
+        return
+
+    assert "private" not in json.dumps(a)
+    assert "google_genai.response.block_reason_message" not in a
+    assert prompt_ratings == SAFETY_RATINGS_STRUCTURE
 
 
 def test_streaming_budgets_inline_data_at_native_size(memory: SimpleNamespace) -> None:

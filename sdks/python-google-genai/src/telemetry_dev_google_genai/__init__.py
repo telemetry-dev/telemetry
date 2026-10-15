@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -551,10 +552,10 @@ def _candidate_index(candidate: Any, fallback: int) -> int:
     return int(index) if index is not None else fallback
 
 
-# Grounding and URL-context metadata are raw attributes, which skip capture_output and the mask.
-# Without raw output capture only these fields are kept; segment text, retrieved document text,
-# titles, URIs, search queries and the search widget are output content. Keep in sync with
-# TypeScript.
+# Response metadata is written as raw attributes, which skip capture_output and the mask. Without
+# raw output capture only these fields are kept; segment text, retrieved document text, titles,
+# URIs, search queries, the search widget and block reason messages are output content. Keep in
+# sync with TypeScript.
 _GROUNDING_STRUCTURE: Any = {
     "groundingChunks": [{"web": {}, "retrievedContext": {}, "maps": {}, "image": {}}],
     "groundingSupports": [
@@ -576,12 +577,30 @@ _URL_RETRIEVAL_STATUSES = frozenset(
     }
 )
 _URL_CONTEXT_STRUCTURE: Any = {"urlMetadata": [{"urlRetrievalStatus": _URL_RETRIEVAL_STATUSES}]}
+# Harm categories gain values often, so enum fields keep any identifier-shaped value.
+_SAFETY_RATINGS_STRUCTURE: Any = [
+    {
+        "category": "enum",
+        "probability": "enum",
+        "probabilityScore": "number",
+        "severity": "enum",
+        "severityScore": "number",
+        "blocked": "boolean",
+        "overwrittenThreshold": "enum",
+    }
+]
+_ENUM_VALUE = re.compile(r"[A-Z][A-Z0-9_]{0,127}")
 
 
-# A shape is "number", a frozenset of allowed strings, a one-item list, or a dict of listed keys.
+# A shape is "number", "boolean", "enum" (an identifier-shaped string), a frozenset of allowed
+# strings, a one-item list, or a dict of listed keys.
 def _project_structure(value: Any, shape: Any) -> Any:
     if shape == "number":
         return _number(value)
+    if shape == "boolean":
+        return value if isinstance(value, bool) else None
+    if shape == "enum":
+        return value if isinstance(value, str) and _ENUM_VALUE.fullmatch(value) else None
     if isinstance(shape, frozenset):
         return value if isinstance(value, str) and value in shape else None
     if isinstance(shape, list):
@@ -600,14 +619,17 @@ def _project_structure(value: Any, shape: Any) -> Any:
     return projected
 
 
+def _metadata(value: Any, shape: Any, metadata_content: bool) -> Any:
+    native = _native(value)
+    return native if metadata_content else _project_structure(native, shape)
+
+
 def _metadata_attr(value: Any, shape: Any, metadata_content: bool) -> str | None:
-    if metadata_content:
-        return _json_attr(value)
-    projected = _project_structure(_native(value), shape)
+    projected = _metadata(value, shape, metadata_content)
     return None if projected is None else _json_attr(projected)
 
 
-# metadata_content keeps grounding and URL-context metadata whole instead of its structure.
+# metadata_content keeps response metadata whole instead of its structure.
 def _record_candidate_metadata(
     candidate: Any,
     index: int,
@@ -627,7 +649,12 @@ def _record_candidate_metadata(
                 entries = []
         else:
             entries = []
-        entries.append({"candidateIndex": index, "ratings": _native(ratings)})
+        entries.append(
+            {
+                "candidateIndex": index,
+                "ratings": _metadata(ratings, _SAFETY_RATINGS_STRUCTURE, metadata_content),
+            }
+        )
         encoded = _json_attr(entries)
         if encoded is not None and (budget is None or budget.accept(encoded)):
             attrs["google_genai.response.safety_ratings"] = encoded
@@ -679,11 +706,11 @@ def _generate_response_fields(response: Any, metadata_content: bool = False) -> 
     if block_reason:
         attrs["google_genai.response.block_reason"] = block_reason
     block_message = _string(_field(feedback, "block_reason_message"))
-    if block_message:
+    if block_message and metadata_content:
         attrs["google_genai.response.block_reason_message"] = block_message
     prompt_ratings = _sequence_items(_field(feedback, "safety_ratings"))
     if prompt_ratings:
-        encoded = _json_attr([_native(rating) for rating in prompt_ratings])
+        encoded = _metadata_attr(prompt_ratings, _SAFETY_RATINGS_STRUCTURE, metadata_content)
         if encoded is not None:
             attrs["google_genai.response.prompt_safety_ratings"] = encoded
     history = _field(response, "automatic_function_calling_history")
@@ -881,11 +908,11 @@ def _record_chunk_inner(chunk: Any, state: _StreamState) -> None:
     if block_reason:
         state.attrs["google_genai.response.block_reason"] = block_reason
     block_message = _string(_field(feedback, "block_reason_message"))
-    if block_message:
+    if block_message and state.metadata_content:
         state.attrs["google_genai.response.block_reason_message"] = block_message
     prompt_ratings = _sequence_items(_field(feedback, "safety_ratings"))
     if prompt_ratings:
-        encoded = _json_attr([_native(rating) for rating in prompt_ratings])
+        encoded = _metadata_attr(prompt_ratings, _SAFETY_RATINGS_STRUCTURE, state.metadata_content)
         if encoded is not None and state.budget.accept(encoded):
             state.attrs["google_genai.response.prompt_safety_ratings"] = encoded
     history = _field(chunk, "automatic_function_calling_history")
