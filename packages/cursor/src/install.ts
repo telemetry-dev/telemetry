@@ -13,9 +13,10 @@ import {
 import { createConnection, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 
-import { configPath } from "./config.ts";
-import { socketPath } from "./daemon.ts";
+import { configPath, readConfigFile } from "./config.ts";
+import { socketPath, tryLock, unlock } from "./daemon.ts";
 import { HOOK_EVENTS } from "./telemetry.ts";
 
 type JsonValue = string | number | boolean | null | undefined | JsonValue[] | JsonRecord;
@@ -27,6 +28,10 @@ interface JsonRecord {
 interface HookEntry extends JsonRecord {
   command: string;
 }
+
+/** Longer than the stale-lock age, so a crashed install's lock is broken while waiting. */
+const LOCK_WAIT_MS = 15_000;
+const LOCK_RETRY_MS = 50;
 
 /**
  * Wires every observed hook event in ~/.cursor/hooks.json to this CLI and
@@ -50,21 +55,51 @@ export async function runInstall(cliPath: string, args: string[]): Promise<void>
   const environment = flag(args, "--environment") ?? process.env.TELEMETRY_DEV_ENVIRONMENT;
 
   if (environment) config.environment = environment;
+  const captureInputFlag = booleanFlag(args, "--capture-input");
+  const captureOutputFlag = booleanFlag(args, "--capture-output");
   const file = configPath();
-  writeSecretJson(file, config);
-
   const hooksPath = join(homedir(), ".cursor", "hooks.json");
-  const hooks = readJson(hooksPath);
   const command = hookCommand(cliPath);
-  const table = (hooks.hooks ?? {}) as Record<string, HookEntry[]>;
 
-  for (const event of HOOK_EVENTS) {
-    const kept = (table[event] ?? []).filter((entry) => entry.telemetryDev !== true);
-    kept.push({ command, telemetryDev: true });
-    table[event] = kept;
+  // The lock keeps an overlapping install from reading the file before this
+  // one replaces it and then writing back the old capture settings.
+  const written = await withConfigLock(() => {
+    // Reinstalling, e.g. to rotate the key, must not silently turn capture back on,
+    // so a config file that cannot be read stops the install instead of being replaced.
+    let previous: JsonRecord;
+
+    try {
+      previous = readConfigFile() ?? {};
+    } catch {
+      return false;
+    }
+
+    const captureInput = captureInputFlag ?? previous.captureInput;
+    const captureOutput = captureOutputFlag ?? previous.captureOutput;
+    writeSecretJson(file, { ...config, enabled: previous.enabled, captureInput, captureOutput });
+
+    const hooks = readJson(hooksPath);
+    const table = (hooks.hooks ?? {}) as Record<string, HookEntry[]>;
+
+    for (const event of HOOK_EVENTS) {
+      const kept = (table[event] ?? []).filter((entry) => entry.telemetryDev !== true);
+      kept.push({ command, telemetryDev: true });
+      table[event] = kept;
+    }
+
+    writeJson(hooksPath, { version: 1, ...hooks, hooks: table });
+
+    return true;
+  });
+
+  if (!written) {
+    // Not the parser's message: it can quote file content, including the key.
+    process.stderr.write(
+      `${file} is not a readable JSON object. Fix or remove it, then run install again.\n`,
+    );
+    process.exit(1);
   }
 
-  writeJson(hooksPath, { version: 1, ...hooks, hooks: table });
   // A running daemon read the old config at startup; stop it so the next hook
   // restarts it with the new settings.
   await stopDaemon();
@@ -76,18 +111,47 @@ export async function runInstall(cliPath: string, args: string[]): Promise<void>
 /** Removes telemetry-dev entries from ~/.cursor/hooks.json. */
 export async function runUninstall(): Promise<void> {
   const hooksPath = join(homedir(), ".cursor", "hooks.json");
-  const hooks = readJson(hooksPath);
-  const table = (hooks.hooks ?? {}) as Record<string, HookEntry[]>;
 
-  for (const [event, entries] of Object.entries(table)) {
-    table[event] = entries.filter((entry) => entry.telemetryDev !== true);
+  await withConfigLock(() => {
+    const hooks = readJson(hooksPath);
+    const table = (hooks.hooks ?? {}) as Record<string, HookEntry[]>;
 
-    if (table[event].length === 0) delete table[event];
-  }
+    for (const [event, entries] of Object.entries(table)) {
+      table[event] = entries.filter((entry) => entry.telemetryDev !== true);
 
-  writeJson(hooksPath, { ...hooks, hooks: table });
+      if (table[event].length === 0) delete table[event];
+    }
+
+    writeJson(hooksPath, { ...hooks, hooks: table });
+  });
   await stopDaemon();
   process.stdout.write(`Removed telemetry-dev hooks from ${hooksPath}.\n`);
+}
+
+/** Runs `change` while holding the lock that install and uninstall share. */
+async function withConfigLock<T>(change: () => T): Promise<T> {
+  const file = configPath();
+  mkdirSync(dirname(file), { recursive: true });
+  const deadline = performance.now() + LOCK_WAIT_MS;
+  let owner = tryLock(file, true);
+
+  while (!owner) {
+    if (performance.now() > deadline) {
+      process.stderr.write(
+        `Another telemetry-dev install or uninstall is still running. Run this again when it finishes, or remove ${file}.lock if none is running.\n`,
+      );
+      process.exit(1);
+    }
+
+    await sleep(LOCK_RETRY_MS);
+    owner = tryLock(file, true);
+  }
+
+  try {
+    return change();
+  } finally {
+    unlock(file, owner);
+  }
 }
 
 /** Asks a running daemon to exit; resolves quietly when none is listening. */
@@ -127,6 +191,16 @@ function flag(args: string[], name: string): string | undefined {
   }
 
   return value;
+}
+
+function booleanFlag(args: string[], name: string): boolean | undefined {
+  const value = flag(args, name);
+
+  if (value === undefined) return undefined;
+
+  if (value === "true" || value === "false") return value === "true";
+  process.stderr.write(`${name} must be true or false.\n`);
+  process.exit(1);
 }
 
 function hookCommand(cliPath: string): string {

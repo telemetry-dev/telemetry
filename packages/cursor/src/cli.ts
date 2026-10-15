@@ -24,7 +24,8 @@ switch (command) {
   default:
     process.stderr.write(
       "Usage: telemetry-dev-cursor <install|uninstall|hook|daemon>\n" +
-        "  install [--api-key td_live_…] [--base-url url] [--environment name]\n",
+        "  install [--api-key td_live_…] [--base-url url] [--environment name]\n" +
+        "          [--capture-input true|false] [--capture-output true|false]\n",
     );
     process.exit(1);
 }

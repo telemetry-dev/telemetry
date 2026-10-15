@@ -28,7 +28,7 @@ interface JsonRecord {
 const IDLE_MS = 15 * 60 * 1000;
 /** Stop waiting for in-flight hook connections after this long when shutting down. */
 const DRAIN_MS = 2000;
-/** A recovery lock older than this belongs to a crashed daemon and may be broken. */
+/** A lock older than this belongs to a crashed process and may be broken. */
 const LOCK_STALE_MS = 10_000;
 /** Delivery ids remembered for replay dedupe (hook retries after a lost ack). */
 const SEEN_IDS_MAX = 1000;
@@ -134,7 +134,7 @@ export async function listen(
     return server;
   }
 
-  const owner = lockRecovery(path);
+  const owner = tryLock(path);
 
   if (!owner) return undefined;
 
@@ -159,16 +159,19 @@ export async function listen(
 
     return server;
   } finally {
-    unlockRecovery(path, owner);
+    unlock(path, owner);
   }
 }
 
 /**
- * Publishes a nonempty lock directory with one rename. The owner's unique
- * entry lets stale cleanup and release remove only the lock they observed,
- * never a lock another daemon created in the meantime.
+ * Takes `${path}.lock` and returns its owner token, or undefined while another
+ * process holds it. Publishes a nonempty lock directory with one rename. The
+ * owner's unique entry lets stale cleanup and release remove only the lock
+ * they observed, never a lock another process created in the meantime. With
+ * `ownerMustExit`, an old lock is broken only once its owner's PID has exited,
+ * so a stalled holder can never resume writing alongside a new one.
  */
-function lockRecovery(path: string): string | undefined {
+export function tryLock(path: string, ownerMustExit = false): string | undefined {
   const lock = `${path}.lock`;
   const owner = `${process.pid}-${randomUUID()}`;
   const pending = `${lock}.${owner}`;
@@ -183,10 +186,10 @@ function lockRecovery(path: string): string | undefined {
     } catch (error) {
       const code = errorCode(error);
 
-      if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
+      if (!lockHeld(code)) throw error;
     }
 
-    if (!clearStaleLock(lock)) return undefined;
+    if (!clearStaleLock(lock, ownerMustExit)) return undefined;
 
     try {
       renameSync(pending, lock);
@@ -195,7 +198,7 @@ function lockRecovery(path: string): string | undefined {
     } catch (error) {
       const code = errorCode(error);
 
-      if (code === "EEXIST" || code === "ENOTEMPTY") return undefined;
+      if (lockHeld(code)) return undefined;
       throw error;
     }
   } finally {
@@ -203,7 +206,7 @@ function lockRecovery(path: string): string | undefined {
   }
 }
 
-function clearStaleLock(lock: string): boolean {
+function clearStaleLock(lock: string, ownerMustExit: boolean): boolean {
   let entries: string[];
 
   try {
@@ -229,6 +232,8 @@ function clearStaleLock(lock: string): boolean {
 
     if (Date.now() - mtimeMs <= LOCK_STALE_MS) return false;
 
+    if (ownerMustExit && !ownerExited(entry)) return false;
+
     try {
       unlinkSync(held);
     } catch (error) {
@@ -245,7 +250,31 @@ function clearStaleLock(lock: string): boolean {
   }
 }
 
-function unlockRecovery(path: string, owner: string): void {
+/** True only when the PID in an owner token is confirmed to have exited. */
+function ownerExited(owner: string): boolean {
+  const prefix = /^(\d+)-/.exec(owner)?.[1];
+  const pid = Number(prefix);
+
+  if (!prefix || !Number.isSafeInteger(pid) || pid <= 0) return false;
+
+  try {
+    process.kill(pid, 0);
+
+    return false;
+  } catch (error) {
+    return errorCode(error) === "ESRCH";
+  }
+}
+
+/** Renaming onto an existing directory fails with EPERM on Windows. */
+function lockHeld(code: string | undefined): boolean {
+  return (
+    code === "EEXIST" || code === "ENOTEMPTY" || (process.platform === "win32" && code === "EPERM")
+  );
+}
+
+/** Releases a lock taken by `tryLock` if `owner` still holds it. */
+export function unlock(path: string, owner: string): void {
   const lock = `${path}.lock`;
 
   try {
