@@ -1536,7 +1536,7 @@ def test_masked_agent_stream_withholds_text_only_when_text_was_rejected(
     memory = make(mask=mask)
     events: list[dict[str, Any]] = [
         {"chunk": {"bytes": b"Complete answer"}},
-        {"trace": {"trace": {"orchestrationTrace": {"rawResponse": "t" * 50_000}}}},
+        {"trace": {"sessionId": "t" * 50_000}},
     ]
     if later_text:
         events.append({"chunk": {"bytes": b" and more"}})
@@ -1560,6 +1560,410 @@ def test_masked_agent_stream_withholds_text_only_when_text_was_rejected(
         output = _json_attr(span, "gen_ai.output.messages")
         assert output[0]["parts"][0]["content"] == "Complete answer"
         assert any("Complete answer" in value for value in seen)
+
+
+def _pii_assessment(match: str) -> dict[str, Any]:
+    return {
+        "sensitiveInformationPolicy": {
+            "piiEntities": [{"match": match, "type": "EMAIL", "action": "NONE"}]
+        }
+    }
+
+
+def _agent_trace_events(prompt: str) -> list[dict[str, Any]]:
+    # Content markers end in _TEXT; UNKNOWN_SECRET sits only in fields the trace shape doesn't know.
+    unknown = "UNKNOWN_SECRET"
+    return [
+        {
+            "trace": {
+                "agentId": "agent-1",
+                "callerChain": [{"agentAliasArn": "arn:alias"}, {"futureCaller": unknown}],
+                "futureEnvelopeField": unknown,
+                "trace": {
+                    "orchestrationTrace": {
+                        "modelInvocationInput": {
+                            "traceId": "t-1",
+                            "type": "ORCHESTRATION",
+                            "text": prompt,
+                        },
+                        "invocationInput": {
+                            "traceId": "t-1",
+                            "invocationType": "KNOWLEDGE_BASE",
+                            "knowledgeBaseLookupInput": {
+                                "text": "QUERY_TEXT",
+                                "knowledgeBaseId": "kb-1",
+                            },
+                        },
+                        "modelInvocationOutput": {
+                            "traceId": "t-1",
+                            "rawResponse": {"content": "MODEL_TEXT"},
+                            "metadata": {
+                                "usage": {"inputTokens": 3, "outputTokens": 4},
+                                "totalTimeMs": 12,
+                                "clientRequestId": "req-1",
+                                "newContentField": "MODEL_META_TEXT",
+                            },
+                        },
+                        "rationale": {"traceId": "t-1", "text": "RATIONALE_TEXT"},
+                        "observation": {
+                            "traceId": "t-1",
+                            "type": "KNOWLEDGE_BASE",
+                            "knowledgeBaseLookupOutput": {
+                                "retrievedReferences": [{"content": {"text": "REFERENCE_TEXT"}}]
+                            },
+                        },
+                        "futurePart": {"text": unknown},
+                    }
+                },
+            }
+        },
+        {
+            "trace": {
+                "trace": {
+                    "preProcessingTrace": {
+                        "modelInvocationInput": {
+                            "traceId": "pre",
+                            "type": "PRE_PROCESSING",
+                            "text": "PRE_TEXT",
+                        },
+                        "modelInvocationOutput": {
+                            "traceId": "pre",
+                            "parsedResponse": {"isValid": True, "rationale": "PRE_RATIONALE_TEXT"},
+                            "metadata": {"usage": {"inputTokens": 10, "outputTokens": 20}},
+                        },
+                    }
+                }
+            }
+        },
+        {
+            "trace": {
+                "trace": {
+                    "postProcessingTrace": {
+                        "modelInvocationInput": {
+                            "traceId": "post",
+                            "type": "POST_PROCESSING",
+                            "text": "POST_TEXT",
+                        },
+                        "modelInvocationOutput": {
+                            "traceId": "post",
+                            "parsedResponse": {"text": "POST_OUT_TEXT"},
+                            "metadata": {"usage": {"inputTokens": 1000, "outputTokens": 2000}},
+                        },
+                    }
+                }
+            }
+        },
+        {
+            "trace": {
+                "trace": {
+                    "routingClassifierTrace": {
+                        "modelInvocationInput": {
+                            "traceId": "route",
+                            "type": "ROUTING",
+                            "text": "ROUTE_TEXT",
+                        },
+                        "invocationInput": {
+                            "traceId": "route",
+                            "invocationType": "AGENT_COLLABORATOR",
+                            "agentCollaboratorInvocationInput": {
+                                "input": {"text": "COLLAB_IN_TEXT"}
+                            },
+                        },
+                        "modelInvocationOutput": {
+                            "traceId": "route",
+                            "rawResponse": {"content": "ROUTE_OUT_TEXT"},
+                            "metadata": {"usage": {"inputTokens": 10000, "outputTokens": 20000}},
+                        },
+                        "observation": {
+                            "traceId": "route",
+                            "type": "AGENT_COLLABORATOR",
+                            "agentCollaboratorInvocationOutput": {
+                                "output": {"text": "COLLAB_OUT_TEXT"}
+                            },
+                        },
+                    }
+                }
+            }
+        },
+        {
+            "trace": {
+                "trace": {
+                    "customOrchestrationTrace": {
+                        "traceId": "custom",
+                        "event": {"text": "CUSTOM_TEXT"},
+                        "futureField": unknown,
+                    }
+                }
+            }
+        },
+        {
+            "trace": {
+                "trace": {
+                    "guardrailTrace": {
+                        "traceId": "g-1",
+                        "action": "NONE",
+                        "metadata": {"totalTimeMs": 5, "newContentField": unknown},
+                        "inputAssessments": [_pii_assessment("INPUT_PII_TEXT")],
+                        "outputAssessments": [_pii_assessment("OUTPUT_PII_TEXT")],
+                    }
+                }
+            }
+        },
+        {
+            "trace": {
+                "trace": {
+                    "failureTrace": {
+                        "traceId": "f-1",
+                        "failureCode": 500,
+                        "failureReason": "FAILURE_TEXT",
+                        "metadata": {"clientRequestId": "req-f", "newContentField": unknown},
+                    }
+                }
+            }
+        },
+        {
+            "trace": {
+                "trace": {
+                    "futureTrace": {
+                        "text": unknown,
+                        "guardrailTrace": {"action": unknown},
+                        "failureTrace": {"failureCode": 400},
+                        "modelInvocationOutput": {
+                            "metadata": {"usage": {"inputTokens": 100, "outputTokens": 100}}
+                        },
+                    }
+                }
+            }
+        },
+        {"trace": {"trace": {"$unknown": ["futureTrace", {"text": unknown}]}}},
+        {"chunk": {"bytes": b"ANSWER_TEXT"}},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("options", "keeps_input", "keeps_output"),
+    [
+        ({}, True, True),
+        ({"capture_input": False}, False, True),
+        ({"capture_output": False}, True, False),
+        ({"capture_input": False, "capture_output": False}, False, False),
+        (
+            {
+                "mask": lambda value, _context: json.loads(
+                    json.dumps(value).replace("_TEXT", "_MASKED")
+                )
+            },
+            False,
+            False,
+        ),
+    ],
+    ids=["all on", "input off", "output off", "both off", "masked"],
+)
+def test_agent_trace_content_follows_the_capture_flags(
+    make: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    options: dict[str, Any],
+    keeps_input: bool,
+    keeps_output: bool,
+) -> None:
+    memory = make(**options)
+    # Withheld content past the fixed bound must not spend it.
+    prompt = "PROMPT_TEXT" if keeps_input else f"PROMPT_TEXT {'p' * 60_000}"
+    events = _agent_trace_events(prompt)
+    orchestration, pre, post, routing, custom, guardrail, failure = (
+        event["trace"]["trace"] for event in events[:7]
+    )
+    client = _client("bedrock-agent-runtime")
+    _stub_api_call(client, [{"completion": FakeEventStream(events)}], monkeypatch)
+    wrap_bedrock(client, capture_agent_trace=True)
+
+    response = client.invoke_agent(  # type: ignore[attr-defined]
+        agentId="agent-1", agentAliasId="alias", sessionId="sess-1"
+    )
+    assert list(response["completion"]) == _agent_trace_events(prompt)
+
+    def present(**fields: Any) -> dict[str, Any]:
+        return {key: value for key, value in fields.items() if value is not None}
+
+    def input_part(value: Any, withheld: Any = None) -> Any:
+        return value if keeps_input else withheld
+
+    def output_part(value: Any, withheld: Any = None) -> Any:
+        return value if keeps_output else withheld
+
+    keeps_failure_reason = keeps_input and keeps_output
+    span = memory.span_exporter.get_finished_spans()[0]
+    assert "telemetry.dev.capture.truncated" not in span.attributes
+    assert span.attributes["gen_ai.usage.input_tokens"] == 3 + 10 + 1000 + 10000
+    assert span.attributes["gen_ai.usage.output_tokens"] == 4 + 20 + 2000 + 20000
+    assert span.attributes["td.metadata.guardrail_action"] == "NONE"
+    assert span.attributes["td.metadata.failure"] == "true"
+    assert span.attributes["td.metadata.failure_code"] == "500"
+    assert span.attributes.get("td.metadata.failure_reason") == (
+        "FAILURE_TEXT" if keeps_failure_reason else None
+    )
+    orchestration_trace = orchestration["orchestrationTrace"]
+    assert _json_attr(span, "td.metadata.agent_trace") == [
+        {
+            "agentId": "agent-1",
+            "callerChain": [{"agentAliasArn": "arn:alias"}, {}],
+            "trace": {
+                "orchestrationTrace": {
+                    "modelInvocationInput": input_part(
+                        orchestration_trace["modelInvocationInput"],
+                        {"traceId": "t-1", "type": "ORCHESTRATION"},
+                    ),
+                    "invocationInput": input_part(
+                        orchestration_trace["invocationInput"],
+                        {"traceId": "t-1", "invocationType": "KNOWLEDGE_BASE"},
+                    ),
+                    "modelInvocationOutput": output_part(
+                        orchestration_trace["modelInvocationOutput"],
+                        {
+                            "traceId": "t-1",
+                            "metadata": {
+                                "usage": {"inputTokens": 3, "outputTokens": 4},
+                                "totalTimeMs": 12,
+                                "clientRequestId": "req-1",
+                            },
+                        },
+                    ),
+                    "rationale": output_part(orchestration_trace["rationale"], {"traceId": "t-1"}),
+                    "observation": output_part(
+                        orchestration_trace["observation"],
+                        {"traceId": "t-1", "type": "KNOWLEDGE_BASE"},
+                    ),
+                }
+            },
+        },
+        {
+            "trace": {
+                "preProcessingTrace": {
+                    "modelInvocationInput": input_part(
+                        pre["preProcessingTrace"]["modelInvocationInput"],
+                        {"traceId": "pre", "type": "PRE_PROCESSING"},
+                    ),
+                    "modelInvocationOutput": output_part(
+                        pre["preProcessingTrace"]["modelInvocationOutput"],
+                        {
+                            "traceId": "pre",
+                            "metadata": {"usage": {"inputTokens": 10, "outputTokens": 20}},
+                        },
+                    ),
+                }
+            }
+        },
+        {
+            "trace": {
+                "postProcessingTrace": {
+                    "modelInvocationInput": input_part(
+                        post["postProcessingTrace"]["modelInvocationInput"],
+                        {"traceId": "post", "type": "POST_PROCESSING"},
+                    ),
+                    "modelInvocationOutput": output_part(
+                        post["postProcessingTrace"]["modelInvocationOutput"],
+                        {
+                            "traceId": "post",
+                            "metadata": {"usage": {"inputTokens": 1000, "outputTokens": 2000}},
+                        },
+                    ),
+                }
+            }
+        },
+        {
+            "trace": {
+                "routingClassifierTrace": {
+                    "modelInvocationInput": input_part(
+                        routing["routingClassifierTrace"]["modelInvocationInput"],
+                        {"traceId": "route", "type": "ROUTING"},
+                    ),
+                    "invocationInput": input_part(
+                        routing["routingClassifierTrace"]["invocationInput"],
+                        {"traceId": "route", "invocationType": "AGENT_COLLABORATOR"},
+                    ),
+                    "modelInvocationOutput": output_part(
+                        routing["routingClassifierTrace"]["modelInvocationOutput"],
+                        {
+                            "traceId": "route",
+                            "metadata": {"usage": {"inputTokens": 10000, "outputTokens": 20000}},
+                        },
+                    ),
+                    "observation": output_part(
+                        routing["routingClassifierTrace"]["observation"],
+                        {"traceId": "route", "type": "AGENT_COLLABORATOR"},
+                    ),
+                }
+            }
+        },
+        {
+            "trace": {
+                "customOrchestrationTrace": present(
+                    traceId="custom",
+                    event=output_part(custom["customOrchestrationTrace"]["event"]),
+                )
+            }
+        },
+        {
+            "trace": {
+                "guardrailTrace": present(
+                    traceId="g-1",
+                    action="NONE",
+                    metadata={"totalTimeMs": 5},
+                    inputAssessments=input_part(guardrail["guardrailTrace"]["inputAssessments"]),
+                    outputAssessments=output_part(guardrail["guardrailTrace"]["outputAssessments"]),
+                )
+            }
+        },
+        {
+            "trace": {
+                "failureTrace": present(
+                    traceId="f-1",
+                    failureCode=500,
+                    failureReason=failure["failureTrace"]["failureReason"]
+                    if keeps_failure_reason
+                    else None,
+                    metadata={"clientRequestId": "req-f"},
+                )
+            }
+        },
+        {"trace": {}},
+        {"trace": {}},
+    ]
+    exported = [str(value) for value in span.attributes.values()]
+    assert any("_TEXT" in value for value in exported) is (keeps_input or keeps_output)
+    assert not any("UNKNOWN_SECRET" in value for value in exported)
+
+
+@pytest.mark.parametrize(
+    ("options", "reason"),
+    [({"mask": lambda value, _context: value}, None), ({}, "FAILURE_TEXT")],
+    ids=["masked", "all on"],
+)
+def test_agent_failure_metadata_follows_the_capture_flags_without_trace_capture(
+    make: Any, monkeypatch: pytest.MonkeyPatch, options: dict[str, Any], reason: str | None
+) -> None:
+    memory = make(**options)
+    events = [
+        {
+            "trace": {
+                "trace": {"failureTrace": {"failureCode": 500, "failureReason": "FAILURE_TEXT"}}
+            }
+        }
+    ]
+    client = _client("bedrock-agent-runtime")
+    _stub_api_call(client, [{"completion": FakeEventStream(events)}], monkeypatch)
+    wrap_bedrock(client)
+
+    response = client.invoke_agent(  # type: ignore[attr-defined]
+        agentId="agent-1", agentAliasId="alias", sessionId="sess-1"
+    )
+    list(response["completion"])
+
+    span = memory.span_exporter.get_finished_spans()[0]
+    assert "td.metadata.agent_trace" not in span.attributes
+    assert span.attributes["td.metadata.failure"] == "true"
+    assert span.attributes["td.metadata.failure_code"] == "500"
+    assert span.attributes.get("td.metadata.failure_reason") == reason
 
 
 def test_agent_retrieve_rag_flow_and_global_instrument(

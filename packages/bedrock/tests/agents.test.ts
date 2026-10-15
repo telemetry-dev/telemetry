@@ -91,6 +91,364 @@ test("InvokeAgent aggregates trace usage and return control", async () => {
   });
 });
 
+// Content markers end in _TEXT; UNKNOWN_SECRET sits only in fields the trace shape doesn't know.
+function agentTraceEvents(prompt: string): any[] {
+  const unknown = "UNKNOWN_SECRET";
+
+  return [
+    {
+      trace: {
+        agentId: "agent-1",
+        eventTime: new Date("2026-01-02T03:04:05Z"),
+        callerChain: [{ agentAliasArn: "arn:alias" }, { $unknown: ["futureCaller", unknown] }],
+        futureEnvelopeField: unknown,
+        trace: {
+          orchestrationTrace: {
+            modelInvocationInput: { traceId: "t-1", type: "ORCHESTRATION", text: prompt },
+            invocationInput: {
+              traceId: "t-1",
+              invocationType: "KNOWLEDGE_BASE",
+              knowledgeBaseLookupInput: { text: "QUERY_TEXT", knowledgeBaseId: "kb-1" },
+            },
+            modelInvocationOutput: {
+              traceId: "t-1",
+              rawResponse: { content: "MODEL_TEXT" },
+              metadata: {
+                usage: { inputTokens: 3, outputTokens: 4 },
+                totalTimeMs: 12,
+                clientRequestId: "req-1",
+                newContentField: "MODEL_META_TEXT",
+              },
+            },
+            rationale: { traceId: "t-1", text: "RATIONALE_TEXT" },
+            observation: {
+              traceId: "t-1",
+              type: "KNOWLEDGE_BASE",
+              knowledgeBaseLookupOutput: {
+                retrievedReferences: [{ content: { text: "REFERENCE_TEXT" } }],
+              },
+            },
+            $unknown: ["futurePart", { text: unknown }],
+          },
+        },
+      },
+    },
+    {
+      trace: {
+        trace: {
+          preProcessingTrace: {
+            modelInvocationInput: { traceId: "pre", type: "PRE_PROCESSING", text: "PRE_TEXT" },
+            modelInvocationOutput: {
+              traceId: "pre",
+              parsedResponse: { isValid: true, rationale: "PRE_RATIONALE_TEXT" },
+              metadata: { usage: { inputTokens: 10, outputTokens: 20 } },
+            },
+          },
+        },
+      },
+    },
+    {
+      trace: {
+        trace: {
+          postProcessingTrace: {
+            modelInvocationInput: { traceId: "post", type: "POST_PROCESSING", text: "POST_TEXT" },
+            modelInvocationOutput: {
+              traceId: "post",
+              parsedResponse: { text: "POST_OUT_TEXT" },
+              metadata: { usage: { inputTokens: 1000, outputTokens: 2000 } },
+            },
+          },
+        },
+      },
+    },
+    {
+      trace: {
+        trace: {
+          routingClassifierTrace: {
+            modelInvocationInput: { traceId: "route", type: "ROUTING", text: "ROUTE_TEXT" },
+            invocationInput: {
+              traceId: "route",
+              invocationType: "AGENT_COLLABORATOR",
+              agentCollaboratorInvocationInput: { input: { text: "COLLAB_IN_TEXT" } },
+            },
+            modelInvocationOutput: {
+              traceId: "route",
+              rawResponse: { content: "ROUTE_OUT_TEXT" },
+              metadata: { usage: { inputTokens: 10000, outputTokens: 20000 } },
+            },
+            observation: {
+              traceId: "route",
+              type: "AGENT_COLLABORATOR",
+              agentCollaboratorInvocationOutput: { output: { text: "COLLAB_OUT_TEXT" } },
+            },
+          },
+        },
+      },
+    },
+    {
+      trace: {
+        trace: {
+          customOrchestrationTrace: {
+            traceId: "custom",
+            event: { text: "CUSTOM_TEXT" },
+            futureField: unknown,
+          },
+        },
+      },
+    },
+    {
+      trace: {
+        trace: {
+          guardrailTrace: {
+            traceId: "g-1",
+            action: "NONE",
+            metadata: { totalTimeMs: 5, newContentField: unknown },
+            inputAssessments: [piiAssessment("INPUT_PII_TEXT")],
+            outputAssessments: [piiAssessment("OUTPUT_PII_TEXT")],
+          },
+        },
+      },
+    },
+    {
+      trace: {
+        trace: {
+          failureTrace: {
+            traceId: "f-1",
+            failureCode: 500,
+            failureReason: "FAILURE_TEXT",
+            metadata: { clientRequestId: "req-f", newContentField: unknown },
+          },
+        },
+      },
+    },
+    {
+      trace: {
+        trace: {
+          futureTrace: {
+            text: unknown,
+            guardrailTrace: { action: unknown },
+            failureTrace: { failureCode: 400 },
+            modelInvocationOutput: { metadata: { usage: { inputTokens: 100, outputTokens: 100 } } },
+          },
+        },
+      },
+    },
+    { trace: { trace: { $unknown: ["futureTrace", { text: unknown }] } } },
+    { files: { files: [{ name: "FILE_NAME_TEXT.png", type: "image/png", bytes: bytes("raw") }] } },
+    { chunk: { bytes: bytes("ANSWER_TEXT") } },
+  ];
+}
+
+function piiAssessment(match: string) {
+  return {
+    sensitiveInformationPolicy: { piiEntities: [{ match, type: "EMAIL", action: "NONE" }] },
+  };
+}
+
+test.each([
+  ["all on", {}, true, true],
+  ["input off", { captureInput: false }, false, true],
+  ["output off", { captureOutput: false }, true, false],
+  ["both off", { captureInput: false, captureOutput: false }, false, false],
+  [
+    "masked",
+    { mask: (value: unknown) => JSON.parse(JSON.stringify(value).replaceAll("_TEXT", "_MASKED")) },
+    false,
+    false,
+  ],
+])(
+  "InvokeAgent trace content follows the capture flags (%s)",
+  async (_, options, keepsInput, keepsOutput) => {
+    const spans = setup(options);
+    // Withheld content past the fixed bound must not spend it.
+    const prompt = keepsInput ? "PROMPT_TEXT" : `PROMPT_TEXT ${"p".repeat(60_000)}`;
+    const events = agentTraceEvents(prompt);
+    const [orchestration, pre, post, routing, custom, guardrail, failure] = events.map(
+      (event) => event.trace?.trace,
+    );
+
+    const client = wrapBedrockAgents(new FakeClient([{ completion: streamOf(events) }]), {
+      captureAgentTrace: true,
+    });
+
+    const response = (await client.send(
+      new InvokeAgentCommand({ agentId: "agent-1", agentAliasId: "a", sessionId: "s" }),
+    )) as { completion: AsyncIterable<unknown> };
+
+    expect(await collect(response.completion)).toEqual(agentTraceEvents(prompt));
+
+    const input = <T>(value: T, withheld?: unknown) => (keepsInput ? value : withheld);
+    const output = <T>(value: T, withheld?: unknown) => (keepsOutput ? value : withheld);
+    const [span] = spans.getFinishedSpans();
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+    expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(3 + 10 + 1000 + 10000);
+    expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(4 + 20 + 2000 + 20000);
+    expect(span.attributes["td.metadata.guardrail_action"]).toBe("NONE");
+    expect(span.attributes["td.metadata.failure"]).toBe("true");
+    expect(span.attributes["td.metadata.failure_code"]).toBe("500");
+    expect(span.attributes["td.metadata.failure_reason"]).toBe(
+      keepsInput && keepsOutput ? "FAILURE_TEXT" : undefined,
+    );
+    expect(jsonAttr(span, "td.metadata.output_files")).toEqual([
+      { name: output("FILE_NAME_TEXT.png"), type: "image/png" },
+    ]);
+    expect(jsonAttr(span, "td.metadata.agent_trace")).toEqual([
+      {
+        agentId: "agent-1",
+        eventTime: "2026-01-02T03:04:05.000Z",
+        callerChain: [{ agentAliasArn: "arn:alias" }, {}],
+        trace: {
+          orchestrationTrace: {
+            modelInvocationInput: input(orchestration.orchestrationTrace.modelInvocationInput, {
+              traceId: "t-1",
+              type: "ORCHESTRATION",
+            }),
+            invocationInput: input(orchestration.orchestrationTrace.invocationInput, {
+              traceId: "t-1",
+              invocationType: "KNOWLEDGE_BASE",
+            }),
+            modelInvocationOutput: output(orchestration.orchestrationTrace.modelInvocationOutput, {
+              traceId: "t-1",
+              metadata: {
+                usage: { inputTokens: 3, outputTokens: 4 },
+                totalTimeMs: 12,
+                clientRequestId: "req-1",
+              },
+            }),
+            rationale: output(orchestration.orchestrationTrace.rationale, { traceId: "t-1" }),
+            observation: output(orchestration.orchestrationTrace.observation, {
+              traceId: "t-1",
+              type: "KNOWLEDGE_BASE",
+            }),
+          },
+        },
+      },
+      {
+        trace: {
+          preProcessingTrace: {
+            modelInvocationInput: input(pre.preProcessingTrace.modelInvocationInput, {
+              traceId: "pre",
+              type: "PRE_PROCESSING",
+            }),
+            modelInvocationOutput: output(pre.preProcessingTrace.modelInvocationOutput, {
+              traceId: "pre",
+              metadata: { usage: { inputTokens: 10, outputTokens: 20 } },
+            }),
+          },
+        },
+      },
+      {
+        trace: {
+          postProcessingTrace: {
+            modelInvocationInput: input(post.postProcessingTrace.modelInvocationInput, {
+              traceId: "post",
+              type: "POST_PROCESSING",
+            }),
+            modelInvocationOutput: output(post.postProcessingTrace.modelInvocationOutput, {
+              traceId: "post",
+              metadata: { usage: { inputTokens: 1000, outputTokens: 2000 } },
+            }),
+          },
+        },
+      },
+      {
+        trace: {
+          routingClassifierTrace: {
+            modelInvocationInput: input(routing.routingClassifierTrace.modelInvocationInput, {
+              traceId: "route",
+              type: "ROUTING",
+            }),
+            invocationInput: input(routing.routingClassifierTrace.invocationInput, {
+              traceId: "route",
+              invocationType: "AGENT_COLLABORATOR",
+            }),
+            modelInvocationOutput: output(routing.routingClassifierTrace.modelInvocationOutput, {
+              traceId: "route",
+              metadata: { usage: { inputTokens: 10000, outputTokens: 20000 } },
+            }),
+            observation: output(routing.routingClassifierTrace.observation, {
+              traceId: "route",
+              type: "AGENT_COLLABORATOR",
+            }),
+          },
+        },
+      },
+      {
+        trace: {
+          customOrchestrationTrace: {
+            traceId: "custom",
+            event: output(custom.customOrchestrationTrace.event),
+          },
+        },
+      },
+      {
+        trace: {
+          guardrailTrace: {
+            traceId: "g-1",
+            action: "NONE",
+            metadata: { totalTimeMs: 5 },
+            inputAssessments: input(guardrail.guardrailTrace.inputAssessments),
+            outputAssessments: output(guardrail.guardrailTrace.outputAssessments),
+          },
+        },
+      },
+      {
+        trace: {
+          failureTrace: {
+            traceId: "f-1",
+            failureCode: 500,
+            failureReason:
+              keepsInput && keepsOutput ? failure.failureTrace.failureReason : undefined,
+            metadata: { clientRequestId: "req-f" },
+          },
+        },
+      },
+      { trace: {} },
+      { trace: {} },
+    ]);
+
+    const exported = Object.values(span.attributes).map(String);
+    expect(exported.some((value) => value.includes("_TEXT"))).toBe(keepsInput || keepsOutput);
+    expect(exported.some((value) => value.includes("UNKNOWN_SECRET"))).toBe(false);
+  },
+);
+
+test.each([
+  ["masked", { mask: (value: unknown) => value }, undefined],
+  ["all on", {}, "FAILURE_TEXT"],
+])(
+  "InvokeAgent failure metadata follows the capture flags without trace capture (%s)",
+  async (_, options, reason) => {
+    const spans = setup(options);
+
+    const client = wrapBedrockAgents(
+      new FakeClient([
+        {
+          completion: streamOf([
+            {
+              trace: {
+                trace: { failureTrace: { failureCode: 500, failureReason: "FAILURE_TEXT" } },
+              },
+            },
+          ]),
+        },
+      ]),
+    );
+
+    const response = (await client.send(
+      new InvokeAgentCommand({ agentId: "agent-1", agentAliasId: "a", sessionId: "s" }),
+    )) as { completion: AsyncIterable<unknown> };
+
+    await collect(response.completion);
+
+    const [span] = spans.getFinishedSpans();
+    expect(span.attributes["td.metadata.agent_trace"]).toBeUndefined();
+    expect(span.attributes["td.metadata.failure"]).toBe("true");
+    expect(span.attributes["td.metadata.failure_code"]).toBe("500");
+    expect(span.attributes["td.metadata.failure_reason"]).toBe(reason);
+  },
+);
+
 test.each([false, true])(
   "InvokeAgent text past the fixed bound is flagged and withheld from a mask (masked %s)",
   async (masked) => {
@@ -139,8 +497,8 @@ test.each([false, true])(
 );
 
 test.each([
-  ["trace", { trace: { trace: { orchestrationTrace: { rawResponse: "t".repeat(50_000) } } } }],
-  ["output file", { files: { files: [{ name: "f".repeat(50_000), type: "text/plain" }] } }],
+  ["trace", { trace: { sessionId: "t".repeat(50_000) } }],
+  ["output file", { files: { files: [{ name: "f.txt", type: "t".repeat(50_000) }] } }],
 ])(
   "masked InvokeAgent keeps complete text when only %s metadata passed the bound",
   async (_kind, metadataEvent) => {
@@ -194,7 +552,7 @@ test("masked InvokeAgent withholds text when a chunk after the metadata bound is
       {
         completion: streamOf([
           { chunk: { bytes: bytes("Complete answer") } },
-          { trace: { trace: { orchestrationTrace: { rawResponse: "t".repeat(50_000) } } } },
+          { trace: { sessionId: "t".repeat(50_000) } },
           { chunk: { bytes: bytes(" and more") } },
         ]),
       },

@@ -5,6 +5,7 @@ import {
   awsMetadataFields,
   basenameArn,
   bytesToString,
+  captureMaskedBeforeStart,
   isRecord,
   mergeFields,
   modeledStreamError,
@@ -55,6 +56,8 @@ export class AgentStreamState implements StreamState {
   private textRejected = false;
   private usage: NonNullable<SpanFields["usage"]> = {};
   private traceEventCount = 0;
+  private failed = false;
+  private failureCode: number | undefined;
   private failureReason: string | undefined;
   private guardrailAction: string | undefined;
   private returnControl: unknown;
@@ -65,6 +68,12 @@ export class AgentStreamState implements StreamState {
   private errorFields: SpanFields | undefined;
   private citationCount = 0;
   private readonly outputFiles: unknown[] = [];
+  // Metadata bypasses the capture flags and the mask, so trace and file content is filtered here,
+  // and a mask that cannot see it withholds it.
+  private readonly contentCapture: AgentTraceCapture = {
+    input: captureEnabled("input") && !captureMaskedBeforeStart(),
+    output: captureEnabled("output") && !captureMaskedBeforeStart(),
+  };
 
   constructor(private readonly options: BedrockInstrumentationOptions) {}
 
@@ -98,7 +107,9 @@ export class AgentStreamState implements StreamState {
 
     const files = isRecord(raw.files) ? arrayValue<JsonValue>(raw.files.files) : undefined;
 
-    const sanitizedFiles = files?.map(sanitizeOutputFile);
+    const sanitizedFiles = files?.map((file) =>
+      sanitizeOutputFile(file, this.contentCapture.output),
+    );
 
     if (sanitizedFiles && this.retention.accept(sanitizedFiles)) {
       this.outputFiles.push(...sanitizedFiles);
@@ -126,16 +137,35 @@ export class AgentStreamState implements StreamState {
     if (traceEvent) {
       this.traceEventCount += 1;
 
-      if (this.options.captureAgentTrace && this.retention.accept(traceEvent)) {
-        this.traces.push(traceEvent);
+      if (this.options.captureAgentTrace) {
+        const retained = projectTrace(traceEvent, TRACE_PART, this.contentCapture);
+
+        if (this.retention.accept(retained)) this.traces.push(retained);
       }
 
-      collectTrace(traceEvent, (usage) => this.addUsage(usage));
-      const failure = findKey(traceEvent, "failureTrace");
+      // Summaries are read only where the API puts them, so content and unknown branches can't
+      // feed them.
+      const trace = isRecord(traceEvent.trace) ? traceEvent.trace : {};
 
-      if (isRecord(failure))
-        this.failureReason = stringValue(failure.failureReason) ?? this.failureReason;
-      const guardrail = findKey(traceEvent, "guardrailTrace");
+      for (const step of MODEL_INVOCATION_STEPS) {
+        const member = isRecord(trace[step]) ? trace[step] : undefined;
+        const output = isRecord(member?.modelInvocationOutput) ? member.modelInvocationOutput : {};
+        this.addUsage(isRecord(output.metadata) ? output.metadata.usage : undefined);
+      }
+
+      const failure = trace.failureTrace;
+
+      if (isRecord(failure)) {
+        this.failed = true;
+        this.failureCode = numberValue(failure.failureCode) ?? this.failureCode;
+
+        // The reason is free-form text that can quote the prompt or a tool result.
+        if (this.contentCapture.input && this.contentCapture.output) {
+          this.failureReason = stringValue(failure.failureReason) ?? this.failureReason;
+        }
+      }
+
+      const guardrail = trace.guardrailTrace;
 
       if (isRecord(guardrail))
         this.guardrailAction = stringValue(guardrail.action) ?? this.guardrailAction;
@@ -152,6 +182,8 @@ export class AgentStreamState implements StreamState {
   finish(): SpanFields {
     const metadata = omitUndefined({
       trace_event_count: this.traceEventCount || undefined,
+      failure: this.failed ? true : undefined,
+      failure_code: this.failureCode,
       failure_reason: this.failureReason,
       guardrail_action: this.guardrailAction,
       return_control: this.sawReturnControl ? true : undefined,
@@ -197,13 +229,13 @@ export class AgentStreamState implements StreamState {
   }
 }
 
-function sanitizeOutputFile<T>(value: T): JsonValue {
+function sanitizeOutputFile<T>(value: T, keepName: boolean): JsonValue {
   const raw: unknown = value;
 
   if (!isRecord(raw)) return undefined;
 
   return omitUndefined({
-    name: stringValue(raw.name),
+    name: keepName ? stringValue(raw.name) : undefined,
     type: stringValue(raw.type),
   });
 }
@@ -453,35 +485,135 @@ export function ragName(input: JsonRecord): string {
   return `retrieve_and_generate ${basenameArn(ragModel(input)) ?? "knowledge-base"}`;
 }
 
-function collectTrace<T>(value: T, onUsage: <TUsage>(usage: TUsage) => void): void {
-  const raw: unknown = value;
+type AgentTraceCapture = Record<"input" | "output", boolean>;
 
-  if (!isRecord(raw)) return;
-  const output = isRecord(raw.modelInvocationOutput) ? raw.modelInvocationOutput : undefined;
-
-  if (output) {
-    const metadata = isRecord(output.metadata) ? output.metadata : undefined;
-    onUsage(metadata?.usage);
-  }
-
-  for (const child of Object.values(raw)) {
-    if (isRecord(child)) collectTrace(child, onUsage);
-    else if (Array.isArray(child)) child.forEach((item) => collectTrace(item, onUsage));
-  }
+/** Content kept as received when every listed capture is on; otherwise reduced to `withheld`. */
+class TraceContent {
+  constructor(
+    readonly needs: ReadonlyArray<keyof AgentTraceCapture>,
+    readonly withheld?: TraceShape,
+  ) {}
 }
 
-function findKey<T>(value: T, key: string): JsonValue {
-  const raw: unknown = value;
+const SCALAR = "scalar";
 
-  if (!isRecord(raw)) return undefined;
+// A record shape lists the only fields kept; a one-item array shape is a list of that shape.
+type TraceShape =
+  | typeof SCALAR
+  | TraceContent
+  | readonly [TraceShape]
+  | { readonly [field: string]: TraceShape };
 
-  if (raw[key] !== undefined) return raw[key];
+const TRACE_METADATA: TraceShape = {
+  usage: { inputTokens: SCALAR, outputTokens: SCALAR },
+  startTime: SCALAR,
+  endTime: SCALAR,
+  totalTimeMs: SCALAR,
+  operationTotalTimeMs: SCALAR,
+  clientRequestId: SCALAR,
+};
 
-  for (const child of Object.values(raw)) {
-    const found = findKey(child, key);
+// What the agent sends to a model, tool, or guardrail is input content; what comes back is output.
+const MODEL_INVOCATION_INPUT = new TraceContent(["input"], {
+  traceId: SCALAR,
+  type: SCALAR,
+  foundationModel: SCALAR,
+});
 
-    if (found !== undefined) return found;
+const INVOCATION_INPUT = new TraceContent(["input"], { traceId: SCALAR, invocationType: SCALAR });
+
+const MODEL_INVOCATION_OUTPUT = new TraceContent(["output"], {
+  traceId: SCALAR,
+  metadata: TRACE_METADATA,
+});
+
+const OBSERVATION = new TraceContent(["output"], { traceId: SCALAR, type: SCALAR });
+
+const MODEL_INVOCATION_STEPS = [
+  "preProcessingTrace",
+  "orchestrationTrace",
+  "postProcessingTrace",
+  "routingClassifierTrace",
+];
+
+const PROCESSING_TRACE: TraceShape = {
+  modelInvocationInput: MODEL_INVOCATION_INPUT,
+  modelInvocationOutput: MODEL_INVOCATION_OUTPUT,
+};
+
+// Mirrors TracePart and the Trace union in the Bedrock Agent Runtime API; anything else, including
+// the AWS SDK's `$unknown` union member, is dropped because nothing says what it holds.
+const TRACE_PART: TraceShape = {
+  agentId: SCALAR,
+  agentAliasId: SCALAR,
+  agentVersion: SCALAR,
+  sessionId: SCALAR,
+  collaboratorName: SCALAR,
+  eventTime: SCALAR,
+  callerChain: [{ agentAliasArn: SCALAR }],
+  trace: {
+    preProcessingTrace: PROCESSING_TRACE,
+    postProcessingTrace: PROCESSING_TRACE,
+    orchestrationTrace: {
+      modelInvocationInput: MODEL_INVOCATION_INPUT,
+      invocationInput: INVOCATION_INPUT,
+      modelInvocationOutput: MODEL_INVOCATION_OUTPUT,
+      rationale: new TraceContent(["output"], { traceId: SCALAR }),
+      observation: OBSERVATION,
+    },
+    routingClassifierTrace: {
+      modelInvocationInput: MODEL_INVOCATION_INPUT,
+      invocationInput: INVOCATION_INPUT,
+      modelInvocationOutput: MODEL_INVOCATION_OUTPUT,
+      observation: OBSERVATION,
+    },
+    customOrchestrationTrace: { traceId: SCALAR, event: new TraceContent(["output"]) },
+    guardrailTrace: {
+      traceId: SCALAR,
+      action: SCALAR,
+      metadata: TRACE_METADATA,
+      inputAssessments: new TraceContent(["input"]),
+      outputAssessments: new TraceContent(["output"]),
+    },
+    failureTrace: {
+      traceId: SCALAR,
+      failureCode: SCALAR,
+      metadata: TRACE_METADATA,
+      // Free-form text that can quote either the prompt or a tool result.
+      failureReason: new TraceContent(["input", "output"]),
+    },
+  },
+};
+
+function projectTrace(value: JsonValue, shape: TraceShape, capture: AgentTraceCapture): JsonValue {
+  if (shape instanceof TraceContent) {
+    if (shape.needs.every((kind) => capture[kind])) return value ?? undefined;
+
+    return shape.withheld === undefined ? undefined : projectTrace(value, shape.withheld, capture);
   }
 
-  return undefined;
+  if (shape === SCALAR) {
+    const scalar = ["string", "number", "boolean"].includes(typeof value) || value instanceof Date;
+
+    return scalar ? value : undefined;
+  }
+
+  if (Array.isArray(shape)) {
+    if (!Array.isArray(value)) return undefined;
+
+    return value
+      .map((item) => projectTrace(item, shape[0], capture))
+      .filter((item) => item !== undefined);
+  }
+
+  if (!isRecord(value)) return undefined;
+
+  return omitUndefined(
+    Object.fromEntries(
+      Object.entries(shape).map(([field, child]) => [
+        field,
+        projectTrace(value[field], child, capture),
+      ]),
+    ),
+  );
 }
