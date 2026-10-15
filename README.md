@@ -162,6 +162,11 @@ Each integration links to its installation instructions and API coverage.
 Other languages can use an existing OTLP/HTTP exporter.
 The [documentation](https://docs.telemetry.dev) describes endpoint configuration and authentication.
 
+The Claude SDKs (`@anthropic-ai/sdk` 0.134.0 and later, Python `anthropic` 1.14.0 and later) emit OpenTelemetry spans natively.
+To send these spans to telemetry.dev, refer to Native Claude SDK spans for [TypeScript](packages/otel/README.md#native-claude-sdk-spans) and [Python](sdks/python/README.md#native-claude-sdk-spans).
+Do not use these spans together with the Anthropic integration, because each request then has two spans.
+The Claude API can also send server-side spans through a Console destination. Refer to [Claude Platform](https://telemetry.dev/docs/integrations/claude-platform).
+
 ## Development
 
 Local development uses Node.js 24, pnpm 11.25.0, Vite+, uv, and Python 3.10 or newer.

@@ -65,6 +65,20 @@ disabled, response IDs and models, finish reasons, usage, timing, and errors may
 Capture flags do not gate stop sequences, caller-supplied metadata or raw attributes, or exception
 messages and stack traces; redact those separately when needed. Request tools and `tool_choice` are part of the captured input, so `captureInput: false` removes them.
 
+## Native Claude SDK spans
+
+`@anthropic-ai/sdk` 0.134.0 and later emits OpenTelemetry spans natively when the application registers a global tracer provider. Use this package or the native spans, not the two. If you use the two, each request has two spans.
+
+To keep this package, turn off the native spans on each client:
+
+```ts
+const anthropic = wrapAnthropic(new Anthropic({ openTelemetry: false }));
+```
+
+With global instrumentation, set `ANTHROPIC_OPEN_TELEMETRY=false` before you make the clients. The Claude SDK reads this variable only for a client that has no `openTelemetry` option. For a client with this option, set `openTelemetry: false`.
+
+To use the native spans instead of this package, refer to [Native Claude SDK spans](../otel/README.md#native-claude-sdk-spans). The Claude API can also send server-side spans to telemetry.dev. Refer to [Claude Platform](https://telemetry.dev/docs/integrations/claude-platform).
+
 ## Limitations
 
 - `messages.countTokens`, `beta.messages.countTokens`, batches, and other non-Messages surfaces are not instrumented.
