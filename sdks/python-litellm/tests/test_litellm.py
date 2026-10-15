@@ -959,7 +959,7 @@ def test_stream_finish_reasons_are_capped_at_a_fixed_length(
     make: Any, monkeypatch: pytest.MonkeyPatch, spent: bool
 ) -> None:
     memory = make()
-    max_length = telemetry_dev_litellm._FINISH_REASON_MAX_LENGTH  # pyright: ignore[reportPrivateUsage]
+    max_length = 128
 
     def choice(index: int, content: str | None, finish_reason: str | None) -> Any:
         return SimpleNamespace(

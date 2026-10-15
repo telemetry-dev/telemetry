@@ -802,6 +802,30 @@ def test_chat_stream_choice_states_are_bounded(memory: SimpleNamespace) -> None:
     assert a["telemetry.dev.capture.truncated"] is True
 
 
+@pytest.mark.parametrize("spent", [False, True], ids=["within-budget", "budget-spent"])
+def test_chat_stream_finish_reasons_are_capped_at_a_fixed_length(
+    memory: SimpleNamespace, spent: bool
+) -> None:
+    max_length = 128
+    content = "x" * 1024 if spent else "Hi"
+    events: list[dict[str, Any]] = [
+        *(chat_chunk({"role": "assistant", "content": content}) for _ in range(70 if spent else 1)),
+        {
+            **chat_chunk({}),
+            "choices": [
+                {"index": 0, "delta": {}, "finish_reason": "r" * 10_000},
+                {"index": 1, "delta": {}, "finish_reason": "stop"},
+            ],
+        },
+    ]
+
+    stream, a = _streamed_chat(memory, events)
+
+    assert list(a["gen_ai.response.finish_reasons"]) == ["r" * max_length, "stop"]
+    assert all(len(state.finish_reason or "") <= max_length for state in stream._states.values())
+    assert (a.get("telemetry.dev.capture.truncated") is True) is spent
+
+
 def test_chat_stream_chunk_error_sets_error_status(memory: SimpleNamespace) -> None:
     events = [
         chat_chunk(

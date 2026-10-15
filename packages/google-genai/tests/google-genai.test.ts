@@ -1668,6 +1668,33 @@ test.each([false, true])(
   },
 );
 
+test("streaming takes finish reasons from per-index state when a chunk repeats an index", async () => {
+  const spans = setupSpans();
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield {
+          candidates: [
+            { index: 0, finishReason: "R".repeat(10_000) },
+            { index: 0, finishReason: "STOP" },
+          ],
+        };
+      },
+    },
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: "go" }),
+  );
+
+  for await (const _chunk of stream) {
+  }
+
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["STOP"]);
+});
+
 test("masked streaming early break withholds partial output", async () => {
   const seen: string[] = [];
 

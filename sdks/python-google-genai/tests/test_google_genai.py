@@ -1308,7 +1308,7 @@ def test_stream_candidate_indices_are_charged_against_the_bound(
 @pytest.mark.parametrize("spent", [False, True], ids=["within-budget", "budget-spent"])
 def test_stream_finish_reasons_are_capped_at_a_fixed_length(make: Any, spent: bool) -> None:
     memory = make()
-    max_length = google_genai_instrumentation._FINISH_REASON_MAX_LENGTH  # pyright: ignore[reportPrivateUsage]
+    max_length = 128
     chunks: list[dict[str, Any]] = [
         {
             "candidates": [

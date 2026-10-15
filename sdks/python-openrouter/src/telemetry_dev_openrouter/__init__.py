@@ -25,6 +25,7 @@ _CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated"
 # max_attribute_length after the mask.
 _STREAM_CAPTURE_MAX_BYTES = 64 * 1024
 _STREAM_CAPTURE_MAX_ITEMS = 1024
+_FINISH_REASON_MAX_LENGTH = 128
 _TERMINAL_RESPONSE_EVENTS = frozenset(
     {"response.completed", "response.failed", "response.incomplete"}
 )
@@ -451,7 +452,7 @@ def _record_chat_chunk(
                 _merge_tool_call(state, tool_call)
         finish_reason = _field(choice, "finish_reason")
         if isinstance(finish_reason, str):
-            state.finish_reason = finish_reason
+            state.finish_reason = finish_reason[:_FINISH_REASON_MAX_LENGTH]
     return {
         "response_id": _string(_field(chunk, "id")),
         "response_model": _string(_field(chunk, "model")),

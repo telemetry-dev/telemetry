@@ -1370,6 +1370,9 @@ class StreamAggregator {
         : record,
     );
 
+    // A chunk can repeat an index, so its own list would keep uncapped reasons; finish() builds
+    // the list from the capped per-index state instead.
+    delete chunkAttributes["gen_ai.response.finish_reasons"];
     Object.assign(this.attributes, chunkAttributes);
   }
 
