@@ -3979,3 +3979,165 @@ def test_compaction_replacement_respects_the_item_limit(make: Any, spare_items: 
     assert state.budget.truncated is False
     assert state.budget.items_used == sum(held for _, held in state.block_reservations.values())
     assert state.blocks.get(1) == (replaced if spare_items == 0 else None)
+
+
+COMPACTION_ITERATION: dict[str, Any] = {
+    "type": "compaction",
+    "input_tokens": 40,
+    "output_tokens": 7,
+    "cache_creation_input_tokens": 4,
+    "cache_read_input_tokens": 6,
+    "cache_creation": {"ephemeral_5m_input_tokens": 1, "ephemeral_1h_input_tokens": 3},
+}
+FIRST_TURN: dict[str, Any] = {
+    "type": "message",
+    "model": "claude-opus-5",
+    "input_tokens": 4,
+    "output_tokens": 2,
+    "cache_creation_input_tokens": 1,
+    "cache_read_input_tokens": 1,
+    "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 1},
+}
+SECOND_TURN: dict[str, Any] = {
+    **FIRST_TURN,
+    "type": "fallback_message",
+    "model": "claude-opus-4-8",
+    "input_tokens": 6,
+    "output_tokens": 3,
+    "cache_creation_input_tokens": 2,
+    "cache_read_input_tokens": 2,
+    "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 2},
+}
+# Advisor tokens are billed at the advisor's rates and left out of the top-level usage.
+ADVISOR_TURN: dict[str, Any] = {
+    **FIRST_TURN,
+    "type": "advisor_message",
+    "model": "claude-haiku-4-5",
+    "input_tokens": 100,
+    "output_tokens": 50,
+    "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 5},
+}
+# The top-level usage sums both executor turns, while message_start reports only the first.
+TURNS_USAGE: dict[str, Any] = {
+    "input_tokens": 10,
+    "output_tokens": 5,
+    "cache_creation_input_tokens": 3,
+    "cache_read_input_tokens": 3,
+    "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 3},
+}
+FIRST_TURN_USAGE: dict[str, Any] = {
+    "input_tokens": 4,
+    "output_tokens": 0,
+    "cache_creation_input_tokens": 1,
+    "cache_read_input_tokens": 1,
+    "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 1},
+}
+
+
+def usage_span(
+    memory: SimpleNamespace,
+    streaming: bool,
+    start_usage: dict[str, Any],
+    final_usage: dict[str, Any],
+) -> dict[str, object]:
+    # A stream reports start_usage on message_start and final_usage, minus the one-hour split it
+    # never carries there, on message_delta; a unary response reports final_usage.
+    delta_usage = {key: value for key, value in final_usage.items() if key != "cache_creation"}
+    events = [
+        {
+            "type": "message_start",
+            "message": message_payload(id="msg_usage", content=[], usage=start_usage),
+        },
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": delta_usage},
+        {"type": "message_stop"},
+    ]
+    response = message_payload(usage=final_usage)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(events) if streaming else json_response(response)
+
+    client = wrapped_sync_client(handler)
+    if streaming:
+        for _event in client.beta.messages.create(
+            model="claude-opus-5", max_tokens=64, messages=BETA_MESSAGES, stream=True
+        ):
+            pass
+    else:
+        client.beta.messages.create(model="claude-opus-5", max_tokens=64, messages=BETA_MESSAGES)
+    return attrs(only_span(memory))
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["unary", "stream"])
+def test_compaction_iterations_are_added_to_usage_with_one_hour_cache_writes(
+    memory: SimpleNamespace, streaming: bool
+) -> None:
+    a = usage_span(
+        memory,
+        streaming,
+        FIRST_TURN_USAGE,
+        {
+            **TURNS_USAGE,
+            "iterations": [FIRST_TURN, ADVISOR_TURN, COMPACTION_ITERATION, SECOND_TURN],
+        },
+    )
+
+    assert a["gen_ai.usage.input_tokens"] == 10 + 3 + 3 + 40 + 6 + 4
+    assert a["gen_ai.usage.output_tokens"] == 5 + 7
+    assert a["gen_ai.usage.cache_read.input_tokens"] == 3 + 6
+    assert a["gen_ai.usage.cache_creation.input_tokens"] == 3 + 4
+    assert a["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"] == 1 + 2 + 3
+    assert "telemetry.dev.capture.truncated" not in a
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["unary", "stream"])
+def test_one_hour_cache_writes_are_recorded_without_iterations(
+    memory: SimpleNamespace, streaming: bool
+) -> None:
+    a = usage_span(memory, streaming, FIRST_TURN_USAGE, {**FIRST_TURN_USAGE, "output_tokens": 2})
+
+    assert a["gen_ai.usage.cache_creation.input_tokens"] == 1
+    assert a["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"] == 1
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["unary", "stream"])
+def test_compaction_usage_past_the_iteration_bound_is_flagged(
+    memory: SimpleNamespace, streaming: bool
+) -> None:
+    a = usage_span(
+        memory,
+        streaming,
+        FIRST_TURN_USAGE,
+        {**FIRST_TURN_USAGE, "iterations": [COMPACTION_ITERATION] * 1_001},
+    )
+
+    assert a["gen_ai.usage.output_tokens"] == 7 * 1_000
+    assert a["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"] == 1 + 3 * 1_000
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+def test_iterations_usage_reads_only_the_bounded_tail() -> None:
+    class HostileIterations(list[dict[str, Any]]):
+        def __iter__(self) -> Iterator[dict[str, Any]]:
+            raise AssertionError("inspected an iteration outside the bounded tail")
+
+        def __reversed__(self) -> Iterator[dict[str, Any]]:
+            raise AssertionError("inspected an iteration outside the bounded tail")
+
+        def __getitem__(self, index: Any) -> Any:
+            # A slice copies the whole sequence, so a full scan of the copy would go unseen.
+            if isinstance(index, slice):
+                raise AssertionError("sliced the iterations")
+            if isinstance(index, int) and index < 1_001:
+                raise AssertionError("inspected an iteration outside the bounded tail")
+            return super().__getitem__(index)
+
+    implementation = cast(Any, telemetry_dev_anthropic)
+    values = [FIRST_TURN] * 2_001
+    values[1_001] = COMPACTION_ITERATION
+
+    iterations = implementation._iterations_usage({"iterations": HostileIterations(values)})
+
+    assert iterations.compaction["output_tokens"] == 7
+    assert iterations.compaction_one_hour_cache_creation_tokens == 3
+    assert iterations.executor_one_hour_cache_creation_tokens == 999
+    assert iterations.truncated is True

@@ -2227,3 +2227,161 @@ test("beta streams keep a compaction delta without a start block as compaction",
     },
   ]);
 });
+
+const compactionIteration = {
+  type: "compaction",
+  input_tokens: 40,
+  output_tokens: 7,
+  cache_creation_input_tokens: 4,
+  cache_read_input_tokens: 6,
+  cache_creation: { ephemeral_5m_input_tokens: 1, ephemeral_1h_input_tokens: 3 },
+};
+
+const firstTurn = {
+  type: "message",
+  model: "claude-opus-5",
+  input_tokens: 4,
+  output_tokens: 2,
+  cache_creation_input_tokens: 1,
+  cache_read_input_tokens: 1,
+  cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 1 },
+};
+
+const secondTurn = {
+  ...firstTurn,
+  type: "fallback_message",
+  model: "claude-opus-4-8",
+  input_tokens: 6,
+  output_tokens: 3,
+  cache_creation_input_tokens: 2,
+  cache_read_input_tokens: 2,
+  cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 2 },
+};
+
+// Advisor tokens are billed at the advisor's rates and left out of the top-level usage.
+const advisorTurn = {
+  ...firstTurn,
+  type: "advisor_message",
+  model: "claude-haiku-4-5",
+  input_tokens: 100,
+  output_tokens: 50,
+  cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 5 },
+};
+
+// The top-level usage sums both executor turns, while message_start reports only the first.
+const turnsUsage = {
+  input_tokens: 10,
+  output_tokens: 5,
+  cache_creation_input_tokens: 3,
+  cache_read_input_tokens: 3,
+  cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 3 },
+};
+
+const firstTurnUsage = {
+  input_tokens: 4,
+  output_tokens: 0,
+  cache_creation_input_tokens: 1,
+  cache_read_input_tokens: 1,
+  cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 1 },
+};
+
+// A stream reports startUsage on message_start and finalUsage, minus the one-hour split it
+// never carries there, on message_delta; a unary response reports finalUsage.
+async function usageSpan(
+  streaming: boolean,
+  startUsage: JsonRecord,
+  finalUsage: JsonRecord,
+): Promise<ReadableSpan> {
+  const errors: unknown[] = [];
+
+  const spans = setupSpans(undefined, true, undefined, {
+    onError: (error) => errors.push(error),
+  });
+
+  const { cache_creation: _split, ...deltaUsage } = finalUsage;
+
+  const events = [
+    {
+      type: "message_start",
+      message: messagePayload({ id: "msg_usage", content: [], usage: startUsage }),
+    },
+    { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: deltaUsage },
+    { type: "message_stop" },
+  ];
+
+  const source = {
+    controller: new AbortController(),
+    async *[Symbol.asyncIterator]() {
+      yield* events;
+    },
+  };
+
+  const response = messagePayload({ usage: finalUsage });
+
+  const client = wrapAnthropic({
+    messages: { create: async (_params: unknown) => (streaming ? source : response) },
+  });
+
+  const result = await client.messages.create({
+    model: "claude-opus-5",
+    max_tokens: 64,
+    messages: [],
+    stream: streaming,
+  });
+
+  if (streaming) await collectStream(result as AsyncIterable<unknown>);
+  const span = await exportedSpan(spans);
+  expect(errors).toEqual([]);
+
+  return span;
+}
+
+test.each([false, true])(
+  "compaction iterations are added to usage and one-hour cache writes are recorded (streaming: %s)",
+  async (streaming) => {
+    const span = await usageSpan(streaming, firstTurnUsage, {
+      ...turnsUsage,
+      iterations: [firstTurn, advisorTurn, compactionIteration, secondTurn],
+    });
+
+    expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(10 + 3 + 3 + 40 + 6 + 4);
+    expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(5 + 7);
+    expect(span.attributes["gen_ai.usage.cache_read.input_tokens"]).toBe(3 + 6);
+    expect(span.attributes["gen_ai.usage.cache_creation.input_tokens"]).toBe(3 + 4);
+    expect(span.attributes["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"]).toBe(
+      1 + 2 + 3,
+    );
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  },
+);
+
+test.each([false, true])(
+  "one-hour cache writes are recorded without usage.iterations (streaming: %s)",
+  async (streaming) => {
+    const span = await usageSpan(streaming, firstTurnUsage, {
+      ...firstTurnUsage,
+      output_tokens: 2,
+    });
+
+    expect(span.attributes["gen_ai.usage.cache_creation.input_tokens"]).toBe(1);
+    expect(span.attributes["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"]).toBe(1);
+  },
+);
+
+test.each([false, true])(
+  "compaction usage reads only the bounded tail of usage.iterations (streaming: %s)",
+  async (streaming) => {
+    const iterations = Array<JsonRecord>(1_001).fill(declinedIteration);
+    Object.defineProperty(iterations, 0, {
+      get() {
+        throw new Error("inspected an iteration outside the bounded tail");
+      },
+    });
+    iterations[1] = compactionIteration;
+
+    const span = await usageSpan(streaming, firstTurnUsage, { ...firstTurnUsage, iterations });
+
+    expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(7);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  },
+);

@@ -285,16 +285,99 @@ def _messages_usage(raw: Any) -> dict[str, int | float] | None:
     )
 
 
+def _add_tokens(current: int | float | None, incoming: int | float | None) -> int | float | None:
+    if current is None or incoming is None:
+        return incoming if current is None else current
+    return current + incoming
+
+
+def _add_usage(
+    current: dict[str, int | float] | None, incoming: dict[str, int | float] | None
+) -> dict[str, int | float] | None:
+    if incoming is None:
+        return current
+    total = dict(current or {})
+    for key, value in incoming.items():
+        total[key] = total.get(key, 0) + value
+    return total or None
+
+
+def _one_hour_cache_creation_tokens(raw: Any) -> int | float | None:
+    return _number(_field(_field(raw, "cache_creation"), "ephemeral_1h_input_tokens"))
+
+
+class _IterationsUsage:
+    def __init__(self, truncated: bool) -> None:
+        self.compaction: dict[str, int | float] | None = None
+        self.compaction_one_hour_cache_creation_tokens: int | float | None = None
+        self.executor_one_hour_cache_creation_tokens: int | float | None = None
+        self.truncated = truncated
+
+
+def _iterations_usage(usage: Any) -> _IterationsUsage | None:
+    # The top-level usage fields sum the executor iterations (message and fallback_message) and
+    # leave out compaction, so compaction is added from here. Like the fallback lookup, only the
+    # bounded tail of usage.iterations is read.
+    value = _field(usage, "iterations")
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes | bytearray):
+        return None
+    iterations = cast(Sequence[Any], value)
+    result = _IterationsUsage(len(iterations) > _STREAM_CAPTURE_MAX_ITEMS)
+    first_index = max(0, len(iterations) - _STREAM_CAPTURE_MAX_ITEMS)
+    for index in range(first_index, len(iterations)):
+        entry = iterations[index]
+        entry_type = _string(_field(entry, "type"))
+        if entry_type == "compaction":
+            result.compaction = _add_usage(result.compaction, _messages_usage(entry))
+            result.compaction_one_hour_cache_creation_tokens = _add_tokens(
+                result.compaction_one_hour_cache_creation_tokens,
+                _one_hour_cache_creation_tokens(entry),
+            )
+        elif entry_type in ("message", "fallback_message"):
+            result.executor_one_hour_cache_creation_tokens = _add_tokens(
+                result.executor_one_hour_cache_creation_tokens,
+                _one_hour_cache_creation_tokens(entry),
+            )
+    return result
+
+
+def _usage_attributes(
+    one_hour_cache_creation: int | float | None, capture_incomplete: bool
+) -> dict[str, Any] | None:
+    attributes: dict[str, Any] = {}
+    if one_hour_cache_creation is not None:
+        attributes["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"] = (
+            one_hour_cache_creation
+        )
+    if capture_incomplete:
+        attributes["telemetry.dev.capture.truncated"] = True
+    return attributes or None
+
+
 def _messages_response(response: Any) -> dict[str, Any]:
     content = _field(response, "content")
     role = _string(_field(response, "role")) or "assistant"
-    return {
+    usage = _field(response, "usage")
+    iterations = _iterations_usage(usage)
+    fields: dict[str, Any] = {
         "response_model": _string(_field(response, "model")),
         "response_id": _string(_field(response, "id")),
         "finish_reason": _string(_field(response, "stop_reason")),
         "output": [{"role": role, "content": _native(content)}] if content is not None else None,
-        "usage": _cache_inclusive_usage(_messages_usage(_field(response, "usage"))),
+        "usage": _cache_inclusive_usage(
+            _add_usage(_messages_usage(usage), iterations.compaction if iterations else None)
+        ),
     }
+    attributes = _usage_attributes(
+        _add_tokens(
+            _one_hour_cache_creation_tokens(usage),
+            iterations.compaction_one_hour_cache_creation_tokens if iterations else None,
+        ),
+        iterations is not None and iterations.truncated,
+    )
+    if attributes:
+        fields["attributes"] = attributes
+    return fields
 
 
 def _is_anthropic_class(client: object | None, name: str) -> bool:
@@ -352,6 +435,8 @@ class _StreamState:
         self.blocks: dict[int, dict[str, Any]] = {}
         self.tool_json: dict[int, str] = {}
         self.usage: dict[str, int | float] | None = None
+        self.one_hour_cache_creation_tokens: int | float | None = None
+        self.iterations: _IterationsUsage | None = None
         self.finish_reason: str | None = None
         self.response_model: str | None = None
         self.metadata_truncated = False
@@ -599,14 +684,29 @@ def _stream_partial(
         or state.unresolved_encrypted_content
     )
     capture_incomplete = output_incomplete or state.metadata_truncated
+    iterations = state.iterations
     fields: dict[str, Any] = {
         "output": None if mask_output_when_incomplete and output_incomplete else output,
-        "usage": _cache_inclusive_usage(state.usage),
+        "usage": _cache_inclusive_usage(
+            _add_usage(state.usage, iterations.compaction if iterations else None)
+        ),
         "finish_reason": state.finish_reason,
         "response_model": state.response_model,
     }
-    if capture_incomplete:
-        fields["attributes"] = {"telemetry.dev.capture.truncated": True}
+    # Only message_start carries the one-hour split, so later turns come from the executor
+    # iterations in the final usage when they report it.
+    executor_one_hour = iterations.executor_one_hour_cache_creation_tokens if iterations else None
+    one_hour = (
+        state.one_hour_cache_creation_tokens if executor_one_hour is None else executor_one_hour
+    )
+    attributes = _usage_attributes(
+        _add_tokens(
+            one_hour, iterations.compaction_one_hour_cache_creation_tokens if iterations else None
+        ),
+        capture_incomplete,
+    )
+    if attributes:
+        fields["attributes"] = attributes
     return fields
 
 
@@ -935,6 +1035,12 @@ def _fallback_serving_model(usage: Any, state: _StreamState) -> str | None:
     return None
 
 
+def _record_one_hour_cache_creation(usage: Any, state: _StreamState) -> None:
+    one_hour = _one_hour_cache_creation_tokens(usage)
+    if one_hour is not None:
+        state.one_hour_cache_creation_tokens = one_hour
+
+
 def _record_stream_event(event: Any, state: _StreamState) -> dict[str, Any]:
     event_type = _string(_field(event, "type"))
     update: dict[str, Any] = {}
@@ -943,6 +1049,7 @@ def _record_stream_event(event: Any, state: _StreamState) -> dict[str, Any]:
         update["response_id"] = _string(_field(message, "id"))
         update["response_model"] = _string(_field(message, "model"))
         state.usage = _merge_usage(state.usage, _messages_usage(_field(message, "usage")))
+        _record_one_hour_cache_creation(_field(message, "usage"), state)
     elif event_type == "content_block_start":
         _record_content_block_start(event, state)
     elif event_type == "content_block_delta":
@@ -951,9 +1058,13 @@ def _record_stream_event(event: Any, state: _StreamState) -> dict[str, Any]:
         delta = _field(event, "delta")
         state.finish_reason = _string(_field(delta, "stop_reason")) or state.finish_reason
         state.usage = _merge_usage(state.usage, _messages_usage(_field(event, "usage")))
+        _record_one_hour_cache_creation(_field(event, "usage"), state)
         state.response_model = (
             _fallback_serving_model(_field(event, "usage"), state) or state.response_model
         )
+        iterations = _iterations_usage(_field(event, "usage"))
+        if iterations is not None:
+            state.iterations = iterations
     elif event_type == "content_block_stop":
         stop_index = _field(event, "index")
         if isinstance(stop_index, int):
