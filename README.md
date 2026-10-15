@@ -16,7 +16,7 @@
 
 Trace model calls, tool steps, and agent runs. Find slow requests, debug errors, and monitor token usage and cost.
 
-[Start tracing](https://telemetry.dev/signup) · [Documentation](https://docs.telemetry.dev) · [Integrations](https://telemetry.dev/integrations)
+[Start tracing](https://telemetry.dev/signup) · [Documentation](https://telemetry.dev/docs) · [Integrations](https://telemetry.dev/docs/integrations)
 
 </div>
 
@@ -160,7 +160,7 @@ Each integration links to its installation instructions and API coverage.
 | Pi                           | [Pi](packages/pi)                     |                                          |
 
 Other languages can use an existing OTLP/HTTP exporter.
-The [documentation](https://docs.telemetry.dev) describes endpoint configuration and authentication.
+The [documentation](https://telemetry.dev/docs) describes endpoint configuration and authentication.
 
 ## Development
 
@@ -226,6 +226,6 @@ This project uses the [MIT License](LICENSE).
 
 - [Website](https://telemetry.dev)
 - [Dashboard](https://telemetry.dev/login)
-- [Documentation](https://docs.telemetry.dev)
-- [Integrations](https://telemetry.dev/integrations)
+- [Documentation](https://telemetry.dev/docs)
+- [Integrations](https://telemetry.dev/docs/integrations)
 - [Pricing](https://telemetry.dev/pricing)
