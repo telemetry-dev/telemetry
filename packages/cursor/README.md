@@ -34,7 +34,11 @@ parts:
 - `telemetry-dev-cursor hook` is the command in `hooks.json`. The command sends
   the event payload to the daemon through a local socket. The command always
   returns `{}` and exit code 0. A hook error does not stop the agent, but the
-  first delivery can add up to 10 seconds.
+  first delivery can add up to 10 seconds. On Windows the socket is a named
+  pipe, and pipe names are shared by all users of the machine. There the hook
+  sends a payload only after the pipe server proves that it can read
+  `~/.cursor/telemetry-dev-pipe.key`, a random key that the daemon creates on
+  its first start.
 - `telemetry-dev-cursor daemon` — the first hook starts it on demand. It
   holds open spans across hook processes and exports batched OTLP. It stops
   after 15 minutes without events.
@@ -158,3 +162,14 @@ To export none of this, set `enabled` to `false`.
   entries to the repository and supply the api key in the cloud environment.
 - The integration does not register Tab (inline completion) hooks. It traces
   only agent sessions.
+- On Windows, another user who creates the daemon's pipe first does not
+  receive payloads, as long as they can't read your `~/.cursor` folder (the
+  default for a user profile). An administrator, or a process that can
+  impersonate pipe clients, is not covered. Telemetry still stops: the daemon cannot start, and each
+  hook gives up after its delivery timeout. If
+  `~/.cursor/telemetry-dev-pipe.key` is deleted while the daemon runs, hooks
+  fail until the daemon stops; run `install` again to stop it. If the key file
+  is not exactly 32 bytes, the hook and the daemon refuse it; delete it, and
+  the next daemon creates a new one. After an upgrade from a version without
+  the key, the old daemon keeps running on its old pipe. It exits after 15
+  idle minutes only if it has no open turn; otherwise stop it by hand.

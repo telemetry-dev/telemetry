@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHmac, randomBytes } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -10,7 +11,7 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { createConnection } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -22,7 +23,8 @@ import { afterEach, describe, expect, expectTypeOf, onTestFinished, test, vi } f
 import { sessionSpanContext } from "../../otel/src/index.ts";
 
 import { fileConfig, resetForTesting, type TelemetryDevCursorOptions } from "../src/config.ts";
-import { listen, tryLock, unlock } from "../src/daemon.ts";
+import { listen, readPipeKey, tryLock, unlock } from "../src/daemon.ts";
+import { send } from "../src/hook.ts";
 import { runInstall, runUninstall } from "../src/install.ts";
 import { createCursorTelemetry, type CursorTelemetry } from "../src/telemetry.ts";
 import { createTitleLookup } from "../src/titles.ts";
@@ -1353,6 +1355,108 @@ describe.skipIf(process.platform === "win32")("daemon socket protocol", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+  test("with a pipe key, the hook delivers to a daemon that holds the same key", async () => {
+    const { spans, telemetry } = makeHarness();
+    const dir = mkdtempSync(join(tmpdir(), "tdc-key-"));
+    const path = join(dir, "d.sock");
+    const key = randomBytes(32);
+    const server = await listen(path, telemetry, undefined, key);
+
+    if (!server) throw new Error("failed to start test daemon");
+
+    try {
+      for (const line of [
+        event("beforeSubmitPrompt", { prompt: "x" }),
+        event("stop", { status: "completed" }),
+      ]) {
+        await send(path, `${JSON.stringify(line)}\n`, Date.now() + 3000, key);
+      }
+
+      await flush();
+      expect(agentSpans(spans, "cursor")).toHaveLength(1);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    { server: "knows the key", serverKey: "same", delivered: true },
+    { server: "uses another key", serverKey: "other", delivered: false },
+    { server: "acks without a proof", serverKey: undefined, delivered: false },
+    { server: "sends data after the proof", serverKey: "same", delivered: false, extra: "ok\n" },
+  ] as const)(
+    "with a pipe key, the hook sends only to a server that $server",
+    async ({ serverKey, delivered, ...rest }) => {
+      const extra = "extra" in rest ? rest.extra : "";
+      const dir = mkdtempSync(join(tmpdir(), "tdc-fake-"));
+      const path = join(dir, "d.sock");
+      const key = randomBytes(32);
+      const keys = { same: key, other: randomBytes(32) };
+      const received: string[] = [];
+
+      const server = createServer((socket) => {
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk: string) => {
+          for (const line of chunk.split("\n").filter((l) => l.length > 0)) {
+            const nonce = (JSON.parse(line) as JsonRecord).telemetry_dev_challenge;
+
+            if (typeof nonce === "string" && serverKey) {
+              socket.write(
+                `${createHmac("sha256", keys[serverKey]).update(nonce).digest("hex")}\n${extra}`,
+              );
+            } else {
+              received.push(line);
+              socket.write("ok\n");
+            }
+          }
+        });
+      });
+
+      await new Promise<void>((resolve) => server.listen(path, resolve));
+
+      const ended = new Promise((resolve) =>
+        server.once("connection", (socket) => socket.once("close", resolve)),
+      );
+
+      try {
+        const sent = send(path, '{"prompt":"secret"}\n', Date.now() + 3000, key);
+
+        if (delivered) await sent;
+        else await expect(sent).rejects.toThrow("ownership check");
+        // Every byte the hook sent has arrived once its connection is closed.
+        await ended;
+        expect(received.some((line) => line.includes("secret"))).toBe(delivered);
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("the pipe key is accepted only at exactly 32 bytes", () => {
+    const home = mkdtempSync(join(tmpdir(), "tdc-pipekey-"));
+    const restoreHome = setHome(home);
+    mkdirSync(join(home, ".cursor"));
+    const file = join(home, ".cursor", "telemetry-dev-pipe.key");
+
+    try {
+      expect(() => readPipeKey()).toThrow();
+
+      for (const size of [0, 16, 31, 33, 64]) {
+        writeFileSync(file, randomBytes(size));
+        expect(() => readPipeKey(), `${size} bytes`).toThrow("malformed pipe key");
+      }
+
+      const key = randomBytes(32);
+      writeFileSync(file, key);
+      expect(readPipeKey().equals(key)).toBe(true);
+    } finally {
+      restoreHome();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test("a stale startup lock yields one socket owner", async () => {
     const { telemetry } = makeHarness();
     const dir = mkdtempSync(join(tmpdir(), "tdc-lock-"));

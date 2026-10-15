@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { socketPath } from "./daemon.ts";
+import { pipeProof, readPipeKey, socketPath } from "./daemon.ts";
 
 type JsonValue = string | number | boolean | null | undefined | JsonValue[] | JsonRecord;
 
@@ -52,8 +52,12 @@ async function deliver(payload: string, cliPath: string): Promise<void> {
   const line = frame(payload);
   const deadline = Date.now() + DELIVER_DEADLINE_MS;
 
+  // Read per attempt: a daemon spawned below creates the key on first start.
+  const attempt = (): Promise<void> =>
+    send(socketPath(), line, deadline, process.platform === "win32" ? readPipeKey() : undefined);
+
   try {
-    await send(line, deadline);
+    await attempt();
 
     return;
   } catch {
@@ -65,7 +69,7 @@ async function deliver(payload: string, cliPath: string): Promise<void> {
     await sleep(100);
 
     try {
-      await send(line, deadline);
+      await attempt();
 
       return;
     } catch {
@@ -109,27 +113,64 @@ function spawnDaemon(cliPath: string): void {
   child.unref();
 }
 
-function send(line: string, deadline: number): Promise<void> {
+/**
+ * Writes one line and waits for the ack. With `pipeKey`, the line is sent
+ * only after the server answers a fresh challenge with the matching
+ * pipeProof; a server that cannot is refused. Exported for tests.
+ */
+export function send(
+  path: string,
+  line: string,
+  deadline: number,
+  pipeKey?: Buffer,
+): Promise<void> {
   const budget = Math.min(ACK_TIMEOUT_MS, deadline - Date.now());
 
   if (budget <= 0) return Promise.reject(new Error("delivery deadline exceeded"));
   const { promise, resolve, reject } = Promise.withResolvers<void>();
-  const socket: Socket = createConnection(socketPath());
+  const socket: Socket = createConnection(path);
+  const nonce = randomBytes(32).toString("hex");
+  const expected = pipeKey && Buffer.from(pipeProof(pipeKey, nonce));
+  let proven = false;
+  let reply = "";
 
-  const timer = setTimeout(() => {
+  const fail = (error: Error): void => {
+    clearTimeout(timer);
     socket.destroy();
-    reject(new Error("ack timeout"));
-  }, budget);
-
-  socket.once("error", (error) => {
-    clearTimeout(timer);
     reject(error);
-  });
-  socket.once("connect", () => socket.write(line));
-  socket.once("data", () => {
-    clearTimeout(timer);
-    socket.end();
-    resolve();
+  };
+
+  const timer = setTimeout(() => fail(new Error("ack timeout")), budget);
+
+  socket.once("error", fail);
+  socket.once("connect", () =>
+    socket.write(expected ? `${JSON.stringify({ telemetry_dev_challenge: nonce })}\n` : line),
+  );
+  socket.on("data", (chunk: Buffer) => {
+    if (!expected || proven) {
+      clearTimeout(timer);
+      socket.end();
+      resolve();
+
+      return;
+    }
+
+    reply += chunk.toString("utf8");
+    const end = reply.indexOf("\n");
+
+    if (end < 0 && reply.length <= expected.length) return;
+    const answer = Buffer.from(end < 0 ? reply : reply.slice(0, end));
+    // The daemon sends nothing after the proof until the payload is acked.
+    const trailing = end >= 0 && end + 1 < reply.length;
+
+    if (trailing || answer.length !== expected.length || !timingSafeEqual(answer, expected)) {
+      fail(new Error("pipe server failed the ownership check"));
+
+      return;
+    }
+
+    proven = true;
+    socket.write(line);
   });
 
   return promise;

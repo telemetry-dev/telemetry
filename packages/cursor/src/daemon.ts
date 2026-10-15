@@ -1,8 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import {
   chmodSync,
+  linkSync,
   lstatSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
   renameSync,
   rmSync,
@@ -11,8 +13,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { tmpdir, userInfo } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir, userInfo } from "node:os";
+import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { fileConfig } from "./config.ts";
@@ -35,10 +37,64 @@ const SEEN_IDS_MAX = 1000;
 
 export function socketPath(): string {
   if (process.platform === "win32") {
-    return `\\\\.\\pipe\\telemetry-dev-cursor-${userInfo().username}`;
+    // The "-v2" suffix keeps hooks that require pipeProof from reaching a
+    // daemon of an earlier version, which cannot answer the challenge.
+    return `\\\\.\\pipe\\telemetry-dev-cursor-v2-${userInfo().username}`;
   }
 
   return join(socketDir(), "d.sock");
+}
+
+/**
+ * Windows pipe names are global, so another local user can create ours
+ * before the daemon does. Before sending a payload, the hook makes the pipe
+ * server prove that it can read this per-user key; the user profile that
+ * holds it is not readable by other non-admin users.
+ */
+export function pipeKeyPath(): string {
+  return join(homedir(), ".cursor", "telemetry-dev-pipe.key");
+}
+
+/** The pipe server's answer to a hook's challenge nonce. */
+export function pipeProof(key: Buffer, nonce: string): string {
+  return createHmac("sha256", key).update(nonce).digest("hex");
+}
+
+/** Bytes in the pipe key. A shorter key, even an empty one, would be guessable. */
+const PIPE_KEY_BYTES = 32;
+
+/** Reads the pipe key; throws when it is missing or not exactly PIPE_KEY_BYTES long. */
+export function readPipeKey(): Buffer {
+  const key = readFileSync(pipeKeyPath());
+
+  if (key.length !== PIPE_KEY_BYTES) throw new Error("malformed pipe key");
+
+  return key;
+}
+
+/** Reads the pipe key, creating it on first use; concurrent daemons agree on one key. */
+function ensurePipeKey(): Buffer {
+  try {
+    return readPipeKey();
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error;
+  }
+
+  const path = pipeKeyPath();
+  mkdirSync(dirname(path), { recursive: true });
+  const temp = `${path}.${process.pid}.${randomUUID()}`;
+  writeFileSync(temp, randomBytes(PIPE_KEY_BYTES), { flag: "wx", mode: 0o600 });
+
+  try {
+    // link fails on an existing key, so a fully written key is published once.
+    linkSync(temp, path);
+  } catch (error) {
+    if (errorCode(error) !== "EEXIST") throw error;
+  } finally {
+    rmSync(temp, { force: true });
+  }
+
+  return readPipeKey();
 }
 
 /**
@@ -76,7 +132,8 @@ export async function runDaemon(): Promise<void> {
     if (server) void stop(server, telemetry);
   };
 
-  server = await listen(socketPath(), telemetry, shutdown);
+  const pipeKey = process.platform === "win32" ? ensurePipeKey() : undefined;
+  server = await listen(socketPath(), telemetry, shutdown, pipeKey);
 
   if (!server) {
     await telemetry.settle();
@@ -110,14 +167,18 @@ async function stop(server: Server, telemetry: CursorTelemetry): Promise<void> {
   process.exit(0);
 }
 
-/** Exported for tests; production wiring lives in runDaemon. */
+/**
+ * Exported for tests; production wiring lives in runDaemon. With `pipeKey`,
+ * the server answers hook challenges with pipeProof.
+ */
 export async function listen(
   path: string,
   telemetry: CursorTelemetry,
   onShutdown: () => void = () => {},
+  pipeKey?: Buffer,
 ): Promise<Server | undefined> {
   const seenIds = new Set<string>();
-  const server = createServer((socket) => serve(socket, telemetry, seenIds, onShutdown));
+  const server = createServer((socket) => serve(socket, telemetry, seenIds, onShutdown, pipeKey));
 
   if (process.platform === "win32") {
     try {
@@ -326,6 +387,7 @@ function serve(
   telemetry: CursorTelemetry,
   seenIds: Set<string>,
   onShutdown: () => void,
+  pipeKey: Buffer | undefined,
 ): void {
   let buffer = "";
   socket.setEncoding("utf8");
@@ -340,11 +402,15 @@ function serve(
 
       if (line.trim().length === 0) continue;
       let shutdown = false;
+      let reply = "ok\n";
 
       try {
         const parsed = JSON.parse(line) as JsonRecord;
+        const challenge = readString(parsed.telemetry_dev_challenge);
 
-        if (parsed.telemetry_dev_control === "shutdown") {
+        if (challenge !== undefined && pipeKey) {
+          reply = `${pipeProof(pipeKey, challenge)}\n`;
+        } else if (parsed.telemetry_dev_control === "shutdown") {
           // Sent by install/uninstall so the next hook restarts the daemon
           // with the new configuration.
           shutdown = true;
@@ -355,7 +421,7 @@ function serve(
         // Malformed line from a mismatched forwarder version; drop it.
       }
 
-      socket.write("ok\n");
+      socket.write(reply);
 
       if (shutdown) onShutdown();
     }
