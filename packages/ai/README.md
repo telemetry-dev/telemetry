@@ -177,6 +177,12 @@ media and batch wrappers record no payloads; when a `mask` is passed to a wrappe
 records the masked error message as its status and exception message, or a generic text when the
 mask omits it or throws, and no stack trace.
 
+The mask sees only error messages. Error names and error types (`error.type` and
+`exception.type`) are recorded unmasked. Without a mask, a wrapper records the original error,
+and OpenTelemetry uses its `code`, when it has one, as `exception.type`. With a mask, a wrapper
+records the exception as `{ name, message }`, so `code` is not used: a file-not-found error with
+code `ENOENT` is recorded with type `Error`.
+
 `ai@7` still accepts `experimental_telemetry` as a deprecated alias for `telemetry`.
 
 ### Global registration
