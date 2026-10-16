@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.9](https://github.com/telemetry-dev/telemetry/compare/mcp-v0.1.8...mcp-v0.1.9) (2026-10-16)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.1.9
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.1.9
+
 ## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/mcp-v0.1.7...mcp-v0.1.8) (2026-10-14)
 
 

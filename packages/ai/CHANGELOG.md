@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.9](https://github.com/telemetry-dev/telemetry/compare/ai-sdk-v0.1.8...ai-sdk-v0.1.9) (2026-10-16)
+
+
+### Features
+
+* **sdk:** run the configured mask on integration content and in the ai package ([#73](https://github.com/telemetry-dev/telemetry/issues/73)) ([365b6e7](https://github.com/telemetry-dev/telemetry/commit/365b6e76ebbccd3bb63803d0abb1757b7d16573d))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/otel bumped to 0.1.6
+
 ## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/ai-sdk-v0.1.7...ai-sdk-v0.1.8) (2026-09-30)
 
 

@@ -2880,7 +2880,7 @@ wheels = [
 
 [[package]]
 name = "telemetry-dev"
-version = "0.2.9"
+version = "0.2.10"
 source = { editable = "../python" }
 dependencies = [
     { name = "opentelemetry-api", version = "1.43.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -2908,7 +2908,7 @@ dev = [
 
 [[package]]
 name = "telemetry-dev-litellm"
-version = "0.1.5"
+version = "0.1.6"
 source = { editable = "." }
 dependencies = [
     { name = "litellm" },
