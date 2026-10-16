@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.10](https://github.com/telemetry-dev/telemetry/compare/python-v0.2.9...python-v0.2.10) (2026-10-16)
+
+
+### Features
+
+* **sdk:** run the configured mask on integration content and in the ai package ([#73](https://github.com/telemetry-dev/telemetry/issues/73)) ([365b6e7](https://github.com/telemetry-dev/telemetry/commit/365b6e76ebbccd3bb63803d0abb1757b7d16573d))
+
 ## [0.2.9](https://github.com/telemetry-dev/telemetry/compare/python-v0.2.8...python-v0.2.9) (2026-10-14)
 
 

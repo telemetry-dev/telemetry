@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.9](https://github.com/telemetry-dev/telemetry/compare/tanstack-ai-v0.1.8...tanstack-ai-v0.1.9) (2026-10-16)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/otel bumped to 0.1.6
+
 ## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/tanstack-ai-v0.1.7...tanstack-ai-v0.1.8) (2026-10-14)
 
 
