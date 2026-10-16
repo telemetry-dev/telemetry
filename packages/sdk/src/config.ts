@@ -12,7 +12,11 @@ import {
 
 export type { BatchOptions, ExportMode, LogLevel, SdkLogLevel } from "@telemetry-dev/otel";
 
-/** Redaction hook applied to captured content (input/output/log message) before JSON stringification. */
+/**
+ * Redaction hook applied to captured content (input/output, log messages and attributes, and
+ * content passed to `SpanHandle.serializeContent`) before JSON stringification. Not applied to
+ * metadata or raw attributes.
+ */
 export type MaskFn<T = unknown> = (value: T, ctx: { key: string }) => T;
 
 export interface TelemetryOptions {

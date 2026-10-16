@@ -202,6 +202,75 @@ describe("capture integration", () => {
     expect(span.name).toBe("survives");
   });
 
+  test("serializeContent masks, stringifies and truncates integration content", () => {
+    const rewrite = (value: unknown): unknown =>
+      typeof value === "string"
+        ? value.replaceAll("secret", "[masked]")
+        : Array.isArray(value)
+          ? value.map(rewrite)
+          : value !== null && typeof value === "object"
+            ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, rewrite(item)]))
+            : value;
+
+    const keys: string[] = [];
+
+    setup({
+      maxAttributeLength: 40,
+      mask: (value, ctx) => {
+        keys.push(ctx.key);
+
+        return rewrite(value);
+      },
+    });
+
+    const span = startSpan("integration", { captureInput: false, captureOutput: false });
+
+    expect(span.serializeContent?.("tool failed: secret path", "exception.message")).toBe(
+      "tool failed: [masked] path",
+    );
+    expect(span.serializeContent?.({ chunks: [{ text: "secret doc" }] }, "grounding")).toBe(
+      '{"chunks":[{"text":"[masked] doc"}]}',
+    );
+    expect(span.serializeContent?.(`secret ${"x".repeat(60)}`, "long")).toBe(
+      `[masked] ${"x".repeat(17)}...[truncated]`,
+    );
+    expect(keys).toEqual(["exception.message", "grounding", "long"]);
+    span.end();
+  });
+
+  test("serializeContent withholds content the mask cannot handle", () => {
+    expect(startSpan("before-init").serializeContent?.("secret", "key")).toBeUndefined();
+
+    const errors: Error[] = [];
+
+    setup({
+      mask: (value, ctx) => {
+        if (ctx.key === "dropped") return undefined;
+
+        if (ctx.key === "broken") throw new Error("mask broke");
+
+        if (ctx.key === "odd-throw") throw Object.create(null);
+
+        return value;
+      },
+      onError: (error) => errors.push(error),
+    });
+
+    const span = startSpan("integration");
+    const circular: Record<string, unknown> = { text: "secret" };
+    circular.self = circular;
+
+    expect(span.serializeContent?.("secret", "dropped")).toBeUndefined();
+    expect(span.serializeContent?.("secret", "broken")).toBeUndefined();
+    expect(span.serializeContent?.("secret", "odd-throw")).toBeUndefined();
+    expect(span.serializeContent?.(circular, "circular")).toBeUndefined();
+    expect(errors.map((error) => error.message)).toEqual([
+      "mask broke",
+      "A value that cannot be converted to a string was thrown",
+    ]);
+    span.end();
+  });
+
   test("preserves truncation markers at default and custom span limits", async () => {
     const defaults = setup();
     startSpan("big", { input: "x".repeat(70_000) }).end();

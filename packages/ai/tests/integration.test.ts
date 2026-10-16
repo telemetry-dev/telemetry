@@ -326,6 +326,89 @@ test("a failed tool call records ERROR status and an exception event", async () 
   expect(exc?.attributes?.["log.severity_number"]).toBe(17);
 });
 
+test("the mask rewrites every exported payload", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const keys = new Set<string>();
+
+  const maskSecrets = (value: unknown): unknown =>
+    typeof value === "string"
+      ? value.replaceAll("secret", "[masked]")
+      : Array.isArray(value)
+        ? value.map(maskSecrets)
+        : value !== null && typeof value === "object"
+          ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, maskSecrets(item)]))
+          : value;
+
+  const integ = telemetryDev(
+    {
+      apiKey: "td_live_test",
+      environment: "test",
+      serviceName: "svc",
+      mask: (value, { key }) => {
+        keys.add(key);
+
+        return maskSecrets(value);
+      },
+    },
+    overrides,
+  );
+
+  const read = { toolCallId: "a", toolName: "read", input: { path: "secret-in" } };
+  const failing = { toolCallId: "b", toolName: "read", input: { path: "error-secret-in" } };
+
+  integ.onStart?.({ model, system: "secret system", prompt: "secret prompt" });
+  integ.onStepStart?.({ stepNumber: 0, model, messages: [{ role: "user", content: "secret" }] });
+  integ.onToolCallFinish?.({
+    stepNumber: 0,
+    toolCall: read,
+    durationMs: 1,
+    success: true,
+    output: { text: "secret-out" },
+  });
+  integ.onToolCallFinish?.({
+    stepNumber: 0,
+    toolCall: failing,
+    durationMs: 1,
+    success: false,
+    error: new Error("cannot read secret file"),
+  });
+  integ.onStepFinish?.({
+    stepNumber: 0,
+    model,
+    text: "secret step out",
+    finishReason: "stop",
+    response: { id: "r", modelId: "gpt-4o" },
+    usage: { inputTokens: 1, outputTokens: 1 },
+    warnings: [{ type: "other", message: "secret warning" }],
+  });
+  await integ.onFinish?.({ text: "secret root out", finishReason: "stop" });
+
+  const spans = spanBatches[0]!;
+  const failed = byOperation(spans, "execute_tool").find(
+    (s) => s.attributes["gen_ai.tool.call.id"] === "b",
+  )!;
+  const step = spans.find((s) => s.kind === SpanKind.CLIENT)!;
+
+  expect(
+    JSON.stringify(spans.map((span) => ({ attributes: span.attributes, events: span.events }))),
+  ).not.toContain("secret");
+  expect(event(failed, "exception")?.attributes?.["exception.message"]).toBe(
+    "cannot read [masked] file",
+  );
+  expect(event(step, "model.warning")?.attributes?.["log.message"]).toBe(
+    "Model warning: [masked] warning",
+  );
+  expect(step.attributes["gen_ai.output.messages"]).toBe("[masked] step out");
+  expect([...keys].sort()).toEqual([
+    "exception.message",
+    "gen_ai.input.messages",
+    "gen_ai.output.messages",
+    "gen_ai.tool.call.arguments",
+    "gen_ai.tool.call.result",
+    "log.message",
+  ]);
+});
+
 test("gateway provider is relabeled to Vercel AI Gateway on every span", async () => {
   const { spanBatches, overrides } = makeCapture();
 

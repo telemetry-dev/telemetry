@@ -16,5 +16,6 @@ export const NOOP_SPAN_HANDLE: SpanHandle = {
   update: () => NOOP_SPAN_HANDLE,
   recordOutputChunk: () => {},
   reportError: () => {},
+  serializeContent: () => undefined,
   end: () => {},
 };

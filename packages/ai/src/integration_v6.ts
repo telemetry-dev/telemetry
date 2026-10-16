@@ -19,7 +19,9 @@ import {
 
 import { resolveConfig, type ResolvedConfig, type TelemetryDevOptions } from "./config.ts";
 import {
+  contentAttr,
   providerLabel,
+  reportTelemetryError,
   readId,
   SEVERITY_ERROR,
   SEVERITY_INFO,
@@ -150,6 +152,7 @@ export function telemetryDev(
 // instance, one trace per generation, flushed at onFinish.
 function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
   const onError = config.onError;
+  const maskedAttr = (key: string, value: unknown) => contentAttr(config, key, value);
 
   // Per-generation state. Reset on every onStart.
   let rootSpan: Span | undefined;
@@ -262,7 +265,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
         );
         rootCtx = trace.setSpan(ROOT_CONTEXT, rootSpan);
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -285,7 +288,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
           messages: e.messages,
         });
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -345,8 +348,8 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
             "gen_ai.usage.reasoning.output_tokens": reasoningTokens ?? undefined,
             "gen_ai.response.finish_reasons": e.finishReason ? [e.finishReason] : undefined,
             "gen_ai.output.type": "text",
-            "gen_ai.input.messages": jsonAttr(step.messages),
-            "gen_ai.output.messages": jsonAttr(e.text),
+            "gen_ai.input.messages": maskedAttr("gen_ai.input.messages", step.messages),
+            "gen_ai.output.messages": maskedAttr("gen_ai.output.messages", e.text),
           }),
         );
 
@@ -368,7 +371,8 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
             "model.warning",
             omitUndefined({
               "log.severity_number": SEVERITY_WARN,
-              "log.message": `Model warning: ${detail}`,
+              "log.message":
+                maskedAttr("log.message", `Model warning: ${detail}`) ?? "Model warning",
               "warning.type":
                 warning.type?.constructor === String ? String(warning.type) : undefined,
             }),
@@ -386,7 +390,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
           responseModel: e.response?.modelId ?? null,
         });
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -394,7 +398,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
       try {
         toolStarts.set(e.toolCall.toolCallId, new Date());
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -420,15 +424,24 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
               "gen_ai.tool.name": e.toolCall.toolName,
               "gen_ai.tool.call.id": e.toolCall.toolCallId,
               ...conversationAttributes(),
-              "gen_ai.tool.call.arguments": jsonAttr(e.toolCall.input),
-              "gen_ai.tool.call.result": e.success ? jsonAttr(e.output) : undefined,
+              "gen_ai.tool.call.arguments": maskedAttr(
+                "gen_ai.tool.call.arguments",
+                e.toolCall.input,
+              ),
+              "gen_ai.tool.call.result": e.success
+                ? maskedAttr("gen_ai.tool.call.result", e.output)
+                : undefined,
             }),
           },
           parentCtx,
         );
 
         if (!e.success) {
-          const message = e.error instanceof Error ? e.error.message : unknownErrorMessage(e.error);
+          const message =
+            maskedAttr(
+              "exception.message",
+              e.error instanceof Error ? e.error.message : unknownErrorMessage(e.error),
+            ) ?? "Tool execution failed";
 
           const errorType = e.error instanceof Error ? e.error.name : "tool_error";
           span.setStatus({ code: SpanStatusCode.ERROR });
@@ -447,7 +460,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
           durationSec: Math.max(endedAt.getTime() - startedAt.getTime(), 0) / 1000,
         });
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -478,8 +491,8 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
             "gen_ai.request.model": model ?? undefined,
             "gen_ai.response.model": responseModel ?? undefined,
             ...conversationAttributes(),
-            "gen_ai.input.messages": jsonAttr(rootInput),
-            "gen_ai.output.messages": jsonAttr(rootOutput),
+            "gen_ai.input.messages": maskedAttr("gen_ai.input.messages", rootInput),
+            "gen_ai.output.messages": maskedAttr("gen_ai.output.messages", rootOutput),
             "gen_ai.response.finish_reasons": rootFinishReason ? [rootFinishReason] : undefined,
             "user.id": userId ?? undefined,
             ...samplingAttributes,
@@ -550,7 +563,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
 
         await emitter.flush([rootSpan, ...childSpans]);
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
   };

@@ -38,6 +38,7 @@ import {
   type SpanFields,
   type SpanType,
 } from "./attrs.ts";
+import { prepareCaptureValue } from "./capture.ts";
 import { type ClientCore, currentClient } from "./client.ts";
 import { NOOP_SPAN_HANDLE } from "./noop.ts";
 
@@ -80,6 +81,15 @@ export interface SpanHandle {
   /** Records an output chunk arrival. Pull-based streams include consumer delay between pulls. */
   recordOutputChunk(timestampMs?: number): void;
   reportError?(cause: unknown): void;
+  /**
+   * Prepares content that the span writes outside `input` and `output` the way those are
+   * prepared: the configured mask with `key` (the attribute the result is written to), JSON
+   * stringify (strings pass through), then truncation to `maxAttributeLength`. Returns undefined
+   * when the mask throws (reported to `onError`) or drops the value, or the value cannot be
+   * serialized. Capture flags are not checked. Absent on cores that predate it; treat a missing
+   * method as masked.
+   */
+  serializeContent?(value: unknown, key: string): string | undefined;
   end(fields?: SpanFields & { endTime?: Date | number }): void;
 }
 
@@ -302,6 +312,9 @@ export function createSpanHandle(
     },
     reportError(cause) {
       reportError(meta.onError, cause instanceof Error ? cause : new Error(String(cause)));
+    },
+    serializeContent(value, key) {
+      return prepareCaptureValue(key, value, meta.capture);
     },
     end(fields) {
       try {

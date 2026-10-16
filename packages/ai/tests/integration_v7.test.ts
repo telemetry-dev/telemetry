@@ -3319,6 +3319,403 @@ test("recordInputs and recordOutputs false omit message and tool payload attrs b
   ]);
 });
 
+const maskSecrets = (value: unknown): unknown =>
+  typeof value === "string"
+    ? value.replaceAll("secret", "[masked]")
+    : Array.isArray(value)
+      ? value.map(maskSecrets)
+      : value !== null && typeof value === "object"
+        ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, maskSecrets(item)]))
+        : value;
+
+const exported = (spans: ReadableSpan[]) =>
+  JSON.stringify(spans.map((span) => ({ attributes: span.attributes, events: span.events })));
+
+test("the mask rewrites every exported payload", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const keys = new Set<string>();
+
+  const integ = telemetryDev(
+    {
+      ...baseOptions,
+      mask: (value, { key }) => {
+        keys.add(key);
+
+        return maskSecrets(value);
+      },
+    },
+    overrides,
+  );
+
+  const providerCall = {
+    type: "tool-call",
+    toolCallId: "provider-history",
+    toolName: "web_search",
+    input: { q: "history-secret-in" },
+    providerExecuted: true,
+  };
+
+  const history = [{ role: "assistant", content: [providerCall] }];
+
+  integ.onStart?.({
+    callId: "text",
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+    instructions: "secret instructions",
+    messages: history,
+  });
+  integ.onStepStart?.({ callId: "text", stepNumber: 0, messages: history });
+  integ.onLanguageModelCallEnd?.({
+    callId: "text",
+    content: [
+      {
+        type: "tool-result",
+        toolCallId: "provider-history",
+        toolName: "web_search",
+        output: { found: "provider-history-secret-out" },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-call",
+        toolCallId: "provider-error",
+        toolName: "web_search",
+        input: { q: "provider-secret-in" },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-error",
+        toolCallId: "provider-error",
+        toolName: "web_search",
+        error: new RangeError("provider-secret-out"),
+        providerExecuted: true,
+      },
+      {
+        type: "tool-call",
+        toolCallId: "provider-mcp-error",
+        toolName: "mcp.delete_file",
+        input: '{"path":"mcp-secret-in"}',
+        providerExecuted: true,
+      },
+      {
+        type: "tool-result",
+        toolCallId: "provider-mcp-error",
+        toolName: "mcp.delete_file",
+        output: {
+          type: "call",
+          serverLabel: "files",
+          name: "delete_file",
+          arguments: '{"path":"mcp-secret-in"}',
+          error: "mcp-secret-out",
+        },
+        providerExecuted: true,
+      },
+      {
+        type: "tool-call",
+        toolCallId: "provider-invalid",
+        toolName: "web_search",
+        input: { q: "invalid-secret-in" },
+        error: new Error("invalid input: invalid-secret"),
+        invalid: true,
+        providerExecuted: true,
+      },
+    ],
+  });
+  integ.onToolExecutionEnd?.({
+    callId: "text",
+    toolCall: { toolCallId: "local", toolName: "read", input: { path: "local-secret-in" } },
+    toolExecutionMs: 5,
+    toolOutput: { type: "tool-result", output: { text: "local-secret-out" } },
+  });
+  integ.onToolExecutionEnd?.({
+    callId: "text",
+    toolCall: { toolCallId: "local-error", toolName: "read", input: { path: "error-secret-in" } },
+    toolExecutionMs: 5,
+    toolOutput: { type: "tool-error", error: new Error("cannot read secret file") },
+  });
+  integ.onStepEnd?.({
+    callId: "text",
+    stepNumber: 0,
+    model,
+    text: "secret step out",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+    warnings: [{ type: "other", message: "secret warning" }],
+  });
+  await integ.onEnd?.({
+    callId: "text",
+    text: "secret root out",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  integ.onStart?.({
+    callId: "object",
+    operationId: "ai.streamObject",
+    provider: "openai",
+    modelId: "gpt-4o",
+    prompt: "secret prompt",
+  });
+  integ.onObjectStepStart?.({ callId: "object", promptMessages: [{ content: "secret prompt" }] });
+  integ.onObjectStepEnd?.({
+    callId: "object",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+    objectText: '{"name":"secret"}',
+  });
+  await integ.onEnd?.({
+    callId: "object",
+    object: { name: "secret" },
+    error: new Error("secret object failure"),
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  integ.onStart?.({
+    callId: "embed",
+    operationId: "ai.embed",
+    provider: "openai",
+    modelId: "text-embedding-3-small",
+    value: "secret embedding",
+  });
+  await integ.onEnd?.({ callId: "embed", usage: { tokens: 1 } });
+
+  integ.onStart?.({
+    callId: "rerank",
+    operationId: "ai.rerank",
+    provider: "cohere",
+    modelId: "rerank-english-v3.0",
+    documents: ["secret document"],
+    query: "secret query",
+  });
+  await integ.onEnd?.({ callId: "rerank", ranking: [{ index: 0, score: 1, document: "secret" }] });
+
+  integ.experimental_onEvaluateStart?.({
+    callId: "evaluate",
+    provider: "openai",
+    modelId: "judge",
+    state: { notes: "secret state" },
+    questions: { q: { type: "score", question: "secret question" } },
+  });
+  integ.experimental_onEvaluationModelCallStart?.({ callId: "evaluate" });
+  integ.experimental_onEvaluationModelCallEnd?.({
+    callId: "evaluate",
+    answers: { q: { type: "score", reason: "secret reason" } },
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.experimental_onEvaluateEnd?.({
+    callId: "evaluate",
+    answers: { q: { type: "score", reason: "secret reason" } },
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  integ.onStart?.({
+    callId: "failed",
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+  });
+  integ.onStepStart?.({ callId: "failed", stepNumber: 0 });
+  await integ.onError?.({ callId: "failed", error: new Error("secret stream failure") });
+
+  const spans = spanBatches.flat();
+  const textSpans = spanBatches[0]!;
+  const tool = (id: string) =>
+    byOperation(textSpans, "execute_tool").find((s) => s.attributes["gen_ai.tool.call.id"] === id)!;
+
+  const message = (span: ReadableSpan) =>
+    event(span, "exception")?.attributes?.["exception.message"];
+
+  expect(exported(spans)).not.toContain("secret");
+  expect(spanBatches).toHaveLength(6);
+  expect(tool("provider-history").attributes["gen_ai.tool.call.arguments"]).toBe(
+    JSON.stringify({ q: "history-[masked]-in" }),
+  );
+  expect(tool("provider-history").attributes["gen_ai.tool.call.result"]).toBe(
+    JSON.stringify({ found: "provider-history-[masked]-out" }),
+  );
+  expect(message(tool("provider-error"))).toBe("provider-[masked]-out");
+  expect(message(tool("provider-mcp-error"))).toBe("mcp-[masked]-out");
+  expect(message(tool("provider-invalid"))).toBe("invalid input: invalid-[masked]");
+  expect(message(tool("local-error"))).toBe("cannot read [masked] file");
+  expect(tool("local").attributes["gen_ai.tool.call.result"]).toBe(
+    JSON.stringify({ text: "local-[masked]-out" }),
+  );
+
+  const step = textSpans.find((s) => s.kind === SpanKind.CLIENT)!;
+  expect(event(step, "model.warning")?.attributes?.["log.message"]).toBe(
+    "Model warning: [masked] warning",
+  );
+  expect(step.attributes["gen_ai.output.messages"]).toBe("[masked] step out");
+  expect(spanBatches[1]!.find((s) => s.kind === SpanKind.INTERNAL)!.status.code).toBe(
+    SpanStatusCode.ERROR,
+  );
+  expect(message(spanBatches[1]!.find((s) => s.kind === SpanKind.INTERNAL)!)).toBe(
+    "[masked] object failure",
+  );
+  expect(message(spanBatches[5]!.find((s) => s.kind === SpanKind.INTERNAL)!)).toBe(
+    "[masked] stream failure",
+  );
+
+  const root = (index: number) => spanBatches[index]!.find((s) => s.kind === SpanKind.INTERNAL)!;
+  expect(root(0).attributes["gen_ai.input.messages"]).toContain("[masked] instructions");
+  expect(root(0).attributes["gen_ai.output.messages"]).toBe("[masked] root out");
+  expect(spanBatches[1]!.find((s) => s.kind === SpanKind.CLIENT)!.attributes).toMatchObject({
+    "gen_ai.input.messages": JSON.stringify([{ content: "[masked] prompt" }]),
+    "gen_ai.output.messages": '{"name":"[masked]"}',
+  });
+  expect(root(1).attributes["gen_ai.output.messages"]).toBe(JSON.stringify({ name: "[masked]" }));
+  expect(root(2).attributes["gen_ai.input.messages"]).toBe("[masked] embedding");
+  expect(root(3).attributes["gen_ai.input.messages"]).toBe(
+    JSON.stringify({ query: "[masked] query", documents: ["[masked] document"] }),
+  );
+  expect(root(3).attributes["gen_ai.output.messages"]).toBe(
+    JSON.stringify([{ index: 0, score: 1, document: "[masked]" }]),
+  );
+  expect(root(4).attributes["gen_ai.output.messages"]).toBe(
+    JSON.stringify({ q: { type: "score", reason: "[masked] reason" } }),
+  );
+  expect([...keys].sort()).toEqual([
+    "exception.message",
+    "gen_ai.input.messages",
+    "gen_ai.output.messages",
+    "gen_ai.tool.call.arguments",
+    "gen_ai.tool.call.result",
+    "log.message",
+  ]);
+});
+
+test("a throwing mask omits payloads and generic error text replaces messages", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const reported: unknown[] = [];
+
+  const integ = telemetryDev(
+    {
+      ...baseOptions,
+      mask: () => {
+        throw new Error("mask broke");
+      },
+      onError: (error) => {
+        reported.push(error);
+        throw new Error("onError broke");
+      },
+    },
+    overrides,
+  );
+
+  integ.onStart?.({
+    callId: "call",
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+    messages: [{ role: "user", content: "secret in" }],
+  });
+  integ.onStepStart?.({ callId: "call", stepNumber: 0 });
+  integ.onToolExecutionEnd?.({
+    callId: "call",
+    toolCall: { toolCallId: "local-error", toolName: "read", input: { path: "secret" } },
+    toolExecutionMs: 5,
+    toolOutput: { type: "tool-error", error: new Error("cannot read secret file") },
+  });
+  integ.onStepEnd?.({
+    callId: "call",
+    stepNumber: 0,
+    model,
+    text: "secret out",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+    warnings: [{ type: "other", message: "secret warning" }],
+  });
+  await integ.onEnd?.({
+    callId: "call",
+    text: "secret out",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const spans = spanBatches[0]!;
+  const tool = byOperation(spans, "execute_tool")[0]!;
+  const step = spans.find((s) => s.kind === SpanKind.CLIENT)!;
+
+  expect(spans).toHaveLength(3);
+  expect(exported(spans)).not.toContain("secret");
+  expect(event(tool, "exception")?.attributes?.["exception.message"]).toBe("Tool execution failed");
+  expect(event(step, "model.warning")?.attributes?.["log.message"]).toBe("Model warning");
+  expect(reported.length).toBeGreaterThan(0);
+  expect(reported.every((error) => error instanceof Error && error.message === "mask broke")).toBe(
+    true,
+  );
+});
+
+test("a provider-tool input the mask omits is not replaced from history", async () => {
+  const { spanBatches, overrides } = makeCapture();
+
+  const integ = telemetryDev(
+    {
+      ...baseOptions,
+      mask: (value) =>
+        JSON.stringify(value).includes("direct-secret") ? undefined : maskSecrets(value),
+    },
+    overrides,
+  );
+
+  const history = [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool-call",
+          toolCallId: "provider",
+          toolName: "web_search",
+          input: { q: "history" },
+          providerExecuted: true,
+        },
+      ],
+    },
+  ];
+
+  integ.onStart?.({
+    callId: "call",
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+    messages: history,
+  });
+  integ.onStepStart?.({ callId: "call", stepNumber: 0, messages: history });
+  integ.onLanguageModelCallEnd?.({
+    callId: "call",
+    content: [
+      {
+        type: "tool-result",
+        toolCallId: "provider",
+        toolName: "web_search",
+        input: { q: "direct-secret" },
+        output: { found: "result" },
+        providerExecuted: true,
+      },
+    ],
+  });
+  integ.onStepEnd?.({
+    callId: "call",
+    stepNumber: 0,
+    model,
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId: "call",
+    text: "done",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const tool = byOperation(spanBatches[0]!, "execute_tool")[0]!;
+
+  expect(tool.attributes["gen_ai.tool.call.arguments"]).toBeUndefined();
+  expect(tool.attributes["gen_ai.tool.call.result"]).toBe(JSON.stringify({ found: "result" }));
+});
+
 test("v7 exports session spans only when the configured sampler selects them", async () => {
   const roots: Sampler[] = [
     new AlwaysOnSampler(),

@@ -26,8 +26,16 @@ export const diag = {
 
 /** Fail-open guard: SDK internals report through onError + diagnostics, never into user code. */
 export function reportError(onError: ((error: Error) => void) | undefined, cause: unknown): void {
+  let error: Error;
+
   try {
-    onError?.(cause instanceof Error ? cause : new Error(String(cause)));
+    error = cause instanceof Error ? cause : new Error(String(cause));
+  } catch {
+    error = new Error("A value that cannot be converted to a string was thrown");
+  }
+
+  try {
+    onError?.(error);
   } catch {
     // onError itself must never propagate
   }

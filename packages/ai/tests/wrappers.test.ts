@@ -500,3 +500,148 @@ test("batch result stream own iterator cancels once on early for-await exit", as
   for await (const _item of results) break;
   expect(cancellations).toBe(1);
 });
+
+test("media and batch failures pass error text through the mask", async () => {
+  const masks = [
+    { name: "rewriting", mask: (value: unknown) => String(value).replaceAll("secret", "[masked]") },
+    { name: "omitting", mask: () => undefined },
+    {
+      name: "throwing",
+      mask: () => {
+        throw new Error("mask broke");
+      },
+    },
+  ];
+
+  for (const { name, mask } of masks) {
+    const { spans, overrides } = capture();
+    const reported: unknown[] = [];
+    const options = { ...config, mask, onError: (error: unknown) => reported.push(error) };
+    const failure = new TypeError("cannot read secret file");
+
+    await expect(
+      wrapGenerateImage(() => Promise.reject(failure), options, overrides)(),
+    ).rejects.toBe(failure);
+    await expect(wrapStartBatch(() => Promise.reject(failure), options, overrides)()).rejects.toBe(
+      failure,
+    );
+
+    const results = wrapGetBatchResults(
+      () =>
+        (async function* () {
+          yield "item";
+          throw failure;
+        })(),
+      options,
+      overrides,
+    )();
+
+    await expect(
+      (async () => {
+        for await (const _item of results);
+      })(),
+    ).rejects.toBe(failure);
+
+    expect(spans.map((span) => span.attributes["gen_ai.operation.name"])).toEqual([
+      "generate_content",
+      "batch.submit",
+      "batch.results",
+    ]);
+
+    const expected = {
+      rewriting: [
+        "cannot read [masked] file",
+        "cannot read [masked] file",
+        "cannot read [masked] file",
+      ],
+      omitting: ["Media generation failed", "Batch request failed", "Batch request failed"],
+      throwing: ["Media generation failed", "Batch request failed", "Batch request failed"],
+    }[name]!;
+
+    for (const [index, span] of spans.entries()) {
+      const exception = span.events.find((event) => event.name === "exception")!;
+
+      expect(span.status).toEqual({ code: SpanStatusCode.ERROR, message: expected[index] });
+      expect(exception.attributes).toEqual({
+        "exception.type": "TypeError",
+        "exception.message": expected[index],
+      });
+    }
+
+    expect(JSON.stringify(spans.map((span) => [span.status, span.events]))).not.toContain("secret");
+    expect(reported).toHaveLength(name === "throwing" ? 3 : 0);
+  }
+});
+
+test("failures whose string conversion throws are still recorded", async () => {
+  const masks = [undefined, (value: unknown) => value];
+
+  for (const mask of masks) {
+    const { spans, overrides } = capture();
+    const options = { ...config, mask };
+    const failure = new RangeError("disk full");
+
+    failure.toString = () => {
+      throw new Error("toString broke");
+    };
+
+    await expect(
+      wrapGenerateImage(() => Promise.reject(failure), options, overrides)(),
+    ).rejects.toBe(failure);
+    await expect(wrapStartBatch(() => Promise.reject(failure), options, overrides)()).rejects.toBe(
+      failure,
+    );
+
+    const results = wrapGetBatchResults(
+      () =>
+        (async function* () {
+          yield "item";
+          throw failure;
+        })(),
+      options,
+      overrides,
+    )();
+
+    await expect(
+      (async () => {
+        for await (const _item of results);
+      })(),
+    ).rejects.toBe(failure);
+
+    const expected = mask
+      ? ["disk full", "disk full", "disk full"]
+      : ["Media generation failed", "Batch request failed", "Batch request failed"];
+
+    expect(spans).toHaveLength(3);
+
+    for (const [index, span] of spans.entries()) {
+      const exception = span.events.find((event) => event.name === "exception");
+
+      expect(span.status).toEqual({ code: SpanStatusCode.ERROR, message: expected[index] });
+      expect(exception?.attributes).toMatchObject({
+        "exception.type": "RangeError",
+        "exception.message": "disk full",
+      });
+    }
+  }
+});
+
+test("thrown values that cannot be stringified still reach onError", async () => {
+  const reported: unknown[] = [];
+
+  const options = {
+    ...config,
+    mask: () => {
+      throw Object.create(null);
+    },
+    onError: (error: unknown) => reported.push(error),
+  };
+
+  await expect(
+    wrapGenerateImage(() => Promise.reject(new Error("secret")), options, capture().overrides)(),
+  ).rejects.toThrow("secret");
+  expect(reported).toHaveLength(1);
+  expect((reported[0] as Error).message).toBe(
+    "A value that cannot be converted to a string was thrown",
+  );
+});

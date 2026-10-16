@@ -6,7 +6,7 @@ import {
 } from "@telemetry-dev/otel";
 
 import { resolveConfig, type TelemetryDevOptions } from "./config.ts";
-import { providerLabel, unknownErrorMessage } from "./shared.ts";
+import { failureRecord, providerLabel, reportTelemetryError } from "./shared.ts";
 
 export type MediaWrapperOverrides = GenerationEmitterOverrides;
 
@@ -156,12 +156,11 @@ function wrapMedia<F extends Callable>(
       };
 
       if (failed) {
-        attempt(() =>
-          span.setStatus({ code: SpanStatusCode.ERROR, message: unknownErrorMessage(error) }),
-        );
-        attempt(() =>
-          span.recordException(error instanceof Error ? error : unknownErrorMessage(error)),
-        );
+        attempt(() => {
+          const failure = failureRecord(config, error, "Media generation failed");
+          attempt(() => span.setStatus({ code: SpanStatusCode.ERROR, message: failure.message }));
+          attempt(() => span.recordException(failure.exception));
+        });
       } else {
         let resultAttrs: Attributes = {};
         attempt(() => {
@@ -212,12 +211,6 @@ function wrapMedia<F extends Callable>(
 
     return value;
   }) as F;
-}
-
-function reportTelemetryError(onError: TelemetryDevOptions["onError"], error: unknown): void {
-  try {
-    onError?.(error instanceof Error ? error : String(error));
-  } catch {}
 }
 
 export const wrapGenerateImage = <F extends Callable>(

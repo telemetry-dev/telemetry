@@ -26,6 +26,15 @@ export interface TelemetryDevOptions {
   fetch?: typeof fetch;
   /** Serverless extender (e.g. Cloudflare `ctx.waitUntil`). When provided, `onFinish` does not await the POST. */
   waitUntil?: (p: Promise<unknown>) => void;
+  /**
+   * Redaction hook run on each piece of captured content before it is JSON-stringified: input and
+   * output messages, tool arguments and results, detailed error messages, and model warning text.
+   * `context.key` is the attribute being written (`exception.message` for error messages,
+   * `log.message` for warnings). Returning undefined omits the content; a throwing mask omits it
+   * too (error messages fall back to a generic text) and reports through onError. Not applied to
+   * runtimeContext metadata.
+   */
+  mask?: (value: unknown, context: { key: string }) => unknown;
   /** Receives any error raised while emitting telemetry; the integration never throws into the SDK. */
   onError?: (error: TelemetryError) => void;
 }
@@ -38,6 +47,7 @@ export interface ResolvedConfig {
   sampler?: Sampler;
   fetchImpl: typeof fetch;
   waitUntil?: (p: Promise<unknown>) => void;
+  mask?: TelemetryDevOptions["mask"];
   onError?: (error: TelemetryError) => void;
 }
 
@@ -59,6 +69,7 @@ export function resolveConfig(options: TelemetryDevOptions = {}): ResolvedConfig
     sampler: options.sampler,
     fetchImpl: options.fetch ?? globalThis.fetch,
     waitUntil: options.waitUntil,
+    mask: options.mask,
     onError: options.onError,
   };
 }
