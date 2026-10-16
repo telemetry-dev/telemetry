@@ -271,7 +271,7 @@ export function prepareCaptureValue(
     try {
       masked = cfg.mask(value, { key });
     } catch (error) {
-      reportError(cfg.onError, error instanceof Error ? error : new Error(String(error)));
+      reportError(cfg.onError, error);
 
       return undefined;
     }

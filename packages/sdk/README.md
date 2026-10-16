@@ -70,6 +70,12 @@ still record non-content metadata such as response IDs and models, finish reason
 and errors. Capture flags do not gate stop sequences, tool descriptions and definitions (`gen_ai.tool.description`, `gen_ai.tool.definitions`), caller-supplied metadata or raw attributes,
 or exception messages and stack traces; redact those separately when needed.
 
+`mask` receives input and output content, system instructions, log messages, log attributes
+other than numbers and booleans, and content that integrations pass to
+`handle.serializeContent`. `ctx.key` names the attribute being written. It does not receive
+span or propagated `metadata`, raw `attributes`, or exception messages and stack traces; redact
+those separately.
+
 Root spans remain independent by default. `init({ sessionMode: "process" })` groups otherwise
 uncorrelated spans and logs using a fresh opaque UUID for each enabled SDK initialization.
 Explicit and propagated session IDs take precedence, and valid parent trace context is preserved.
@@ -89,6 +95,13 @@ The SDK installs the [session sampling wrapper](../otel/README.md#correlation-at
 - `startSpan(name, options?)` — manual handle; does **not** activate context. `handle.update()`,
   `handle.end()`, `handle.recordOutputChunk(timestampMs?)`, `handle.traceparent`, `handle.span`
   (raw OTel span).
+- `handle.serializeContent(value, key)` — prepare content that an integration writes outside
+  `input` and `output`, such as an error message or a raw attribute, the way `input` and `output`
+  are prepared: the configured `mask` with `key`, JSON stringify (strings pass through), then
+  truncation to `maxAttributeLength`. Returns `undefined` when the mask throws (reported through
+  `onError`) or drops the value, or the value cannot be serialized; write nothing then. It does not
+  check `captureInput` / `captureOutput`. Integrations that support older cores should treat a
+  missing method as a configured mask.
 - `startActiveSpan(name, options?, fn)` — callback-scoped; activates context, auto-ends.
 - `updateActiveSpan(fields)` — update the innermost active span.
 - `propagateAttributes({ userId, sessionId, metadata }, fn)` — stamps `user.id`,
