@@ -30,6 +30,7 @@ Repository = "https://github.com/telemetry-dev/telemetry"
 
 [dependency-groups]
 dev = [
+  "litellm[proxy]",
   "pytest>=8.3",
   "pytest-asyncio>=0.25",
   "ruff>=0.9",

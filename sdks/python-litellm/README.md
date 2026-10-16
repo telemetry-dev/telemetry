@@ -122,17 +122,30 @@ Aggregate usage keys are `input_tokens`, `output_tokens`, `total_tokens`, `cache
 
 ## Metadata
 
-Each key of the call's `litellm_metadata` argument, or of `metadata` when `litellm_metadata` is absent or empty, is exported as `td.metadata.<key>`, except the keys listed below. That includes keys LiteLLM's Router adds to the argument, such as `model_group`, `deployment`, `model_info` and `api_base`. Rerank spans also add `result_count` and `search_units`.
+On a LiteLLM or Router call made outside the LiteLLM proxy, each key of the call's `litellm_metadata` argument, or of `metadata` when `litellm_metadata` is absent or empty, is exported as `td.metadata.<key>`, except the keys listed below. That includes keys LiteLLM's Router adds to the argument, such as `model_group`, `deployment`, `model_info` and `api_base`. Rerank spans also add `result_count` and `search_units`.
 
-Strings, numbers, booleans and non-empty sequences of only strings, only booleans or only numbers are exported as they are; other values, including empty sequences, are JSON-encoded. Each string, including each string in a sequence, and each JSON value is truncated to `max_attribute_length`. Metadata values are not passed to the `mask` callback.
+Strings, numbers, booleans and non-empty sequences of only strings, only booleans or only numbers are exported as they are; other values, including empty sequences, are JSON-encoded. Each string, including each string in a sequence, and each JSON value is truncated to `max_attribute_length`. Metadata values are not passed to the `mask` callback, and metadata is exported whatever `capture_input` and `capture_output` are set to.
 
-Metadata is exported whatever `capture_input` and `capture_output` are set to. These top-level keys are dropped:
+These top-level keys are always dropped:
 
 - `headers`, `requester_metadata`, `requester_ip_address`, `user_agent`, `endpoint`, `user_api_end_user_max_budget`, and every key that starts with `user_api_key`. LiteLLM's proxy stores the incoming request's headers, client IP address, user agent and URL under these names, along with the authenticated key, user, team and end user, including the user's email and JWT claims.
 - `previous_models`, where the Router keeps copies of the arguments and metadata of earlier failed calls on a retry or fallback.
+- `userId`, `sessionId`, `user_id` and `session_id`, which the core SDK reserves. Use `propagate_attributes(user_id=..., session_id=...)` instead.
 
 Don't use these names for your own metadata. Other keys, including nested values, are exported as they are, so don't put credentials or personal data in metadata.
-- `userId`, `sessionId`, `user_id` and `session_id`, which the core SDK reserves. Use `propagate_attributes(user_id=..., session_id=...)` instead.
+
+### Calls made by the LiteLLM proxy
+
+When LiteLLM's proxy server handles a request, the call it makes through its Router carries a `proxy_server_request` argument. For every call with that argument, the integration reads metadata differently. The proxy and its guardrails and hooks write their own data into both metadata arguments, such as the request's headers, the authenticated key and user, or Presidio's `pii_tokens`. So only part of one argument is read: `litellm_metadata` for Responses calls, and `metadata` for chat, embedding and rerank calls. These are the arguments the proxy and Router write into for those calls. Two parts of it are exported:
+
+- `requester_metadata`, the proxy's copy of the request body's `metadata` object. The proxy takes this copy before its guardrails and hooks run, but after authentication and request preparation have added data to the body's metadata, such as the `x-litellm-tags` header and the key's tags. So these keys of the copy are not exported, even when the client sent them in the body: `tags`, `spend_logs_metadata`, `agent_id`, `trace_id`, `session_id`, `used_client_oauth_token` and `litellm_session_id_omitted`, plus the keys dropped for every call listed above. If the body has no `metadata` object, nothing from `requester_metadata` is exported.
+- The Router's `model_group`, `model_group_alias`, `model_group_size`, `deployment`, `deployment_model_name`, `attempted_retries` and `max_retries`, when that argument holds a string, number or boolean under them. Objects, lists and `null` under these names are not exported. The Router's `model_info` and `api_base` are not exported, because `model_info` holds any fields an admin configured for the deployment and an `api_base` URL can contain credentials.
+
+Anything else is not exported, including keys the client sends in the body's `litellm_metadata`. Some limits remain:
+
+- The integration has no copy of the request of its own. A guardrail or hook that rewrites `requester_metadata`, or writes one of the Router's key names into that argument, changes what is exported. The Router's key names are read whoever wrote them, so a scalar value a client or hook wrote under one of those names can appear when the Router wrote none.
+- `/queue` routes skip the proxy's usual request preparation and record no `requester_metadata`. Only the Router's keys are exported, unless the body's `metadata` itself contains a `requester_metadata` object, which is then exported as the client sent it.
+- The list of request keys left out of `requester_metadata` matches LiteLLM 1.90.2 through 1.105.1. A later release that adds other keys there before taking its copy would have them exported.
 
 ## Streaming
 

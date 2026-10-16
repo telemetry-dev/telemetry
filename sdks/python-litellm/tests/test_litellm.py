@@ -166,66 +166,162 @@ def test_completion_litellm_metadata_maps_to_td_metadata(memory: SimpleNamespace
     assert attrs(only_span(memory))["td.metadata.tenant"] == "acme"
 
 
-def test_router_call_from_litellm_proxy_drops_request_and_auth_metadata(
+@pytest.mark.parametrize(
+    ("path", "body", "send_litellm_metadata", "hook_routing_values"),
+    [
+        (
+            "/v1/chat/completions",
+            {"messages": CHAT_MESSAGES, "metadata": {"tenant": "acme"}},
+            True,
+            {},
+        ),
+        ("/v1/responses", {"input": "Say hi", "metadata": {"tenant": "acme"}}, True, {}),
+        ("/v1/responses", {"input": "Say hi"}, True, {}),
+        # Without a litellm_metadata argument the pre-auth tag merge writes the header's tags
+        # into the body's metadata before the proxy copies it. On chat the Router writes its
+        # retry keys into litellm_metadata, so a hook's values under these names in metadata
+        # reach the span unchanged.
+        (
+            "/v1/chat/completions",
+            {"messages": CHAT_MESSAGES, "metadata": {"tenant": "acme"}},
+            False,
+            {
+                "model_group_size": {"authorization": "hook-routing-secret"},
+                "attempted_retries": ["hook-routing-secret"],
+                "max_retries": 3,
+            },
+        ),
+    ],
+)
+async def test_litellm_proxy_request_exports_only_requester_and_router_metadata(
     memory: SimpleNamespace,
+    path: str,
+    body: dict[str, Any],
+    send_litellm_metadata: bool,
+    hook_routing_values: dict[str, Any],
 ) -> None:
-    # Shape of the metadata LiteLLM 1.90.2's proxy passes to its Router for a client
-    # that authenticates with x-litellm-api-key and also sends an Anthropic OAuth token.
+    from litellm.proxy._types import UserAPIKeyAuth  # pyright: ignore[reportMissingTypeStubs]
+    from litellm.proxy.litellm_pre_call_utils import (  # pyright: ignore[reportMissingTypeStubs]
+        LiteLLMProxyRequestSetup,  # pyright: ignore[reportUnknownVariableType]
+        add_litellm_data_to_request,  # pyright: ignore[reportUnknownVariableType]
+    )
+    from litellm.proxy.proxy_server import ProxyConfig  # pyright: ignore[reportMissingTypeStubs]
+    from starlette.requests import Request
+
     headers = {
-        "host": "proxy.internal",
+        "x-litellm-api-key": "sk-proxy-key",
         "authorization": "Bearer sk-ant-oat01-oauth-secret",
         "cookie": "session=cookie-secret",
-        "x-internal-tenant-token": "custom-header-secret",
-        "user-agent": "client/1.0",
+        "x-litellm-spend-logs-metadata": json.dumps(
+            {"headers": {"authorization": "spend-header-secret"}}
+        ),
+        "x-litellm-agent-id": "agent-header-secret",
+        "x-litellm-session-id": "session-header-secret",
+        "x-litellm-trace-id": "trace-header-secret",
+        "x-litellm-tags": "tag-header-secret",
     }
-    secrets = (
-        "oauth-secret",
-        "cookie-secret",
-        "custom-header-secret",
-        "203.0.113.7",
-        "jwt-subject",
-        "user@example.com",
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "https",
+            "server": ("proxy.internal", 443),
+            "client": ("203.0.113.7", 50000),
+            "root_path": "",
+            "path": path,
+            "query_string": b"",
+            "headers": [(name.encode(), value.encode()) for name, value in headers.items()],
+        }
     )
+    data: dict[str, Any] = {"model": "gpt-4o-mini", **body}
+    if send_litellm_metadata:
+        data["litellm_metadata"] = {
+            "requester_metadata": {"forged": "client-litellm-metadata"},
+            "model_group": "client-litellm-metadata",
+            "deployment": "client-litellm-metadata",
+            "model_info": {"note": "client-litellm-metadata"},
+        }
+    user_api_key_dict = cast(Any, UserAPIKeyAuth)(
+        api_key="hashed-key", user_email="user@example.com", jwt_claims={"sub": "jwt-subject"}
+    )
+    # Authentication runs this before the proxy prepares the request.
+    cast(Any, LiteLLMProxyRequestSetup).apply_client_tag_policy_pre_auth(
+        request=request, request_data=data, user_api_key_dict=user_api_key_dict
+    )
+    data = await cast(Any, add_litellm_data_to_request)(
+        data=data,
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=cast(Any, ProxyConfig)(),
+        general_settings={},
+        version="1.90.2",
+    )
+    # What a Presidio guardrail with output_parse_pii and LiteLLM's skills hook add before the
+    # proxy calls its Router.
+    data.setdefault("metadata", {})["pii_tokens"] = {"<PERSON_1>": "Jane Doe"}
+    data["metadata"].update(hook_routing_values)
+    data.setdefault("litellm_metadata", {})["_skill_files"] = {
+        "skill-1": {"main.py": "skill-file-secret"}
+    }
     instrument_litellm()
     router = llm.Router(
         model_list=[
             {
                 "model_name": "gpt-4o-mini",
-                "litellm_params": {"model": "gpt-4o-mini", "mock_response": "routed"},
+                "litellm_params": {
+                    "model": "openai/gpt-4o-mini",
+                    "api_key": "sk-fake",
+                    "api_base": "https://user:api-base-secret@llm.internal/v1",
+                    "mock_response": "routed",
+                },
+                "model_info": {"note": "model-info-secret"},
             }
         ]
     )
-    router.completion(
-        model="gpt-4o-mini",
-        messages=CHAT_MESSAGES,
-        metadata={
-            "tenant": "acme",
-            "headers": headers,
-            "requester_metadata": {"tenant": "acme", "headers": headers},
-            "requester_ip_address": "203.0.113.7",
-            "user_agent": "client/1.0",
-            "endpoint": "http://proxy.internal/v1/chat/completions",
-            "litellm_api_version": "1.90.2",
-            "user_api_key": "hashed-key",
-            "user_api_key_hash": "hashed-key",
-            "user_api_key_user_email": "user@example.com",
-            "user_api_key_auth": {
-                "user_email": "user@example.com",
-                "jwt_claims": {"sub": "jwt-subject"},
-            },
-        },
-    )
+    await (router.aresponses if path == "/v1/responses" else router.acompletion)(**data)
 
     a = attrs(only_span(memory))
-    assert a["td.metadata.tenant"] == "acme"
-    assert a["td.metadata.model_group"] == "gpt-4o-mini"
-    assert a["td.metadata.litellm_api_version"] == "1.90.2"
     exported = {key.removeprefix("td.metadata.") for key in a if key.startswith("td.metadata.")}
-    assert exported.isdisjoint(
-        {"headers", "requester_metadata", "requester_ip_address", "user_agent", "endpoint"}
-    )
-    assert not any(key.startswith("user_api_key") for key in exported)
-    leaked = [secret for secret in secrets for value in a.values() if secret in str(value)]
+    router_keys = {
+        "model_group",
+        "model_group_alias",
+        "model_group_size",
+        "deployment",
+        "deployment_model_name",
+        "attempted_retries",
+        "max_retries",
+    }
+    client_keys: set[str] = {"tenant"} if "metadata" in body else set()
+    assert client_keys | {"model_group", "deployment"} <= exported <= client_keys | router_keys
+    assert a["td.metadata.model_group"] == "gpt-4o-mini"
+    assert a["td.metadata.deployment"] == "openai/gpt-4o-mini"
+    if hook_routing_values:
+        assert a["td.metadata.max_retries"] == 3
+        assert "td.metadata.model_group_size" not in a
+        assert "td.metadata.attempted_retries" not in a
+    leaked = [
+        secret
+        for secret in (
+            "oauth-secret",
+            "cookie-secret",
+            "spend-header-secret",
+            "agent-header-secret",
+            "session-header-secret",
+            "trace-header-secret",
+            "tag-header-secret",
+            "203.0.113.7",
+            "jwt-subject",
+            "user@example.com",
+            "Jane Doe",
+            "skill-file-secret",
+            "api-base-secret",
+            "model-info-secret",
+            "client-litellm-metadata",
+            "hook-routing-secret",
+        )
+        for value in a.values()
+        if secret in str(value)
+    ]
     assert leaked == []
 
 
