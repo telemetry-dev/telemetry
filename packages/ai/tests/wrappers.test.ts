@@ -573,6 +573,59 @@ test("media and batch failures pass error text through the mask", async () => {
   }
 });
 
+test("failures whose string conversion throws are still recorded", async () => {
+  const masks = [undefined, (value: unknown) => value];
+
+  for (const mask of masks) {
+    const { spans, overrides } = capture();
+    const options = { ...config, mask };
+    const failure = new RangeError("disk full");
+
+    failure.toString = () => {
+      throw new Error("toString broke");
+    };
+
+    await expect(
+      wrapGenerateImage(() => Promise.reject(failure), options, overrides)(),
+    ).rejects.toBe(failure);
+    await expect(wrapStartBatch(() => Promise.reject(failure), options, overrides)()).rejects.toBe(
+      failure,
+    );
+
+    const results = wrapGetBatchResults(
+      () =>
+        (async function* () {
+          yield "item";
+          throw failure;
+        })(),
+      options,
+      overrides,
+    )();
+
+    await expect(
+      (async () => {
+        for await (const _item of results);
+      })(),
+    ).rejects.toBe(failure);
+
+    const expected = mask
+      ? ["disk full", "disk full", "disk full"]
+      : ["Media generation failed", "Batch request failed", "Batch request failed"];
+
+    expect(spans).toHaveLength(3);
+
+    for (const [index, span] of spans.entries()) {
+      const exception = span.events.find((event) => event.name === "exception");
+
+      expect(span.status).toEqual({ code: SpanStatusCode.ERROR, message: expected[index] });
+      expect(exception?.attributes).toMatchObject({
+        "exception.type": "RangeError",
+        "exception.message": "disk full",
+      });
+    }
+  }
+});
+
 test("thrown values that cannot be stringified still reach onError", async () => {
   const reported: unknown[] = [];
 

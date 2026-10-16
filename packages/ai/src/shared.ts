@@ -69,10 +69,15 @@ export function failureRecord(
   fallback: string,
 ): { message: string; exception: Exception } {
   if (!config.mask) {
-    return {
-      message: unknownErrorMessage(error),
-      exception: error instanceof Error ? error : unknownErrorMessage(error),
-    };
+    let message = fallback;
+
+    try {
+      message = unknownErrorMessage(error);
+    } catch {
+      // An error whose string conversion throws is still recorded, with the fallback text.
+    }
+
+    return { message, exception: error instanceof Error ? error : message };
   }
 
   let name: string | undefined;
