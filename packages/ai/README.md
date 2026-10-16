@@ -156,6 +156,25 @@ text generation steps, model warning messages are reduced to a generic "Model wa
 input and output recording are enabled; a warning that supplies a string `type` still records it
 as `warning.type`.
 
+To redact payloads instead of dropping them, pass a `mask` to `telemetryDev()`:
+
+```ts
+telemetryDev({
+  mask: (value, { key }) => redact(value, key),
+});
+```
+
+The mask receives each payload before it is JSON-stringified: prompt and response messages, tool
+arguments and results (including provider-executed tools), detailed error messages including
+failed tool calls (`key` is `exception.message`), and model warning text (`key` is
+`log.message`). For other payloads `key` is the attribute being written, such as
+`gen_ai.input.messages` or `gen_ai.tool.call.result`. It runs only on payloads that
+`recordInputs` and `recordOutputs` allow. Returning `undefined` omits the payload. If the mask
+throws, the payload is omitted, an error message falls back to a generic text, and the error goes
+to `onError`. The mask does not see `runtimeContext` keys recorded as `user.id`,
+`gen_ai.conversation.id`, or `td.metadata.*`; leave out keys that should not be recorded. The
+media and batch wrappers record no payloads, and their exception messages are not masked.
+
 `ai@7` still accepts `experimental_telemetry` as a deprecated alias for `telemetry`.
 
 ### Global registration
@@ -198,6 +217,10 @@ const { text } = await generateText({
 
 `metadata.userId` / `metadata.sessionId` / remaining keys map to the same attributes as the
 `runtimeContext` keys above (no opt-in filter exists on `ai@6`).
+
+The `mask` option works the same way on `ai@6`, but this entry has no `recordInputs` /
+`recordOutputs` gate, so the mask receives every payload. As on `ai@7`, it does not see
+`metadata`.
 
 > **Caveat (ai@6 only):** a single globally-registered instance holds mutable per-generation state
 > and is **not** safe for overlapping concurrent generations. Prefer the per-call form above —

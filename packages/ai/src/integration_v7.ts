@@ -19,6 +19,7 @@ import {
 
 import { resolveConfig, type ResolvedConfig, type TelemetryDevOptions } from "./config.ts";
 import {
+  contentAttr,
   providerLabel,
   readId,
   SEVERITY_ERROR,
@@ -408,6 +409,7 @@ export function createV7Hooks(
 ): TelemetryDevIntegration {
   const onError = config.onError;
   const calls = new Map<string, CallState>();
+  const maskedAttr = (key: string, value: unknown) => contentAttr(config, key, value);
 
   const conversationAttributes = (state: CallState): Attributes =>
     state.sessionId ? { "gen_ai.conversation.id": state.sessionId } : {};
@@ -457,7 +459,9 @@ export function createV7Hooks(
       "gen_ai.request.model": state.model,
       "gen_ai.response.model": state.responseModel ?? undefined,
       ...conversationAttributes(state),
-      "gen_ai.input.messages": state.recordInputs ? jsonAttr(state.rootInput) : undefined,
+      "gen_ai.input.messages": state.recordInputs
+        ? maskedAttr("gen_ai.input.messages", state.rootInput)
+        : undefined,
       "user.id": state.userId ?? undefined,
       ...state.samplingAttributes,
     });
@@ -559,7 +563,9 @@ export function createV7Hooks(
 
     return {
       errorType,
-      message: recordOutputs ? detailedErrorMessage(value, fallback) : fallback,
+      message: recordOutputs
+        ? (maskedAttr("exception.message", detailedErrorMessage(value, fallback)) ?? fallback)
+        : fallback,
     };
   };
 
@@ -647,7 +653,9 @@ export function createV7Hooks(
               // mutated in place between steps, so a cached serialization goes stale.
               state.providerToolInputs.set(
                 providerToolIdentityKey(identity),
-                input === unavailableProviderToolInput ? undefined : jsonAttr(input),
+                input === unavailableProviderToolInput
+                  ? undefined
+                  : maskedAttr("gen_ai.tool.call.arguments", input),
               );
             }
           } catch {
@@ -686,7 +694,7 @@ export function createV7Hooks(
 
     return {
       type: "tool-result",
-      result: state.recordOutputs ? jsonAttr(part.output) : undefined,
+      result: state.recordOutputs ? maskedAttr("gen_ai.tool.call.result", part.output) : undefined,
     };
   };
 
@@ -960,7 +968,9 @@ export function createV7Hooks(
           stepNumber: state.currentStepNumber,
           occurrenceIndex,
           confirmed: false,
-          arguments: state.recordInputs ? jsonAttr(part.input) : undefined,
+          arguments: state.recordInputs
+            ? maskedAttr("gen_ai.tool.call.arguments", part.input)
+            : undefined,
           invalidFailure:
             part.invalid === true
               ? failureDetails(part.error, state.recordInputs && state.recordOutputs)
@@ -993,10 +1003,12 @@ export function createV7Hooks(
           stepNumber: state.currentStepNumber,
           occurrenceIndex: undefined,
           confirmed: false,
-          arguments: state.recordInputs
-            ? (jsonAttr(part.input) ??
-              state.providerToolInputs.get(providerToolIdentityKey(identity)))
-            : undefined,
+          // History stands in only for a missing input, never for one the mask omitted.
+          arguments: !state.recordInputs
+            ? undefined
+            : part.input !== undefined
+              ? maskedAttr("gen_ai.tool.call.arguments", part.input)
+              : state.providerToolInputs.get(providerToolIdentityKey(identity)),
         };
         state.providerToolCalls.push(pending);
       }
@@ -1302,8 +1314,12 @@ export function createV7Hooks(
             "gen_ai.usage.reasoning.output_tokens": reasoningTokens ?? undefined,
             "gen_ai.response.finish_reasons": e.finishReason ? [e.finishReason] : undefined,
             "gen_ai.output.type": "text",
-            "gen_ai.input.messages": state.recordInputs ? jsonAttr(step.messages) : undefined,
-            "gen_ai.output.messages": state.recordOutputs ? jsonAttr(e.text) : undefined,
+            "gen_ai.input.messages": state.recordInputs
+              ? maskedAttr("gen_ai.input.messages", step.messages)
+              : undefined,
+            "gen_ai.output.messages": state.recordOutputs
+              ? maskedAttr("gen_ai.output.messages", e.text)
+              : undefined,
             // Seconds, per semconv; ingest converts back to ms.
             "gen_ai.client.operation.time_to_first_chunk":
               timeToFirstOutputMs != null ? timeToFirstOutputMs / 1000 : undefined,
@@ -1327,9 +1343,9 @@ export function createV7Hooks(
             omitUndefined({
               "log.severity_number": SEVERITY_WARN,
               "log.message":
-                state.recordInputs && state.recordOutputs
-                  ? `Model warning: ${detail}`
-                  : "Model warning",
+                (state.recordInputs && state.recordOutputs
+                  ? maskedAttr("log.message", `Model warning: ${detail}`)
+                  : undefined) ?? "Model warning",
               "warning.type":
                 warning.type?.constructor === String ? String(warning.type) : undefined,
             }),
@@ -1434,10 +1450,12 @@ export function createV7Hooks(
           "gen_ai.tool.name": e.toolCall.toolName,
           "gen_ai.tool.call.id": e.toolCall.toolCallId,
           ...conversationAttributes(state),
-          "gen_ai.tool.call.arguments": state.recordInputs ? jsonAttr(e.toolCall.input) : undefined,
+          "gen_ai.tool.call.arguments": state.recordInputs
+            ? maskedAttr("gen_ai.tool.call.arguments", e.toolCall.input)
+            : undefined,
           "gen_ai.tool.call.result":
             success && state.recordOutputs && "output" in e.toolOutput
-              ? jsonAttr(e.toolOutput.output)
+              ? maskedAttr("gen_ai.tool.call.result", e.toolOutput.output)
               : undefined,
         });
 
@@ -1512,7 +1530,9 @@ export function createV7Hooks(
               "gen_ai.provider.name": providerLabel(e.provider ?? state.provider),
               "gen_ai.request.model": e.modelId ?? state.model,
               "gen_ai.output.type": "json",
-              "gen_ai.input.messages": state.recordInputs ? jsonAttr(e.promptMessages) : undefined,
+              "gen_ai.input.messages": state.recordInputs
+                ? maskedAttr("gen_ai.input.messages", e.promptMessages)
+                : undefined,
             }),
           },
           state.rootCtx,
@@ -1553,7 +1573,9 @@ export function createV7Hooks(
             "gen_ai.usage.reasoning.output_tokens":
               usage.outputTokenDetails?.reasoningTokens ?? undefined,
             "gen_ai.response.finish_reasons": e.finishReason ? [e.finishReason] : undefined,
-            "gen_ai.output.messages": state.recordOutputs ? jsonAttr(e.objectText) : undefined,
+            "gen_ai.output.messages": state.recordOutputs
+              ? maskedAttr("gen_ai.output.messages", e.objectText)
+              : undefined,
             "gen_ai.client.operation.time_to_first_chunk":
               e.msToFirstChunk != null ? e.msToFirstChunk / 1000 : undefined,
           }),
@@ -1773,7 +1795,9 @@ export function createV7Hooks(
               "gen_ai.operation.name": "evaluate",
               "gen_ai.provider.name": state.provider,
               "gen_ai.request.model": state.model,
-              "gen_ai.input.messages": state.recordInputs ? jsonAttr(state.rootInput) : undefined,
+              "gen_ai.input.messages": state.recordInputs
+                ? maskedAttr("gen_ai.input.messages", state.rootInput)
+                : undefined,
             }),
           },
           state.rootCtx,
@@ -1802,7 +1826,9 @@ export function createV7Hooks(
             "gen_ai.response.id": e.response?.id,
             "gen_ai.usage.input_tokens": inputTokens ?? undefined,
             "gen_ai.usage.output_tokens": outputTokens ?? undefined,
-            "gen_ai.output.messages": state.recordOutputs ? jsonAttr(e.answers) : undefined,
+            "gen_ai.output.messages": state.recordOutputs
+              ? maskedAttr("gen_ai.output.messages", e.answers)
+              : undefined,
           }),
         );
         span.end(endedAt);
@@ -1836,7 +1862,9 @@ export function createV7Hooks(
             "gen_ai.operation.name": "evaluate",
             ...rootBaseAttributes(state),
             "gen_ai.response.id": e.response?.id,
-            "gen_ai.output.messages": state.recordOutputs ? jsonAttr(e.answers) : undefined,
+            "gen_ai.output.messages": state.recordOutputs
+              ? maskedAttr("gen_ai.output.messages", e.answers)
+              : undefined,
           }),
         );
         state.rootSpan.end(new Date());
@@ -1875,7 +1903,9 @@ export function createV7Hooks(
             omitUndefined({
               "gen_ai.operation.name": state.hasToolSpan ? "invoke_agent" : "chat",
               ...rootBaseAttributes(state),
-              "gen_ai.output.messages": state.recordOutputs ? jsonAttr(e.text) : undefined,
+              "gen_ai.output.messages": state.recordOutputs
+                ? maskedAttr("gen_ai.output.messages", e.text)
+                : undefined,
               "gen_ai.response.finish_reasons": e.finishReason ? [e.finishReason] : undefined,
             }),
           );
@@ -1907,7 +1937,9 @@ export function createV7Hooks(
               "gen_ai.operation.name": "chat",
               "gen_ai.output.type": "json",
               ...rootBaseAttributes(state),
-              "gen_ai.output.messages": state.recordOutputs ? jsonAttr(e.object) : undefined,
+              "gen_ai.output.messages": state.recordOutputs
+                ? maskedAttr("gen_ai.output.messages", e.object)
+                : undefined,
               "gen_ai.response.finish_reasons": e.finishReason ? [e.finishReason] : undefined,
             }),
           );
@@ -1946,7 +1978,9 @@ export function createV7Hooks(
             omitUndefined({
               "gen_ai.operation.name": "rerank",
               ...rootBaseAttributes(state),
-              "gen_ai.output.messages": state.recordOutputs ? jsonAttr(e.ranking) : undefined,
+              "gen_ai.output.messages": state.recordOutputs
+                ? maskedAttr("gen_ai.output.messages", e.ranking)
+                : undefined,
             }),
           );
         }

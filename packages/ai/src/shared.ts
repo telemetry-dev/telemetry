@@ -1,3 +1,7 @@
+import { jsonAttr } from "@telemetry-dev/otel";
+
+import type { ResolvedConfig } from "./config.ts";
+
 export type JsonValue =
   | string
   | number
@@ -28,6 +32,33 @@ export function readId(value: JsonValue): string | null {
 // Applied at both provider read sites so the chain root and its model steps never disagree.
 export function providerLabel(provider: string): string {
   return provider === "gateway" ? "Vercel AI Gateway" : provider;
+}
+
+/**
+ * Masks and JSON-stringifies one piece of captured content. Undefined means write nothing: the
+ * value is absent or unserializable, the mask dropped it, or the mask threw.
+ */
+export function contentAttr(
+  config: Pick<ResolvedConfig, "mask" | "onError">,
+  key: string,
+  value: unknown,
+): string | undefined {
+  if (value === undefined || !config.mask) return jsonAttr(value);
+  let masked: unknown;
+
+  try {
+    masked = config.mask(value, { key });
+  } catch (error) {
+    try {
+      config.onError?.(error instanceof Error ? error : String(error));
+    } catch {
+      // A throwing onError must not stop the hook from ending its spans.
+    }
+
+    return undefined;
+  }
+
+  return jsonAttr(masked);
 }
 
 export function unknownErrorMessage(value: unknown): string {
