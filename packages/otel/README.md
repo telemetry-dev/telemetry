@@ -49,6 +49,63 @@ const provider = new BasicTracerProvider({
 trace.setGlobalTracerProvider(provider);
 ```
 
+## Native Claude SDK spans
+
+`@anthropic-ai/sdk` 0.134.0 and later emits OpenTelemetry spans natively. The Claude SDK uses the global tracer provider of the application.
+To send these spans to telemetry.dev, register a global tracer provider with `TelemetrySpanProcessor`:
+
+```sh
+npm i @telemetry-dev/otel @opentelemetry/sdk-trace-node @anthropic-ai/sdk
+```
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import { TelemetrySpanProcessor } from "@telemetry-dev/otel";
+
+const provider = new NodeTracerProvider({
+  spanProcessors: [new TelemetrySpanProcessor()],
+});
+provider.register();
+
+const anthropic = new Anthropic();
+await anthropic.messages.create({
+  model: "claude-sonnet-4-6",
+  max_tokens: 256,
+  messages: [{ role: "user", content: "Say hello." }],
+});
+
+await provider.shutdown();
+```
+
+By default, the spans contain metadata only. To also send prompts and responses, set `ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE=content`. The client reads this variable one time, when you make the client.
+
+Do not use the native spans and `@telemetry-dev/anthropic` together. If you use the two, each request has two spans.
+
+You can also send the native spans without this package. Use an OTLP/HTTP protobuf exporter:
+
+```sh
+npm i @opentelemetry/sdk-trace-node @opentelemetry/exporter-trace-otlp-proto
+```
+
+```ts
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
+import { BatchSpanProcessor, NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+
+const exporter = new OTLPTraceExporter({
+  url: "https://ingest.telemetry.dev/v1/traces",
+  headers: { Authorization: `Bearer ${process.env.TELEMETRY_DEV_API_KEY}` },
+});
+const provider = new NodeTracerProvider({
+  spanProcessors: [new BatchSpanProcessor(exporter)],
+});
+provider.register();
+```
+
+The Claude API can also send server-side spans to telemetry.dev through a Console destination. Set the endpoint to `https://ingest.telemetry.dev`. Set the `Authorization` header to `Bearer <telemetry.dev API key>`. For more information, refer to [Claude Platform](https://telemetry.dev/docs/integrations/claude-platform).
+
+telemetry.dev counts the tokens of a request one time only when the API span is a direct child of the SDK span. For this link, the SDK must send the W3C trace context to the API. The setup above does this, unless you set `ANTHROPIC_OPEN_TELEMETRY_PROPAGATION=false`. Without the link, telemetry.dev counts the tokens of the request two times. Claude Platform on AWS does not link the spans yet. On that platform, send the API spans to a different project, or use only one of the two sources.
+
 ## Options
 
 | Option         | Fallback                                                      | Default / behavior                                                                                                    |
