@@ -396,6 +396,19 @@ class SpanHandle:
         if self._client is not None:
             self._client.report("provider instrumentation failed", cause)
 
+    def serialize_content(self, value: Any, key: str) -> str | None:
+        """Prepare content written outside ``input`` and ``output`` the way those are prepared.
+
+        Runs the configured mask with ``key`` (the attribute the result is written to), JSON
+        serialization (strings pass through), then truncation to ``max_attribute_length``.
+        Returns None when the mask raises (reported to ``on_error``) or the value cannot be
+        serialized. Capture flags are not checked. Cores that predate this method lack it;
+        treat a missing method as masked.
+        """
+        if self._client is None:
+            return None
+        return self._client.serialize(value, key)
+
     def _recording(self) -> bool:
         return (
             self._client is not None

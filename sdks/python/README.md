@@ -76,6 +76,7 @@ later `init()` generates a new ID. It is not persisted across processes.
 | `@observe` / `@observe(name=, type=, capture_input=, capture_output=, attributes=)` | Wrap a sync/async function (or generator) in a span. Arguments become `input` (param-name dict, `self`/`cls` dropped), the return value becomes `output`, exceptions are captured and re-raised. |
 | `start_span(name, *, type="span", ...) -> SpanHandle` | Start a span. `with` activates it in the current context; without `with` it is a detached handle you must `.end()`. |
 | `SpanHandle.update(**fields)` / `.end(**fields, end_time=)` / `.record_output_chunk(timestamp_ms=None)` / `.traceparent()` | Update attributes, end, record arrival of a non-empty output chunk, or read the W3C traceparent. |
+| `SpanHandle.serialize_content(value, key) -> str \| None` | Prepare content an integration writes outside `input` and `output`, such as an error message or a raw attribute, the way `input` and `output` are prepared: the configured `mask` with `key`, JSON serialization (strings pass through), then truncation to `max_attribute_length`. Returns `None` when the mask raises (reported through `on_error`) or the value cannot be serialized; write nothing then. Does not check `capture_input` / `capture_output`. Integrations that support older cores should treat a missing method as a configured mask. |
 | `update_current_span(**fields)` | Apply the update field set to the currently active span (no-op without one). |
 | `propagate_attributes(*, user_id=, session_id=, metadata=)` | Context manager stamping `user.id` / `gen_ai.conversation.id` / `td.metadata.*` on every span and log record started inside (threads/asyncio included via contextvars). |
 | `log(message, *, level="info", event_name=None, attributes=None)` | Emit an OTLP log record to `/v1/logs`, correlated with the current trace. Levels: `debug`/`info`/`warn`/`error` (`"warning"` is accepted as an alias of `warn`). |
@@ -134,7 +135,7 @@ the core SDK with provider integrations to enable the new metric.
 | `export_mode` | `"batched"` | `"immediate"` exports synchronously per span/log (serverless). |
 | `log_level` | `"warn"` | SDK diagnostics level: `debug`/`info`/`warn`/`error`/`silent`. |
 | `capture_input`, `capture_output` | `True` | Global content-capture defaults. |
-| `mask` | `None` | `Callable[[Any, MaskContext], Any]` redaction hook, runs before JSON serialization on input/output/log messages (`MaskContext.key` is the attribute being written). Not applied to correlation identifiers. |
+| `mask` | `None` | `Callable[[Any, MaskContext], Any]` redaction hook, runs before JSON serialization on input/output/log messages and `SpanHandle.serialize_content` (`MaskContext.key` is the attribute being written). Not applied to correlation identifiers. |
 | `max_attribute_length` | `65536` | Non-negative integer per-content-attribute cap. Invalid values call `on_error`, do not raise into application code, and install a disabled client; truncated values use the ASCII `...[truncated]` marker, or its prefix when the cap is shorter than the marker. The cap also applies, with the marker, to string metadata and log attributes; any other string attribute is cut at the cap without a marker, except that a cap of `0` leaves those at 65536. |
 | `span_filter` | `None` | Export predicate `Callable[[ReadableSpan], bool]`. |
 | `sampler` | OTel environment configuration | OTel `Sampler` that overrides environment settings. Session roots use its root policy. Real parents keep their sampling decisions. |
@@ -147,6 +148,11 @@ the core SDK with provider integrations to enable the new metric.
 still record non-content metadata such as response IDs and models, finish reasons, usage, timing,
 and errors. Capture flags do not gate stop sequences, tool descriptions and definitions (`gen_ai.tool.description`, `gen_ai.tool.definitions`), caller-supplied metadata or raw attributes,
 or exception messages and stack traces; redact those separately when needed.
+
+`mask` receives input and output content, system instructions, log messages, and content that
+integrations pass to `SpanHandle.serialize_content`. `MaskContext.key` names the attribute being
+written. It does not receive span or propagated `metadata`, raw `attributes`, log attributes, or
+exception messages and stack traces; redact those separately.
 
 Session roots share trace IDs from the API key and session ID. The hash matches the TypeScript SDK.
 The SDK uses the configured OTel sampling policy, not the synthetic parent's flags.

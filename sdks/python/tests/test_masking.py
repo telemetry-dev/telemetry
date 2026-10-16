@@ -81,6 +81,62 @@ def test_mask_applies_to_log_message(make: MakeClient) -> None:
     assert record.log_record.body == "***"
 
 
+def _rewrite(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace("secret", "[masked]")
+    if isinstance(value, list):
+        return [_rewrite(item) for item in cast("list[Any]", value)]
+    if isinstance(value, dict):
+        return {key: _rewrite(item) for key, item in cast("dict[str, Any]", value).items()}
+    return value
+
+
+def test_serialize_content_masks_serializes_and_truncates(make: MakeClient) -> None:
+    keys: list[str] = []
+
+    def mask(value: Any, ctx: MaskContext) -> Any:
+        keys.append(ctx.key)
+        return _rewrite(value)
+
+    make(mask=mask, max_attribute_length=40)
+    span = telemetry_dev.start_span("integration", capture_input=False, capture_output=False)
+
+    assert (
+        span.serialize_content("tool failed: secret path", "exception.message")
+        == "tool failed: [masked] path"
+    )
+    grounding = span.serialize_content({"chunks": [{"text": "secret doc"}]}, "grounding")
+    assert grounding is not None
+    assert json.loads(grounding) == {"chunks": [{"text": "[masked] doc"}]}
+    assert span.serialize_content("secret " + "x" * 60, "long") == (
+        "[masked] " + "x" * 17 + "...[truncated]"
+    )
+    assert keys == ["exception.message", "grounding", "long"]
+    span.end()
+
+
+def test_serialize_content_withholds_content_the_mask_cannot_handle(make: MakeClient) -> None:
+    assert telemetry_dev.start_span("before-init").serialize_content("secret", "key") is None
+
+    errors: list[BaseException] = []
+
+    def mask(value: Any, ctx: MaskContext) -> Any:
+        if ctx.key == "broken":
+            raise RuntimeError("mask broke")
+        return value
+
+    make(mask=mask, on_error=errors.append, max_attribute_length=40)
+    span = telemetry_dev.start_span("integration")
+    circular: dict[str, Any] = {"text": "secret"}
+    circular["self"] = circular
+
+    assert span.serialize_content("secret", "broken") is None
+    assert span.serialize_content(circular, "circular") is None
+    assert span.serialize_content("\udcff" + "x" * 60, "lone-surrogate") is None
+    assert [type(error) for error in errors] == [RuntimeError, ValueError, UnicodeEncodeError]
+    span.end()
+
+
 def test_truncation_cap_and_marker(memory: SimpleNamespace) -> None:
     telemetry_dev.start_span("big", input="x" * 70_000).end()
     value = str(attrs(only_span(memory))["gen_ai.input.messages"])

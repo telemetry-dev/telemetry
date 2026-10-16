@@ -66,11 +66,10 @@ def serialize_content(
             report_error(on_error, f"mask hook raised for attribute '{key}'", exc)
             return None
     try:
-        text = stringify(value)
+        return truncate(stringify(value), max_len)
     except BaseException as exc:
         report_error(on_error, f"failed to serialize attribute '{key}'", exc)
         return None
-    return truncate(text, max_len)
 
 
 def coerce_attr_value(
