@@ -4139,5 +4139,22 @@ def test_iterations_usage_reads_only_the_bounded_tail() -> None:
 
     assert iterations.compaction["output_tokens"] == 7
     assert iterations.compaction_one_hour_cache_creation_tokens == 3
-    assert iterations.executor_one_hour_cache_creation_tokens == 999
+    # Executor iterations past the bound go unseen, so their sum isn't kept.
+    assert iterations.executor_one_hour_cache_creation_tokens is None
     assert iterations.truncated is True
+
+
+def test_stream_keeps_message_start_one_hour_split_when_an_iteration_leaves_it_out(
+    memory: SimpleNamespace,
+) -> None:
+    a = usage_span(
+        memory,
+        True,
+        {
+            **FIRST_TURN_USAGE,
+            "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 10},
+        },
+        {**TURNS_USAGE, "iterations": [{**FIRST_TURN, "cache_creation": None}, SECOND_TURN]},
+    )
+
+    assert a["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"] == 10

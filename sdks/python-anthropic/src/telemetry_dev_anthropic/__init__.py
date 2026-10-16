@@ -324,6 +324,9 @@ def _iterations_usage(usage: Any) -> _IterationsUsage | None:
     iterations = cast(Sequence[Any], value)
     result = _IterationsUsage(len(iterations) > _STREAM_CAPTURE_MAX_ITEMS)
     first_index = max(0, len(iterations) - _STREAM_CAPTURE_MAX_ITEMS)
+    # A stream uses the executor sum in place of message_start, so the sum is kept only when every
+    # executor iteration reports the one-hour split. Iterations past the bound go unseen.
+    executor_split_complete = not result.truncated
     for index in range(first_index, len(iterations)):
         entry = iterations[index]
         entry_type = _string(_field(entry, "type"))
@@ -334,10 +337,14 @@ def _iterations_usage(usage: Any) -> _IterationsUsage | None:
                 _one_hour_cache_creation_tokens(entry),
             )
         elif entry_type in ("message", "fallback_message"):
+            one_hour = _one_hour_cache_creation_tokens(entry)
+            if one_hour is None:
+                executor_split_complete = False
             result.executor_one_hour_cache_creation_tokens = _add_tokens(
-                result.executor_one_hour_cache_creation_tokens,
-                _one_hour_cache_creation_tokens(entry),
+                result.executor_one_hour_cache_creation_tokens, one_hour
             )
+    if not executor_split_complete:
+        result.executor_one_hour_cache_creation_tokens = None
     return result
 
 
@@ -694,7 +701,7 @@ def _stream_partial(
         "response_model": state.response_model,
     }
     # Only message_start carries the one-hour split, so later turns come from the executor
-    # iterations in the final usage when they report it.
+    # iterations in the final usage when every one reports it.
     executor_one_hour = iterations.executor_one_hour_cache_creation_tokens if iterations else None
     one_hour = (
         state.one_hour_cache_creation_tokens if executor_one_hour is None else executor_one_hour

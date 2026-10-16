@@ -2371,7 +2371,7 @@ test.each([false, true])(
 test.each([false, true])(
   "compaction usage reads only the bounded tail of usage.iterations (streaming: %s)",
   async (streaming) => {
-    const iterations = Array<JsonRecord>(1_001).fill(declinedIteration);
+    const iterations = Array<JsonRecord>(1_001).fill(firstTurn);
     Object.defineProperty(iterations, 0, {
       get() {
         throw new Error("inspected an iteration outside the bounded tail");
@@ -2381,7 +2381,22 @@ test.each([false, true])(
 
     const span = await usageSpan(streaming, firstTurnUsage, { ...firstTurnUsage, iterations });
 
+    // Executor iterations past the bound go unseen, so a stream keeps message_start's split.
     expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(7);
+    expect(span.attributes["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"]).toBe(1 + 3);
     expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
   },
 );
+
+test("streams keep message_start's one-hour split when an executor iteration leaves it out", async () => {
+  const span = await usageSpan(
+    true,
+    {
+      ...firstTurnUsage,
+      cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 10 },
+    },
+    { ...turnsUsage, iterations: [{ ...firstTurn, cache_creation: null }, secondTurn] },
+  );
+
+  expect(span.attributes["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"]).toBe(10);
+});

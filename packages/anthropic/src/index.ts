@@ -241,6 +241,9 @@ function iterationsUsage<T>(usage: T): IterationsUsage | undefined {
   };
 
   const firstIndex = Math.max(0, iterations.length - STREAM_CAPTURE_MAX_ITEMS);
+  // A stream uses the executor sum in place of message_start, so the sum is kept only when every
+  // executor iteration reports the one-hour split. Iterations past the bound go unseen.
+  let executorSplitComplete = !result.truncated;
 
   for (let index = firstIndex; index < iterations.length; index += 1) {
     const entry = asRecord(iterations[index]);
@@ -253,12 +256,18 @@ function iterationsUsage<T>(usage: T): IterationsUsage | undefined {
         oneHourCacheCreationTokens(entry),
       );
     } else if (entry?.type === "message" || entry?.type === "fallback_message") {
+      const oneHour = oneHourCacheCreationTokens(entry);
+
+      if (oneHour === undefined) executorSplitComplete = false;
+
       result.executorOneHourCacheCreationTokens = addTokens(
         result.executorOneHourCacheCreationTokens,
-        oneHourCacheCreationTokens(entry),
+        oneHour,
       );
     }
   }
+
+  if (!executorSplitComplete) result.executorOneHourCacheCreationTokens = undefined;
 
   return result;
 }
@@ -574,7 +583,7 @@ function streamPartialFields(state: StreamState): SpanFields {
   if (state.responseModel !== undefined) fields.responseModel = state.responseModel;
 
   // Only message_start carries the one-hour split, so later turns come from the executor
-  // iterations in the final usage when they report it.
+  // iterations in the final usage when every one reports it.
   const attributes = usageAttributes(
     addTokens(
       state.iterations?.executorOneHourCacheCreationTokens ?? state.oneHourCacheCreationTokens,
