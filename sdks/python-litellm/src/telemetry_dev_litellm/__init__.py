@@ -364,9 +364,48 @@ _PROXY_REQUEST_METADATA_KEYS = frozenset(
 )
 _PROXY_AUTH_METADATA_PREFIX = "user_api_key"
 
+# Keys the Router writes into the metadata argument when it picks a deployment and retries,
+# exported on the proxy only with a scalar value, since a hook can write anything under them.
+# model_info and api_base are left out: model_info holds whatever fields an admin configured
+# for the deployment, and an api_base URL can carry credentials.
+_PROXY_ROUTER_METADATA_KEYS = (
+    "model_group",
+    "model_group_alias",
+    "model_group_size",
+    "deployment",
+    "deployment_model_name",
+    "attempted_retries",
+    "max_retries",
+)
+# Keys the proxy adds to the client's metadata before it copies it into requester_metadata:
+# authentication merges the x-litellm-tags header and the key's tags into tags, and request
+# preparation adds the rest, mostly from request headers. used_client_oauth_token and
+# litellm_session_id_omitted come from LiteLLM releases after 1.90.2.
+_PROXY_REQUESTER_METADATA_KEYS = frozenset(
+    {
+        "tags",
+        "spend_logs_metadata",
+        "agent_id",
+        "trace_id",
+        "session_id",
+        "used_client_oauth_token",
+        "litellm_session_id_omitted",
+    }
+)
 
-def _request_metadata(kwargs: Mapping[str, Any]) -> Mapping[str, Any] | None:
-    metadata = _metadata(kwargs.get("litellm_metadata")) or _metadata(kwargs.get("metadata"))
+
+def _request_metadata(
+    kwargs: Mapping[str, Any], proxy_metadata_argument: str = "metadata"
+) -> Mapping[str, Any] | None:
+    """proxy_metadata_argument names the argument that LiteLLM's proxy and Router write their
+    own metadata into for this operation."""
+    proxy_request = _metadata(kwargs.get("proxy_server_request"))
+    if proxy_request is None:
+        metadata = _metadata(kwargs.get("litellm_metadata")) or _metadata(kwargs.get("metadata"))
+    else:
+        metadata = _proxy_request_metadata(
+            proxy_request, _metadata(kwargs.get(proxy_metadata_argument)) or {}
+        )
     if metadata is None:
         return None
     return {
@@ -374,6 +413,34 @@ def _request_metadata(kwargs: Mapping[str, Any]) -> Mapping[str, Any] | None:
         for key, value in metadata.items()
         if str(key) not in _PROXY_REQUEST_METADATA_KEYS
         and not str(key).startswith(_PROXY_AUTH_METADATA_PREFIX)
+    }
+
+
+def _proxy_request_metadata(
+    proxy_request: Mapping[str, Any], proxy_metadata: Mapping[str, Any]
+) -> dict[str, Any]:
+    # The proxy's guardrails and pre-call hooks add arbitrary keys to both metadata arguments, so
+    # only two parts of the proxy's own argument are read: requester_metadata, the copy of the
+    # body's metadata the proxy takes before any hook runs, and the Router's keys. The proxy only
+    # takes that copy when the body it recorded has a metadata object; without one, any
+    # requester_metadata there was sent by the client in litellm_metadata.
+    body = _metadata(proxy_request.get("body")) or {}
+    requester_metadata = (
+        _metadata(proxy_metadata.get("requester_metadata"))
+        if isinstance(body.get("metadata"), Mapping)
+        else None
+    ) or {}
+    return {
+        **{
+            key: value
+            for key, value in requester_metadata.items()
+            if str(key) not in _PROXY_REQUESTER_METADATA_KEYS
+        },
+        **{
+            key: proxy_metadata[key]
+            for key in _PROXY_ROUTER_METADATA_KEYS
+            if isinstance(proxy_metadata.get(key), str | int | float | bool)
+        },
     }
 
 
@@ -494,7 +561,7 @@ def _responses_request(
             "max_tokens": _number(kwargs.get("max_output_tokens")),
             "output_type": _output_type(kwargs.get("text_format"))
             or _output_type(kwargs.get("text")),
-            "metadata": _request_metadata(kwargs),
+            "metadata": _request_metadata(kwargs, proxy_metadata_argument="litellm_metadata"),
             "attributes": attributes,
         },
     )
