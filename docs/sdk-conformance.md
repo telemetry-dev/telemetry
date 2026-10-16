@@ -48,7 +48,9 @@ client, and never checks the capture flags. Integrations use it for content they
 attributes. A TypeScript mask that returns `undefined` omits the value; Python has no equivalent,
 and a mask returning `None` serializes as `null`, like a TypeScript mask returning `null`.
 
-The mask never sees per-span or propagated metadata or raw attributes.
+The mask never sees per-span or propagated metadata or raw span attributes. TypeScript `log()`
+passes log attributes other than numbers and booleans through the mask; Python `log()` does not
+mask log attributes.
 
 Shared constants: env vars `TELEMETRY_DEV_API_KEY` / `TELEMETRY_DEV_BASE_URL` (default
 `https://ingest.telemetry.dev`) / `TELEMETRY_DEV_ENVIRONMENT` (default `production`) /

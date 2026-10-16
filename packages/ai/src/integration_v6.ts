@@ -21,6 +21,7 @@ import { resolveConfig, type ResolvedConfig, type TelemetryDevOptions } from "./
 import {
   contentAttr,
   providerLabel,
+  reportTelemetryError,
   readId,
   SEVERITY_ERROR,
   SEVERITY_INFO,
@@ -264,7 +265,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
         );
         rootCtx = trace.setSpan(ROOT_CONTEXT, rootSpan);
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -287,7 +288,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
           messages: e.messages,
         });
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -389,7 +390,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
           responseModel: e.response?.modelId ?? null,
         });
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -397,7 +398,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
       try {
         toolStarts.set(e.toolCall.toolCallId, new Date());
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -459,7 +460,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
           durationSec: Math.max(endedAt.getTime() - startedAt.getTime(), 0) / 1000,
         });
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -562,7 +563,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
 
         await emitter.flush([rootSpan, ...childSpans]);
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
   };

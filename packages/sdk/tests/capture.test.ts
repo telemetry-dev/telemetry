@@ -264,7 +264,10 @@ describe("capture integration", () => {
     expect(span.serializeContent?.("secret", "broken")).toBeUndefined();
     expect(span.serializeContent?.("secret", "odd-throw")).toBeUndefined();
     expect(span.serializeContent?.(circular, "circular")).toBeUndefined();
-    expect(errors.map((error) => error.message)).toEqual(["mask broke"]);
+    expect(errors.map((error) => error.message)).toEqual([
+      "mask broke",
+      "A value that cannot be converted to a string was thrown",
+    ]);
     span.end();
   });
 

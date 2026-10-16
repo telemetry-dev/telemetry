@@ -1,6 +1,7 @@
+import type { Exception } from "@opentelemetry/api";
 import { jsonAttr } from "@telemetry-dev/otel";
 
-import type { ResolvedConfig } from "./config.ts";
+import type { ResolvedConfig, TelemetryDevOptions } from "./config.ts";
 
 export type JsonValue =
   | string
@@ -49,16 +50,69 @@ export function contentAttr(
   try {
     masked = config.mask(value, { key });
   } catch (error) {
-    try {
-      config.onError?.(error instanceof Error ? error : String(error));
-    } catch {
-      // A throwing onError must not stop the hook from ending its spans.
-    }
+    reportTelemetryError(config.onError, error);
 
     return undefined;
   }
 
   return jsonAttr(masked);
+}
+
+/**
+ * What a failed wrapper call records as its span status message and exception. Without a mask
+ * that is the error itself; with one it is the masked message, or `fallback` when the mask omits
+ * it or throws, and no stack trace, which repeats the message.
+ */
+export function failureRecord(
+  config: Pick<ResolvedConfig, "mask" | "onError">,
+  error: unknown,
+  fallback: string,
+): { message: string; exception: Exception } {
+  if (!config.mask) {
+    return {
+      message: unknownErrorMessage(error),
+      exception: error instanceof Error ? error : unknownErrorMessage(error),
+    };
+  }
+
+  let name: string | undefined;
+  let detail: string | undefined;
+
+  try {
+    if (error instanceof Error) {
+      name = typeof error.name === "string" && error.name.length > 0 ? error.name : undefined;
+      detail = error.message;
+    } else {
+      detail = unknownErrorMessage(error);
+    }
+  } catch {
+    detail = undefined;
+  }
+
+  const message =
+    (detail ? contentAttr(config, "exception.message", detail) : undefined) || fallback;
+
+  return { message, exception: { name: name ?? "Error", message } };
+}
+
+/** Reports to onError without throwing, including for thrown values String() cannot convert. */
+export function reportTelemetryError(
+  onError: TelemetryDevOptions["onError"],
+  error: unknown,
+): void {
+  let reported: Error | string;
+
+  try {
+    reported = error instanceof Error ? error : String(error);
+  } catch {
+    reported = new Error("A value that cannot be converted to a string was thrown");
+  }
+
+  try {
+    onError?.(reported);
+  } catch {
+    // A throwing onError must not stop the caller from ending its spans.
+  }
 }
 
 export function unknownErrorMessage(value: unknown): string {

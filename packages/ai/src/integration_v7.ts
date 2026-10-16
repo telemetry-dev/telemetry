@@ -21,6 +21,7 @@ import { resolveConfig, type ResolvedConfig, type TelemetryDevOptions } from "./
 import {
   contentAttr,
   providerLabel,
+  reportTelemetryError,
   readId,
   SEVERITY_ERROR,
   SEVERITY_INFO,
@@ -1185,7 +1186,7 @@ export function createV7Hooks(
         rememberProviderToolInputs(state, e.messages);
         calls.set(e.callId, state);
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1225,7 +1226,7 @@ export function createV7Hooks(
         });
         state.currentStepNumber = e.stepNumber;
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1237,7 +1238,7 @@ export function createV7Hooks(
         const e = event as V7LanguageModelCallEndEvent;
         recordProviderToolSpans(state, e.content);
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1371,7 +1372,7 @@ export function createV7Hooks(
           responseModel: e.response?.modelId ?? null,
         });
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1399,7 +1400,7 @@ export function createV7Hooks(
         const e = event as V7ToolExecutionStartEvent;
         state.toolStarts.set(e.toolCall.toolCallId, new Date());
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1429,7 +1430,7 @@ export function createV7Hooks(
           state.toolSpans.set(toolCallId, { span, startedAt });
           ctx = trace.setSpan(parentCtx, span);
         } catch (err) {
-          onError?.(err instanceof Error ? err : String(err));
+          reportTelemetryError(onError, err);
         }
       }
 
@@ -1505,7 +1506,7 @@ export function createV7Hooks(
         state.hasToolSpan = true;
         state.toolMetrics.push({ durationSec: e.toolExecutionMs / 1000 });
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1540,7 +1541,7 @@ export function createV7Hooks(
 
         state.objectStep = { span, startedAt };
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1598,7 +1599,7 @@ export function createV7Hooks(
           responseModel: e.response?.modelId ?? null,
         });
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1628,7 +1629,7 @@ export function createV7Hooks(
 
         state.embedSpans.set(e.embedCallId, { span, startedAt });
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1665,7 +1666,7 @@ export function createV7Hooks(
           responseModel: null,
         });
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1694,7 +1695,7 @@ export function createV7Hooks(
 
         state.rerankSpan = { span, startedAt };
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1725,7 +1726,7 @@ export function createV7Hooks(
           responseModel: null,
         });
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1774,7 +1775,7 @@ export function createV7Hooks(
           evaluationSpan: undefined,
         });
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1805,7 +1806,7 @@ export function createV7Hooks(
 
         state.evaluationSpan = { span, startedAt };
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1844,7 +1845,7 @@ export function createV7Hooks(
           responseModel: e.response?.modelId ?? null,
         });
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1870,7 +1871,7 @@ export function createV7Hooks(
         state.rootSpan.end(new Date());
         await finishCall(state, callId);
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -1988,7 +1989,7 @@ export function createV7Hooks(
         root.end(endedAt);
         await finishCall(state, callId);
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -2026,7 +2027,7 @@ export function createV7Hooks(
         markSpanFailed(state.rootSpan, errorType, message, endedAt);
         await finishCall(state, callId);
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
 
@@ -2055,7 +2056,7 @@ export function createV7Hooks(
         state.rootSpan.end(endedAt);
         await finishCall(state, callId);
       } catch (err) {
-        onError?.(err instanceof Error ? err : String(err));
+        reportTelemetryError(onError, err);
       }
     },
   };

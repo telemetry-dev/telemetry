@@ -173,7 +173,9 @@ failed tool calls (`key` is `exception.message`), and model warning text (`key` 
 throws, the payload is omitted, an error message falls back to a generic text, and the error goes
 to `onError`. The mask does not see `runtimeContext` keys recorded as `user.id`,
 `gen_ai.conversation.id`, or `td.metadata.*`; leave out keys that should not be recorded. The
-media and batch wrappers record no payloads, and their exception messages are not masked.
+media and batch wrappers record no payloads; when a `mask` is passed to a wrapper, a failed call
+records the masked error message as its status and exception message, or a generic text when the
+mask omits it or throws, and no stack trace.
 
 `ai@7` still accepts `experimental_telemetry` as a deprecated alias for `telemetry`.
 

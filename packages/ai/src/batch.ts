@@ -2,7 +2,7 @@ import { type Attributes, SpanKind, SpanStatusCode } from "@opentelemetry/api";
 import { createGenerationEmitter, type GenerationEmitterOverrides } from "@telemetry-dev/otel";
 
 import { resolveConfig, type TelemetryDevOptions } from "./config.ts";
-import { unknownErrorMessage } from "./shared.ts";
+import { failureRecord, reportTelemetryError } from "./shared.ts";
 
 type Callable = (...args: never[]) => unknown;
 
@@ -98,12 +98,11 @@ function wrapBatch<F extends Callable>(
       };
 
       if (failed) {
-        attempt(() =>
-          span.setStatus({ code: SpanStatusCode.ERROR, message: unknownErrorMessage(error) }),
-        );
-        attempt(() =>
-          span.recordException(error instanceof Error ? error : unknownErrorMessage(error)),
-        );
+        attempt(() => {
+          const failure = failureRecord(config, error, "Batch request failed");
+          attempt(() => span.setStatus({ code: SpanStatusCode.ERROR, message: failure.message }));
+          attempt(() => span.recordException(failure.exception));
+        });
       } else {
         const result = value;
         attempt(() => {
@@ -236,12 +235,11 @@ export const wrapGetBatchResults = <F extends Callable>(
       attempt(() => span.setAttribute("td.ai.batch.completed", completed));
 
       if (failed) {
-        attempt(() =>
-          span.setStatus({ code: SpanStatusCode.ERROR, message: unknownErrorMessage(error) }),
-        );
-        attempt(() =>
-          span.recordException(error instanceof Error ? error : unknownErrorMessage(error)),
-        );
+        attempt(() => {
+          const failure = failureRecord(config, error, "Batch request failed");
+          attempt(() => span.setStatus({ code: SpanStatusCode.ERROR, message: failure.message }));
+          attempt(() => span.recordException(failure.exception));
+        });
       }
 
       attempt(() => span.end());
@@ -425,9 +423,3 @@ export const wrapGetBatchResults = <F extends Callable>(
     }
   }) as F;
 };
-
-function reportTelemetryError(onError: TelemetryDevOptions["onError"], error: unknown): void {
-  try {
-    onError?.(error instanceof Error ? error : String(error));
-  } catch {}
-}
