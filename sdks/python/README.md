@@ -288,7 +288,7 @@ trace.set_tracer_provider(provider)
 
 The Claude API can also send server-side spans to telemetry.dev through a Console destination. Set the endpoint to `https://ingest.telemetry.dev`. Set the `Authorization` header to `Bearer <telemetry.dev API key>`. For more information, refer to [Claude Platform](https://telemetry.dev/docs/integrations/claude-platform).
 
-telemetry.dev counts the tokens of a request one time only when the API span is a direct child of the SDK span. For this link, the SDK must send the W3C trace context to the API. The setup above does this, unless you set `ANTHROPIC_OPEN_TELEMETRY_PROPAGATION=false`. Without the link, telemetry.dev counts the tokens of the request two times. Claude Platform on AWS does not link the spans yet. On that platform, send the API spans to a different project, or use only one of the two sources.
+When the SDK and the Claude API send the spans of a request to the same telemetry.dev project, telemetry.dev counts the tokens of the request one time, from the API span. The SDK span stays in the trace with no tokens. telemetry.dev matches the two spans by the request ID or the response ID, so the API span does not have to be a child of the SDK span. If the Console destination uses an API key that is scoped to one environment, its API spans take over only the SDK spans of that environment.
 
 ## Limitations
 
