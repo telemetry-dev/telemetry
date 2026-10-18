@@ -178,6 +178,13 @@ that mode only this SDK's spans are exported by default.
 Any vanilla OTel app can also skip the SDK entirely: point a stock OTLP/HTTP protobuf exporter at
 `https://ingest.telemetry.dev/v1/traces` with an `Authorization: Bearer td_live_...` header.
 
+### Native Claude SDK spans
+
+`@anthropic-ai/sdk` 0.134.0 and later emits OpenTelemetry spans natively through the global tracer provider.
+To send these spans to telemetry.dev, refer to [Native Claude SDK spans](../otel/README.md#native-claude-sdk-spans).
+If you use `init({ registerGlobal: true })`, also set `spanFilter: () => true`. The default filter of that mode exports only the spans of this SDK.
+Do not use the native spans and `@telemetry-dev/anthropic` together. If you use the two, each request has two spans.
+
 ## Notes
 
 - AsyncLocalStorage powers context propagation. On runtimes without it (Workers without

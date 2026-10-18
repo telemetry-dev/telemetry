@@ -82,6 +82,20 @@ messages and stack traces; redact those separately when needed. Request tools an
 
 Class instrumentation covers the provider clients. Their `messages` resources reuse the stable `Messages` and `AsyncMessages` classes. The Bedrock and Vertex `beta.messages` resources are separate provider classes, which are patched too: Bedrock exposes `create()` and Vertex exposes `create()` and `stream()`. Provider attribution comes from the client class, including subclasses: `aws.bedrock` for `AnthropicBedrock` and `AnthropicBedrockMantle`, and `gcp.vertex_ai` for `AnthropicVertex`. `AnthropicAWS` (Claude Platform on AWS) and `AnthropicFoundry` (Microsoft Foundry) serve the Anthropic API, so they are recorded as `anthropic`.
 
+## Native Claude SDK spans
+
+The `anthropic` SDK 1.14.0 and later emits OpenTelemetry spans natively when the application registers a global tracer provider. Use this package or the native spans, not the two. If you use the two, each request has two spans.
+
+To keep this package, turn off the native spans on each client:
+
+```python
+client = wrap_anthropic(Anthropic(open_telemetry=False))
+```
+
+With global instrumentation, set `ANTHROPIC_OPEN_TELEMETRY=false` before you make the clients. The Claude SDK reads this variable only for a client that has no `open_telemetry` option. For a client with this option, set `open_telemetry=False`.
+
+To use the native spans instead of this package, refer to [Native Claude SDK spans](../python/README.md#native-claude-sdk-spans). The Claude API can also send server-side spans to telemetry.dev. Refer to [Claude Platform](https://telemetry.dev/docs/integrations/claude-platform).
+
 ## Limitations
 
 - `messages.count_tokens()`, `beta.messages.count_tokens()`, and batches are not instrumented.
