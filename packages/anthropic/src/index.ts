@@ -80,6 +80,8 @@ interface StreamState {
   unresolvedReplacements: Set<number>;
   unresolvedEncryptedContent: Set<number>;
   usage?: SpanFields["usage"];
+  oneHourCacheCreationTokens?: number;
+  iterations?: IterationsUsage;
   finishReason?: string;
   responseModel?: string;
 }
@@ -187,17 +189,127 @@ function cacheInclusiveUsage(usage: SpanFields["usage"]): SpanFields["usage"] {
   };
 }
 
+function addTokens(current: number | undefined, incoming: number | undefined): number | undefined {
+  return current === undefined || incoming === undefined
+    ? (current ?? incoming)
+    : current + incoming;
+}
+
+function addUsage(
+  current: SpanFields["usage"],
+  incoming: SpanFields["usage"],
+): SpanFields["usage"] {
+  if (!incoming) return current;
+
+  return compactUsage({
+    inputTokens: addTokens(current?.inputTokens, incoming.inputTokens),
+    outputTokens: addTokens(current?.outputTokens, incoming.outputTokens),
+    cacheReadInputTokens: addTokens(current?.cacheReadInputTokens, incoming.cacheReadInputTokens),
+    cacheCreationInputTokens: addTokens(
+      current?.cacheCreationInputTokens,
+      incoming.cacheCreationInputTokens,
+    ),
+    reasoningOutputTokens: addTokens(
+      current?.reasoningOutputTokens,
+      incoming.reasoningOutputTokens,
+    ),
+  });
+}
+
+function oneHourCacheCreationTokens<T>(usage: T): number | undefined {
+  return readNumber(asRecord(asRecord(usage)?.cache_creation)?.ephemeral_1h_input_tokens);
+}
+
+interface IterationsUsage {
+  compaction: SpanFields["usage"];
+  compactionOneHourCacheCreationTokens?: number;
+  executorOneHourCacheCreationTokens?: number;
+  truncated: boolean;
+}
+
+// The top-level usage fields sum the executor iterations (message and fallback_message) and leave
+// out compaction, so compaction is added from here. Like the fallback lookup, only the bounded
+// tail of usage.iterations is read.
+function iterationsUsage<T>(usage: T): IterationsUsage | undefined {
+  const iterations = asRecord(usage)?.iterations;
+
+  if (!Array.isArray(iterations)) return undefined;
+
+  const result: IterationsUsage = {
+    compaction: undefined,
+    truncated: iterations.length > STREAM_CAPTURE_MAX_ITEMS,
+  };
+
+  const firstIndex = Math.max(0, iterations.length - STREAM_CAPTURE_MAX_ITEMS);
+  // A stream uses the executor sum in place of message_start, so the sum is kept only when every
+  // executor iteration reports the one-hour split. Iterations past the bound go unseen.
+  let executorSplitComplete = !result.truncated;
+
+  for (let index = firstIndex; index < iterations.length; index += 1) {
+    const entry = asRecord(iterations[index]);
+
+    if (entry?.type === "compaction") {
+      result.compaction = addUsage(result.compaction, messagesUsage(entry));
+
+      result.compactionOneHourCacheCreationTokens = addTokens(
+        result.compactionOneHourCacheCreationTokens,
+        oneHourCacheCreationTokens(entry),
+      );
+    } else if (entry?.type === "message" || entry?.type === "fallback_message") {
+      const oneHour = oneHourCacheCreationTokens(entry);
+
+      if (oneHour === undefined) executorSplitComplete = false;
+
+      result.executorOneHourCacheCreationTokens = addTokens(
+        result.executorOneHourCacheCreationTokens,
+        oneHour,
+      );
+    }
+  }
+
+  if (!executorSplitComplete) result.executorOneHourCacheCreationTokens = undefined;
+
+  return result;
+}
+
+function usageAttributes(
+  oneHourCacheCreation: number | undefined,
+  captureIncomplete: boolean,
+): SpanFields["attributes"] {
+  const attributes: NonNullable<SpanFields["attributes"]> = {};
+
+  if (oneHourCacheCreation !== undefined)
+    attributes["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"] = oneHourCacheCreation;
+
+  if (captureIncomplete) attributes["telemetry.dev.capture.truncated"] = true;
+
+  return Object.keys(attributes).length > 0 ? attributes : undefined;
+}
+
 function messagesResponse<T>(response: T): SpanFields {
   const record: ValueRecord = asRecord(response) ?? {};
   const role = readString(record.role) ?? "assistant";
+  const iterations = iterationsUsage(record.usage);
 
-  return {
+  const fields: SpanFields = {
     responseModel: readString(record.model),
     responseId: readString(record.id),
     finishReason: readString(record.stop_reason),
     output: record.content !== undefined ? [{ role, content: record.content }] : undefined,
-    usage: cacheInclusiveUsage(messagesUsage(record.usage)),
+    usage: cacheInclusiveUsage(addUsage(messagesUsage(record.usage), iterations?.compaction)),
   };
+
+  const attributes = usageAttributes(
+    addTokens(
+      oneHourCacheCreationTokens(record.usage),
+      iterations?.compactionOneHourCacheCreationTokens,
+    ),
+    iterations?.truncated === true,
+  );
+
+  if (attributes) fields.attributes = attributes;
+
+  return fields;
 }
 
 function constructorName<T>(value: T): string | undefined {
@@ -464,13 +576,23 @@ function streamPartialFields(state: StreamState): SpanFields {
 
   const fields: SpanFields = {
     output: state.maskOutputWhenIncomplete && outputIncomplete ? undefined : boundedOutput?.value,
-    usage: cacheInclusiveUsage(state.usage),
+    usage: cacheInclusiveUsage(addUsage(state.usage, state.iterations?.compaction)),
     finishReason: state.finishReason,
   };
 
   if (state.responseModel !== undefined) fields.responseModel = state.responseModel;
 
-  if (captureIncomplete) fields.attributes = { "telemetry.dev.capture.truncated": true };
+  // Only message_start carries the one-hour split, so later turns come from the executor
+  // iterations in the final usage when every one reports it.
+  const attributes = usageAttributes(
+    addTokens(
+      state.iterations?.executorOneHourCacheCreationTokens ?? state.oneHourCacheCreationTokens,
+      state.iterations?.compactionOneHourCacheCreationTokens,
+    ),
+    captureIncomplete,
+  );
+
+  if (attributes) fields.attributes = attributes;
 
   return fields;
 }
@@ -813,6 +935,9 @@ function recordStreamEvent<T>(event: T, state: StreamState): SpanFields {
     fields.responseId = readString(message.id);
     fields.responseModel = readString(message.model);
     state.usage = mergeUsage(state.usage, messagesUsage(message.usage));
+
+    state.oneHourCacheCreationTokens =
+      oneHourCacheCreationTokens(message.usage) ?? state.oneHourCacheCreationTokens;
   }
 
   if (type === "content_block_start") recordContentBlockStart(record, state);
@@ -823,7 +948,11 @@ function recordStreamEvent<T>(event: T, state: StreamState): SpanFields {
     const delta = asRecord(record.delta) ?? {};
     state.finishReason = readString(delta.stop_reason) ?? state.finishReason;
     state.usage = mergeUsage(state.usage, messagesUsage(record.usage));
+
+    state.oneHourCacheCreationTokens =
+      oneHourCacheCreationTokens(record.usage) ?? state.oneHourCacheCreationTokens;
     state.responseModel = fallbackServingModel(record.usage, state) ?? state.responseModel;
+    state.iterations = iterationsUsage(record.usage) ?? state.iterations;
   }
 
   if (type === "message_stop") state.messageStopped = true;
