@@ -2,6 +2,8 @@
 
 LiteLLM integration for the telemetry.dev Python SDK. It instruments LiteLLM completion, Responses, embedding, and rerank APIs, including their async and streaming variants, and `litellm.Router` methods when available.
 
+Docs: https://telemetry.dev/docs/integrations/litellm
+
 ## Install
 
 ```sh
@@ -10,7 +12,7 @@ pip install telemetry-dev telemetry-dev-litellm
 uv add telemetry-dev telemetry-dev-litellm
 ```
 
-Requires Python `>=3.10,<3.14`.
+Requires Python 3.10 to 3.13 and `litellm` 1.90.2 or a later 1.x release.
 
 ## Initialize telemetry.dev
 
@@ -205,3 +207,7 @@ pnpm run py:sync
 pnpm run py:check
 pnpm run py:test
 ```
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/sdks/python-litellm/LICENSE).

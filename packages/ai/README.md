@@ -1,7 +1,11 @@
 # @telemetry-dev/ai-sdk
 
 Vercel AI SDK telemetry integration for [telemetry.dev](https://telemetry.dev). Streams AI SDK
-runs to the telemetry.dev ingest API. The package ships one entry per supported `ai` major:
+runs to the telemetry.dev ingest API.
+
+Docs: https://telemetry.dev/docs/integrations/vercel-ai-sdk
+
+The package ships one entry per supported `ai` major:
 
 - `@telemetry-dev/ai-sdk` — for `ai@7`. Covers `generateText` / `streamText` / `Agent` /
   `generateObject` / `streamObject` / `embed` / `embedMany` / `rerank` /
@@ -97,7 +101,7 @@ Trace sampling uses `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG`, which als
 The default is parent-based always-on.
 Pass an OTel `Sampler` as `telemetryDev({ sampler })` to override the environment for version 6 or version 7.
 Real active parents keep their sampling decisions. The integration does not send dropped or record-only spans.
-The [session sampling contract](../otel/README.md#correlation-attributes) lists environment modes and argument defaults.
+The [session sampling contract](https://github.com/telemetry-dev/telemetry/blob/main/packages/otel/README.md#correlation-attributes) lists environment modes and argument defaults.
 
 ## Usage (ai@7)
 
@@ -279,3 +283,7 @@ On both majors:
 - Integration hook exceptions are swallowed by the AI SDK; this client additionally wraps every
   hook in `try/catch` and routes errors to the optional `onError` callback so instrumentation can
   never break your generation.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/packages/ai/LICENSE).

@@ -2,22 +2,22 @@
 
 Google GenAI (Gemini) SDK instrumentation for telemetry.dev. It wraps the official `google-genai` Python SDK and emits telemetry.dev generation and embedding spans through `telemetry-dev`.
 
+Docs: https://telemetry.dev/docs/integrations/google-genai
+
 ## Install
 
 ```sh
 pip install telemetry-dev-google-genai
 ```
 
-Initialize the core SDK first:
+Requires Python 3.10 or later and `google-genai` 2.
+
+Initialize the core SDK first. `init()` reads your project API key from the `TELEMETRY_DEV_API_KEY` environment variable, so set it before you start the app:
 
 ```py
 import telemetry_dev
 
-telemetry_dev.init(
-    api_key="td_live_...",
-    base_url="http://localhost:4318",
-    service_name="my-service",
-)
+telemetry_dev.init(service_name="my-service")
 ```
 
 ## Per-client wrapping
@@ -124,3 +124,7 @@ Mapping code is defensive; wrapped calls return the SDK response unchanged and r
 - Media operations capture text prompts, model/provider attribution, non-binary media references such as URIs and MIME types, and `gen_ai.operation.name=generate_content`. Image, video, and reference-image bytes are never captured. Image and video operations emit the corresponding `gen_ai.output.type`.
 - Deliberately not captured: logprobs, citation metadata, `create_time`, `sdk_http_response`.
 - Unconsumed streams end their spans only when the stream is exhausted, errors, or is closed.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/sdks/python-google-genai/LICENSE).

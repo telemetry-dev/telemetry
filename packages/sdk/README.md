@@ -3,8 +3,11 @@
 Pure TypeScript SDK for [telemetry.dev](https://telemetry.dev): add LLM traces, logs, and GenAI
 metrics to any app. Built on OpenTelemetry — spans use the `gen_ai.*` semantic conventions and
 ship as OTLP protobuf to `https://ingest.telemetry.dev`. Works on Node >= 20.19 and edge runtimes
-(Vercel Edge, Cloudflare Workers with `nodejs_compat`). ESM-only; CJS consumers can `require()` it
-on Node >= 20.19.
+(Vercel Edge, and Cloudflare Workers with Node.js compatibility, which is on by default for
+compatibility dates of 2026-08-04 or later; earlier dates need the `nodejs_compat` flag). ESM-only;
+CJS consumers can `require()` it on Node >= 20.19.
+
+Docs: https://telemetry.dev/docs/sdk/typescript
 
 ```sh
 npm install @telemetry-dev/sdk
@@ -12,10 +15,20 @@ npm install @telemetry-dev/sdk
 
 ## Quickstart
 
+Set `TELEMETRY_DEV_API_KEY` to your project API key. `init()` reads it from the environment.
+
 ```ts
 import { init, observe, startSpan, propagateAttributes, log, flush } from "@telemetry-dev/sdk";
 
-init({ apiKey: "td_live_..." }); // or TELEMETRY_DEV_API_KEY
+init();
+
+// Stand-in for your model client, so the example runs on its own. Replace it with a real call.
+async function callModel(question: string) {
+  return {
+    message: { role: "assistant", content: `You asked: ${question}` },
+    usage: { input: 12, output: 9 },
+  };
+}
 
 const answer = observe(
   async function answer(question: string) {
@@ -25,13 +38,13 @@ const answer = observe(
       provider: "openai",
       input: [{ role: "user", content: question }],
     });
-    const res = await llm.chat(question);
+    const res = await callModel(question);
     generation.end({
-      output: res.message,
+      output: [res.message],
       usage: { inputTokens: res.usage.input, outputTokens: res.usage.output },
     });
     log("generation finished", { attributes: { cached: false } });
-    return res.message;
+    return res.message.content;
   },
   { type: "agent" },
 );
@@ -85,7 +98,7 @@ new ID. It is not persisted across processes.
 `sampler` accepts an OpenTelemetry `Sampler` and overrides `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG`.
 The default is parent-based always-on. Session roots keep the configured root policy.
 Nested spans and explicitly parented spans keep the real parent's policy.
-The SDK installs the [session sampling wrapper](../otel/README.md#correlation-attributes) on its provider. This includes the global provider that Eve uses.
+The SDK installs the [session sampling wrapper](https://github.com/telemetry-dev/telemetry/blob/main/packages/otel/README.md#correlation-attributes) on its provider. This includes the global provider that Eve uses.
 
 ## API
 
@@ -181,14 +194,18 @@ Any vanilla OTel app can also skip the SDK entirely: point a stock OTLP/HTTP pro
 ### Native Claude SDK spans
 
 `@anthropic-ai/sdk` 0.134.0 and later emits OpenTelemetry spans natively through the global tracer provider.
-To send these spans to telemetry.dev, refer to [Native Claude SDK spans](../otel/README.md#native-claude-sdk-spans).
+To send these spans to telemetry.dev, refer to [Claude SDK](https://telemetry.dev/docs/integrations/claude-sdk).
 If you use `init({ registerGlobal: true })`, also set `spanFilter: () => true`. The default filter of that mode exports only the spans of this SDK.
 Do not use the native spans and `@telemetry-dev/anthropic` together. If you use the two, each request has two spans.
 
 ## Notes
 
-- AsyncLocalStorage powers context propagation. On runtimes without it (Workers without
-  `nodejs_compat`) automatic nesting is unavailable entirely unless the host app registered its
+- AsyncLocalStorage powers context propagation. On runtimes without it (Cloudflare Workers without
+  Node.js compatibility) automatic nesting is unavailable entirely unless the host app registered its
   own global OTel context manager — pass `parent` explicitly there.
 - `@opentelemetry/api` is a peer dependency (installed automatically by npm/pnpm) so the SDK
   shares the host app's OTel API singleton.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/packages/sdk/LICENSE).

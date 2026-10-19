@@ -2,11 +2,15 @@
 
 Anthropic SDK instrumentation for telemetry.dev. It wraps the Anthropic Messages API and emits OpenTelemetry GenAI spans through `@telemetry-dev/sdk`.
 
+Docs: https://telemetry.dev/docs/integrations/anthropic
+
 ## Install
 
 ```sh
 pnpm add @telemetry-dev/sdk @telemetry-dev/anthropic @anthropic-ai/sdk
 ```
+
+Requires `@anthropic-ai/sdk` 0.110.0 or a later 0.x release, and `@telemetry-dev/sdk`, which needs Node.js 20.19.0 or later.
 
 Set `TELEMETRY_DEV_API_KEY` for telemetry export and `ANTHROPIC_API_KEY` for Anthropic.
 
@@ -77,11 +81,15 @@ const anthropic = wrapAnthropic(new Anthropic({ openTelemetry: false }));
 
 With global instrumentation, set `ANTHROPIC_OPEN_TELEMETRY=false` before you make the clients. The Claude SDK reads this variable only for a client that has no `openTelemetry` option. For a client with this option, set `openTelemetry: false`.
 
-To use the native spans instead of this package, refer to [Native Claude SDK spans](../otel/README.md#native-claude-sdk-spans). The Claude API can also send server-side spans to telemetry.dev. Refer to [Claude Platform](https://telemetry.dev/docs/integrations/claude-platform).
+To use the native spans instead of this package, refer to [Claude SDK](https://telemetry.dev/docs/integrations/claude-sdk). The Claude API can also send server-side spans to telemetry.dev. Refer to [Claude Platform](https://telemetry.dev/docs/integrations/claude-platform).
 
 ## Limitations
 
 - `messages.countTokens`, `beta.messages.countTokens`, batches, and other non-Messages surfaces are not instrumented.
-- `with_raw_response` and `with_streaming_response` helper namespaces are not patched directly.
+- Wrapped calls preserve `withResponse()` and `asResponse()`.
 - If application code never consumes or closes a stream, the span cannot finish until the stream is finalized by the runtime.
 - Global instrumentation patches the ES module build of the `@anthropic-ai/sdk` copy this package resolves. Clients loaded through `require()` use the package's CommonJS build, which has separate classes. The Bedrock, Vertex, AWS, and Foundry client packages depend on `@anthropic-ai/sdk` 0.115.1 or newer, so a package manager can also install them a separate copy. Wrap those clients with `wrapAnthropic()`.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/packages/anthropic/LICENSE).

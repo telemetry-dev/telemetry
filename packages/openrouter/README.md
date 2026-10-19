@@ -2,22 +2,22 @@
 
 OpenRouter SDK instrumentation for telemetry.dev. It wraps the official `@openrouter/sdk` client and emits generation and embedding spans through `@telemetry-dev/sdk`.
 
+Docs: https://telemetry.dev/docs/integrations/openrouter
+
 ## Install
 
 ```sh
 pnpm add @telemetry-dev/sdk @telemetry-dev/openrouter @openrouter/sdk
 ```
 
-Initialize the core SDK before making OpenRouter calls:
+Requires `@openrouter/sdk` 1.1.2 or a later 1.x release, and `@telemetry-dev/sdk`, which needs Node.js 20.19.0 or later.
+
+Initialize the core SDK before making OpenRouter calls. `init()` reads your project API key from the `TELEMETRY_DEV_API_KEY` environment variable, so set it before you start the app:
 
 ```ts
 import { init } from "@telemetry-dev/sdk";
 
-init({
-  apiKey: process.env.TELEMETRY_DEV_API_KEY,
-  baseUrl: process.env.TELEMETRY_DEV_BASE_URL,
-  serviceName: "my-service",
-});
+init({ serviceName: "my-service" });
 ```
 
 Calls continue to work when telemetry.dev has not been initialized; instrumentation becomes a no-op.
@@ -131,3 +131,7 @@ vp test
 vp check
 vp run build
 ```
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/packages/openrouter/LICENSE).

@@ -11,6 +11,8 @@ one conversation (`metadata.sessionId`, falling back to the chat's `threadId`) s
 the root of each call as a sibling in start order; the id is also stamped as
 `gen_ai.conversation.id` on every span.
 
+Docs: https://telemetry.dev/docs/integrations/tanstack-ai
+
 ## Install
 
 ```sh
@@ -36,7 +38,7 @@ Trace sampling uses `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG`, which als
 The default is parent-based always-on.
 Pass an OTel `Sampler` as `telemetryDev({ sampler })` to override the environment.
 Real active parents keep their sampling decisions. The integration does not send dropped or record-only spans.
-The [session sampling contract](../otel/README.md#correlation-attributes) lists environment modes and argument defaults.
+The [session sampling contract](https://github.com/telemetry-dev/telemetry/blob/main/packages/otel/README.md#correlation-attributes) lists environment modes and argument defaults.
 
 ## Usage
 
@@ -177,3 +179,7 @@ telemetryDev({ waitUntil: (p) => ctx.waitUntil(p) });
   call.
 - Middleware hook exceptions are wrapped in `try/catch` and routed to the optional `onError`
   callback so instrumentation can never break your chat.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/packages/tanstack-ai/LICENSE).
