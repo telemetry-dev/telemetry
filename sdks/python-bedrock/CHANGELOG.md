@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.1.5...python-bedrock-v0.1.6) (2026-10-19)
+
+
+### Bug Fixes
+
+* **sdk-bedrock:** keep agent trace content out of spans when it is not captured ([#68](https://github.com/telemetry-dev/telemetry/issues/68)) ([0bc2adf](https://github.com/telemetry-dev/telemetry/commit/0bc2adf2ef43a0b195982e41a3ca7927880ed208))
+
+
+### Documentation
+
+* link each package readme to its docs and fix stale setup ([#76](https://github.com/telemetry-dev/telemetry/issues/76)) ([dde0b0c](https://github.com/telemetry-dev/telemetry/commit/dde0b0cb0639b1e2dcde31a8a3098ad349f71d23))
+
 ## [0.1.5](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.1.4...python-bedrock-v0.1.5) (2026-10-14)
 
 

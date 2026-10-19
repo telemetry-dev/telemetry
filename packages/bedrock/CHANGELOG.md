@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.11](https://github.com/telemetry-dev/telemetry/compare/bedrock-v0.1.10...bedrock-v0.1.11) (2026-10-19)
+
+
+### Bug Fixes
+
+* **sdk-bedrock:** keep agent trace content out of spans when it is not captured ([#68](https://github.com/telemetry-dev/telemetry/issues/68)) ([0bc2adf](https://github.com/telemetry-dev/telemetry/commit/0bc2adf2ef43a0b195982e41a3ca7927880ed208))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.1.9
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.1.9
+
 ## [0.1.10](https://github.com/telemetry-dev/telemetry/compare/bedrock-v0.1.9...bedrock-v0.1.10) (2026-10-14)
 
 

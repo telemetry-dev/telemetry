@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.11](https://github.com/telemetry-dev/telemetry/compare/openai-v0.1.10...openai-v0.1.11) (2026-10-19)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.1.9
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.1.9
+
 ## [0.1.10](https://github.com/telemetry-dev/telemetry/compare/openai-v0.1.9...openai-v0.1.10) (2026-10-14)
 
 

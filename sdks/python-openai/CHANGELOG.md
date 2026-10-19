@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/python-openai-v0.1.7...python-openai-v0.1.8) (2026-10-19)
+
+
+### Documentation
+
+* link each package readme to its docs and fix stale setup ([#76](https://github.com/telemetry-dev/telemetry/issues/76)) ([dde0b0c](https://github.com/telemetry-dev/telemetry/commit/dde0b0cb0639b1e2dcde31a8a3098ad349f71d23))
+
 ## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/python-openai-v0.1.6...python-openai-v0.1.7) (2026-10-14)
 
 
