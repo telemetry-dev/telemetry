@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.9](https://github.com/telemetry-dev/telemetry/compare/openrouter-v0.1.8...openrouter-v0.1.9) (2026-10-19)
+
+
+### Bug Fixes
+
+* **sdk:** cap the length of retained stream finish reasons ([#58](https://github.com/telemetry-dev/telemetry/issues/58)) ([f423cb4](https://github.com/telemetry-dev/telemetry/commit/f423cb4f602ff032128faf9fadff572d644458a7))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/otel bumped to 0.1.6
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.1.9
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.1.9
+
 ## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/openrouter-v0.1.7...openrouter-v0.1.8) (2026-10-14)
 
 

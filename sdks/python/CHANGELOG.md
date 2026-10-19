@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.10](https://github.com/telemetry-dev/telemetry/compare/python-v0.2.9...python-v0.2.10) (2026-10-19)
+
+
+### Features
+
+* **sdk:** run the configured mask on integration content and in the ai package ([#73](https://github.com/telemetry-dev/telemetry/issues/73)) ([365b6e7](https://github.com/telemetry-dev/telemetry/commit/365b6e76ebbccd3bb63803d0abb1757b7d16573d))
+
+
+### Documentation
+
+* document native claude sdk spans ([#61](https://github.com/telemetry-dev/telemetry/issues/61)) ([e280bcc](https://github.com/telemetry-dev/telemetry/commit/e280bccab3960f1e8388d6cddb5361b0f947e081))
+* link each package readme to its docs and fix stale setup ([#76](https://github.com/telemetry-dev/telemetry/issues/76)) ([dde0b0c](https://github.com/telemetry-dev/telemetry/commit/dde0b0cb0639b1e2dcde31a8a3098ad349f71d23))
+
 ## [0.2.9](https://github.com/telemetry-dev/telemetry/compare/python-v0.2.8...python-v0.2.9) (2026-10-14)
 
 

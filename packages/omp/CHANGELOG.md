@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.10](https://github.com/telemetry-dev/telemetry/compare/omp-v0.1.9...omp-v0.1.10) (2026-10-19)
+
+
+### Bug Fixes
+
+* **sdk:** keep failed tool output out of exceptions in coding agent plugins ([#67](https://github.com/telemetry-dev/telemetry/issues/67)) ([4ff4324](https://github.com/telemetry-dev/telemetry/commit/4ff43242bf5ff1863588e978d2d92845b6061844))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/sdk bumped to 0.1.9
+
 ## [0.1.9](https://github.com/telemetry-dev/telemetry/compare/omp-v0.1.8...omp-v0.1.9) (2026-10-14)
 
 

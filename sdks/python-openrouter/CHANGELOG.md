@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/python-openrouter-v0.1.6...python-openrouter-v0.1.7) (2026-10-19)
+
+
+### Bug Fixes
+
+* **sdk:** cap the length of retained stream finish reasons ([#58](https://github.com/telemetry-dev/telemetry/issues/58)) ([f423cb4](https://github.com/telemetry-dev/telemetry/commit/f423cb4f602ff032128faf9fadff572d644458a7))
+
+
+### Documentation
+
+* link each package readme to its docs and fix stale setup ([#76](https://github.com/telemetry-dev/telemetry/issues/76)) ([dde0b0c](https://github.com/telemetry-dev/telemetry/commit/dde0b0cb0639b1e2dcde31a8a3098ad349f71d23))
+
 ## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/python-openrouter-v0.1.5...python-openrouter-v0.1.6) (2026-10-14)
 
 

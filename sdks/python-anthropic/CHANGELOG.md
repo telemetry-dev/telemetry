@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/python-anthropic-v0.1.5...python-anthropic-v0.1.6) (2026-10-19)
+
+
+### Bug Fixes
+
+* **anthropic:** count compaction usage and one-hour cache writes ([#64](https://github.com/telemetry-dev/telemetry/issues/64)) ([59cafca](https://github.com/telemetry-dev/telemetry/commit/59cafca68884a912f8c8da92a027c4afea03c549))
+
+
+### Documentation
+
+* document native claude sdk spans ([#61](https://github.com/telemetry-dev/telemetry/issues/61)) ([e280bcc](https://github.com/telemetry-dev/telemetry/commit/e280bccab3960f1e8388d6cddb5361b0f947e081))
+* link each package readme to its docs and fix stale setup ([#76](https://github.com/telemetry-dev/telemetry/issues/76)) ([dde0b0c](https://github.com/telemetry-dev/telemetry/commit/dde0b0cb0639b1e2dcde31a8a3098ad349f71d23))
+
 ## [0.1.5](https://github.com/telemetry-dev/telemetry/compare/python-anthropic-v0.1.4...python-anthropic-v0.1.5) (2026-10-14)
 
 

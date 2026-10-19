@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.11](https://github.com/telemetry-dev/telemetry/compare/anthropic-v0.1.10...anthropic-v0.1.11) (2026-10-19)
+
+
+### Bug Fixes
+
+* **anthropic:** count compaction usage and one-hour cache writes ([#64](https://github.com/telemetry-dev/telemetry/issues/64)) ([59cafca](https://github.com/telemetry-dev/telemetry/commit/59cafca68884a912f8c8da92a027c4afea03c549))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.1.9
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.1.9
+
 ## [0.1.10](https://github.com/telemetry-dev/telemetry/compare/anthropic-v0.1.9...anthropic-v0.1.10) (2026-10-14)
 
 

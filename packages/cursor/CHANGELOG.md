@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.9](https://github.com/telemetry-dev/telemetry/compare/cursor-v0.1.8...cursor-v0.1.9) (2026-10-19)
+
+
+### Bug Fixes
+
+* **sdk-cursor:** authenticate the daemon pipe on windows before sending events ([#70](https://github.com/telemetry-dev/telemetry/issues/70)) ([ede9a32](https://github.com/telemetry-dev/telemetry/commit/ede9a3291aef0e083465e5de12a61426257e0cf9))
+* **sdk-cursor:** honor capture options from the config file and install ([#69](https://github.com/telemetry-dev/telemetry/issues/69)) ([f5c1858](https://github.com/telemetry-dev/telemetry/commit/f5c1858e6851fa471a59744b0c747c6aa2ed2720))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/sdk bumped to 0.1.9
+
 ## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/cursor-v0.1.7...cursor-v0.1.8) (2026-10-14)
 
 
