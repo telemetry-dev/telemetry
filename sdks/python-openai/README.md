@@ -2,22 +2,22 @@
 
 OpenAI SDK instrumentation for telemetry.dev. It wraps the official `openai` Python SDK and emits telemetry.dev generation and embedding spans through `telemetry-dev`.
 
+Docs: https://telemetry.dev/docs/integrations/openai
+
 ## Install
 
 ```sh
 pip install telemetry-dev-openai
 ```
 
-Initialize the core SDK first:
+Requires Python 3.10 or later and `openai` 2 or 3.
+
+Initialize the core SDK first. `init()` reads your project API key from the `TELEMETRY_DEV_API_KEY` environment variable, so set it before you start the app:
 
 ```py
 import telemetry_dev
 
-telemetry_dev.init(
-    api_key="td_live_...",
-    base_url="http://localhost:4318",
-    service_name="my-service",
-)
+telemetry_dev.init(service_name="my-service")
 ```
 
 ## Per-client wrapping
@@ -74,7 +74,7 @@ The integration maps native OpenAI request/response shapes directly into telemet
 
 Chat completion streams are traced. Requests are sent unchanged by default, so token usage is only captured when the caller sets `stream_options={"include_usage": True}` themselves. Pass `inject_stream_usage=True` to `wrap_openai` or `instrument_openai` to inject it automatically; the synthetic usage-only chunk is then hidden from the caller. Injection is opt-in because some providers reject `stream_options` — for example Azure OpenAI "on your data" (`data_sources`) returns 400 for it while plain `stream=True` works.
 
-Streamed chat output and finish reasons use separate budgets of up to 48 KiB and 1,000 items; The configured `max_attribute_length` does not shrink these retention bounds; the core applies it to the exported attribute after the mask runs, with its `...[truncated]` marker, without setting `telemetry.dev.capture.truncated`. When present, `gen_ai.output.messages` contains bounded partial output. If output and/or finish-reason capture is incomplete, including when a choice ends without `finish_reason`, `telemetry.dev.capture.truncated` is `true`. With a mask configured, incomplete output is omitted because the mask cannot inspect the complete value. When output capture is disabled or omitted, response IDs and models, finish reasons, usage, timing, and errors may still be recorded.
+Streamed chat output and finish reasons use separate budgets of up to 48 KiB and 1,000 items; the configured `max_attribute_length` does not shrink these retention bounds; the core applies it to the exported attribute after the mask runs, with its `...[truncated]` marker, without setting `telemetry.dev.capture.truncated`. When present, `gen_ai.output.messages` contains bounded partial output. If output and/or finish-reason capture is incomplete, including when a choice ends without `finish_reason`, `telemetry.dev.capture.truncated` is `true`. With a mask configured, incomplete output is omitted because the mask cannot inspect the complete value. When output capture is disabled or omitted, response IDs and models, finish reasons, usage, timing, and errors may still be recorded.
 
 Capture flags do not gate stop sequences, caller-supplied metadata or raw attributes, or exception messages and stack traces; redact those separately when needed.
 
@@ -106,3 +106,7 @@ OpenAI-compatible URLs on Groq, xAI, DeepSeek, Together, and Fireworks domains (
 - Realtime is not wrapped: OpenAI Python 2.x exposes an async WebSocket connection (`realtime.connect`), not an event emitter with a stable listener lifecycle, so an explicit event-emitter wrapper would be misleading.
 - Videos (`client.videos`) are not traced because OpenAI shut down the Videos API on 2026-09-24; video create and retrieve calls produce no spans. The TypeScript integration keeps its legacy video tracing for compatible endpoints.
 - Batch list pagination is not instrumented so the SDK's synchronous `AsyncPaginator` remains directly usable with `async for`.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/sdks/python-openai/LICENSE).

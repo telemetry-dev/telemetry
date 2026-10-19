@@ -2,22 +2,22 @@
 
 Google GenAI (Gemini) SDK instrumentation for telemetry.dev. Wraps the official `@google/genai` client and emits generation and embedding spans through `@telemetry-dev/sdk`.
 
+Docs: https://telemetry.dev/docs/integrations/google-genai
+
 ## Install
 
 ```sh
 pnpm add @telemetry-dev/sdk @telemetry-dev/google-genai @google/genai
 ```
 
-Initialize the core SDK first:
+Requires `@google/genai` 2, and `@telemetry-dev/sdk`, which needs Node.js 20.19.0 or later.
+
+Initialize the core SDK first. `init()` reads your project API key from the `TELEMETRY_DEV_API_KEY` environment variable, so set it before you start the app:
 
 ```ts
 import { init, flush, shutdown } from "@telemetry-dev/sdk";
 
-init({
-  apiKey: process.env.TELEMETRY_DEV_API_KEY,
-  baseUrl: process.env.TELEMETRY_DEV_BASE_URL,
-  serviceName: "my-service",
-});
+init({ serviceName: "my-service" });
 
 // app code...
 await flush();
@@ -116,3 +116,7 @@ When the SDK performs an internal AFC loop for callable tools, one wrapped `gene
 ## Not instrumented
 
 `countTokens`, `computeTokens`, `live`, `caches`, `files`, `tunings`, and `batches` are not wrapped in this package.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/packages/google-genai/LICENSE).

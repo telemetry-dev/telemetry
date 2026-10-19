@@ -3,21 +3,22 @@
 OpenRouter SDK instrumentation for telemetry.dev. It wraps the official `openrouter` Python SDK
 and emits telemetry.dev generation and embedding spans through `telemetry-dev`.
 
+Docs: https://telemetry.dev/docs/integrations/openrouter
+
 ## Install
 
 ```sh
 pip install telemetry-dev-openrouter
 ```
 
-Initialize the core SDK first:
+Requires Python 3.10 or later and `openrouter` 1.1.0 or a later 1.x release.
+
+Initialize the core SDK first. `init()` reads your project API key from the `TELEMETRY_DEV_API_KEY` environment variable, so set it before you start the app:
 
 ```py
 import telemetry_dev
 
-telemetry_dev.init(
-    api_key="td_live_...",
-    service_name="my-service",
-)
+telemetry_dev.init(service_name="my-service")
 ```
 
 ## Per-client wrapping
@@ -124,3 +125,7 @@ uv run ruff format --check .
 uv run ruff check .
 uv run pyright
 ```
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/sdks/python-openrouter/LICENSE).

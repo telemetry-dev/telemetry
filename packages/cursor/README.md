@@ -6,12 +6,19 @@ Telemetry integration for the [Cursor](https://cursor.com) agent and
 responses, thinking blocks, tool executions, subagents, and lifecycle events.
 It does not change the behavior of Cursor.
 
+Docs: https://telemetry.dev/docs/integrations/cursor
+
 ## Install
+
+Requires Node.js 22 or later.
 
 ```sh
 npm install -g @telemetry-dev/cursor
-telemetry-dev-cursor install --api-key td_live_…
+telemetry-dev-cursor install
 ```
+
+`install` reads your project API key from `TELEMETRY_DEV_API_KEY`, so set that variable first, or
+pass the key with `--api-key`.
 
 The `install` command connects each observed hook event to this package in
 `~/.cursor/hooks.json`. It also writes the key to `~/.cursor/telemetry-dev.json`.
@@ -173,3 +180,7 @@ To export none of this, set `enabled` to `false`.
   the next daemon creates a new one. After an upgrade from a version without
   the key, the old daemon keeps running on its old pipe. It exits after 15
   idle minutes only if it has no open turn; otherwise stop it by hand.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/packages/cursor/LICENSE).

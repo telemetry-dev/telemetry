@@ -2,6 +2,8 @@
 
 AWS Bedrock instrumentation for the telemetry.dev Python SDK.
 
+Docs: https://telemetry.dev/docs/integrations/bedrock
+
 This package instruments boto3/botocore clients for:
 
 - `bedrock-runtime`
@@ -33,16 +35,18 @@ or with pip:
 pip install telemetry-dev telemetry-dev-bedrock boto3
 ```
 
+Requires Python 3.10 or later and `boto3` 1.36 or later.
+
 ## Quickstart
 
+`init()` reads your project API key from the `TELEMETRY_DEV_API_KEY` environment variable, so set it before you start the app.
+
 ```py
-import os
 import boto3
 import telemetry_dev
 from telemetry_dev_bedrock import wrap_bedrock
 
 telemetry_dev.init(
-    api_key=os.getenv("TELEMETRY_DEV_API_KEY"),
     service_name="bedrock-app",
     environment="production",
 )
@@ -155,3 +159,7 @@ The following calls pass through unless a supported operation above is used:
 - `AgenticRetrieveStream`
 
 Provider-native `InvokeModel` usage is best-effort. Anthropic Claude, Amazon Titan/Nova, Meta Llama, and Titan embeddings expose known token fields. Cohere and Mistral text models do not consistently include usage in the JSON body; spans still capture request/response bodies and finish reasons where present.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/sdks/python-bedrock/LICENSE).

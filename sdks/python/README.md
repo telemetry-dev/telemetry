@@ -4,6 +4,8 @@ telemetry.dev SDK for Python — OpenTelemetry-native GenAI tracing, logs, and m
 ergonomic functions over OTel spans (`gen_ai.*` semantic conventions), exported as OTLP
 protobuf to the telemetry.dev ingest.
 
+Docs: https://telemetry.dev/docs/sdk/python
+
 ## Install
 
 ```sh
@@ -131,6 +133,7 @@ the core SDK with provider integrations to enable the new metric.
 | --- | --- | --- |
 | `api_key`, `base_url`, `environment`, `service_name` | env vars | Connection + resource settings. |
 | `enabled` | `True` | `False` = hard kill switch (tests). |
+| `session_mode` | `"explicit"` | `"process"` groups otherwise uncorrelated spans and logs under one generated session ID per `init()` (see [Environment variables](#environment-variables)). Other values call `on_error` and install a disabled client. |
 | `register_global` | `False` | Also register the tracer provider globally. Applies a default export filter (only `telemetry_dev`-scoped spans are exported); pass `span_filter=lambda s: True` to export everything. |
 | `export_mode` | `"batched"` | `"immediate"` exports synchronously per span/log (serverless). |
 | `log_level` | `"warn"` | SDK diagnostics level: `debug`/`info`/`warn`/`error`/`silent`. |
@@ -318,3 +321,7 @@ uv build                # build wheel + sdist
 
 `examples/quickstart.py` is runnable against a real ingest:
 `TELEMETRY_DEV_API_KEY=td_live_... uv run examples/quickstart.py`.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/sdks/python/LICENSE).

@@ -4,17 +4,16 @@ Telemetry integration for the [pi coding agent](https://github.com/earendil-work
 [telemetry.dev](https://telemetry.dev). It records pi agent loops, model calls, tool executions, and
 lifecycle events without changing pi's behavior.
 
+Docs: https://telemetry.dev/docs/integrations/pi
+
 ## Install
 
-Add the package to `~/.pi/agent/settings.json`:
-
-```json
-{
-  "packages": ["npm:@telemetry-dev/pi"]
-}
+```sh
+pi install npm:@telemetry-dev/pi
 ```
 
-Pi reads the package's `pi.extensions` manifest and loads `@telemetry-dev/pi/register`
+This adds `npm:@telemetry-dev/pi` to the `packages` list in `~/.pi/agent/settings.json` and
+installs it. Pi reads the package's `pi.extensions` manifest and loads `@telemetry-dev/pi/register`
 automatically.
 
 Alternatively, install `@telemetry-dev/pi` where pi can resolve it and create
@@ -25,8 +24,12 @@ import { telemetryDevExtension } from "@telemetry-dev/pi";
 export default telemetryDevExtension();
 ```
 
-The integration targets `@earendil-works/pi-coding-agent` 0.82.1. The pi package is an optional peer
-dependency because pi bundles its extension API and provides it to installed extensions.
+Use one route, not both: if the package is in `settings.json` and also loaded from an extension
+file, pi loads the extension twice and every span is recorded twice.
+
+Requires pi (`@earendil-works/pi-coding-agent`) 0.80.4 or later; tested with 0.82.1. The pi package
+is an optional peer dependency because pi bundles its extension API and provides it to installed
+extensions.
 
 ## Environment
 
@@ -119,3 +122,7 @@ message regardless of `captureOutput` and `mask`.
   server-calculated invoice value.
 - Initialization is one-shot. Loading the package more than once does not replace the first
   configuration.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/packages/pi/LICENSE).

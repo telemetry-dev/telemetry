@@ -2,21 +2,22 @@
 
 Anthropic Claude SDK instrumentation for telemetry.dev. It wraps the official `anthropic` Python SDK and emits telemetry.dev generation spans through `telemetry-dev`.
 
+Docs: https://telemetry.dev/docs/integrations/anthropic
+
 ## Install
 
 ```sh
 pip install telemetry-dev-anthropic
 ```
 
-Initialize the core SDK first:
+Requires Python 3.10 or later and `anthropic` 0.116 or later, below 2.
+
+Initialize the core SDK first. `init()` reads your project API key from the `TELEMETRY_DEV_API_KEY` environment variable, so set it before you start the app:
 
 ```python
 import telemetry_dev
 
-telemetry_dev.init(
-    api_key="td_live_...",
-    service_name="my-service",
-)
+telemetry_dev.init(service_name="my-service")
 ```
 
 ## Per-client wrapping
@@ -94,10 +95,14 @@ client = wrap_anthropic(Anthropic(open_telemetry=False))
 
 With global instrumentation, set `ANTHROPIC_OPEN_TELEMETRY=false` before you make the clients. The Claude SDK reads this variable only for a client that has no `open_telemetry` option. For a client with this option, set `open_telemetry=False`.
 
-To use the native spans instead of this package, refer to [Native Claude SDK spans](../python/README.md#native-claude-sdk-spans). The Claude API can also send server-side spans to telemetry.dev. Refer to [Claude Platform](https://telemetry.dev/docs/integrations/claude-platform).
+To use the native spans instead of this package, refer to [Claude SDK](https://telemetry.dev/docs/integrations/claude-sdk). The Claude API can also send server-side spans to telemetry.dev. Refer to [Claude Platform](https://telemetry.dev/docs/integrations/claude-platform).
 
 ## Limitations
 
 - `messages.count_tokens()`, `beta.messages.count_tokens()`, and batches are not instrumented.
 - `with_raw_response` snapshots bound methods; wrap or instrument clients before creating raw-response wrappers.
 - Unconsumed streams end spans only on exhaustion, close, context-manager exit, or error.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/sdks/python-anthropic/LICENSE).

@@ -2,6 +2,8 @@
 
 First-class AWS Bedrock instrumentation for the telemetry.dev TypeScript SDK.
 
+Docs: https://telemetry.dev/docs/integrations/bedrock
+
 This package instruments AWS SDK for JavaScript v3 clients for:
 
 - `@aws-sdk/client-bedrock-runtime`
@@ -29,7 +31,11 @@ pnpm add @telemetry-dev/sdk @telemetry-dev/bedrock @aws-sdk/client-bedrock-runti
 pnpm add @aws-sdk/client-bedrock-agent-runtime
 ```
 
+Requires `@aws-sdk/client-bedrock-runtime` 3.600.0 or a later 3.x release (and the same range for the optional `@aws-sdk/client-bedrock-agent-runtime`), and `@telemetry-dev/sdk`, which needs Node.js 20.19.0 or later.
+
 ## Quickstart
+
+`init()` reads your project API key from the `TELEMETRY_DEV_API_KEY` environment variable, so set it before you start the app.
 
 ```ts
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
@@ -37,7 +43,6 @@ import { init, shutdown } from "@telemetry-dev/sdk";
 import { wrapBedrock } from "@telemetry-dev/bedrock";
 
 init({
-  apiKey: process.env.TELEMETRY_DEV_API_KEY,
   serviceName: "bedrock-app",
   environment: "production",
 });
@@ -172,3 +177,7 @@ The following calls pass through unless a supported operation above is used:
 - `AgenticRetrieveStream`
 
 Provider-native `InvokeModel` usage is best-effort. Anthropic Claude, Amazon Titan/Nova, Meta Llama, and Titan embeddings expose known token fields. Cohere and Mistral text models do not consistently include usage in the JSON body; spans still capture request/response bodies and finish reasons where present.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/packages/bedrock/LICENSE).

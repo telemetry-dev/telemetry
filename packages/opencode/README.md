@@ -1,28 +1,24 @@
 # @telemetry-dev/opencode
 
-Telemetry.dev integration for [opencode](https://opencode.ai). It records agent turns, model generations, tool executions, and session lifecycle events with OpenTelemetry GenAI semantic conventions.
+telemetry.dev integration for [opencode](https://opencode.ai). It records agent turns, model generations, tool executions, and session lifecycle events with OpenTelemetry GenAI semantic conventions.
+
+Docs: https://telemetry.dev/docs/integrations/opencode
 
 ## Install
 
-```sh
-npm install @telemetry-dev/opencode
-```
-
-### Project plugin file
-
-Create `.opencode/plugin/telemetry-dev.ts`:
-
-```ts
-import { telemetryDevPlugin } from "@telemetry-dev/opencode";
-
-export const TelemetryDev = telemetryDevPlugin();
-```
-
-opencode discovers project plugin files automatically.
+Requires opencode 1.15.11 or later.
 
 ### npm plugin config
 
-Alternatively, register the package in `opencode.json`:
+Register the package in `opencode.json`, either the project's file or `~/.config/opencode/opencode.json` for all projects:
+
+```json
+{
+  "plugin": ["@telemetry-dev/opencode"]
+}
+```
+
+opencode installs npm plugins itself when it starts, so you do not need to install the package. To pass options, use a `[name, options]` tuple:
 
 ```json
 {
@@ -31,6 +27,30 @@ Alternatively, register the package in `opencode.json`:
 ```
 
 The tuple's options are merged over options passed to `telemetryDevPlugin()`. Keep `apiKey` out of configuration files; provide it through `TELEMETRY_DEV_API_KEY`.
+
+### Project plugin file
+
+Use a plugin file when you need an option that is a function, such as `mask`. The plugin file and the package dependency go in the same opencode config directory: `.opencode/` for one project, or `~/.config/opencode/` for all projects. Add the package to `package.json` in that directory:
+
+```json
+{
+  "dependencies": {
+    "@telemetry-dev/opencode": "^0.1.9"
+  }
+}
+```
+
+Then create `plugins/telemetry-dev.ts` in the same directory, for example `.opencode/plugins/telemetry-dev.ts`:
+
+```ts
+import { telemetryDevPlugin } from "@telemetry-dev/opencode";
+
+export const TelemetryDev = telemetryDevPlugin();
+```
+
+opencode loads every file in the plugins directory automatically.
+
+Use one route, not both. If the package is in `opencode.json` and also loaded from a plugin file, opencode loads it twice and every span is recorded twice.
 
 ## Environment
 
@@ -57,7 +77,7 @@ invoke_agent                        (session turn)
 └── chat {model}
 ```
 
-- `invoke_agent` starts at `chat.message` and ends when opencode emits `session.idle` or `session.error`.
+- `invoke_agent` starts at `chat.message` and ends when the session goes idle (a `session.status` event with type `idle`, or the older `session.idle` event) or when opencode disposes the plugin. A `session.error` does not end it, because opencode can compact the context and continue the same prompt: if a compaction follows, the error is dropped; otherwise it is applied when the session goes idle.
 - Assistant `message.updated` events open a `chat` span at first sight (start = `time.created`) and close it at `time.completed` with provider, model, finish reason, cost, and token usage.
 - Tool callbacks become `execute_tool` spans nested under the session's open `chat` span (falling back to the `invoke_agent` span). Tool failures are reconstructed from `message.part.updated` events.
 - Subagent (task) sessions run in-process; their `invoke_agent` spans nest under the parent session's open span using `session.created`'s `parentID`.
@@ -86,3 +106,7 @@ Assistant output text is not captured because opencode's completed assistant mes
 - `dispose` is not reached when `opencode serve` receives `SIGTERM`, so the last telemetry batch may be lost in that shutdown path. `session.idle` still triggers a non-blocking flush after each turn.
 - Per-step token detail is available only as accumulated totals on completed assistant messages.
 - Tool errors do not reach `tool.execute.after`; error spans are reconstructed from `message.part.updated`.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/packages/opencode/LICENSE).

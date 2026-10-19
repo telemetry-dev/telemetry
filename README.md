@@ -22,6 +22,7 @@ Trace model calls, tool steps, and agent runs. Find slow requests, debug errors,
 
 [telemetry.dev](https://telemetry.dev) connects your AI application to a shared view of traces, logs, and metrics.
 This repository contains the official TypeScript and Python SDKs and integrations, built on OpenTelemetry.
+The ingest service and the dashboard are hosted by telemetry.dev and are not in this repository.
 
 ## Quick start
 
@@ -35,13 +36,13 @@ export OPENAI_API_KEY="your-openai-api-key"
 
 ### TypeScript
 
-Use Node.js 24 or newer. Install the SDK and the OpenAI integration:
+Use Node.js 22.18 or later, which runs TypeScript files directly. Install the SDK and the OpenAI integration:
 
 ```sh
 npm install @telemetry-dev/sdk @telemetry-dev/openai openai
 ```
 
-Save this as `trace.ts`:
+Save this as `trace.mts`:
 
 ```ts
 import OpenAI from "openai";
@@ -65,7 +66,7 @@ try {
 Run the request:
 
 ```sh
-node trace.ts
+node trace.mts
 ```
 
 Open your project in [telemetry.dev](https://telemetry.dev/login) to inspect the trace.
@@ -108,24 +109,20 @@ python trace.py
 
 </details>
 
-The SDKs capture inputs and outputs by default.
+The core SDKs and most integrations capture inputs and outputs by default.
 To disable input and output capture, set `captureInput: false` and `captureOutput: false` in TypeScript `init()`.
 For Python, use `capture_input=False` and `capture_output=False`.
+Some integrations work differently: MCP captures no tool arguments or results unless you pass
+`capturePayloads: true`, the AI SDK integration follows AI SDK's `recordInputs` and `recordOutputs`,
+Cursor reads `captureInput` and `captureOutput` from its own config file, and TanStack AI has no
+capture setting of its own and records chat messages and tool payloads.
 Disabling output capture omits message content; response IDs and models, finish reasons, usage,
 timing, and errors may still be recorded when providers supply them. For streamed OpenAI chat,
 usage requires provider support or the documented stream-usage option in the OpenAI integration.
 Capture flags do not gate stop sequences, tool descriptions and definitions (`gen_ai.tool.description`, `gen_ai.tool.definitions`), caller-supplied metadata or raw attributes, or exception
 messages and stack traces; redact those separately when needed.
-OpenAI streamed chat reconstruction and Anthropic stream reconstruction retain up to 48 KiB and
-1,000 items, as do Bedrock and Google GenAI stream reconstruction and Python LiteLLM stream
-reconstruction. OpenRouter stream reconstruction retains up to 64 KiB and 1,024 items. OpenAI Responses reconstruction retains up to 48 KiB and 1,000 items in TypeScript,
-and 1,024 items in Python. OpenAI transcription text has no item limit; TypeScript retains up to
-65,536 UTF-16 units of serialized JSON, and Python retains up to 64 KiB of UTF-8.
-These are fixed resource bounds: the configured attribute-length limit is applied by the core to
-the exported attribute after masking, not to stream retention. A truncated or otherwise
-incomplete stream sets
-`telemetry.dev.capture.truncated`; when a mask is configured, incomplete reconstructed output is
-omitted because the mask cannot inspect the complete value.
+Streamed output is kept within fixed size limits that each provider package's README lists, and
+[Privacy](https://telemetry.dev/docs/platform/privacy) describes what is sent and how to redact it.
 
 ## Features
 
@@ -138,26 +135,31 @@ omitted because the mask cannot inspect the complete value.
 
 ## Integrations
 
-Each integration links to its installation instructions and API coverage.
+Each integration links to its installation instructions and API coverage. The link text is the npm or PyPI package name.
 
-| Integration                  | TypeScript                            | Python                                   |
-| ---------------------------- | ------------------------------------- | ---------------------------------------- |
-| Core SDK                     | [SDK](packages/sdk)                   | [SDK](sdks/python)                       |
-| Existing OpenTelemetry setup | [Span processor](packages/otel)       | [Span processor](sdks/python)            |
-| OpenAI                       | [OpenAI](packages/openai)             | [OpenAI](sdks/python-openai)             |
-| Anthropic                    | [Anthropic](packages/anthropic)       | [Anthropic](sdks/python-anthropic)       |
-| Amazon Bedrock               | [Bedrock](packages/bedrock)           | [Bedrock](sdks/python-bedrock)           |
-| Google GenAI                 | [Google GenAI](packages/google-genai) | [Google GenAI](sdks/python-google-genai) |
-| OpenRouter                   | [OpenRouter](packages/openrouter)     | [OpenRouter](sdks/python-openrouter)     |
-| Vercel AI SDK                | [AI SDK](packages/ai)                 |                                          |
-| TanStack AI                  | [TanStack AI](packages/tanstack-ai)   |                                          |
-| LiteLLM                      |                                       | [LiteLLM](sdks/python-litellm)           |
-| MCP                          | [MCP](packages/mcp)                   |                                          |
-| Eve                          | [Eve](packages/eve)                   |                                          |
-| Cursor                       | [Cursor](packages/cursor)             |                                          |
-| OpenCode                     | [OpenCode](packages/opencode)         |                                          |
-| Oh My Pi                     | [Oh My Pi](packages/omp)              |                                          |
-| Pi                           | [Pi](packages/pi)                     |                                          |
+| Integration                  | TypeScript                                             | Python                                                   |
+| ---------------------------- | ------------------------------------------------------ | -------------------------------------------------------- |
+| Core SDK                     | [`@telemetry-dev/sdk`](packages/sdk)                   | [`telemetry-dev`](sdks/python)                           |
+| Existing OpenTelemetry setup | [`@telemetry-dev/otel`](packages/otel)                 | [`telemetry-dev`](sdks/python) (`telemetry_dev.otel`)    |
+| OpenAI                       | [`@telemetry-dev/openai`](packages/openai)             | [`telemetry-dev-openai`](sdks/python-openai)             |
+| Anthropic                    | [`@telemetry-dev/anthropic`](packages/anthropic)       | [`telemetry-dev-anthropic`](sdks/python-anthropic)       |
+| Amazon Bedrock               | [`@telemetry-dev/bedrock`](packages/bedrock)           | [`telemetry-dev-bedrock`](sdks/python-bedrock)           |
+| Google GenAI                 | [`@telemetry-dev/google-genai`](packages/google-genai) | [`telemetry-dev-google-genai`](sdks/python-google-genai) |
+| OpenRouter                   | [`@telemetry-dev/openrouter`](packages/openrouter)     | [`telemetry-dev-openrouter`](sdks/python-openrouter)     |
+| Vercel AI SDK                | [`@telemetry-dev/ai-sdk`](packages/ai)                 |                                                          |
+| TanStack AI                  | [`@telemetry-dev/tanstack-ai`](packages/tanstack-ai)   |                                                          |
+| LiteLLM                      |                                                        | [`telemetry-dev-litellm`](sdks/python-litellm)           |
+| MCP                          | [`@telemetry-dev/mcp`](packages/mcp)                   |                                                          |
+| Eve                          | [`@telemetry-dev/eve`](packages/eve)                   |                                                          |
+| Cursor                       | [`@telemetry-dev/cursor`](packages/cursor)             |                                                          |
+| OpenCode                     | [`@telemetry-dev/opencode`](packages/opencode)         |                                                          |
+| Oh My Pi                     | [`@telemetry-dev/omp`](packages/omp)                   |                                                          |
+| Pi                           | [`@telemetry-dev/pi`](packages/pi)                     |                                                          |
+
+Some integrations need no package from this repository, because the tool exports OpenTelemetry
+itself or through a third-party library: Claude Code, Claude Platform, Claude SDK native spans,
+Hermes Agent, OpenClaw, CrewAI, LangChain and LangGraph, and Pydantic AI. Their guides are in
+[Integrations](https://telemetry.dev/docs/integrations).
 
 Other languages can use an existing OTLP/HTTP exporter.
 The [documentation](https://telemetry.dev/docs) describes endpoint configuration and authentication.
@@ -189,39 +191,7 @@ pnpm run py:build
 CI runs dependency, code, test, build, and release-safety checks for TypeScript and Python.
 The [SDK conformance guide](docs/sdk-conformance.md) defines the shared telemetry format and behavior.
 
-<details>
-<summary><strong>Release maintenance</strong></summary>
-
-## Releases
-
-The [`Release` workflow](.github/workflows/release.yml) uses Release Please to propose version bumps on `main`. Merging a release PR lets Release Please create component releases such as `sdk-v0.1.3` or `python-v0.2.3`. Each published release builds and publishes only its matching package. Build jobs have no publishing credentials; separate publish jobs use registry OIDC trusted publishing, not long-lived npm or PyPI tokens.
-
-The manifest retains versions already published from the original repository. `bootstrap-sha` points to the initial SDK import so that import's `feat` commit does not trigger new versions. Do not create releases to republish these baseline versions: wait for subsequent releasable changes. No new version is required merely to transfer publishing to this repository.
-
-### Required setup
-
-The workflow is restored, but publishing is not fully configured until the following handoff is complete:
-
-- Provide the repository Actions secret `RELEASE_PLEASE_TOKEN`, authorized for `telemetry-dev/telemetry` with contents, issues, and pull-request write permissions. The original repository's secret cannot be read or copied from GitHub; its owner must supply or replace it. The workflow deliberately fails when this secret is missing. Do not substitute `GITHUB_TOKEN`: releases created with it do not trigger the downstream release workflow.
-- Configure every npm package's GitHub Actions trusted publisher for owner `telemetry-dev`, repository `telemetry`, and workflow filename `release.yml`, without an environment name. npm publishing runs on GitHub-hosted runners and includes provenance for this public repository.
-- Configure every PyPI project's GitHub Actions trusted publisher for owner `telemetry-dev`, repository `telemetry`, and workflow filename `release.yml`, and environment `pypi`. The repository's `pypi` environment permits branch `main` for retries and tags matching `python*-v*`; it has no required reviewers. These branch/tag restrictions are not a manual approval gate.
-- Require successful CI before merging release PRs. Verify all trusted-publisher settings and the secret before expecting an end-to-end publish to succeed.
-
-### Validation and retries
-
-Run the release safety suite locally with Bash, Git, jq, Python 3, tar, and OpenSSL; the registry commands in these tests are mocked and publish nothing:
-
-```sh
-bash .github/scripts/release_test.sh
-shellcheck .github/scripts/*.sh
-actionlint
-```
-
-To retry an existing published release, run the `Release` workflow from `main` and set `release_tag` to that release's full tag. This is a real publication attempt, not a dry run. The tag must be an ancestor of the selected `main` commit. Every configured SDK directory, shared build scripts, lockfiles, release configuration, and root build configuration must be unchanged from the tag; only `packageManager` may differ within root `package.json`. Workflow-only recovery changes are allowed. Source-changing fixes need a new release, not a retry of an old version.
-
-Artifact names and versions are checked before upload. npm retries skip an existing version only when its SHA-512 integrity matches the local tarball, and publication waits for published `@telemetry-dev/*` dependencies and peer dependencies to satisfy their declared ranges. PyPI retries use `uv publish --check-url` to check existing distributions. An integrity mismatch must be investigated, not bypassed or overwritten.
-
-</details>
+Maintainers: [RELEASING.md](RELEASING.md) describes versioning, publishing, and release retries.
 
 ## License
 

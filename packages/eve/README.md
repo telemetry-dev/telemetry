@@ -4,6 +4,8 @@ Eve telemetry integration for [telemetry.dev](https://telemetry.dev). It wires V
 [Eve](https://eve.dev) agent framework to telemetry.dev through Eve's native OpenTelemetry,
 lifecycle-hook, and HTTP-client surfaces.
 
+Docs: https://telemetry.dev/docs/integrations/eve
+
 ## Install
 
 ```sh
@@ -184,3 +186,7 @@ and logs.
   `subagent.started`, `subagent.called`, `subagent.completed`, and child failure events.
 - Eve workflow `$eve.*` run tags are a Vercel-dashboard surface and are not visible to OpenTelemetry,
   so this package does not capture them.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/packages/eve/LICENSE).

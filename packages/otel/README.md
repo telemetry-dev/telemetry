@@ -2,11 +2,13 @@
 
 Bring-your-own OpenTelemetry base layer for [telemetry.dev](https://telemetry.dev). It provides the span processor and OTLP/protobuf trace exporter used by `@telemetry-dev/sdk`, without requiring the SDK runtime.
 
+Docs: https://telemetry.dev/docs/sdk/opentelemetry
+
 ```sh
 npm i @telemetry-dev/otel
 ```
 
-`@opentelemetry/api` is a peer dependency and is installed automatically by current npm and pnpm versions.
+Requires Node.js 20.19.0 or later. `@opentelemetry/api` 1.9 or later 1.x is a peer dependency and is installed automatically by current npm and pnpm versions.
 
 ## NodeSDK
 
@@ -178,3 +180,7 @@ span.end();
 The environment modes are `always_on`, `always_off`, `traceidratio`, `parentbased_always_on` (default), `parentbased_always_off`, and `parentbased_traceidratio`.
 Ratio modes accept a finite argument in `[0, 1]`. Missing, invalid, or out-of-range arguments use `1` and cause an OTel diagnostic. Unknown modes use `parentbased_always_on`.
 The TypeScript and Python SDKs share deterministic session IDs. Their built-in ratio samplers can select different sessions because the OTel algorithms differ.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/packages/otel/LICENSE).

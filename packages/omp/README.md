@@ -4,22 +4,35 @@ Telemetry integration for the [Oh My Pi (omp)](https://www.npmjs.com/package/@oh
 coding agent and [telemetry.dev](https://telemetry.dev). It records omp agent loops, model calls,
 tool executions, and lifecycle events without changing omp's behavior.
 
+Docs: https://telemetry.dev/docs/integrations/omp
+
 ## Install
 
-Create `~/.omp/agent/extensions/telemetry-dev.ts` (global) or
-`.omp/extensions/telemetry-dev.ts` (project):
+```sh
+omp install @telemetry-dev/omp
+```
+
+omp installs the package and loads the extension listed in its `omp.extensions` manifest
+(`@telemetry-dev/omp/register`), which reads its configuration from the environment variables
+below.
+
+To set options in code, load the extension from a file instead. Create
+`~/.omp/agent/extensions/telemetry-dev.ts` (global) or `.omp/extensions/telemetry-dev.ts`
+(project):
 
 ```ts
 import { telemetryDevExtension } from "@telemetry-dev/omp";
 export default telemetryDevExtension();
 ```
 
-Install `@telemetry-dev/omp` somewhere that file can resolve it. The package also ships an
-`omp.extensions` manifest pointing at `@telemetry-dev/omp/register`, so installing it as an omp
-package loads the extension automatically with environment-driven configuration.
+Install `@telemetry-dev/omp` somewhere that file can resolve it, for example with
+`npm install @telemetry-dev/omp` in `~/.omp/agent` for the global file. Use one route, not both: if
+the package is installed with `omp install` and also loaded from an extension file, omp loads the
+extension twice and every span is recorded twice.
 
-The integration targets `@oh-my-pi/pi-coding-agent` 17.x. The omp package is an optional peer
-dependency because omp bundles its extension API and provides it to loaded extensions.
+Requires Oh My Pi (`@oh-my-pi/pi-coding-agent`) 17 or later; tested with 17.1.8. The omp package
+is an optional peer dependency because omp bundles its extension API and provides it to loaded
+extensions.
 
 ## Environment
 
@@ -107,3 +120,7 @@ joined. Usage metadata still includes reasoning-token counts when omp reports th
   telemetry appears as separate sessions.
 - Initialization is one-shot. Loading the extension more than once does not replace the first
   configuration.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/packages/omp/LICENSE).

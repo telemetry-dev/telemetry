@@ -2,6 +2,8 @@
 
 Model Context Protocol instrumentation for telemetry.dev. It instruments official TypeScript MCP SDK v2 transports and emits request spans using the current OpenTelemetry MCP attribute vocabulary through `@telemetry-dev/sdk`.
 
+Docs: https://telemetry.dev/docs/integrations/mcp
+
 ## Install
 
 For a client:
@@ -15,6 +17,8 @@ For a server:
 ```sh
 pnpm add @telemetry-dev/sdk @telemetry-dev/mcp @modelcontextprotocol/server
 ```
+
+Requires `@modelcontextprotocol/client` or `@modelcontextprotocol/server` 2.x, `@opentelemetry/api` 1.9 or a later 1.x release, and `@telemetry-dev/sdk`, which needs Node.js 20.19.0 or later.
 
 ## Client
 
@@ -63,3 +67,7 @@ Trace context propagates by default. OpenTelemetry baggage remains local unless 
 - Only the stable official TypeScript MCP SDK v2 transport contract is supported. MCP v1 is not supported.
 - Metrics and notification processing spans are not emitted.
 - OpenTelemetry MCP semantic conventions are currently in Development status, so attribute requirements may change in future releases.
+
+## License
+
+MIT. See [LICENSE](https://github.com/telemetry-dev/telemetry/blob/main/packages/mcp/LICENSE).
