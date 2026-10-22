@@ -470,6 +470,128 @@ test("InvokeModel captures provider-native bodies and embedding spans", async ()
   expect(embedding.attributes["gen_ai.usage.input_tokens"]).toBe(6);
 });
 
+test.each(["absent", "compaction", "at-bound", "bounded"])(
+  "Claude InvokeModel usage: %s",
+  async (kind) => {
+    const spans = setup();
+    const compaction = {
+      type: "compaction",
+      input_tokens: 11,
+      output_tokens: 7,
+      cache_read_input_tokens: 3,
+      cache_creation_input_tokens: 5,
+    };
+    const usage = {
+      input_tokens: 20,
+      output_tokens: 9,
+      cache_read_input_tokens: 2,
+      cache_creation_input_tokens: 4,
+      ...(kind === "absent"
+        ? {}
+        : {
+            iterations:
+              kind === "bounded" || kind === "at-bound"
+                ? [
+                    {
+                      ...compaction,
+                      input_tokens: 17,
+                      output_tokens: 13,
+                      cache_read_input_tokens: 6,
+                      cache_creation_input_tokens: 8,
+                    },
+                    ...Array.from({ length: kind === "bounded" ? 999 : 998 }, () => ({
+                      type: "message",
+                      input_tokens: 20,
+                    })),
+                    compaction,
+                  ]
+                : [compaction, { type: "message", input_tokens: 20, output_tokens: 9 }],
+          }),
+    };
+    const events = [
+      {
+        type: "message_start",
+        message: {
+          usage: { input_tokens: 1, cache_read_input_tokens: 1, cache_creation_input_tokens: 1 },
+        },
+      },
+      { type: "message_delta", usage, delta: { stop_reason: "end_turn" } },
+      {
+        type: "message_stop",
+        ...(kind === "compaction"
+          ? {}
+          : { "amazon-bedrock-invocationMetrics": { inputTokenCount: 31, outputTokenCount: 16 } }),
+      },
+    ].map((event) => ({ chunk: { bytes: bytes(event) } }));
+    const client = wrapBedrock(
+      new FakeClient([
+        { body: bytes({ usage }), contentType: "application/json" },
+        { body: streamOf(events) },
+      ]),
+    );
+    const input = { modelId: "anthropic.claude", body: bytes({ messages: [] }) };
+    await client.send(new InvokeModelCommand(input));
+    const response = (await client.send(new InvokeModelWithResponseStreamCommand(input))) as {
+      body: AsyncIterable<unknown>;
+    };
+    await collect(response.body);
+    const finished = spans.getFinishedSpans();
+    expect(finished).toHaveLength(2);
+    for (const span of finished) {
+      expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(
+        kind === "absent" ? 26 : kind === "at-bound" ? 76 : 45,
+      );
+      expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(
+        kind === "absent" ? 9 : kind === "at-bound" ? 29 : 16,
+      );
+      expect(span.attributes["gen_ai.usage.cache_read.input_tokens"]).toBe(
+        kind === "absent" ? 2 : kind === "at-bound" ? 11 : 5,
+      );
+      expect(span.attributes["gen_ai.usage.cache_creation.input_tokens"]).toBe(
+        kind === "absent" ? 4 : kind === "at-bound" ? 17 : 9,
+      );
+      if (kind === "bounded") expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    }
+  },
+);
+
+test.each([0, undefined])("Claude final usage takes precedence over metrics: %s", async (count) => {
+  const spans = setup();
+  const events = [
+    {
+      type: "message_delta",
+      usage: {
+        input_tokens: count,
+        output_tokens: count,
+        iterations: [
+          {
+            type: "compaction",
+            input_tokens: 11,
+            output_tokens: 7,
+            cache_read_input_tokens: 3,
+            cache_creation_input_tokens: 5,
+          },
+        ],
+      },
+    },
+    {
+      type: "message_stop",
+      "amazon-bedrock-invocationMetrics": { inputTokenCount: 31, outputTokenCount: 16 },
+    },
+  ].map((event) => ({ chunk: { bytes: bytes(event) } }));
+  const client = wrapBedrock(new FakeClient([{ body: streamOf(events) }]));
+  const response = (await client.send(
+    new InvokeModelWithResponseStreamCommand({
+      modelId: "anthropic.claude",
+      body: bytes({ messages: [] }),
+    }),
+  )) as { body: AsyncIterable<unknown> };
+  await collect(response.body);
+  const [span] = spans.getFinishedSpans();
+  expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(count === 0 ? 19 : 31);
+  expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(count === 0 ? 7 : 16);
+});
+
 test("InvokeModel captures Nova native sampling fields", async () => {
   const spans = setup();
   const client = wrapBedrock(new FakeClient([{ body: bytes({ output: { message: {} } }) }]));

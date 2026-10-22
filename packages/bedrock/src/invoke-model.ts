@@ -10,6 +10,7 @@ import {
   omitUndefined,
   parseJson,
   PROVIDER,
+  STREAM_CAPTURE_MAX_ITEMS,
   stringValue,
   StreamRetention,
   type JsonRecord,
@@ -165,12 +166,7 @@ function nativeResponseFields(
       {
         output: body,
         finishReason: stringValue(body.stop_reason),
-        usage: omitUndefined({
-          inputTokens: numberValue(usage.input_tokens),
-          outputTokens: numberValue(usage.output_tokens),
-          cacheReadInputTokens: numberValue(usage.cache_read_input_tokens),
-          cacheCreationInputTokens: numberValue(usage.cache_creation_input_tokens),
-        }),
+        ...claudeUsageFields(usage),
       },
       metadata,
     );
@@ -216,6 +212,39 @@ function nativeResponseFields(
   return withHeaderUsage({ output: body }, metadata);
 }
 
+const CLAUDE_USAGE_KEYS = {
+  inputTokens: "input_tokens",
+  outputTokens: "output_tokens",
+  cacheReadInputTokens: "cache_read_input_tokens",
+  cacheCreationInputTokens: "cache_creation_input_tokens",
+} as const;
+
+function claudeUsageFields(record: JsonRecord): SpanFields {
+  const usage: NonNullable<SpanFields["usage"]> = {};
+  for (const [key, source] of Object.entries(CLAUDE_USAGE_KEYS)) {
+    const value = numberValue(record[source]);
+    if (value !== undefined) usage[key as keyof typeof CLAUDE_USAGE_KEYS] = value;
+  }
+  const iterations = record.iterations;
+  if (!Array.isArray(iterations)) return { usage };
+
+  // Executor iterations are already in top-level usage; only compaction is additive.
+  const first = Math.max(0, iterations.length - STREAM_CAPTURE_MAX_ITEMS);
+  for (let index = first; index < iterations.length; index += 1) {
+    const entry = iterations[index];
+    if (!isRecord(entry) || entry.type !== "compaction") continue;
+    for (const [key, source] of Object.entries(CLAUDE_USAGE_KEYS)) {
+      const value = numberValue(entry[source]);
+      const target = key as keyof typeof CLAUDE_USAGE_KEYS;
+      if (value !== undefined) usage[target] = (usage[target] ?? 0) + value;
+    }
+  }
+  return {
+    usage,
+    ...(first > 0 ? { attributes: { "telemetry.dev.capture.truncated": true } } : {}),
+  };
+}
+
 function withHeaderUsage<T>(fields: SpanFields, metadata: T): SpanFields {
   if (fields.usage && Object.keys(fields.usage).length > 0) return fields;
 
@@ -256,6 +285,8 @@ export class InvokeModelStreamState implements StreamState {
   private readonly chunks: unknown[] = [];
   private text = "";
   private usage: SpanFields["usage"];
+  private finalUsage: NonNullable<SpanFields["usage"]> = {};
+  private compaction: SpanFields = {};
   private finishReason: string | undefined;
   private error: Error | undefined;
   private errorFields: SpanFields | undefined;
@@ -290,6 +321,14 @@ export class InvokeModelStreamState implements StreamState {
       const messageUsage = isRecord(message?.usage) ? message?.usage : undefined;
       const usage = isRecord(parsed.usage) ? parsed.usage : undefined;
 
+      for (const [key, source] of Object.entries(CLAUDE_USAGE_KEYS)) {
+        const value = numberValue(usage?.[source]);
+        if (value !== undefined) this.finalUsage[key as keyof typeof CLAUDE_USAGE_KEYS] = value;
+      }
+      if (Array.isArray(usage?.iterations)) {
+        this.compaction = claudeUsageFields({ iterations: usage.iterations });
+      }
+
       const metrics = isRecord(parsed["amazon-bedrock-invocationMetrics"])
         ? parsed["amazon-bedrock-invocationMetrics"]
         : undefined;
@@ -314,6 +353,7 @@ export class InvokeModelStreamState implements StreamState {
       this.usage = omitUndefined({
         ...this.usage,
         inputTokens:
+          numberValue(usage?.input_tokens) ??
           numberValue(messageUsage?.input_tokens) ??
           numberValue(metrics?.inputTokenCount) ??
           numberValue(parsed.inputTextTokenCount) ??
@@ -324,8 +364,11 @@ export class InvokeModelStreamState implements StreamState {
           numberValue(parsed.totalOutputTextTokenCount) ??
           this.usage?.outputTokens,
         cacheReadInputTokens:
-          numberValue(messageUsage?.cache_read_input_tokens) ?? this.usage?.cacheReadInputTokens,
+          numberValue(usage?.cache_read_input_tokens) ??
+          numberValue(messageUsage?.cache_read_input_tokens) ??
+          this.usage?.cacheReadInputTokens,
         cacheCreationInputTokens:
+          numberValue(usage?.cache_creation_input_tokens) ??
           numberValue(messageUsage?.cache_creation_input_tokens) ??
           this.usage?.cacheCreationInputTokens,
       });
@@ -335,6 +378,18 @@ export class InvokeModelStreamState implements StreamState {
   }
 
   finish(): SpanFields {
+    const usage = { ...this.usage, ...this.finalUsage };
+    for (const key of Object.keys(CLAUDE_USAGE_KEYS) as (keyof typeof CLAUDE_USAGE_KEYS)[]) {
+      const value = this.compaction.usage?.[key];
+      const baseKey = key === "outputTokens" ? "outputTokens" : "inputTokens";
+      // Invocation metrics have no documented compaction exclusion; never add to that base.
+      if (
+        value !== undefined &&
+        (this.finalUsage[baseKey] !== undefined || this.usage?.[baseKey] === undefined)
+      ) {
+        usage[key] = (usage[key] ?? 0) + value;
+      }
+    }
     return mergeFields(
       omitUndefined({
         output: this.text
@@ -347,7 +402,8 @@ export class InvokeModelStreamState implements StreamState {
             ]
           : this.chunks,
         finishReason: this.finishReason,
-        usage: this.usage,
+        usage,
+        attributes: this.compaction.attributes,
         error: this.error,
       }),
       this.errorFields,

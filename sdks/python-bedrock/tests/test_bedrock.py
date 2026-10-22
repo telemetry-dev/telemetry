@@ -692,6 +692,149 @@ def test_unconsumed_stream_finishes_partial(
     assert spans[0].attributes["gen_ai.operation.name"] == "chat"
 
 
+@pytest.mark.parametrize("kind", ["absent", "compaction", "at-bound", "bounded"])
+def test_claude_invoke_compaction_usage(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    compaction = {
+        "type": "compaction",
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "cache_read_input_tokens": 3,
+        "cache_creation_input_tokens": 5,
+    }
+    usage: dict[str, Any] = {
+        "input_tokens": 20,
+        "output_tokens": 9,
+        "cache_read_input_tokens": 2,
+        "cache_creation_input_tokens": 4,
+    }
+    if kind != "absent":
+        usage["iterations"] = (
+            [
+                {
+                    **compaction,
+                    "input_tokens": 17,
+                    "output_tokens": 13,
+                    "cache_read_input_tokens": 6,
+                    "cache_creation_input_tokens": 8,
+                }
+            ]
+            + [{"type": "message", "input_tokens": 20}] * (999 if kind == "bounded" else 998)
+            + [compaction]
+            if kind in ("bounded", "at-bound")
+            else [compaction, {"type": "message", "input_tokens": 20}]
+        )
+    events = [
+        {
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 1,
+                    "cache_read_input_tokens": 1,
+                    "cache_creation_input_tokens": 1,
+                }
+            },
+        },
+        {"type": "message_delta", "usage": usage, "delta": {"stop_reason": "end_turn"}},
+        {
+            "type": "message_stop",
+            **(
+                {}
+                if kind == "compaction"
+                else {
+                    "amazon-bedrock-invocationMetrics": {
+                        "inputTokenCount": 31,
+                        "outputTokenCount": 16,
+                    }
+                }
+            ),
+        },
+    ]
+    raw = _body({"usage": usage})
+    client = _client("bedrock-runtime")
+    _stub_api_call(
+        client,
+        [
+            {"body": StreamingBody(io.BytesIO(raw), len(raw)), "contentType": "application/json"},
+            {"body": FakeEventStream([{"chunk": {"bytes": _body(event)}} for event in events])},
+        ],
+        monkeypatch,
+    )
+    wrapped = cast(Any, wrap_bedrock(client))
+    result = wrapped.invoke_model(modelId="anthropic.claude", body=_body({"messages": []}))
+    assert result["body"].read() == raw
+    response = wrapped.invoke_model_with_response_stream(
+        modelId="anthropic.claude", body=_body({"messages": []})
+    )
+    list(response["body"])
+    spans = memory.span_exporter.get_finished_spans()
+    assert len(spans) == 2
+    for span in spans:
+        assert span.attributes["gen_ai.usage.input_tokens"] == (
+            26 if kind == "absent" else 76 if kind == "at-bound" else 45
+        )
+        assert span.attributes["gen_ai.usage.output_tokens"] == (
+            9 if kind == "absent" else 29 if kind == "at-bound" else 16
+        )
+        assert span.attributes["gen_ai.usage.cache_read.input_tokens"] == (
+            2 if kind == "absent" else 11 if kind == "at-bound" else 5
+        )
+        assert span.attributes["gen_ai.usage.cache_creation.input_tokens"] == (
+            4 if kind == "absent" else 17 if kind == "at-bound" else 9
+        )
+        if kind == "bounded":
+            assert span.attributes["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize("count", [0, None, "9", True, float("inf"), float("nan"), 10**400])
+def test_claude_final_usage_precedes_metrics(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, count: Any
+) -> None:
+    usage: dict[str, Any] = {
+        "iterations": [
+            {
+                "type": "compaction",
+                "input_tokens": 11.0,
+                "output_tokens": 7.0,
+                "cache_read_input_tokens": 3,
+                "cache_creation_input_tokens": 5,
+            }
+        ],
+    }
+    if count is not None:
+        usage.update(input_tokens=count, output_tokens=count)
+    events = [
+        {"type": "message_delta", "usage": usage},
+        {
+            "type": "message_stop",
+            "amazon-bedrock-invocationMetrics": {"inputTokenCount": 31, "outputTokenCount": 16},
+        },
+    ]
+    client = _client("bedrock-runtime")
+    raw = _body({"usage": usage})
+    _stub_api_call(
+        client,
+        [
+            {"body": StreamingBody(io.BytesIO(raw), len(raw)), "contentType": "application/json"},
+            {"body": FakeEventStream([{"chunk": {"bytes": _body(event)}} for event in events])},
+        ],
+        monkeypatch,
+    )
+    wrapped = cast(Any, wrap_bedrock(client))
+    result = wrapped.invoke_model(modelId="anthropic.claude", body=_body({"messages": []}))
+    assert result["body"].read() == raw
+    response = wrapped.invoke_model_with_response_stream(
+        modelId="anthropic.claude", body=_body({"messages": []})
+    )
+    list(response["body"])
+    nonstream, span = memory.span_exporter.get_finished_spans()
+    assert nonstream.attributes["gen_ai.usage.input_tokens"] == 19
+    assert nonstream.attributes["gen_ai.usage.output_tokens"] == 7
+    assert span.attributes["gen_ai.usage.input_tokens"] == (19 if count == 0 else 31)
+    assert span.attributes["gen_ai.usage.output_tokens"] == (7 if count == 0 else 16)
+
+
 def test_invoke_model_provider_native_and_streaming_body(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -10,6 +10,7 @@ from typing import Any, cast
 import telemetry_dev
 
 from ._fields import clean, error_fields, merge_fields, usage_from_converse
+from ._invoke_model import claude_usage_fields, usage_number
 from ._messages import normalize_content_block
 
 # Retention uses fixed bounds; the core applies max_attribute_length after the mask.
@@ -287,6 +288,8 @@ class InvokeModelStreamState(StreamState):
         self.budget = stream_capture_budget()
         self.chunks: list[Any] = []
         self.usage: dict[str, int] = {}
+        self.final_usage: dict[str, int] = {}
+        self.compaction: dict[str, Any] = {}
         self.finish_reason: str | None = None
 
     def feed(self, event: Any) -> bool:
@@ -368,6 +371,12 @@ class InvokeModelStreamState(StreamState):
     def finish(self, *, partial: bool) -> dict[str, Any]:
         del partial
         text = "".join(_text_from_provider_chunk(chunk) for chunk in self.chunks)
+        usage = {**self.usage, **self.final_usage}
+        for key, value in self.compaction.get("usage", {}).items():
+            base_key = "output_tokens" if key == "output_tokens" else "input_tokens"
+            # Invocation metrics have no documented compaction exclusion.
+            if base_key in self.final_usage or base_key not in self.usage:
+                usage[key] = usage.get(key, 0) + value
         output: Any = self.chunks
         if text:
             output = [
@@ -382,7 +391,8 @@ class InvokeModelStreamState(StreamState):
         return clean(
             {
                 "output": output if output else None,
-                "usage": self.usage or None,
+                "usage": usage or None,
+                "attributes": self.compaction.get("attributes"),
                 "finish_reason": self.finish_reason,
             }
         )
@@ -393,16 +403,21 @@ class InvokeModelStreamState(StreamState):
         usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else {}
         message_usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
         self.finish_reason = delta.get("stop_reason") or self.finish_reason
-        self.usage.update(
-            clean(
-                {
-                    "input_tokens": message_usage.get("input_tokens"),
-                    "output_tokens": usage.get("output_tokens"),
-                    "cache_read_input_tokens": message_usage.get("cache_read_input_tokens"),
-                    "cache_creation_input_tokens": message_usage.get("cache_creation_input_tokens"),
-                }
-            )
-        )
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ):
+            value = usage_number(usage.get(key))
+            if value is not None:
+                self.final_usage[key] = value
+            if value is None:
+                value = usage_number(message_usage.get(key))
+            if value is not None:
+                self.usage[key] = value
+        if isinstance(usage.get("iterations"), list):
+            self.compaction = claude_usage_fields({"iterations": usage["iterations"]})
 
 
 class AgentStreamState(StreamState):

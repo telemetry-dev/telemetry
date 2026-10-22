@@ -1,9 +1,49 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from ._fields import clean
+
+_USAGE_ITERATION_LIMIT = 1000
+_CLAUDE_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
+def usage_number(value: Any) -> float | None:
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def claude_usage_fields(usage: dict[str, Any]) -> dict[str, Any]:
+    parsed = clean({key: usage_number(usage.get(key)) for key in _CLAUDE_USAGE_KEYS})
+    iterations = usage.get("iterations")
+    if not isinstance(iterations, list):
+        return {"usage": parsed}
+    # Executor iterations are already in top-level usage; only compaction is additive.
+    first = max(0, len(iterations) - _USAGE_ITERATION_LIMIT)
+    for index in range(first, len(iterations)):
+        entry = iterations[index]
+        if not isinstance(entry, dict) or entry.get("type") != "compaction":
+            continue
+        for key in _CLAUDE_USAGE_KEYS:
+            value = usage_number(entry.get(key))
+            if value is not None:
+                parsed[key] = parsed.get(key, 0) + value
+    fields = {"usage": parsed}
+    if first > 0:
+        fields["attributes"] = {"telemetry.dev.capture.truncated": True}
+    return fields
 
 
 def parse_body(body: Any, content_type: Any = "application/json") -> Any:
@@ -162,19 +202,13 @@ def response_fields(
         )
     if "anthropic.claude" in lower:
         usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
-        parsed_usage = clean(
-            {
-                "input_tokens": usage.get("input_tokens"),
-                "output_tokens": usage.get("output_tokens"),
-                "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
-                "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
-            }
-        )
+        fields = claude_usage_fields(usage)
         return clean(
             {
+                **fields,
                 "output": body,
                 "finish_reason": body.get("stop_reason"),
-                "usage": parsed_usage or header_usage_fields(headers).get("usage"),
+                "usage": fields["usage"] or header_usage_fields(headers).get("usage"),
             }
         )
     if "meta.llama" in lower:
