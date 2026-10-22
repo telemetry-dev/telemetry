@@ -286,6 +286,7 @@ export class InvokeModelStreamState implements StreamState {
   private text = "";
   private usage: SpanFields["usage"];
   private finalUsage: NonNullable<SpanFields["usage"]> = {};
+  private startUsage: NonNullable<SpanFields["usage"]> = {};
   private compaction: SpanFields = {};
   private finishReason: string | undefined;
   private error: Error | undefined;
@@ -325,9 +326,23 @@ export class InvokeModelStreamState implements StreamState {
         const value = numberValue(usage?.[source]);
         if (value !== undefined) this.finalUsage[key as keyof typeof CLAUDE_USAGE_KEYS] = value;
       }
-      if (Array.isArray(usage?.iterations)) {
-        this.compaction = claudeUsageFields({ iterations: usage.iterations });
-      }
+      // message_start counts exclude compaction like message_delta counts; metrics may not.
+      this.startUsage = omitUndefined({
+        ...this.startUsage,
+        inputTokens: numberValue(messageUsage?.input_tokens) ?? this.startUsage.inputTokens,
+        outputTokens: numberValue(messageUsage?.output_tokens) ?? this.startUsage.outputTokens,
+        cacheReadInputTokens:
+          numberValue(messageUsage?.cache_read_input_tokens) ??
+          this.startUsage.cacheReadInputTokens,
+        cacheCreationInputTokens:
+          numberValue(messageUsage?.cache_creation_input_tokens) ??
+          this.startUsage.cacheCreationInputTokens,
+      });
+      // An interrupted stream keeps message_start's iterations until a cumulative delta replaces them.
+      const iterations = Array.isArray(usage?.iterations)
+        ? usage.iterations
+        : messageUsage?.iterations;
+      if (Array.isArray(iterations)) this.compaction = claudeUsageFields({ iterations });
 
       const metrics = isRecord(parsed["amazon-bedrock-invocationMetrics"])
         ? parsed["amazon-bedrock-invocationMetrics"]
@@ -354,7 +369,6 @@ export class InvokeModelStreamState implements StreamState {
         ...this.usage,
         inputTokens:
           numberValue(usage?.input_tokens) ??
-          numberValue(messageUsage?.input_tokens) ??
           numberValue(metrics?.inputTokenCount) ??
           numberValue(parsed.inputTextTokenCount) ??
           this.usage?.inputTokens,
@@ -364,13 +378,9 @@ export class InvokeModelStreamState implements StreamState {
           numberValue(parsed.totalOutputTextTokenCount) ??
           this.usage?.outputTokens,
         cacheReadInputTokens:
-          numberValue(usage?.cache_read_input_tokens) ??
-          numberValue(messageUsage?.cache_read_input_tokens) ??
-          this.usage?.cacheReadInputTokens,
+          numberValue(usage?.cache_read_input_tokens) ?? this.usage?.cacheReadInputTokens,
         cacheCreationInputTokens:
-          numberValue(usage?.cache_creation_input_tokens) ??
-          numberValue(messageUsage?.cache_creation_input_tokens) ??
-          this.usage?.cacheCreationInputTokens,
+          numberValue(usage?.cache_creation_input_tokens) ?? this.usage?.cacheCreationInputTokens,
       });
     }
 
@@ -378,7 +388,7 @@ export class InvokeModelStreamState implements StreamState {
   }
 
   finish(): SpanFields {
-    const usage = { ...this.usage, ...this.finalUsage };
+    const usage = { ...this.startUsage, ...this.usage, ...this.finalUsage };
     for (const key of Object.keys(CLAUDE_USAGE_KEYS) as (keyof typeof CLAUDE_USAGE_KEYS)[]) {
       const value = this.compaction.usage?.[key];
       const baseKey = key === "outputTokens" ? "outputTokens" : "inputTokens";

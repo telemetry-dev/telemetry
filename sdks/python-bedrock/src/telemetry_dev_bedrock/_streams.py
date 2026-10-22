@@ -289,6 +289,8 @@ class InvokeModelStreamState(StreamState):
         self.chunks: list[Any] = []
         self.usage: dict[str, int] = {}
         self.final_usage: dict[str, int] = {}
+        # message_start counts exclude compaction like message_delta counts; metrics may not.
+        self.start_usage: dict[str, int] = {}
         self.compaction: dict[str, Any] = {}
         self.finish_reason: str | None = None
 
@@ -371,7 +373,7 @@ class InvokeModelStreamState(StreamState):
     def finish(self, *, partial: bool) -> dict[str, Any]:
         del partial
         text = "".join(_text_from_provider_chunk(chunk) for chunk in self.chunks)
-        usage = {**self.usage, **self.final_usage}
+        usage = {**self.start_usage, **self.usage, **self.final_usage}
         for key, value in self.compaction.get("usage", {}).items():
             base_key = "output_tokens" if key == "output_tokens" else "input_tokens"
             # Invocation metrics have no documented compaction exclusion.
@@ -412,12 +414,15 @@ class InvokeModelStreamState(StreamState):
             value = usage_number(usage.get(key))
             if value is not None:
                 self.final_usage[key] = value
-            if value is None:
-                value = usage_number(message_usage.get(key))
-            if value is not None:
-                self.usage[key] = value
+            start_value = usage_number(message_usage.get(key))
+            if start_value is not None:
+                self.start_usage[key] = start_value
+        # An interrupted stream keeps message_start's iterations until a cumulative delta
+        # replaces them.
         if isinstance(usage.get("iterations"), list):
             self.compaction = claude_usage_fields({"iterations": usage["iterations"]})
+        elif isinstance(message_usage.get("iterations"), list):
+            self.compaction = claude_usage_fields({"iterations": message_usage["iterations"]})
 
 
 class AgentStreamState(StreamState):

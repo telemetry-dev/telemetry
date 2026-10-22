@@ -1,6 +1,6 @@
 [project]
 name = "telemetry-dev"
-version = "0.2.10"
+version = "0.2.11"
 description = "telemetry.dev SDK for Python — OpenTelemetry-native GenAI tracing, logs, and metrics"
 readme = "README.md"
 license = "MIT"
@@ -22,6 +22,7 @@ dependencies = [
   "opentelemetry-api>=1.39.0,<2",
   "opentelemetry-sdk>=1.39.0,<2",
   "opentelemetry-exporter-otlp-proto-http>=1.39.0,<2",
+  "rfc8785>=0.1.4",
 ]
 
 [project.urls]

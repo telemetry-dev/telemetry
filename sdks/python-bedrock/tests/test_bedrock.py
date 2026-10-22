@@ -4,6 +4,7 @@ import copy
 import gc
 import io
 import json
+from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -785,6 +786,113 @@ def test_claude_invoke_compaction_usage(
         )
         if kind == "bounded":
             assert span.attributes["telemetry.dev.capture.truncated"] is True
+
+
+INTERRUPTED_COMPACTION: dict[str, Any] = {
+    "type": "compaction",
+    "input_tokens": 11,
+    "output_tokens": 7,
+    "cache_read_input_tokens": 3,
+    "cache_creation_input_tokens": 5,
+}
+INTERRUPTED_BASE: dict[str, Any] = {
+    "input_tokens": 20,
+    "cache_read_input_tokens": 2,
+    "cache_creation_input_tokens": 4,
+}
+
+
+def _claude_invoke_stream(
+    monkeypatch: pytest.MonkeyPatch, events: list[dict[str, Any]]
+) -> Iterator[Any]:
+    client = _client("bedrock-runtime")
+    _stub_api_call(
+        client,
+        [{"body": FakeEventStream([{"chunk": {"bytes": _body(event)}} for event in events])}],
+        monkeypatch,
+    )
+    response = cast(Any, wrap_bedrock(client)).invoke_model_with_response_stream(
+        modelId="anthropic.claude", body=_body({"messages": []})
+    )
+    return iter(response["body"])
+
+
+@pytest.mark.parametrize(
+    "deltas,input_tokens,output_tokens",
+    [
+        ([], 45, 9),
+        ([{"type": "message_delta", "delta": {}, "usage": {"output_tokens": 3}}], 45, 10),
+        (
+            [
+                {
+                    "type": "message_delta",
+                    "delta": {},
+                    "usage": {
+                        **INTERRUPTED_BASE,
+                        "output_tokens": 3,
+                        "iterations": [
+                            INTERRUPTED_COMPACTION,
+                            {"type": "message"},
+                            INTERRUPTED_COMPACTION,
+                        ],
+                    },
+                }
+            ],
+            26 + 2 * 19,
+            3 + 2 * 7,
+        ),
+    ],
+    ids=["start_only", "delta_without_iterations", "delta_with_cumulative_iterations"],
+)
+def test_interrupted_claude_invoke_stream_keeps_message_start_compaction(
+    memory: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    deltas: list[dict[str, Any]],
+    input_tokens: int,
+    output_tokens: int,
+) -> None:
+    start_usage = {
+        **INTERRUPTED_BASE,
+        "output_tokens": 2,
+        "iterations": [INTERRUPTED_COMPACTION, {"type": "message", "input_tokens": 20}],
+    }
+    events = [
+        {"type": "message_start", "message": {"usage": start_usage}},
+        *deltas,
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "x"}},
+        {"type": "message_stop"},
+    ]
+    stream = _claude_invoke_stream(monkeypatch, events)
+    for _ in range(1 + len(deltas)):
+        next(stream)
+    cast(Any, stream).close()
+
+    span = memory.span_exporter.get_finished_spans()[0]
+    assert span.attributes["gen_ai.usage.input_tokens"] == input_tokens
+    assert span.attributes["gen_ai.usage.output_tokens"] == output_tokens
+    assert span.attributes["telemetry.dev.capture.truncated"] is True
+
+
+def test_message_start_compaction_is_never_added_to_invocation_metrics(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = [
+        {
+            "type": "message_start",
+            "message": {"usage": {**INTERRUPTED_BASE, "iterations": [INTERRUPTED_COMPACTION]}},
+        },
+        {
+            "type": "message_stop",
+            "amazon-bedrock-invocationMetrics": {"inputTokenCount": 31, "outputTokenCount": 16},
+        },
+    ]
+    list(_claude_invoke_stream(monkeypatch, events))
+
+    span = memory.span_exporter.get_finished_spans()[0]
+    assert span.attributes["gen_ai.usage.input_tokens"] == 37
+    assert span.attributes["gen_ai.usage.output_tokens"] == 16
+    assert span.attributes["gen_ai.usage.cache_read.input_tokens"] == 2
+    assert span.attributes["gen_ai.usage.cache_creation.input_tokens"] == 4
 
 
 @pytest.mark.parametrize("count", [0, None, "9", True, float("inf"), float("nan"), 10**400])

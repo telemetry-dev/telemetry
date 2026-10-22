@@ -222,6 +222,8 @@ function oneHourCacheCreationTokens<T>(usage: T): number | undefined {
 
 interface IterationsUsage {
   compaction: SpanFields["usage"];
+  advisor?: SpanFields["usage"];
+  advisorModel?: string;
   compactionOneHourCacheCreationTokens?: number;
   executorOneHourCacheCreationTokens?: number;
   truncated: boolean;
@@ -244,6 +246,7 @@ function iterationsUsage<T>(usage: T): IterationsUsage | undefined {
   // A stream uses the executor sum in place of message_start, so the sum is kept only when every
   // executor iteration reports the one-hour split. Iterations past the bound go unseen.
   let executorSplitComplete = !result.truncated;
+  let advisorModelComplete = true;
 
   for (let index = firstIndex; index < iterations.length; index += 1) {
     const entry = asRecord(iterations[index]);
@@ -255,6 +258,16 @@ function iterationsUsage<T>(usage: T): IterationsUsage | undefined {
         result.compactionOneHourCacheCreationTokens,
         oneHourCacheCreationTokens(entry),
       );
+    } else if (entry?.type === "advisor_message") {
+      result.advisor = addUsage(result.advisor, messagesUsage(entry));
+      const model = readString(entry.model);
+      if (
+        model === undefined ||
+        model.trim() === "" ||
+        (result.advisorModel !== undefined && model !== result.advisorModel)
+      )
+        advisorModelComplete = false;
+      result.advisorModel = model ?? result.advisorModel;
     } else if (entry?.type === "message" || entry?.type === "fallback_message") {
       const oneHour = oneHourCacheCreationTokens(entry);
 
@@ -268,6 +281,11 @@ function iterationsUsage<T>(usage: T): IterationsUsage | undefined {
   }
 
   if (!executorSplitComplete) result.executorOneHourCacheCreationTokens = undefined;
+  // An aggregate must not be priced at one model's rates when its identity is ambiguous.
+  if (!advisorModelComplete) {
+    result.advisorModel = undefined;
+    result.truncated = true;
+  }
 
   return result;
 }
@@ -275,8 +293,23 @@ function iterationsUsage<T>(usage: T): IterationsUsage | undefined {
 function usageAttributes(
   oneHourCacheCreation: number | undefined,
   captureIncomplete: boolean,
+  iterations: IterationsUsage | undefined,
 ): SpanFields["attributes"] {
   const attributes: NonNullable<SpanFields["attributes"]> = {};
+
+  if (iterations?.advisorModel !== undefined)
+    attributes["anthropic.advisor.model"] = iterations.advisorModel;
+
+  const advisor = iterations?.advisor;
+  if (advisor?.inputTokens !== undefined)
+    attributes["anthropic.advisor.usage.input_tokens"] = advisor.inputTokens;
+  if (advisor?.outputTokens !== undefined)
+    attributes["anthropic.advisor.usage.output_tokens"] = advisor.outputTokens;
+  if (advisor?.cacheReadInputTokens !== undefined)
+    attributes["anthropic.advisor.usage.cache_read_input_tokens"] = advisor.cacheReadInputTokens;
+  if (advisor?.cacheCreationInputTokens !== undefined)
+    attributes["anthropic.advisor.usage.cache_creation_input_tokens"] =
+      advisor.cacheCreationInputTokens;
 
   if (oneHourCacheCreation !== undefined)
     attributes["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"] = oneHourCacheCreation;
@@ -305,6 +338,7 @@ function messagesResponse<T>(response: T): SpanFields {
       iterations?.compactionOneHourCacheCreationTokens,
     ),
     iterations?.truncated === true,
+    iterations,
   );
 
   if (attributes) fields.attributes = attributes;
@@ -589,7 +623,8 @@ function streamPartialFields(state: StreamState): SpanFields {
       state.iterations?.executorOneHourCacheCreationTokens ?? state.oneHourCacheCreationTokens,
       state.iterations?.compactionOneHourCacheCreationTokens,
     ),
-    captureIncomplete,
+    captureIncomplete || state.iterations?.truncated === true,
+    state.iterations,
   );
 
   if (attributes) fields.attributes = attributes;
@@ -938,6 +973,8 @@ function recordStreamEvent<T>(event: T, state: StreamState): SpanFields {
 
     state.oneHourCacheCreationTokens =
       oneHourCacheCreationTokens(message.usage) ?? state.oneHourCacheCreationTokens;
+    // A stream interrupted before message_delta keeps the iterations message_start reported.
+    state.iterations = iterationsUsage(message.usage) ?? state.iterations;
   }
 
   if (type === "content_block_start") recordContentBlockStart(record, state);

@@ -22,6 +22,7 @@ from google.genai import _extra_utils
 from google.genai.client import AsyncClient, Client
 from google.genai.models import AsyncModels, Models
 from google.genai.operations import AsyncOperations, Operations
+from telemetry_dev._serialize import json_dumps
 
 __version__ = "0.1.7"
 
@@ -231,8 +232,8 @@ def _stop_sequences(value: Any) -> list[str] | None:
 
 def _json_attr(value: Any) -> str | None:
     try:
-        return json.dumps(_native(value))
-    except (TypeError, ValueError):
+        return json_dumps(_native(value), default=None)
+    except (TypeError, ValueError, RecursionError):
         return None
 
 

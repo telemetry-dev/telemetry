@@ -16,6 +16,7 @@ from anthropic._resource import AsyncAPIResource
 from anthropic.resources.beta.messages import AsyncMessages as AsyncBetaMessages
 from anthropic.resources.beta.messages import Messages as BetaMessages
 from anthropic.resources.messages import AsyncMessages, Messages
+from telemetry_dev._serialize import json_dumps
 
 __version__ = "0.1.6"
 
@@ -309,6 +310,8 @@ def _one_hour_cache_creation_tokens(raw: Any) -> int | float | None:
 class _IterationsUsage:
     def __init__(self, truncated: bool) -> None:
         self.compaction: dict[str, int | float] | None = None
+        self.advisor: dict[str, int | float] | None = None
+        self.advisor_model: str | None = None
         self.compaction_one_hour_cache_creation_tokens: int | float | None = None
         self.executor_one_hour_cache_creation_tokens: int | float | None = None
         self.truncated = truncated
@@ -327,6 +330,7 @@ def _iterations_usage(usage: Any) -> _IterationsUsage | None:
     # A stream uses the executor sum in place of message_start, so the sum is kept only when every
     # executor iteration reports the one-hour split. Iterations past the bound go unseen.
     executor_split_complete = not result.truncated
+    advisor_model_complete = True
     for index in range(first_index, len(iterations)):
         entry = iterations[index]
         entry_type = _string(_field(entry, "type"))
@@ -336,6 +340,16 @@ def _iterations_usage(usage: Any) -> _IterationsUsage | None:
                 result.compaction_one_hour_cache_creation_tokens,
                 _one_hour_cache_creation_tokens(entry),
             )
+        elif entry_type == "advisor_message":
+            result.advisor = _add_usage(result.advisor, _messages_usage(entry))
+            model = _string(_field(entry, "model"))
+            if (
+                model is None
+                or not model.strip()
+                or (result.advisor_model is not None and model != result.advisor_model)
+            ):
+                advisor_model_complete = False
+            result.advisor_model = model if model is not None else result.advisor_model
         elif entry_type in ("message", "fallback_message"):
             one_hour = _one_hour_cache_creation_tokens(entry)
             if one_hour is None:
@@ -345,13 +359,24 @@ def _iterations_usage(usage: Any) -> _IterationsUsage | None:
             )
     if not executor_split_complete:
         result.executor_one_hour_cache_creation_tokens = None
+    # An aggregate must not be priced at one model's rates when its identity is ambiguous.
+    if not advisor_model_complete:
+        result.advisor_model = None
+        result.truncated = True
     return result
 
 
 def _usage_attributes(
-    one_hour_cache_creation: int | float | None, capture_incomplete: bool
+    one_hour_cache_creation: int | float | None,
+    capture_incomplete: bool,
+    iterations: _IterationsUsage | None,
 ) -> dict[str, Any] | None:
     attributes: dict[str, Any] = {}
+    if iterations is not None:
+        if iterations.advisor_model is not None:
+            attributes["anthropic.advisor.model"] = iterations.advisor_model
+        for key, value in (iterations.advisor or {}).items():
+            attributes[f"anthropic.advisor.usage.{key}"] = value
     if one_hour_cache_creation is not None:
         attributes["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"] = (
             one_hour_cache_creation
@@ -381,6 +406,7 @@ def _messages_response(response: Any) -> dict[str, Any]:
             iterations.compaction_one_hour_cache_creation_tokens if iterations else None,
         ),
         iterations is not None and iterations.truncated,
+        iterations,
     )
     if attributes:
         fields["attributes"] = attributes
@@ -651,7 +677,7 @@ def _bounded_stream_output(
     blocks: list[dict[str, Any]], max_bytes: int, max_items: int
 ) -> tuple[list[dict[str, Any]] | None, bool]:
     def encoded_size(value: Any) -> int:
-        return len(json.dumps(value, default=repr, ensure_ascii=False).encode())
+        return len(json_dumps(value).encode())
 
     envelope: list[dict[str, Any]] = [{"role": "assistant", "content": []}]
     item_budget = telemetry_dev.CaptureBudget(max_items=max_items)
@@ -661,7 +687,7 @@ def _bounded_stream_output(
         if not item_budget.accept(envelope):
             return None, True
         for block in blocks:
-            block_size = encoded_size(block) + (2 if kept else 0)
+            block_size = encoded_size(block) + (_BLOCK_SEPARATOR_BYTES if kept else 0)
             if size + block_size > max_bytes or not item_budget.accept(block):
                 break
             size += block_size
@@ -710,7 +736,8 @@ def _stream_partial(
         _add_tokens(
             one_hour, iterations.compaction_one_hour_cache_creation_tokens if iterations else None
         ),
-        capture_incomplete,
+        capture_incomplete or (iterations is not None and iterations.truncated),
+        iterations,
     )
     if attributes:
         fields["attributes"] = attributes
@@ -1057,6 +1084,10 @@ def _record_stream_event(event: Any, state: _StreamState) -> dict[str, Any]:
         update["response_model"] = _string(_field(message, "model"))
         state.usage = _merge_usage(state.usage, _messages_usage(_field(message, "usage")))
         _record_one_hour_cache_creation(_field(message, "usage"), state)
+        # A stream interrupted before message_delta keeps the iterations message_start reported.
+        iterations = _iterations_usage(_field(message, "usage"))
+        if iterations is not None:
+            state.iterations = iterations
     elif event_type == "content_block_start":
         _record_content_block_start(event, state)
     elif event_type == "content_block_delta":
@@ -1082,13 +1113,13 @@ def _record_stream_event(event: Any, state: _StreamState) -> dict[str, Any]:
 
 
 _STREAM_OUTPUT_ENVELOPE: Final[list[dict[str, Any]]] = [{"role": "assistant", "content": []}]
-_BLOCK_SEPARATOR_BYTES: Final = 2
+_BLOCK_SEPARATOR_BYTES: Final = 1
 
 
 def _envelope_cost() -> tuple[int, int]:
     measured = telemetry_dev.CaptureBudget()
     measured.accept(_STREAM_OUTPUT_ENVELOPE)
-    envelope_bytes = len(json.dumps(_STREAM_OUTPUT_ENVELOPE, ensure_ascii=False).encode())
+    envelope_bytes = len(json_dumps(_STREAM_OUTPUT_ENVELOPE).encode())
     return envelope_bytes, measured.items_used
 
 
@@ -1100,7 +1131,7 @@ def _settled_cost(
 ) -> tuple[int, int] | None:
     """Bytes and items the final bounded check counts for a block, or None if it cannot."""
     try:
-        size = len(json.dumps(block, default=repr, ensure_ascii=False).encode())
+        size = len(json_dumps(block).encode())
     except (TypeError, ValueError, RecursionError):
         return None
     if any(other < index for other in state.blocks):
