@@ -2211,7 +2211,7 @@ def test_signature_after_stop_keeps_the_settled_tool_input_charge(signatures: li
     output = implementation._stream_partial(state)["output"]
 
     assert output is not None
-    assert charged >= len(json.dumps(output, ensure_ascii=False).encode())
+    assert charged >= len(json.dumps(output, ensure_ascii=False, separators=(",", ":")).encode())
 
 
 @pytest.mark.parametrize(
@@ -2387,11 +2387,11 @@ def test_settling_a_tool_input_refunds_its_previous_reservation() -> None:
     )
     record({"type": "content_block_stop", "index": 0}, state)
 
-    finalized = implementation._finalize_block(0, state.blocks[0], state)
     # The only block, so the envelope is charged once and there is no separator.
     expected = len(
-        json.dumps(implementation._STREAM_OUTPUT_ENVELOPE, ensure_ascii=False).encode()
-    ) + len(json.dumps(finalized, default=repr, ensure_ascii=False).encode())
+        b'[{"role":"assistant","content":[{"type":"tool_use","id":"t1",'
+        b'"name":"calc","input":{"a":1,"b":2}}]}]'
+    )
 
     assert state.budget.bytes_used == expected
     implementation._settle_tool_input(0, state)
@@ -4048,6 +4048,7 @@ def usage_span(
             "type": "message_start",
             "message": message_payload(id="msg_usage", content=[], usage=start_usage),
         },
+        {"type": "message_delta", "delta": {}, "usage": delta_usage},
         {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": delta_usage},
         {"type": "message_stop"},
     ]
@@ -4077,10 +4078,26 @@ def test_compaction_iterations_are_added_to_usage_with_one_hour_cache_writes(
         FIRST_TURN_USAGE,
         {
             **TURNS_USAGE,
-            "iterations": [FIRST_TURN, ADVISOR_TURN, COMPACTION_ITERATION, SECOND_TURN],
+            "iterations": [
+                FIRST_TURN,
+                ADVISOR_TURN,
+                COMPACTION_ITERATION,
+                SECOND_TURN,
+                {
+                    **ADVISOR_TURN,
+                    "input_tokens": 23,
+                    "output_tokens": 7,
+                    "cache_read_input_tokens": 9,
+                },
+            ],
         },
     )
 
+    assert a["anthropic.advisor.model"] == "claude-haiku-4-5"
+    assert a["anthropic.advisor.usage.input_tokens"] == 123
+    assert a["anthropic.advisor.usage.output_tokens"] == 57
+    assert a["anthropic.advisor.usage.cache_read_input_tokens"] == 10
+    assert a["anthropic.advisor.usage.cache_creation_input_tokens"] == 2
     assert a["gen_ai.usage.input_tokens"] == 10 + 3 + 3 + 40 + 6 + 4
     assert a["gen_ai.usage.output_tokens"] == 5 + 7
     assert a["gen_ai.usage.cache_read.input_tokens"] == 3 + 6
@@ -4097,6 +4114,140 @@ def test_one_hour_cache_writes_are_recorded_without_iterations(
 
     assert a["gen_ai.usage.cache_creation.input_tokens"] == 1
     assert a["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"] == 1
+    assert not any(key.startswith("anthropic.advisor.") for key in a)
+
+
+@pytest.mark.parametrize("streaming,model", [(False, None), (True, None), (False, ""), (True, " ")])
+def test_advisor_usage_preserves_zero_and_omits_absent_fields(
+    memory: SimpleNamespace, streaming: bool, model: str | None
+) -> None:
+    a = usage_span(
+        memory,
+        streaming,
+        FIRST_TURN_USAGE,
+        {
+            **TURNS_USAGE,
+            "iterations": [
+                {"type": "advisor_message", "model": model, "input_tokens": 0, "output_tokens": 0}
+            ],
+        },
+    )
+    assert a["anthropic.advisor.usage.input_tokens"] == 0
+    assert a["anthropic.advisor.usage.output_tokens"] == 0
+    assert "anthropic.advisor.model" not in a
+    assert "anthropic.advisor.usage.cache_read_input_tokens" not in a
+    assert "anthropic.advisor.usage.cache_creation_input_tokens" not in a
+    assert a["gen_ai.usage.input_tokens"] == 16
+    assert a["gen_ai.usage.output_tokens"] == 5
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize(
+    "deltas,advisor_input",
+    [
+        ([], 100),
+        ([{"type": "message_delta", "delta": {}, "usage": {"output_tokens": 3}}], 100),
+        (
+            [
+                {
+                    "type": "message_delta",
+                    "delta": {},
+                    "usage": {
+                        **TURNS_USAGE,
+                        "iterations": [FIRST_TURN, ADVISOR_TURN, ADVISOR_TURN],
+                    },
+                }
+            ],
+            200,
+        ),
+    ],
+    ids=["start_only", "delta_without_iterations", "delta_with_cumulative_iterations"],
+)
+def test_interrupted_stream_keeps_advisor_usage_from_message_start(
+    memory: SimpleNamespace, deltas: list[dict[str, Any]], advisor_input: int
+) -> None:
+    start_usage = {**FIRST_TURN_USAGE, "iterations": [FIRST_TURN, ADVISOR_TURN]}
+    events = [
+        {
+            "type": "message_start",
+            "message": message_payload(id="msg_usage", content=[], usage=start_usage),
+        },
+        *deltas,
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "message_stop"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(events)
+
+    client = wrapped_sync_client(handler)
+    stream = client.beta.messages.create(
+        model="claude-opus-5", max_tokens=64, messages=BETA_MESSAGES, stream=True
+    )
+    iterator = iter(stream)
+    for _ in range(1 + len(deltas)):
+        next(iterator)
+    stream.close()
+
+    a = attrs(only_span(memory))
+    assert a["anthropic.advisor.model"] == "claude-haiku-4-5"
+    assert a["anthropic.advisor.usage.input_tokens"] == advisor_input
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["unary", "stream"])
+async def test_async_advisor_usage(memory: SimpleNamespace, streaming: bool) -> None:
+    usage = {**TURNS_USAGE, "iterations": [ADVISOR_TURN, ADVISOR_TURN]}
+    events = [
+        {"type": "message_start", "message": message_payload(content=[], usage=FIRST_TURN_USAGE)},
+        {"type": "message_delta", "delta": {}, "usage": usage},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": usage},
+        {"type": "message_stop"},
+    ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return (
+            named_sse_response(events) if streaming else json_response(message_payload(usage=usage))
+        )
+
+    client = wrapped_async_client(handler)
+    result = await client.beta.messages.create(
+        model="claude-opus-5", max_tokens=64, messages=BETA_MESSAGES, stream=streaming
+    )
+    if streaming:
+        async for _event in result:
+            pass
+    await client.close()
+    a = attrs(only_span(memory))
+    assert a["anthropic.advisor.model"] == "claude-haiku-4-5"
+    assert a["anthropic.advisor.usage.input_tokens"] == 200
+    assert a["anthropic.advisor.usage.output_tokens"] == 100
+    assert a["anthropic.advisor.usage.cache_read_input_tokens"] == 2
+    assert a["anthropic.advisor.usage.cache_creation_input_tokens"] == 2
+    assert a["gen_ai.usage.input_tokens"] == 16
+    assert a["gen_ai.usage.output_tokens"] == 5
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["unary", "stream"])
+def test_advisor_totals_with_mixed_models_are_not_assigned_one_models_rates(
+    memory: SimpleNamespace, streaming: bool
+) -> None:
+    a = usage_span(
+        memory,
+        streaming,
+        FIRST_TURN_USAGE,
+        {
+            **TURNS_USAGE,
+            "iterations": [
+                ADVISOR_TURN,
+                {**ADVISOR_TURN, "model": "claude-opus-4-8"},
+                ADVISOR_TURN,
+            ],
+        },
+    )
+    assert a["anthropic.advisor.usage.input_tokens"] == 300
+    assert "anthropic.advisor.model" not in a
+    assert a["telemetry.dev.capture.truncated"] is True
 
 
 @pytest.mark.parametrize("streaming", [False, True], ids=["unary", "stream"])

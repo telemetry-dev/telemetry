@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import json
 from types import SimpleNamespace
 from typing import Any, cast
@@ -143,6 +144,84 @@ def test_truncation_cap_and_marker(memory: SimpleNamespace) -> None:
     assert value.endswith(TRUNCATION_MARKER)
     assert len(value) == 65_536
     assert TRUNCATION_MARKER == "...[truncated]"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (float("nan"), "null"),
+        (
+            {"score": float("inf"), "items": [float("-inf"), "NaN"]},
+            '{"score":null,"items":[null,"NaN"]}',
+        ),
+        (
+            {"text": 'é東🤖\n\x01"\\\u2028\u2029', "ok": True, "missing": None},
+            '{"text":"é東🤖\\n\\u0001\\"\\\\\u2028\u2029","ok":true,"missing":null}',
+        ),
+        ({"values": [1] * 30_000}, '{"values":[' + ",".join(["1"] * 30_000) + "]}"),
+        (
+            [1.0, -0.0, 1e-7, 1e-6, 1e20, 1e21, 9007199254740993],
+            "[1,0,1e-7,0.000001,100000000000000000000,1e+21,9007199254740992]",
+        ),
+        (
+            {"z": 0, "10": 10, "2": 2, "01": 1, "4294967295": 5, "a": {"3": 3, "0": 0}},
+            '{"2":2,"10":10,"z":0,"01":1,"4294967295":5,"a":{"0":0,"3":3}}',
+        ),
+        (["\ud800", "\udc00", "\ud83e\udd16"], '["\\ud800","\\udc00","🤖"]'),
+        ({"\ud83e\udd16": 1, "after": 2, "🤖": 3}, '{"🤖":3,"after":2}'),
+        ({float("inf"): 1, float("nan"): 2}, '{"Infinity":1,"NaN":2}'),
+    ],
+    ids=[
+        "nan",
+        "nested-infinities",
+        "unicode-escapes",
+        "compact-cap",
+        "numbers",
+        "keys",
+        "surrogates",
+        "equivalent-surrogate-keys",
+        "nonfinite-keys",
+    ],
+)
+def test_captured_json_matches_shared_contract(make: MakeClient, value: Any, expected: str) -> None:
+    env = make()
+    telemetry_dev.start_span("json", input=value).end()
+    assert attrs(only_span(env))["gen_ai.input.messages"] == expected
+
+
+class _LabelledInt(int):
+    def __str__(self) -> str:
+        return "label"
+
+
+class _Priority(enum.IntEnum):
+    HIGH = 3
+
+
+def test_captured_json_ignores_int_subclass_str(make: MakeClient) -> None:
+    # Python 3.10 IntEnum.__str__ returns "Priority.HIGH"; any int subclass may override __str__.
+    env = make()
+    value = {"count": _LabelledInt(7), "items": [_Priority.HIGH], _LabelledInt(2): "key"}
+    telemetry_dev.start_span("json", input=value).end()
+    captured = attrs(only_span(env))["gen_ai.input.messages"]
+    assert captured == '{"2":"key","count":7,"items":[3]}'
+    assert json.loads(str(captured)) == {"2": "key", "count": 7, "items": [3]}
+
+
+def test_masked_nonfinite_values_and_shared_references(make: MakeClient) -> None:
+    shared = [float("nan"), 2]
+    value = {"first": shared, "second": shared}
+
+    def mask(_value: Any, _context: MaskContext) -> Any:
+        return value
+
+    env = make(mask=mask)
+    telemetry_dev.start_span("masked", input="secret").end()
+    assert attrs(only_span(env))["gen_ai.input.messages"] == (
+        '{"first":[null,2],"second":[null,2]}'
+    )
+    assert value["first"] is shared and value["second"] is shared
+    assert shared[0] != shared[0]
 
 
 def test_truncation_custom_cap(make: MakeClient) -> None:

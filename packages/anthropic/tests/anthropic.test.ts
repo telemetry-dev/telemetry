@@ -2305,6 +2305,7 @@ async function usageSpan(
       type: "message_start",
       message: messagePayload({ id: "msg_usage", content: [], usage: startUsage }),
     },
+    { type: "message_delta", delta: {}, usage: deltaUsage },
     { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: deltaUsage },
     { type: "message_stop" },
   ];
@@ -2341,9 +2342,20 @@ test.each([false, true])(
   async (streaming) => {
     const span = await usageSpan(streaming, firstTurnUsage, {
       ...turnsUsage,
-      iterations: [firstTurn, advisorTurn, compactionIteration, secondTurn],
+      iterations: [
+        firstTurn,
+        advisorTurn,
+        compactionIteration,
+        secondTurn,
+        { ...advisorTurn, input_tokens: 23, output_tokens: 7, cache_read_input_tokens: 9 },
+      ],
     });
 
+    expect(span.attributes["anthropic.advisor.model"]).toBe("claude-haiku-4-5");
+    expect(span.attributes["anthropic.advisor.usage.input_tokens"]).toBe(123);
+    expect(span.attributes["anthropic.advisor.usage.output_tokens"]).toBe(57);
+    expect(span.attributes["anthropic.advisor.usage.cache_read_input_tokens"]).toBe(10);
+    expect(span.attributes["anthropic.advisor.usage.cache_creation_input_tokens"]).toBe(2);
     expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(10 + 3 + 3 + 40 + 6 + 4);
     expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(5 + 7);
     expect(span.attributes["gen_ai.usage.cache_read.input_tokens"]).toBe(3 + 6);
@@ -2365,6 +2377,45 @@ test.each([false, true])(
 
     expect(span.attributes["gen_ai.usage.cache_creation.input_tokens"]).toBe(1);
     expect(span.attributes["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"]).toBe(1);
+    expect(
+      Object.keys(span.attributes).filter((key) => key.startsWith("anthropic.advisor.")),
+    ).toEqual([]);
+  },
+);
+
+test.each([
+  [false, null],
+  [true, null],
+  [false, ""],
+  [true, " "],
+] as const)(
+  "advisor usage preserves zero and omits absent fields (streaming: %s, model: %s)",
+  async (streaming, model) => {
+    const span = await usageSpan(streaming, firstTurnUsage, {
+      ...turnsUsage,
+      iterations: [{ type: "advisor_message", model, input_tokens: 0, output_tokens: 0 }],
+    });
+    expect(span.attributes["anthropic.advisor.usage.input_tokens"]).toBe(0);
+    expect(span.attributes["anthropic.advisor.usage.output_tokens"]).toBe(0);
+    expect(span.attributes["anthropic.advisor.model"]).toBeUndefined();
+    expect(span.attributes["anthropic.advisor.usage.cache_read_input_tokens"]).toBeUndefined();
+    expect(span.attributes["anthropic.advisor.usage.cache_creation_input_tokens"]).toBeUndefined();
+    expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(16);
+    expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(5);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  },
+);
+
+test.each([false, true])(
+  "advisor totals with mixed models are not assigned one model's rates (streaming: %s)",
+  async (streaming) => {
+    const span = await usageSpan(streaming, firstTurnUsage, {
+      ...turnsUsage,
+      iterations: [advisorTurn, { ...advisorTurn, model: "claude-opus-4-8" }, advisorTurn],
+    });
+    expect(span.attributes["anthropic.advisor.usage.input_tokens"]).toBe(300);
+    expect(span.attributes["anthropic.advisor.model"]).toBeUndefined();
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
   },
 );
 
@@ -2384,6 +2435,70 @@ test.each([false, true])(
     // Executor iterations past the bound go unseen, so a stream keeps message_start's split.
     expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(7);
     expect(span.attributes["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"]).toBe(1 + 3);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  },
+);
+
+test.each([
+  { name: "start only", deltas: [], advisorInput: 100 },
+  {
+    name: "delta without iterations",
+    deltas: [{ type: "message_delta", delta: {}, usage: { output_tokens: 3 } }],
+    advisorInput: 100,
+  },
+  {
+    name: "delta with cumulative iterations",
+    deltas: [
+      {
+        type: "message_delta",
+        delta: {},
+        usage: { ...turnsUsage, iterations: [firstTurn, advisorTurn, advisorTurn] },
+      },
+    ],
+    advisorInput: 200,
+  },
+])(
+  "interrupted streams keep advisor usage already received on message_start ($name)",
+  async ({ deltas, advisorInput }) => {
+    const spans = setupSpans();
+    const events = [
+      {
+        type: "message_start",
+        message: messagePayload({
+          id: "msg_usage",
+          content: [],
+          usage: { ...firstTurnUsage, iterations: [firstTurn, advisorTurn] },
+        }),
+      },
+      ...deltas,
+    ];
+
+    const source = {
+      controller: new AbortController(),
+      async *[Symbol.asyncIterator]() {
+        yield* events;
+        yield { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } };
+        throw new Error("the caller stopped before this event");
+      },
+    };
+
+    const client = wrapAnthropic({ messages: { create: async (_params: unknown) => source } });
+    const stream = await client.messages.create({
+      model: "claude-opus-5",
+      max_tokens: 64,
+      messages: [],
+      stream: true,
+    });
+
+    let seen = 0;
+    for await (const _event of stream as AsyncIterable<unknown>) {
+      seen += 1;
+      if (seen === events.length) break;
+    }
+
+    const span = await exportedSpan(spans);
+    expect(span.attributes["anthropic.advisor.model"]).toBe("claude-haiku-4-5");
+    expect(span.attributes["anthropic.advisor.usage.input_tokens"]).toBe(advisorInput);
     expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
   },
 );

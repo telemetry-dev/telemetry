@@ -555,6 +555,106 @@ test.each(["absent", "compaction", "at-bound", "bounded"])(
   },
 );
 
+const interruptedCompaction = {
+  type: "compaction",
+  input_tokens: 11,
+  output_tokens: 7,
+  cache_read_input_tokens: 3,
+  cache_creation_input_tokens: 5,
+};
+const interruptedBase = {
+  input_tokens: 20,
+  cache_read_input_tokens: 2,
+  cache_creation_input_tokens: 4,
+};
+
+test.each([
+  { name: "start only", deltas: [], input: 45, output: 9 },
+  {
+    name: "delta without iterations",
+    deltas: [{ type: "message_delta", delta: {}, usage: { output_tokens: 3 } }],
+    input: 45,
+    output: 10,
+  },
+  {
+    name: "delta with cumulative iterations",
+    deltas: [
+      {
+        type: "message_delta",
+        delta: {},
+        usage: {
+          ...interruptedBase,
+          output_tokens: 3,
+          iterations: [interruptedCompaction, { type: "message" }, interruptedCompaction],
+        },
+      },
+    ],
+    input: 26 + 2 * 19,
+    output: 3 + 2 * 7,
+  },
+])(
+  "interrupted Claude InvokeModel stream keeps message_start compaction usage ($name)",
+  async ({ deltas, input, output }) => {
+    const spans = setup();
+    const events = [
+      {
+        type: "message_start",
+        message: {
+          usage: {
+            ...interruptedBase,
+            output_tokens: 2,
+            iterations: [interruptedCompaction, { type: "message", input_tokens: 20 }],
+          },
+        },
+      },
+      ...deltas,
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "unread" } },
+      { type: "message_stop" },
+    ].map((event) => ({ chunk: { bytes: bytes(event) } }));
+    const client = wrapBedrock(new FakeClient([{ body: streamOf(events) }]));
+    const response = (await client.send(
+      new InvokeModelWithResponseStreamCommand({
+        modelId: "anthropic.claude",
+        body: bytes({ messages: [] }),
+      }),
+    )) as { body: AsyncIterable<unknown> };
+    await collect(response.body, 1 + deltas.length);
+
+    const [span] = spans.getFinishedSpans();
+    expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(input);
+    expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(output);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  },
+);
+
+test("message_start compaction usage is never added to invocation metrics", async () => {
+  const spans = setup();
+  const events = [
+    {
+      type: "message_start",
+      message: { usage: { ...interruptedBase, iterations: [interruptedCompaction] } },
+    },
+    {
+      type: "message_stop",
+      "amazon-bedrock-invocationMetrics": { inputTokenCount: 31, outputTokenCount: 16 },
+    },
+  ].map((event) => ({ chunk: { bytes: bytes(event) } }));
+  const client = wrapBedrock(new FakeClient([{ body: streamOf(events) }]));
+  const response = (await client.send(
+    new InvokeModelWithResponseStreamCommand({
+      modelId: "anthropic.claude",
+      body: bytes({ messages: [] }),
+    }),
+  )) as { body: AsyncIterable<unknown> };
+  await collect(response.body);
+
+  const [span] = spans.getFinishedSpans();
+  expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(37);
+  expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(16);
+  expect(span.attributes["gen_ai.usage.cache_read.input_tokens"]).toBe(2);
+  expect(span.attributes["gen_ai.usage.cache_creation.input_tokens"]).toBe(4);
+});
+
 test.each([0, undefined])("Claude final usage takes precedence over metrics: %s", async (count) => {
   const spans = setup();
   const events = [

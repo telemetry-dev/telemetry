@@ -1,8 +1,8 @@
 """E2E scenario driver for the cross-SDK conformance suite.
 
 This script EMITS the shared conformance scenario against a real ingest endpoint; the
-ClickHouse row assertions live in apps/ingest/src/sdk_conformance.ts (C1-C22), keyed by the
-session id below. Keep the scenario in lockstep with apps/ingest/src/sdk_otlp_e2e_test.ts and
+ClickHouse row assertions live in apps/ingest/src/sdk_conformance.ts (C1-C24), keyed by the
+session id below. Keep the scenario in lockstep with apps/ingest/tests/sdk_otlp_e2e_test.ts and
 docs/sdk-conformance.md.
 
 Run:
@@ -15,6 +15,7 @@ Run:
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from typing import Any
@@ -28,6 +29,22 @@ from telemetry_dev import (
     propagate_attributes,
     start_span,
 )
+
+# C23: inserted in this order; the expected bytes put array-index keys ("2", "10",
+# "4294967294") first in numeric order like JSON.stringify. 2**60 + 1 exceeds the safe integer
+# range, so it serializes as the binary64 number JavaScript would read (2**60).
+JSON_COMPAT_PAYLOAD: dict[str, Any] = {
+    "b": [1, math.nan, {"x": math.inf, "y": -math.inf, "z": [-0.0]}],
+    "10": -0.0,
+    "01": "leading zero",
+    "2": 1e-6,
+    "4294967295": "not an index",
+    "4294967294": "max index",
+    "a": 1e21,
+    "big": 2**60 + 1,
+    "s": "\u00e9\U0001f916",
+    "lone": "\ud800",
+}
 
 
 @observe(name="format-output")  # C5: observed plain function -> operation "function"
@@ -145,6 +162,35 @@ def main() -> int:
             ).end()
             # C16b: mask hook redaction.
             start_span("masked-step", type="generation", input="SECRET stuff").end()
+            # C23: JSON.stringify-compatible serialization of the shared payload.
+            with start_span("json-compat", input=JSON_COMPAT_PAYLOAD) as json_compat:
+                serialized = json_compat.serialize_content(
+                    JSON_COMPAT_PAYLOAD, "gen_ai.input.messages"
+                )
+                if serialized is None:
+                    print("e2e_scenarios: serialize_content returned None", file=sys.stderr)
+                    return 1
+                json_compat.update(attributes={"e2e.json_compat.serialized": serialized})
+            # C24: Anthropic advisor attributes beside unchanged executor usage.
+            start_span(
+                "advisor-call",
+                type="generation",
+                model="claude-sonnet-4-5",
+                provider="anthropic",
+                usage={
+                    "input_tokens": 8,
+                    "output_tokens": 3,
+                    "cache_read_input_tokens": 2,
+                    "cache_creation_input_tokens": 1,
+                },
+                attributes={
+                    "anthropic.advisor.model": "claude-opus-4-1",
+                    "anthropic.advisor.usage.input_tokens": 5,
+                    "anthropic.advisor.usage.output_tokens": 7,
+                    "anthropic.advisor.usage.cache_read_input_tokens": 11,
+                    "anthropic.advisor.usage.cache_creation_input_tokens": 13,
+                },
+            ).end()
             streamed = start_span(
                 "streamed-chat",
                 type="generation",

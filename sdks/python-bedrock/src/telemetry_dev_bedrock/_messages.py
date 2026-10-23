@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 from typing import Any
+
+from telemetry_dev._serialize import json_dumps
 
 
 def normalize_messages(messages: Any) -> list[dict[str, Any]] | None:
@@ -135,7 +136,7 @@ def normalize_content_block(block: dict[str, Any]) -> list[dict[str, Any]]:
             return [{"type": "text", "content": guard_text}]
 
     try:
-        return [{"type": "text", "content": json.dumps(block, default=str)}]
+        return [{"type": "text", "content": json_dumps(block, default=str)}]
     except Exception:
         return [{"type": "text", "content": "[unsupported content block]"}]
 

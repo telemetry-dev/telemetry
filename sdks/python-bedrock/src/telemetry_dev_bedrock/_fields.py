@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 from typing import Any
+
+from telemetry_dev._serialize import json_dumps
 
 PROVIDER = "amazon-bedrock"
 
@@ -74,7 +75,7 @@ def usage_from_converse(value: Any) -> dict[str, int] | None:
 def metadata_attr_value(value: Any) -> Any:
     if value is None or isinstance(value, str):
         return value
-    return json.dumps(value, default=repr, ensure_ascii=False)
+    return json_dumps(value)
 
 
 def merge_fields(*parts: dict[str, Any]) -> dict[str, Any]:
