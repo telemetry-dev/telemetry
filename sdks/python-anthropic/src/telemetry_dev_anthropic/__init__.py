@@ -18,7 +18,7 @@ from anthropic.resources.beta.messages import Messages as BetaMessages
 from anthropic.resources.messages import AsyncMessages, Messages
 from telemetry_dev._serialize import json_dumps
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 ProviderResolver = Callable[[object | None], str]
 RequestMapper = Callable[[Mapping[str, Any]], tuple[str, dict[str, Any]]]

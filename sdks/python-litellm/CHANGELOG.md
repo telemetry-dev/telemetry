@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/python-litellm-v0.1.6...python-litellm-v0.1.7) (2026-10-23)
+
+
+### Bug Fixes
+
+* **sdk:** align captured JSON and provider usage ([#79](https://github.com/telemetry-dev/telemetry/issues/79)) ([1ec98d5](https://github.com/telemetry-dev/telemetry/commit/1ec98d5014ac810116402736cc7db420745eb9ef))
+
 ## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/python-litellm-v0.1.5...python-litellm-v0.1.6) (2026-10-19)
 
 

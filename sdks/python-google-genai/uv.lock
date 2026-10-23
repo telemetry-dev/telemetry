@@ -848,7 +848,7 @@ dev = [
 
 [[package]]
 name = "telemetry-dev-google-genai"
-version = "0.1.7"
+version = "0.1.8"
 source = { editable = "." }
 dependencies = [
     { name = "google-genai" },
