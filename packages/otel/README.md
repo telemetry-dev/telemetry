@@ -8,7 +8,7 @@ Docs: https://telemetry.dev/docs/sdk/opentelemetry
 npm i @telemetry-dev/otel
 ```
 
-Requires Node.js 20.19.0 or later. `@opentelemetry/api` 1.9 or later 1.x is a peer dependency and is installed automatically by current npm and pnpm versions.
+Requires Node.js 20.19.0 or later. `@opentelemetry/api` 1.9 or later 1.x is a peer dependency and is installed automatically by current npm and pnpm versions. The package depends on `@opentelemetry/core` 2.12 or later 2.x.
 
 ## NodeSDK
 
