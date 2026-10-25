@@ -244,8 +244,8 @@ function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): Tel
     if (!logs) {
       const logProcessor =
         config.exportMode === "immediate"
-          ? new SimpleLogRecordProcessor(logExporter)
-          : new BatchLogRecordProcessor(logExporter);
+          ? new SimpleLogRecordProcessor({ exporter: logExporter })
+          : new BatchLogRecordProcessor({ exporter: logExporter });
 
       const loggerProvider = new LoggerProvider({
         resource,
