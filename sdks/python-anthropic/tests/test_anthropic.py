@@ -2309,6 +2309,20 @@ def test_fallback_metadata_overflow_preserves_complete_masked_output(make: Any) 
     assert a["telemetry.dev.capture.truncated"] is True
 
 
+def test_beta_create_records_a_fallback_block_under_its_wire_keys(memory: SimpleNamespace) -> None:
+    content = [FALLBACK_BLOCK, {"type": "text", "text": "Hi"}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload(content=content))
+
+    wrapped_sync_client(handler).beta.messages.create(
+        model="claude-opus-5", max_tokens=64, messages=MESSAGES
+    )
+
+    output = json.loads(str(attrs(only_span(memory))["gen_ai.output.messages"]))
+    assert output[0]["content"] == content
+
+
 @pytest.mark.parametrize(
     ("iterations", "expected"),
     [
