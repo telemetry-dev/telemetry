@@ -10,7 +10,7 @@ import {
   TraceIdRatioBasedSampler,
 } from "@opentelemetry/sdk-trace-base";
 import { sessionSpanContext } from "@telemetry-dev/otel";
-import { expect, test } from "vitest";
+import { expect, onTestFinished, test, vi } from "vitest";
 
 import { telemetryDev } from "../src/v6.ts";
 
@@ -510,6 +510,11 @@ test("model warnings become model.warning events at severity 13", async () => {
 });
 
 test("no apiKey is a complete no-op (transport never invoked)", async () => {
+  // The integration falls back to this variable, which a developer's shell can export.
+  vi.stubEnv("TELEMETRY_DEV_API_KEY", undefined);
+  onTestFinished(() => {
+    vi.unstubAllEnvs();
+  });
   const { spanBatches, metrics, overrides } = makeCapture();
   const integ = telemetryDev({ environment: "test", serviceName: "svc" }, overrides);
 

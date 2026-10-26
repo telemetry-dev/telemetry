@@ -10,7 +10,7 @@ import {
 } from "@opentelemetry/sdk-trace-base";
 import { type ChatMiddlewareContext } from "@tanstack/ai";
 import { sessionSpanContext } from "@telemetry-dev/otel";
-import { expect, test } from "vitest";
+import { expect, onTestFinished, test, vi } from "vitest";
 
 import { telemetryDev } from "../src/index.ts";
 
@@ -560,6 +560,11 @@ test("onAbort closes everything as cancelled", async () => {
 });
 
 test("no apiKey is a complete no-op (transport never invoked)", async () => {
+  // The middleware falls back to this variable, which a developer's shell can export.
+  vi.stubEnv("TELEMETRY_DEV_API_KEY", undefined);
+  onTestFinished(() => {
+    vi.unstubAllEnvs();
+  });
   const { spanBatches, metrics, overrides } = makeCapture();
   const mw = telemetryDev({ environment: "test", serviceName: "svc" }, overrides);
   const ctx = makeCtx();
