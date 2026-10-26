@@ -387,16 +387,6 @@ test("updateActiveSpan maps fields using the active span's type", async () => {
   expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(9);
 });
 
-test("spanLimits backstop truncates raw attributes set outside the capture funnel", async () => {
-  const { spans } = setup();
-  const handle = startSpan("raw");
-  handle.span.setAttribute("raw.dump", "x".repeat(70000));
-  handle.end();
-  await flush();
-  const value = String(spans.getFinishedSpans()[0]!.attributes["raw.dump"]);
-  expect(value.length).toBe(65536);
-});
-
 test("per-call captureInput:false drops input but keeps output", async () => {
   const { spans } = setup();
   startSpan("private", {

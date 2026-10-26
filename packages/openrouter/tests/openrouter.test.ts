@@ -2081,47 +2081,38 @@ test("multi-choice chat streams reconstruct every choice", async () => {
   expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop", "length"]);
 });
 
-test("non-2xx chat responses end one error span and propagate the failure", async () => {
+test.each([
+  {
+    failure: "non-2xx responses",
+    fetcher: (): Fetcher =>
+      createFakeFetcher(
+        new Response(JSON.stringify({ error: { code: 500, message: "provider exploded" } }), {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        }),
+      ).fetcher,
+    message: "provider exploded",
+  },
+  {
+    failure: "rejected transport requests",
+    fetcher: (): Fetcher => () => Promise.reject(new Error("network down")),
+    message: "network down",
+  },
+])("chat $failure end one error span and propagate the failure", async ({ fetcher, message }) => {
   const spans = setupSpans();
 
-  const fake = createFakeFetcher(
-    new Response(JSON.stringify({ error: { code: 500, message: "provider exploded" } }), {
-      status: 500,
-      headers: { "content-type": "application/json" },
-    }),
-  );
-
   await expect(
-    clientWith(fake.fetcher).chat.send({
+    clientWith(fetcher()).chat.send({
       chatRequest: {
         model: "openai/gpt-4o",
         messages: [{ role: "user", content: "Boom" }],
       },
     }),
-  ).rejects.toThrow();
+  ).rejects.toThrow(message);
 
   const span = await exportedSpan(spans);
   expect(span.status.code).toBe(SPAN_STATUS_ERROR);
-  expect(span.events[0]?.name).toBe("exception");
-});
-
-test("rejected transport requests end one error span and rethrow", async () => {
-  const spans = setupSpans();
-  const failure = new Error("network down");
-  const fetcher: Fetcher = () => Promise.reject(failure);
-
-  await expect(
-    clientWith(fetcher).chat.send({
-      chatRequest: {
-        model: "openai/gpt-4o",
-        messages: [{ role: "user", content: "Offline" }],
-      },
-    }),
-  ).rejects.toThrow("network down");
-
-  const span = await exportedSpan(spans);
-  expect(span.status.code).toBe(SPAN_STATUS_ERROR);
-  expect(span.events[0]?.attributes?.["exception.message"]).toContain("network down");
+  expect(span.events[0]?.attributes?.["exception.message"]).toContain(message);
 });
 
 test("mid-stream body failures end one error span with partial output", async () => {

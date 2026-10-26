@@ -404,7 +404,7 @@ interface CallState {
  * onEnd/onError/onAbort). The emitted span/metric shape intentionally matches the v6 path so
  * ingest and the UI see a single format.
  */
-export function createV7Hooks(
+function createV7Hooks(
   config: ResolvedConfig,
   emitter: GenerationEmitter,
 ): TelemetryDevIntegration {

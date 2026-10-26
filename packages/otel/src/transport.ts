@@ -250,7 +250,6 @@ async function postSerialized(
   target: OtlpTarget,
   transport: Transport,
   label: string,
-  post: typeof postOtlp = postOtlp,
   signal?: AbortSignal,
 ): Promise<void> {
   const { body: finalBody, contentEncoding } = await maybeGzip(body);
@@ -259,7 +258,7 @@ async function postSerialized(
     ? { ...target.headers, "content-encoding": contentEncoding }
     : target.headers;
 
-  const res = await post({
+  const res = await postOtlp({
     fetchImpl: transport.fetchImpl,
     url: target.url,
     headers,
@@ -387,7 +386,7 @@ function createOtlpBatchSender<T>(
       return;
     }
 
-    await postSerialized(body, target, transport, label, postOtlp, signal);
+    await postSerialized(body, target, transport, label, signal);
   };
 
   return send;
@@ -446,7 +445,7 @@ export function createMetricExporter(target: OtlpTarget, transport: Transport): 
           : undefined;
 
         if (body !== undefined && body.byteLength > 0) {
-          await postSerialized(body, target, transport, "metric", postOtlp, signal);
+          await postSerialized(body, target, transport, "metric", signal);
         }
       }, resultCallback);
     },

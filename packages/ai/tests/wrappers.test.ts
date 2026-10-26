@@ -44,7 +44,8 @@ test("media wrappers preserve structural function types and record metadata with
       .images[0]!.uint8Array,
   ).toBe(bytes);
   expect(spans).toHaveLength(1);
-  expect(spans[0]!.attributes).toMatchObject({
+  // An exact map: an attribute that carries the bytes in any encoding fails here.
+  expect(spans[0]!.attributes).toEqual({
     "gen_ai.operation.name": "generate_content",
     "gen_ai.output.type": "image",
     "gen_ai.provider.name": "openai",
@@ -54,7 +55,6 @@ test("media wrappers preserve structural function types and record metadata with
     "gen_ai.usage.image.output_tokens": 2,
     "td.ai.output.image_count": 1,
   });
-  expect(JSON.stringify(spans[0]!.attributes)).not.toContain("1,2,3");
 });
 
 test("media wrappers preserve rejection and synchronous throw identity", async () => {
@@ -143,6 +143,11 @@ test("throwing telemetry overrides do not replace provider results or errors", a
   await Promise.resolve();
   expect(durationAttempts).toBe(1);
   expect(spans).toHaveLength(1);
+  expect(telemetryErrors.map((error) => (error as Error).message)).toEqual([
+    "tokens failed",
+    "duration failed",
+  ]);
+  telemetryErrors.length = 0;
 
   const providerError = new Error("provider failed");
   expect(() =>
@@ -154,7 +159,8 @@ test("throwing telemetry overrides do not replace provider results or errors", a
       overrides,
     )(),
   ).toThrow(providerError);
-  expect(telemetryErrors.length).toBeGreaterThan(0);
+  expect(durationAttempts).toBe(2);
+  expect(telemetryErrors.map((error) => (error as Error).message)).toEqual(["duration failed"]);
 });
 
 test("throwing telemetry setup and one-shot input getters preserve exact provider outcomes", () => {

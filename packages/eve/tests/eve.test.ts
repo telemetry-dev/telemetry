@@ -309,6 +309,7 @@ function onlyLog(exporters: Exporters) {
 }
 
 afterEach(async () => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 
@@ -406,11 +407,20 @@ test("instrumentation puts every ai.eve.turn of a session in the session trace",
   }
 });
 
-test("instrumentation captureInput:false maps to eve recordInputs:false", () => {
-  const definition = telemetryDevInstrumentation(telemetryOptions({ captureInput: false }));
+test.each([
+  { capture: { captureInput: false }, recordInputs: false, recordOutputs: true },
+  { capture: { captureOutput: false }, recordInputs: true, recordOutputs: false },
+])(
+  "instrumentation maps $capture to eve recordInputs and recordOutputs",
+  ({ capture, recordInputs, recordOutputs }) => {
+    const definition = telemetryDevInstrumentation(telemetryOptions(capture));
 
-  expect(definition.recordInputs).toBe(false);
-});
+    expect([definition.recordInputs, definition.recordOutputs]).toEqual([
+      recordInputs,
+      recordOutputs,
+    ]);
+  },
+);
 
 test("provider integration forwards content capture flags", () => {
   const integration = telemetryDevOtelIntegration({
@@ -952,17 +962,31 @@ test.each([
 
 test("wrapped eve client puts every turn of one session in the session trace", async () => {
   const exporters = makeExporters();
-  stubFetchSequence([
+
+  const responses = [
     jsonResponse({ sessionId: "session-1" }),
     ndjsonResponse(successfulTurnEvents()),
     jsonResponse({ sessionId: "session-1" }),
     ndjsonResponse(successfulTurnEvents()),
-  ]);
+  ];
+
+  // Each request takes a minute on a frozen clock: a span that started when its
+  // POST resolved would start a minute after its turn was sent.
+  vi.useFakeTimers({ now: Date.parse("2026-01-02T03:04:05.000Z"), toFake: ["Date"] });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => {
+      vi.setSystemTime(Date.now() + 60_000);
+
+      return responses.shift()!;
+    }),
+  );
   const client = wrapClient(exporters);
 
-  const before = Date.now();
+  const sentAt = [Date.now()];
   const { response, session } = await client.sessions.create({ message: "first" });
   await response.result();
+  sentAt.push(Date.now());
   await (await session.send("second")).result();
   await flush();
 
@@ -976,10 +1000,9 @@ test("wrapped eve client puts every turn of one session in the session trace", a
     expect(span.spanContext().traceId).toBe(expected.traceId);
     expect(span.parentSpanContext?.spanId).toBe(expected.spanId);
     expect(span.attributes["gen_ai.conversation.id"]).toBe("session-1");
-    // The span keeps the pre-send start time even though it is created after the response.
-    expect(ms(span.startTime)).toBeGreaterThanOrEqual(before);
-    expect(ms(span.startTime)).toBeLessThanOrEqual(ms(span.endTime));
   }
+
+  expect(spans.map((span) => ms(span.startTime))).toEqual(sentAt);
 });
 
 test("wrapped eve client marks streams without terminal events as errored spans", async () => {

@@ -8,9 +8,9 @@ import {
   SamplingDecision,
   TraceIdRatioBasedSampler,
 } from "@opentelemetry/sdk-trace-base";
-import { type ChatMiddlewareContext } from "@tanstack/ai";
+import { chat, type ChatMiddlewareContext, embed, type EmbeddingAdapter } from "@tanstack/ai";
 import { sessionSpanContext } from "@telemetry-dev/otel";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 
 import { telemetryDev } from "../src/index.ts";
 
@@ -313,48 +313,34 @@ test.each([
   }
 });
 
-test("bigint metadata IDs populate user and conversation attributes", async () => {
-  const { spanBatches, overrides } = makeCapture();
-  const mw = middleware(overrides);
-  const ctx = makeCtx({ options: { metadata: { userId: 2n, sessionId: 9n } } });
+test.each([
+  { kind: "bigint", userId: 2n, sessionId: 9n, user: "2", conversation: "9" },
+  { kind: "string", userId: "u2", sessionId: "sess_9", user: "u2", conversation: "sess_9" },
+])(
+  "$kind metadata IDs override threadId and populate user and conversation attributes",
+  async ({ userId, sessionId, user, conversation }) => {
+    const { spanBatches, overrides } = makeCapture();
+    const mw = middleware(overrides);
+    const ctx = makeCtx({ options: { metadata: { userId, sessionId } } });
 
-  await mw.onStart?.(ctx);
-  await mw.onConfig?.(ctx, chatConfig());
-  await mw.onChunk?.(ctx, { type: "RUN_FINISHED", finishReason: "stop" } as never);
-  await mw.onFinish?.(ctx, { finishReason: "stop", duration: 5, content: "ok" } as never);
+    await mw.onStart?.(ctx);
+    await mw.onConfig?.(ctx, chatConfig());
+    await mw.onChunk?.(ctx, { type: "RUN_FINISHED", finishReason: "stop" } as never);
+    await mw.onFinish?.(ctx, { finishReason: "stop", duration: 5, content: "ok" } as never);
 
-  const spans = spanBatches[0]!;
+    const spans = spanBatches[0]!;
 
-  for (const s of spans) {
-    expect(s.attributes["gen_ai.conversation.id"]).toBe("9");
-  }
+    for (const s of spans) {
+      expect(s.attributes["gen_ai.conversation.id"]).toBe(conversation);
+    }
 
-  const root = spans.find((s) => s.kind === SpanKind.INTERNAL)!;
-  expect(root.attributes["user.id"]).toBe("2");
-  // Reserved keys never leak into td.metadata.*.
-  expect(root.attributes["td.metadata.userId"]).toBeUndefined();
-  expect(root.attributes["td.metadata.sessionId"]).toBeUndefined();
-});
-
-test("string metadata IDs override threadId and populate user attributes", async () => {
-  const { spanBatches, overrides } = makeCapture();
-  const mw = middleware(overrides);
-  const ctx = makeCtx({ options: { metadata: { userId: "u2", sessionId: "sess_9" } } });
-
-  await mw.onStart?.(ctx);
-  await mw.onConfig?.(ctx, chatConfig());
-  await mw.onChunk?.(ctx, { type: "RUN_FINISHED", finishReason: "stop" } as never);
-  await mw.onFinish?.(ctx, { finishReason: "stop", duration: 5, content: "ok" } as never);
-
-  const spans = spanBatches[0]!;
-
-  for (const span of spans) {
-    expect(span.attributes["gen_ai.conversation.id"]).toBe("sess_9");
-  }
-
-  const root = spans.find((span) => span.kind === SpanKind.INTERNAL)!;
-  expect(root.attributes["user.id"]).toBe("u2");
-});
+    const root = spans.find((s) => s.kind === SpanKind.INTERNAL)!;
+    expect(root.attributes["user.id"]).toBe(user);
+    // Reserved keys never leak into td.metadata.*.
+    expect(root.attributes["td.metadata.userId"]).toBeUndefined();
+    expect(root.attributes["td.metadata.sessionId"]).toBeUndefined();
+  },
+);
 
 test("multi-iteration run with a tool yields invoke_agent root and parents the tool to its iteration", async () => {
   const { spanBatches, metrics, overrides } = makeCapture();
@@ -559,18 +545,52 @@ test("onAbort closes everything as cancelled", async () => {
   expect(tool.attributes["error.type"]).toBe("cancelled");
 });
 
-test("no apiKey is a complete no-op (transport never invoked)", async () => {
-  const { spanBatches, metrics, overrides } = makeCapture();
-  const mw = telemetryDev({ environment: "test", serviceName: "svc" }, overrides);
-  const ctx = makeCtx();
+test("no apiKey makes chat and generation hooks a complete no-op (transport never invoked)", async () => {
+  vi.stubEnv("TELEMETRY_DEV_API_KEY", undefined);
 
-  await mw.onStart?.(ctx);
-  await mw.onConfig?.(ctx, chatConfig());
-  await mw.onChunk?.(ctx, { type: "RUN_FINISHED", finishReason: "stop" } as never);
-  await mw.onFinish?.(ctx, { finishReason: "stop", duration: 5, content: "y" } as never);
+  try {
+    let calls = 0;
 
-  expect(spanBatches).toHaveLength(0);
-  expect(metrics).toHaveLength(0);
+    const mw = telemetryDev({
+      environment: "test",
+      serviceName: "svc",
+      fetch: async () => {
+        calls += 1;
+
+        return new Response(null, { status: 200 });
+      },
+    });
+
+    const ctx = makeCtx();
+
+    await mw.onStart?.(ctx);
+    await mw.onConfig?.(ctx, chatConfig());
+    await mw.onChunk?.(ctx, { type: "RUN_FINISHED", finishReason: "stop" } as never);
+    await mw.onUsage?.(ctx, { promptTokens: 1, completionTokens: 1, totalTokens: 2 } as never);
+    await mw.onFinish?.(ctx, { finishReason: "stop", duration: 5, content: "y" } as never);
+
+    const result = await embed({
+      adapter: {
+        kind: "embedding",
+        name: "openai",
+        model: "text-embedding-3-small",
+        "~types": {},
+        createEmbeddings: async () => ({
+          id: "e1",
+          model: "text-embedding-3-small",
+          embeddings: [{ index: 0, vector: [0.1] }],
+          usage: { promptTokens: 1, completionTokens: 0, totalTokens: 1 },
+        }),
+      } as unknown as EmbeddingAdapter,
+      input: "x",
+      middleware: [mw as never],
+    });
+
+    expect(result).toMatchObject({ id: "e1" });
+    expect(calls).toBe(0);
+  } finally {
+    vi.unstubAllEnvs();
+  }
 });
 
 test("one middleware instance handles concurrent chats independently", async () => {
@@ -715,22 +735,20 @@ test.each(["finish", "error", "abort"])(
   },
 );
 
-test("metric export retries a transient ingest failure", async () => {
+test("chat telemetry reaches the configured ingest through the configured fetch", async () => {
   const errors: unknown[] = [];
-  let metricCalls = 0;
+  const posts: Array<{ url: string; authorization: string | null }> = [];
 
   const mw = telemetryDev({
-    apiKey: "td_live_metric_retry",
+    apiKey: "td_live_wiring",
+    baseUrl: "https://ingest.example.test/",
     environment: "test",
-    serviceName: "metric-retry",
-    fetch: async (url: string | Request | URL, _init?: RequestInit) => {
-      const href = url instanceof Request ? url.url : url.toString();
-
-      if (href.endsWith("/v1/metrics")) {
-        metricCalls += 1;
-
-        return new Response(null, { status: metricCalls === 1 ? 503 : 200 });
-      }
+    serviceName: "wiring",
+    fetch: async (url: string | Request | URL, init?: RequestInit) => {
+      posts.push({
+        url: url instanceof Request ? url.url : url.toString(),
+        authorization: new Headers(init?.headers).get("authorization"),
+      });
 
       return new Response(null, { status: 200 });
     },
@@ -747,8 +765,11 @@ test("metric export retries a transient ingest failure", async () => {
   await mw.onUsage?.(ctx, { promptTokens: 10, completionTokens: 5, totalTokens: 15 } as never);
   await mw.onFinish?.(ctx, { finishReason: "stop", duration: 5, content: "ok" } as never);
 
-  expect(metricCalls).toBe(2);
-  expect(errors).toHaveLength(0);
+  expect(posts).toEqual([
+    { url: "https://ingest.example.test/v1/traces", authorization: "Bearer td_live_wiring" },
+    { url: "https://ingest.example.test/v1/metrics", authorization: "Bearer td_live_wiring" },
+  ]);
+  expect(errors).toEqual([]);
 });
 
 test("Ollama-style nested sampling options populate gen_ai.request attrs", async () => {
@@ -794,23 +815,56 @@ test("an iteration with no usage records no token attributes or metrics (not zer
   expect(String(summary?.attributes?.["log.message"])).not.toContain("tokens");
 });
 
-test("onConfig during init opens no iteration span", async () => {
-  const { spanBatches, overrides } = makeCapture();
-  const mw = middleware(overrides);
-  const ctx = makeCtx();
+// The other chat tests script the hook order; this one pins it to the real engine, which fires
+// onConfig for phase "init" before onStart and again before each model call.
+test("a real chat() run opens one iteration span per model call", async () => {
+  const { spanBatches, metrics, overrides } = makeCapture();
+  const timestamp = Date.now();
 
-  await mw.onStart?.(ctx);
-  // The engine may fire onConfig at init before any model call; init must not open an iteration span.
-  Object.assign(ctx, { phase: "init" });
-  await mw.onConfig?.(ctx, chatConfig());
-  Object.assign(ctx, { phase: "beforeModel" });
-  await mw.onConfig?.(ctx, chatConfig());
-  await mw.onChunk?.(ctx, { type: "RUN_FINISHED", finishReason: "stop" } as never);
-  await mw.onFinish?.(ctx, { finishReason: "stop", duration: 5, content: "ok" } as never);
+  const adapter = {
+    kind: "text",
+    name: "openai",
+    model: "gpt-4o",
+    "~types": {},
+    async *chatStream() {
+      yield { type: "RUN_STARTED", runId: "run_real", threadId: "thread_real", timestamp };
+      yield { type: "TEXT_MESSAGE_START", messageId: "m1", role: "assistant", timestamp };
+      yield { type: "TEXT_MESSAGE_CONTENT", messageId: "m1", delta: "hello", timestamp };
+      yield { type: "TEXT_MESSAGE_END", messageId: "m1", timestamp };
+      yield {
+        type: "RUN_FINISHED",
+        runId: "run_real",
+        threadId: "thread_real",
+        finishReason: "stop",
+        model: "gpt-4o-2024-11-20",
+        usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 },
+        timestamp,
+      };
+    },
+    structuredOutput: async () => ({ data: {}, rawText: "{}" }),
+  };
 
+  const stream = chat({
+    adapter: adapter as never,
+    messages: [{ role: "user", content: "hi" }],
+    middleware: [middleware(overrides)],
+  });
+
+  for await (const _chunk of stream);
+
+  expect(spanBatches).toHaveLength(1);
   const spans = spanBatches[0]!;
-  expect(spans).toHaveLength(2);
-  expect(spans.filter((s) => s.kind === SpanKind.CLIENT)).toHaveLength(1);
+  expect(spans.filter((s) => s.kind === SpanKind.INTERNAL)).toHaveLength(1);
+  const iterations = spans.filter((s) => s.kind === SpanKind.CLIENT);
+  expect(iterations).toHaveLength(1);
+  const iteration = iterations[0]!;
+  expect(JSON.parse(String(iteration.attributes["gen_ai.input.messages"]))).toEqual([
+    { role: "user", content: "hi" },
+  ]);
+  expect(iteration.attributes["gen_ai.output.messages"]).toBe("hello");
+  expect(iteration.attributes["gen_ai.usage.input_tokens"]).toBe(3);
+  expect(iteration.attributes["gen_ai.response.model"]).toBe("gpt-4o-2024-11-20");
+  expect(metrics.filter((m) => m.metric === "duration")).toHaveLength(1);
 });
 
 test("structured output finalization records a separate iteration span", async () => {

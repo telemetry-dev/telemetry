@@ -17,7 +17,16 @@ import {
   uninstrumentBedrockAgents,
   wrapBedrockAgents,
 } from "../src/agents.ts";
-import { FakeClient, bytes, collect, jsonAttr, setup, streamOf, teardown } from "./helpers.ts";
+import {
+  FakeClient,
+  bytes,
+  collect,
+  jsonAttr,
+  jsonRequestHandler,
+  setup,
+  streamOf,
+  teardown,
+} from "./helpers.ts";
 
 afterEach(async () => {
   await teardown();
@@ -1021,50 +1030,63 @@ test("modeled stream errors from Agent, RAG, and Flow mark spans as errors", asy
   expect(jsonAttr(flowSpan, "gen_ai.output.messages")).toEqual([{ document: { value: 1 } }]);
 });
 
-test("global agents instrumentation is idempotent", async () => {
+test("global agents instrumentation patches the real client once and restores its inherited send", async () => {
   const spans = setup();
+  const proto = BedrockAgentRuntimeClient.prototype;
+  const command = new RetrieveCommand({ knowledgeBaseId: "kb-1", retrievalQuery: { text: "q" } });
 
-  const originalDescriptor = Object.getOwnPropertyDescriptor(
-    BedrockAgentRuntimeClient.prototype,
-    "send",
-  );
-
-  const fakeSend = async () => ({
-    completion: streamOf([{ chunk: { bytes: bytes("global") } }]),
-    $metadata: { requestId: "agent-global-1" },
+  const client = new BedrockAgentRuntimeClient({
+    region: "us-east-1",
+    credentials: { accessKeyId: "test", secretAccessKey: "test" },
+    maxAttempts: 1,
+    requestHandler: jsonRequestHandler("agent-global-1", {
+      retrievalResults: [{ content: { text: "doc" } }],
+    }),
   });
 
-  Object.defineProperty(BedrockAgentRuntimeClient.prototype, "send", {
-    configurable: true,
-    writable: true,
-    value: fakeSend,
-  });
+  // AWS clients inherit send from the Smithy base class.
+  expect(Object.hasOwn(proto, "send")).toBe(false);
 
   try {
     instrumentBedrockAgents();
     instrumentBedrockAgents();
 
-    const client = new BedrockAgentRuntimeClient({
-      region: "us-east-1",
-      credentials: { accessKeyId: "test", secretAccessKey: "test" },
-    });
-
-    const response = (await client.send(
-      new InvokeAgentCommand({ agentId: "agent-1", agentAliasId: "alias", sessionId: "sess" }),
-    )) as { completion: AsyncIterable<unknown> };
-
-    await collect(response.completion);
+    await client.send(command);
     expect(spans.getFinishedSpans()).toHaveLength(1);
     expect(spans.getFinishedSpans()[0]!.attributes["gen_ai.response.id"]).toBe("agent-global-1");
+
+    const telemetryWrapper = Object.getOwnPropertyDescriptor(proto, "send")?.value;
+    const laterWrapper = async () => ({ retrievalResults: [] });
+    Object.defineProperty(proto, "send", {
+      configurable: true,
+      writable: true,
+      value: laterWrapper,
+    });
     uninstrumentBedrockAgents();
-    expect(
-      Object.getOwnPropertyDescriptor(BedrockAgentRuntimeClient.prototype, "send")?.value,
-    ).toBe(fakeSend);
+    expect(Object.getOwnPropertyDescriptor(proto, "send")?.value).toBe(laterWrapper);
+    Object.defineProperty(proto, "send", {
+      configurable: true,
+      writable: true,
+      value: telemetryWrapper,
+    });
+    uninstrumentBedrockAgents();
+    expect(Object.hasOwn(proto, "send")).toBe(false);
+
+    await client.send(command);
+    expect(spans.getFinishedSpans()).toHaveLength(1);
+
+    const priorOwner = async () => ({ retrievalResults: [] });
+    Object.defineProperty(proto, "send", {
+      configurable: true,
+      writable: true,
+      value: priorOwner,
+    });
+    instrumentBedrockAgents();
+    expect(Object.getOwnPropertyDescriptor(proto, "send")?.value).not.toBe(priorOwner);
+    uninstrumentBedrockAgents();
+    expect(Object.getOwnPropertyDescriptor(proto, "send")?.value).toBe(priorOwner);
   } finally {
     uninstrumentBedrockAgents();
-
-    if (originalDescriptor) {
-      Object.defineProperty(BedrockAgentRuntimeClient.prototype, "send", originalDescriptor);
-    }
+    Reflect.deleteProperty(proto, "send");
   }
 });

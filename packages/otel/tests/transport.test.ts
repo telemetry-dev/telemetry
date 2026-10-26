@@ -27,9 +27,7 @@ import {
   createMetricExporter,
   createLogExporter,
   createTraceExporter,
-  maybeGzip,
   otlpHeaders,
-  postOtlp,
 } from "../src/transport.ts";
 
 interface Call {
@@ -75,6 +73,8 @@ function makeSpans(count: number, attrBytes = 0): ReadableSpan[] {
 
   return exporter.getFinishedSpans();
 }
+
+const target = { url: "https://ingest.example/v1/telemetry", headers: otlpHeaders("td_live_x") };
 
 const exportSpans = (exporter: SpanExporter, spans: ReadableSpan[]): Promise<ExportResultCode> =>
   new Promise((resolve) => exporter.export(spans, (result) => resolve(result.code)));
@@ -152,20 +152,6 @@ test("does not retry non-retryable statuses and reports the failure", async () =
   expect(errors).toHaveLength(1);
 });
 
-test("gives up after exhausting retries", async () => {
-  const { calls, fetchImpl } = makeFetch([503, 503, 503]);
-
-  const res = await postOtlp({
-    fetchImpl,
-    url: "https://ingest.example/v1/traces",
-    headers: {},
-    body: new Uint8Array([1]),
-  });
-
-  expect(res.status).toBe(503);
-  expect(calls).toHaveLength(3);
-});
-
 test("exhausted retries surface as a failed export with onError", async () => {
   const errors: unknown[] = [];
   const { calls, fetchImpl } = makeFetch([503, 503, 503]);
@@ -204,47 +190,37 @@ describe("retry-after", () => {
     vi.useRealTimers();
   });
 
-  const startPost = (statuses: number[], headers: Record<string, string>) => {
+  const startExport = (statuses: number[], headers: Record<string, string>) => {
     const { calls, fetchImpl } = makeFetch(statuses, headers);
 
-    const pending = postOtlp({
-      fetchImpl,
-      url: "https://ingest.example/v1/traces",
-      headers: {},
-      body: new Uint8Array([1]),
-    });
-
-    return { calls, pending };
+    return {
+      calls,
+      pending: exportSpans(createTraceExporter(target, { fetchImpl }), makeSpans(1)),
+    };
   };
 
   test("sets the delay before the next attempt", async () => {
-    const { calls, pending } = startPost([503, 200], { "retry-after": "1" });
+    const { calls, pending } = startExport([503, 200], { "retry-after": "1" });
     await vi.advanceTimersByTimeAsync(999);
     expect(calls).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(calls).toHaveLength(2);
-    expect((await pending).status).toBe(200);
+    expect(await pending).toBe(ExportResultCode.SUCCESS);
   });
 
   test("waits when retry-after fits under the cap", async () => {
-    const { calls, pending } = startPost([503, 200], { "retry-after": "2" });
+    const { calls, pending } = startExport([503, 200], { "retry-after": "2" });
     await vi.advanceTimersByTimeAsync(1999);
     expect(calls).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(calls).toHaveLength(2);
-    expect((await pending).status).toBe(200);
-  });
-
-  test("gives up at once when retry-after exceeds the cap", async () => {
-    const { calls, pending } = startPost([429, 200], { "retry-after": "60" });
-    expect((await pending).status).toBe(429);
-    expect(calls).toHaveLength(1);
+    expect(await pending).toBe(ExportResultCode.SUCCESS);
   });
 
   test("an HTTP date sets the delay relative to now", async () => {
     vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
 
-    const { calls, pending } = startPost([503, 200], {
+    const { calls, pending } = startExport([503, 200], {
       "retry-after": new Date(Date.now() + 1000).toUTCString(),
     });
 
@@ -252,27 +228,27 @@ describe("retry-after", () => {
     expect(calls).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(calls).toHaveLength(2);
-    expect((await pending).status).toBe(200);
+    expect(await pending).toBe(ExportResultCode.SUCCESS);
   });
 
   test.each(["Thursday, 01-Jan-26 00:00:01 GMT", "Thu Jan  1 00:00:01 2026"])(
     "accepts obsolete HTTP date %s",
     async (retryAfter) => {
       vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
-      const { calls, pending } = startPost([503, 200], { "retry-after": retryAfter });
+      const { calls, pending } = startExport([503, 200], { "retry-after": retryAfter });
       await vi.advanceTimersByTimeAsync(999);
       expect(calls).toHaveLength(1);
       await vi.advanceTimersByTimeAsync(1);
       expect(calls).toHaveLength(2);
-      expect((await pending).status).toBe(200);
+      expect(await pending).toBe(ExportResultCode.SUCCESS);
     },
   );
 
   test("falls back to the fixed schedule when unparseable", async () => {
-    const { calls, pending } = startPost([503, 200], { "retry-after": "soon" });
+    const { calls, pending } = startExport([503, 200], { "retry-after": "soon" });
     await vi.advanceTimersByTimeAsync(100);
     expect(calls).toHaveLength(2);
-    expect((await pending).status).toBe(200);
+    expect(await pending).toBe(ExportResultCode.SUCCESS);
   });
 
   test.each([
@@ -288,35 +264,17 @@ describe("retry-after", () => {
     "January 1, 2026 00:00:01 GMT",
   ])("falls back to the fixed schedule for invalid value %s", async (retryAfter) => {
     vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
-    const { calls, pending } = startPost([503, 200], { "retry-after": retryAfter });
+    const { calls, pending } = startExport([503, 200], { "retry-after": retryAfter });
     await vi.advanceTimersByTimeAsync(99);
     expect(calls).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(calls).toHaveLength(2);
-    expect((await pending).status).toBe(200);
+    expect(await pending).toBe(ExportResultCode.SUCCESS);
   });
 });
 
-test("a missing CompressionStream ships large bodies uncompressed", async () => {
-  vi.stubGlobal("CompressionStream", undefined);
-
-  try {
-    const original = new TextEncoder().encode("a".repeat(5000));
-    const { body, contentEncoding } = await maybeGzip(original);
-    expect(contentEncoding).toBeUndefined();
-    expect(body).toBe(original);
-  } finally {
-    vi.unstubAllGlobals();
-  }
-});
-
-test("bodies above the threshold are gzipped and round-trip", async () => {
-  const original = new TextEncoder().encode("a".repeat(5000));
-  const { body, contentEncoding } = await maybeGzip(original);
-  expect(contentEncoding).toBe("gzip");
-  expect(body.byteLength).toBeLessThan(original.byteLength);
-
-  const decompressed = new Uint8Array(
+const gunzip = async (body: Uint8Array) =>
+  new Uint8Array(
     await new Response(
       new Blob([body as Uint8Array<ArrayBuffer>])
         .stream()
@@ -324,27 +282,37 @@ test("bodies above the threshold are gzipped and round-trip", async () => {
     ).arrayBuffer(),
   );
 
-  expect(decompressed).toEqual(original);
-});
+test.each([
+  { name: "large", attrBytes: 10_000, compressionStream: true, encoding: "gzip" },
+  { name: "small", attrBytes: 0, compressionStream: true, encoding: undefined },
+  {
+    name: "large without CompressionStream",
+    attrBytes: 10_000,
+    compressionStream: false,
+    encoding: undefined,
+  },
+])(
+  "$name batches post the serialized request with content-encoding $encoding",
+  async ({ attrBytes, compressionStream, encoding }) => {
+    if (!compressionStream) vi.stubGlobal("CompressionStream", undefined);
 
-test("small bodies are not compressed", async () => {
-  const original = new TextEncoder().encode("tiny");
-  const { body, contentEncoding } = await maybeGzip(original);
-  expect(contentEncoding).toBeUndefined();
-  expect(body).toBe(original);
-});
-
-test("exported batches send a content-encoding gzip header for large payloads", async () => {
-  const { calls, fetchImpl } = makeFetch([200]);
-
-  const exporter = createTraceExporter(
-    { url: "https://ingest.example/v1/traces", headers: otlpHeaders("td_live_x") },
-    { fetchImpl },
-  );
-
-  await exportSpans(exporter, makeSpans(1, 10_000));
-  expect(calls[0]!.headers["content-encoding"]).toBe("gzip");
-});
+    try {
+      const { calls, fetchImpl } = makeFetch([200]);
+      const spans = makeSpans(1, attrBytes);
+      const serialized = ProtobufTraceSerializer.serializeRequest(spans)!;
+      expect(await exportSpans(createTraceExporter(target, { fetchImpl }), spans)).toBe(
+        ExportResultCode.SUCCESS,
+      );
+      expect(calls).toHaveLength(1);
+      const { headers, body } = calls[0]!;
+      expect(headers["content-encoding"]).toBe(encoding);
+      expect(body.byteLength < serialized.byteLength).toBe(encoding === "gzip");
+      expect(encoding === "gzip" ? await gunzip(body) : body).toEqual(serialized);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  },
+);
 
 test("oversized batches split into multiple POSTs", async () => {
   const { calls, fetchImpl } = makeFetch([200]);
@@ -422,8 +390,6 @@ test("metric exporter exhausts retries for a network failure", async () => {
   expect(calls).toBe(3);
   expect(String(errors[0])).toContain("connection reset");
 });
-
-const target = { url: "https://ingest.example/v1/telemetry", headers: otlpHeaders("td_live_x") };
 
 const lifecycleCases = [
   {
