@@ -501,6 +501,7 @@ test("model warnings become model.warning events at severity 13", async () => {
 });
 
 test("no apiKey is a complete no-op (transport never invoked)", async () => {
+  // The integration falls back to this variable, which a developer's shell can export.
   vi.stubEnv("TELEMETRY_DEV_API_KEY", undefined);
 
   try {

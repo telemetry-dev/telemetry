@@ -546,6 +546,7 @@ test("onAbort closes everything as cancelled", async () => {
 });
 
 test("no apiKey makes chat and generation hooks a complete no-op (transport never invoked)", async () => {
+  // The middleware falls back to this variable, which a developer's shell can export.
   vi.stubEnv("TELEMETRY_DEV_API_KEY", undefined);
 
   try {
