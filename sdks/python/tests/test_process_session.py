@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 from typing import Any, cast
 
 from opentelemetry.trace import SpanContext, TraceFlags, TraceState
@@ -36,7 +35,9 @@ def test_explicit_parent_session_wins_for_children_and_logs(make: MakeClient) ->
     ):
         telemetry_dev.start_span("explicit-child").end()
         telemetry_dev.log("explicit-log")
-    for span in env.span_exporter.get_finished_spans():
+    spans = env.span_exporter.get_finished_spans()
+    assert [span.name for span in spans] == ["explicit-child", "explicit-root"]
+    for span in spans:
         assert attrs(span)["gen_ai.conversation.id"] == "explicit"
     (record,) = env.log_exporter.get_finished_logs()
     assert attrs(record.log_record)["gen_ai.conversation.id"] == "explicit"
@@ -56,7 +57,9 @@ def test_concurrently_interleaved_explicit_sessions_do_not_mix(make: MakeClient)
         await asyncio.gather(emit("one"), emit("two"))
 
     asyncio.run(main())
-    for span in env.span_exporter.get_finished_spans():
+    spans = env.span_exporter.get_finished_spans()
+    assert sorted(span.name for span in spans) == ["one-child", "one-root", "two-child", "two-root"]
+    for span in spans:
         assert attrs(span)["gen_ai.conversation.id"] == span.name.split("-")[0]
 
 
@@ -77,10 +80,16 @@ def test_process_mode_honors_remote_parent(make: MakeClient) -> None:
 
 def test_reinit_generates_a_new_process_session(make: MakeClient) -> None:
     first = make(api_key="td_live_k", session_mode="process")
-    first_id = first.client._process_session_id  # pyright: ignore[reportPrivateUsage]
+    telemetry_dev.start_span("first").end()
+    (first_span,) = first.span_exporter.get_finished_spans()
     telemetry_dev.shutdown()
     second = make(api_key="td_live_k", session_mode="process")
-    assert second.client._process_session_id != first_id  # pyright: ignore[reportPrivateUsage]
+    telemetry_dev.start_span("second").end()
+    (second_span,) = second.span_exporter.get_finished_spans()
+    first_id = attrs(first_span)["gen_ai.conversation.id"]
+    second_id = attrs(second_span)["gen_ai.conversation.id"]
+    assert isinstance(first_id, str) and isinstance(second_id, str)
+    assert first_id != second_id
 
 
 def test_invalid_mode_fails_open_via_on_error() -> None:
@@ -94,8 +103,3 @@ def test_invalid_mode_fails_open_via_on_error() -> None:
     )
     assert client.enabled is False
     assert isinstance(errors[0], ValueError)
-
-
-def test_disabled_process_mode_is_a_noop(make: MakeClient) -> None:
-    env: SimpleNamespace = make(enabled=False, session_mode="process")
-    assert env.client._process_session_id is None  # pyright: ignore[reportPrivateUsage]

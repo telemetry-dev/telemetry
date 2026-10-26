@@ -524,11 +524,8 @@ def _media_response(response: Any) -> dict[str, Any]:
     }
 
 
-def _text_media_response(response: Any, *, capture_output: bool | None = None) -> dict[str, Any]:
+def _text_media_response(response: Any, *, capture_output: bool = False) -> dict[str, Any]:
     fields = _media_response(response)
-    if capture_output is None:
-        client = telemetry_dev.get_client()
-        capture_output = client is not None and client.capture_output
     if capture_output:
         text = _string(_field(response, "text"))
         if text is not None:
@@ -1458,26 +1455,12 @@ def _hook_response_close(inner: Any, finish: Callable[[], None]) -> None:
 
 
 def _chat_span_capture_policy(handle: telemetry_dev.SpanHandle) -> tuple[bool, bool]:
-    compatible = cast(Any, handle)
-    client = getattr(compatible, "_client", None)
-    state = getattr(compatible, "_state", None)
-    capture_output = getattr(compatible, "capture_output", None)
-    if not isinstance(capture_output, bool):
-        capture_output = getattr(state, "capture_output", None)
-    if not isinstance(capture_output, bool):
-        capture_output = getattr(client, "capture_output", False)
-    capture_masked = getattr(compatible, "capture_masked", None)
-    if not isinstance(capture_masked, bool):
-        capture_masked = getattr(client, "mask", _OMIT) is not None if client is not None else True
-    return capture_output, capture_masked
+    return handle.capture_output, handle.capture_masked
 
 
 def _chat_span_reporter(
     handle: telemetry_dev.SpanHandle,
 ) -> Callable[[BaseException], None]:
-    compatible = cast(Any, handle)
-    reporter = getattr(compatible, "report_error", None)
-    client = getattr(compatible, "_client", None)
     reported = False
 
     def report(cause: BaseException) -> None:
@@ -1486,12 +1469,7 @@ def _chat_span_reporter(
             return
         reported = True
         try:
-            if callable(reporter):
-                reporter(cause)
-                return
-            client_report = getattr(client, "report", None)
-            if callable(client_report):
-                client_report("provider instrumentation failed", cause)
+            handle.report_error(cause)
         except Exception:
             return
 
@@ -1668,9 +1646,7 @@ class _InstrumentedStream:
             self._unterminated_choices,
         )
         if update["has_output"]:
-            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-            if callable(record_output_chunk):
-                record_output_chunk(received_at * 1000)
+            self._handle.record_output_chunk(received_at * 1000)
         if not self._saw_first:
             self._saw_first = True
             self._handle.update(
@@ -1838,9 +1814,7 @@ class _InstrumentedAsyncStream:
             self._unterminated_choices,
         )
         if update["has_output"]:
-            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-            if callable(record_output_chunk):
-                record_output_chunk(received_at * 1000)
+            self._handle.record_output_chunk(received_at * 1000)
         if not self._saw_first:
             self._saw_first = True
             self._handle.update(
@@ -1955,9 +1929,7 @@ class _InstrumentedResponsesStream:
 
     def _record(self, event: Any, received_at: float) -> None:
         if _response_event_has_output(event):
-            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-            if callable(record_output_chunk):
-                record_output_chunk(received_at * 1000)
+            self._handle.record_output_chunk(received_at * 1000)
         if not self._saw_first:
             self._saw_first = True
             self._handle.update(
@@ -2108,9 +2080,7 @@ class _InstrumentedAsyncResponsesStream:
 
     def _record(self, event: Any, received_at: float) -> None:
         if _response_event_has_output(event):
-            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-            if callable(record_output_chunk):
-                record_output_chunk(received_at * 1000)
+            self._handle.record_output_chunk(received_at * 1000)
         if not self._saw_first:
             self._saw_first = True
             self._handle.update(

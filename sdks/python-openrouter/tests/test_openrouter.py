@@ -23,7 +23,6 @@ from openrouter.responses import Responses
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import StatusCode
 
-import telemetry_dev_openrouter
 from telemetry_dev_openrouter import (
     instrument_openrouter,
     uninstrument_openrouter,
@@ -197,6 +196,14 @@ def responses_payload(
             "cost": 0.002,
         },
     }
+
+
+def completed_without_output(sequence_number: int) -> dict[str, Any]:
+    """A terminal event whose null output fails SDK validation, so it arrives raw and ends the
+    stream without replacing the reconstructed output."""
+    response = responses_payload()
+    response["output"] = None
+    return {"type": "response.completed", "sequence_number": sequence_number, "response": response}
 
 
 def embeddings_payload() -> dict[str, Any]:
@@ -535,7 +542,6 @@ async def test_chat_output_timing_decodes_reasoning_details_once_per_chunk(
 
     assert len(calls) == 3
     assert len(memory.span_exporter.get_finished_spans()) == 1
-    assert memory.metric_reader.get_metrics_data() is not None
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
@@ -590,7 +596,6 @@ async def test_responses_output_timing_accepts_code_and_mcp_deltas_until_stream_
 
     assert len(calls) == 3
     assert len(memory.span_exporter.get_finished_spans()) == 1
-    assert memory.metric_reader.get_metrics_data() is not None
 
 
 def test_chat_stream_capture_is_bounded_without_losing_terminal_metadata(
@@ -623,7 +628,7 @@ def test_chat_stream_capture_is_bounded_without_losing_terminal_metadata(
     assert a["gen_ai.usage.cost"] == 0.04
 
 
-def _streamed_chat(memory: SimpleNamespace, events: list[dict[str, Any]]) -> tuple[Any, Any]:
+def _streamed_chat(memory: SimpleNamespace, events: list[dict[str, Any]]) -> dict[str, object]:
     def handler(request: httpx.Request) -> httpx.Response:
         return sse_response(events)
 
@@ -631,7 +636,7 @@ def _streamed_chat(memory: SimpleNamespace, events: list[dict[str, Any]]) -> tup
         model="openai/gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
     )
     assert len(list(stream)) == len(events)
-    return stream, attrs(only_span(memory))
+    return attrs(only_span(memory))
 
 
 @pytest.mark.parametrize(
@@ -645,7 +650,10 @@ def _streamed_chat(memory: SimpleNamespace, events: list[dict[str, Any]]) -> tup
 def test_configured_cap_applies_after_the_mask_not_to_stream_retention(
     make: Any, max_attribute_length: int, redact: bool, expected: str | None
 ) -> None:
+    seen: list[Any] = []
+
     def mask(value: Any, _context: Any) -> Any:
+        seen.append(value)
         if not redact:
             return value
         return [{"role": "assistant", "content": "[redacted]"}]
@@ -657,11 +665,11 @@ def test_configured_cap_applies_after_the_mask_not_to_stream_retention(
         chat_chunk({}, finish_reason="stop"),
     ]
 
-    stream, a = _streamed_chat(memory, events)
+    a = _streamed_chat(memory, events)
 
-    assert stream._budget.truncated is False
-    assert stream._states[0].content == text
     assert "telemetry.dev.capture.truncated" not in a
+    if redact:
+        assert [{"role": "assistant", "content": text}] in seen
     if expected is None:
         assert a.get("gen_ai.output.messages", "") == ""
     else:
@@ -688,19 +696,18 @@ def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
         chat_chunk({}, finish_reason="stop"),
     ]
 
-    stream, a = _streamed_chat(memory, events)
+    a = _streamed_chat(memory, events)
 
-    budget = stream._budget
-    retained = stream._states[0].content
-    assert budget.truncated is True
-    assert budget.max_bytes == telemetry_dev_openrouter._STREAM_CAPTURE_MAX_BYTES  # pyright: ignore[reportPrivateUsage]
-    assert 0 < len(retained) < 1_100 * 100
     assert a["telemetry.dev.capture.truncated"] is True
     if masked:
         assert "gen_ai.output.messages" not in a
         assert not any("x" * 100 in value for value in seen)
-    elif max_attribute_length > len(retained):
-        assert json.loads(str(a["gen_ai.output.messages"]))[0]["content"] == retained
+    elif max_attribute_length == 1024 * 1024:
+        # The 64 KiB retention bound, not the 1 MiB cap, cuts the stream at a chunk boundary.
+        content = json.loads(str(a["gen_ai.output.messages"]))[0]["content"]
+        assert set(content) == {"x"}
+        assert 0 < len(content) <= 64 * 1024
+        assert len(content) % 100 == 0
     else:
         assert len(str(a.get("gen_ai.output.messages", ""))) <= max_attribute_length
 
@@ -797,7 +804,7 @@ def test_chat_stream_choice_states_are_bounded(memory: SimpleNamespace) -> None:
     assert len(chunks) == 1
     a = attrs(only_span(memory))
     output = json.loads(str(a["gen_ai.output.messages"]))
-    assert len(output) == telemetry_dev_openrouter._STREAM_CAPTURE_MAX_ITEMS  # pyright: ignore[reportPrivateUsage]
+    assert len(output) == 1024
     assert output[0] == {"role": "assistant", "content": "Hi"}
     assert a["telemetry.dev.capture.truncated"] is True
 
@@ -819,10 +826,9 @@ def test_chat_stream_finish_reasons_are_capped_at_a_fixed_length(
         },
     ]
 
-    stream, a = _streamed_chat(memory, events)
+    a = _streamed_chat(memory, events)
 
-    assert list(a["gen_ai.response.finish_reasons"]) == ["r" * max_length, "stop"]
-    assert all(len(state.finish_reason or "") <= max_length for state in stream._states.values())
+    assert list(cast(Any, a["gen_ai.response.finish_reasons"])) == ["r" * max_length, "stop"]
     assert (a.get("telemetry.dev.capture.truncated") is True) is spent
 
 
@@ -1056,7 +1062,18 @@ def test_responses_stream_completed_event_ends_span(memory: SimpleNamespace) -> 
     )
 
 
-def test_responses_stream_failed_event_sets_error(memory: SimpleNamespace) -> None:
+@pytest.mark.parametrize(
+    "code",
+    [
+        # Fails SDK validation, so it arrives as a raw unknown event.
+        pytest.param(502, id="numeric-code"),
+        # Parses as the typed failed event.
+        pytest.param("server_error", id="string-code"),
+    ],
+)
+def test_responses_stream_failed_event_retains_error_code(
+    memory: SimpleNamespace, code: int | str
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         event = {
             "type": "response.failed",
@@ -1064,30 +1081,7 @@ def test_responses_stream_failed_event_sets_error(memory: SimpleNamespace) -> No
             "response": responses_payload(
                 response_id="resp_failed",
                 status="failed",
-                error={"code": "server_error", "message": "model blew up"},
-            ),
-        }
-        return sse_response([event])
-
-    client = wrap_open_router(sync_client(handler))
-    stream = cast(Any, client.responses.send)(model="openai/gpt-4o-mini", input="fail", stream=True)
-    events = list(stream)
-
-    assert [event.type for event in events] == ["response.failed"]
-    span = only_span(memory)
-    assert span.status.status_code == StatusCode.ERROR
-    assert attrs(span)["error.type"] == "RuntimeError"
-
-
-def test_responses_stream_failed_event_retains_numeric_code(memory: SimpleNamespace) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        event = {
-            "type": "response.failed",
-            "sequence_number": 0,
-            "response": responses_payload(
-                response_id="resp_failed",
-                status="failed",
-                error={"code": 502, "message": "model blew up"},
+                error={"code": code, "message": "model blew up"},
             ),
         }
         return sse_response([event])
@@ -1098,12 +1092,13 @@ def test_responses_stream_failed_event_retains_numeric_code(memory: SimpleNamesp
 
     span = only_span(memory)
     assert span.status.status_code == StatusCode.ERROR
+    assert attrs(span)["error.type"] == "RuntimeError"
     events_recorded = list(span.events)
     assert len(events_recorded) == 1
     assert events_recorded[0].name == "exception"
     event_attrs = dict(events_recorded[0].attributes or {})
     assert event_attrs["exception.type"] == "RuntimeError"
-    assert event_attrs["exception.message"] == "response.failed: 502: model blew up"
+    assert event_attrs["exception.message"] == f"response.failed: {code}: model blew up"
 
 
 def test_responses_stream_error_event_retains_numeric_code(memory: SimpleNamespace) -> None:
@@ -1623,6 +1618,7 @@ def test_responses_stream_capture_rejects_sparse_annotation_indexes(
                 "url": "https://example.test/unsafe",
             },
         },
+        completed_without_output(3),
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1631,9 +1627,7 @@ def test_responses_stream_capture_rejects_sparse_annotation_indexes(
     stream = cast(Any, wrap_open_router(sync_client(handler)).responses.send)(
         model="openai/gpt-4o-mini", input="annotate", stream=True
     )
-    for _ in events:
-        next(stream)
-    stream.close()
+    list(stream)
 
     a = attrs(only_span(memory))
     assert json.loads(str(a["gen_ai.output.messages"])) == [
@@ -1648,9 +1642,11 @@ def test_responses_stream_capture_rejects_sparse_annotation_indexes(
     assert a["telemetry.dev.capture.truncated"] is True
 
 
-def test_responses_stream_boolean_indexes_do_not_collide_with_index_one() -> None:
-    state_type = vars(telemetry_dev_openrouter)["_ResponsesStreamState"]
-    state = state_type()
+def test_responses_stream_boolean_indexes_do_not_collide_with_index_one(
+    memory: SimpleNamespace,
+) -> None:
+    # The SDK coerces a JSON true index to 1 on events that validate, so the boolean-index
+    # events below omit item_id: they fail validation and arrive raw.
     events: list[dict[str, Any]] = [
         {
             "type": "response.output_item.added",
@@ -1675,11 +1671,9 @@ def test_responses_stream_boolean_indexes_do_not_collide_with_index_one() -> Non
         {
             "type": "response.output_text.delta",
             "sequence_number": 3,
-            "item_id": "message_zero",
             "output_index": True,
             "content_index": True,
             "delta": "Content zero",
-            "logprobs": [],
         },
         {
             "type": "response.reasoning_summary_part.added",
@@ -1692,17 +1686,21 @@ def test_responses_stream_boolean_indexes_do_not_collide_with_index_one() -> Non
         {
             "type": "response.reasoning_summary_text.delta",
             "sequence_number": 5,
-            "item_id": "reasoning_two",
             "output_index": 2,
             "summary_index": True,
             "delta": "Summary zero",
         },
     ]
 
-    for event in events:
-        state.record(event)
+    def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(events)
 
-    assert state.partial["output"] == [
+    stream = cast(Any, wrap_open_router(sync_client(handler)).responses.send)(
+        model="openai/gpt-4o-mini", input="indexes", stream=True
+    )
+    list(stream)
+
+    assert json.loads(str(attrs(only_span(memory))["gen_ai.output.messages"])) == [
         {
             "id": "message_zero",
             "type": "message",
@@ -2000,6 +1998,7 @@ def test_final_responses_text_replaces_delta_truncated_output_with_fresh_budget(
             "text": "Final answer",
             "logprobs": [],
         },
+        completed_without_output(len(deltas) + 1),
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -2020,10 +2019,7 @@ def test_final_responses_text_replaces_delta_truncated_output_with_fresh_budget(
             "content": [{"type": "output_text", "text": "Final answer", "annotations": []}],
         }
     ]
-    # The done event resolves the cut deltas; the flag remains because no terminal
-    # response arrived.
-    assert stream._state._budget.truncated is False
-    assert a["telemetry.dev.capture.truncated"] is True
+    assert "telemetry.dev.capture.truncated" not in a
 
 
 def test_final_responses_text_preserves_provider_event_truncation(
@@ -2047,6 +2043,7 @@ def test_final_responses_text_preserves_provider_event_truncation(
             "text": "Final answer",
             "logprobs": [],
         },
+        completed_without_output(3),
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:

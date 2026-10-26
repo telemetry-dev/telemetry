@@ -21,8 +21,6 @@ from telemetry_dev._serialize import json_dumps
 __version__ = "0.1.6"
 
 ProviderResolver = Callable[[object | None], str]
-RequestMapper = Callable[[Mapping[str, Any]], tuple[str, dict[str, Any]]]
-ResponseMapper = Callable[[Any], dict[str, Any]]
 
 _WRAPPED_ATTR = "_telemetry_dev_anthropic_wrapped"
 _ORIGINAL_ATTR = "_telemetry_dev_anthropic_original"
@@ -457,13 +455,8 @@ def _end_once(handle: telemetry_dev.SpanHandle) -> Callable[..., None]:
 
 
 class _StreamState:
-    def __init__(
-        self,
-        capture_output: bool = True,
-        expect_message_stop: bool = False,
-    ) -> None:
+    def __init__(self, capture_output: bool = True) -> None:
         self.capture_output = capture_output
-        self.expect_message_stop = expect_message_stop
         self.message_stopped = False
         self.blocks: dict[int, dict[str, Any]] = {}
         self.tool_json: dict[int, str] = {}
@@ -712,7 +705,7 @@ def _stream_partial(
     output_incomplete = bool(
         state.budget.truncated
         or output_truncated
-        or (state.expect_message_stop and not state.message_stopped)
+        or not state.message_stopped
         or state.unresolved_replacements
         or state.unresolved_encrypted_content
     )
@@ -1214,27 +1207,9 @@ def _stream_event_has_output(event: Any) -> bool:
     return input_value not in (None, "", [], {})
 
 
-def _stream_span_capture_policy(handle: telemetry_dev.SpanHandle) -> tuple[bool, bool]:
-    compatible = cast(Any, handle)
-    client = getattr(compatible, "_client", None)
-    state = getattr(compatible, "_state", None)
-    capture_output = getattr(compatible, "capture_output", None)
-    if not isinstance(capture_output, bool):
-        capture_output = getattr(state, "capture_output", None)
-    if not isinstance(capture_output, bool):
-        capture_output = getattr(client, "capture_output", False)
-    capture_masked = getattr(compatible, "capture_masked", None)
-    if not isinstance(capture_masked, bool):
-        capture_masked = getattr(client, "mask", _OMIT) is not None if client is not None else True
-    return capture_output, capture_masked
-
-
 def _stream_span_reporter(
     handle: telemetry_dev.SpanHandle,
 ) -> Callable[[BaseException], None]:
-    compatible = cast(Any, handle)
-    reporter = getattr(compatible, "report_error", None)
-    client = getattr(compatible, "_client", None)
     reported = False
 
     def report(cause: BaseException) -> None:
@@ -1243,12 +1218,7 @@ def _stream_span_reporter(
             return
         reported = True
         try:
-            if callable(reporter):
-                reporter(cause)
-                return
-            client_report = getattr(client, "report", None)
-            if callable(client_report):
-                client_report("provider instrumentation failed", cause)
+            handle.report_error(cause)
         except Exception:
             return
 
@@ -1256,13 +1226,10 @@ def _stream_span_reporter(
 
 
 def _end_mapped_response(
-    handle: telemetry_dev.SpanHandle,
-    end: Callable[..., None],
-    mapper: ResponseMapper,
-    response: Any,
+    handle: telemetry_dev.SpanHandle, end: Callable[..., None], response: Any
 ) -> None:
     try:
-        fields = mapper(response)
+        fields = _messages_response(response)
     except Exception as exc:
         _stream_span_reporter(handle)(exc)
         end(attributes={"telemetry.dev.capture.truncated": True})
@@ -1276,8 +1243,8 @@ class _InstrumentedStream:
         self._handle = handle
         self._end = _end_once(handle)
         self._started_at = started_at
-        capture_output, self._mask_output_when_incomplete = _stream_span_capture_policy(handle)
-        self._state = _StreamState(capture_output, expect_message_stop=True)
+        self._mask_output_when_incomplete = handle.capture_masked
+        self._state = _StreamState(handle.capture_output)
         self._report_error = _stream_span_reporter(handle)
         self._saw_first = False
         self._consume: Iterator[Any] | None = None
@@ -1320,9 +1287,7 @@ class _InstrumentedStream:
                     update = {}
                     has_output = False
                 if has_output:
-                    record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-                    if callable(record_output_chunk):
-                        record_output_chunk(received_at * 1000)
+                    self._handle.record_output_chunk(received_at * 1000)
                 self._update_first(update)
                 yield event
         finally:
@@ -1365,8 +1330,8 @@ class _InstrumentedAsyncStream:
         self._handle = handle
         self._end = _end_once(handle)
         self._started_at = started_at
-        capture_output, self._mask_output_when_incomplete = _stream_span_capture_policy(handle)
-        self._state = _StreamState(capture_output, expect_message_stop=True)
+        self._mask_output_when_incomplete = handle.capture_masked
+        self._state = _StreamState(handle.capture_output)
         self._report_error = _stream_span_reporter(handle)
         self._saw_first = False
         self._consume: AsyncIterator[Any] | None = None
@@ -1409,9 +1374,7 @@ class _InstrumentedAsyncStream:
                     update = {}
                     has_output = False
                 if has_output:
-                    record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-                    if callable(record_output_chunk):
-                        record_output_chunk(received_at * 1000)
+                    self._handle.record_output_chunk(received_at * 1000)
                 self._update_first(update)
                 yield event
         finally:
@@ -1535,19 +1498,14 @@ class _InstrumentedAsyncMessageStreamManager:
 
 
 def _start_span(
-    params: Mapping[str, Any], mapper: RequestMapper, provider: str
+    params: Mapping[str, Any], provider: str
 ) -> tuple[telemetry_dev.SpanHandle, Callable[..., None], float]:
-    name, fields = mapper(params)
+    name, fields = _messages_request(params)
     handle = telemetry_dev.start_span(name, provider=provider, **_clean_fields(fields))
     return handle, _end_once(handle), time.perf_counter()
 
 
-def _wrap_sync(
-    original: Callable[..., Any],
-    request_mapper: RequestMapper,
-    response_mapper: ResponseMapper,
-    provider: ProviderResolver,
-) -> Callable[..., Any]:
+def _wrap_sync(original: Callable[..., Any], provider: ProviderResolver) -> Callable[..., Any]:
     @wraps(original)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         resource = args[0] if args else None
@@ -1555,7 +1513,7 @@ def _wrap_sync(
         if _raw_response_requested(call_kwargs):
             return original(*args, **call_kwargs)
         streaming = call_kwargs.get("stream") is True
-        handle, end, started_at = _start_span(call_kwargs, request_mapper, provider(resource))
+        handle, end, started_at = _start_span(call_kwargs, provider(resource))
         try:
             result = original(*args, **call_kwargs)
         except BaseException as exc:
@@ -1563,7 +1521,7 @@ def _wrap_sync(
             raise
         if streaming:
             return _InstrumentedStream(result, handle, started_at)
-        _end_mapped_response(handle, end, response_mapper, result)
+        _end_mapped_response(handle, end, result)
         return result
 
     setattr(wrapper, _WRAPPED_ATTR, True)
@@ -1571,12 +1529,7 @@ def _wrap_sync(
     return wrapper
 
 
-def _wrap_async(
-    original: Callable[..., Any],
-    request_mapper: RequestMapper,
-    response_mapper: ResponseMapper,
-    provider: ProviderResolver,
-) -> Callable[..., Any]:
+def _wrap_async(original: Callable[..., Any], provider: ProviderResolver) -> Callable[..., Any]:
     @wraps(original)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         resource = args[0] if args else None
@@ -1584,7 +1537,7 @@ def _wrap_async(
         if _raw_response_requested(call_kwargs):
             return await original(*args, **call_kwargs)
         streaming = call_kwargs.get("stream") is True
-        handle, end, started_at = _start_span(call_kwargs, request_mapper, provider(resource))
+        handle, end, started_at = _start_span(call_kwargs, provider(resource))
         try:
             result = await original(*args, **call_kwargs)
         except BaseException as exc:
@@ -1592,7 +1545,7 @@ def _wrap_async(
             raise
         if streaming:
             return _InstrumentedAsyncStream(result, handle, started_at)
-        _end_mapped_response(handle, end, response_mapper, result)
+        _end_mapped_response(handle, end, result)
         return result
 
     setattr(wrapper, _WRAPPED_ATTR, True)
@@ -1601,13 +1554,13 @@ def _wrap_async(
 
 
 def _wrap_stream_manager_sync(
-    original: Callable[..., Any], request_mapper: RequestMapper, provider: ProviderResolver
+    original: Callable[..., Any], provider: ProviderResolver
 ) -> Callable[..., Any]:
     @wraps(original)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         resource = args[0] if args else None
         call_kwargs = _normalize_request_params(kwargs)
-        name, fields = request_mapper(call_kwargs)
+        name, fields = _messages_request(call_kwargs)
         manager = original(*args, **call_kwargs)
         return _InstrumentedMessageStreamManager(manager, name, fields, provider(resource))
 
@@ -1617,13 +1570,13 @@ def _wrap_stream_manager_sync(
 
 
 def _wrap_stream_manager_async(
-    original: Callable[..., Any], request_mapper: RequestMapper, provider: ProviderResolver
+    original: Callable[..., Any], provider: ProviderResolver
 ) -> Callable[..., Any]:
     @wraps(original)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         resource = args[0] if args else None
         call_kwargs = _normalize_request_params(kwargs)
-        name, fields = request_mapper(call_kwargs)
+        name, fields = _messages_request(call_kwargs)
         manager = original(*args, **call_kwargs)
         return _InstrumentedAsyncMessageStreamManager(manager, name, fields, provider(resource))
 
@@ -1651,9 +1604,9 @@ def _wrap_method(
 ) -> Callable[..., Any]:
     if name == "stream":
         factory = _wrap_stream_manager_async if async_resource else _wrap_stream_manager_sync
-        return factory(original, _messages_request, provider)
-    response_factory = _wrap_async if async_resource else _wrap_sync
-    return response_factory(original, _messages_request, _messages_response, provider)
+    else:
+        factory = _wrap_async if async_resource else _wrap_sync
+    return factory(original, provider)
 
 
 def _patch_instance_method(

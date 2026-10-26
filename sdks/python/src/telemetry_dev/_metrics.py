@@ -72,8 +72,7 @@ class _ChunkAggregate:
 
 
 class OutputChunkAggregation:
-    def __init__(self, max_attribute_sets: int = _MAX_CHUNK_ATTRIBUTE_SETS) -> None:
-        self._max_attribute_sets = max_attribute_sets
+    def __init__(self) -> None:
         self._values: dict[tuple[tuple[str, Any], ...], _ChunkAggregate] = {}
         self._lock = threading.Lock()
         self._collection_start = time.time_ns()
@@ -85,7 +84,7 @@ class OutputChunkAggregation:
     ) -> None:
         key = tuple(sorted(attributes.items()))
         with self._lock:
-            if key not in self._values and len(self._values) >= self._max_attribute_sets - 1:
+            if key not in self._values and len(self._values) >= _MAX_CHUNK_ATTRIBUTE_SETS - 1:
                 key = (("otel.metric.overflow", True),)
             count, total, minimum, maximum, buckets = aggregate
             existing = self._values.get(key)

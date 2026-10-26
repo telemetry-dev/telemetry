@@ -3,7 +3,6 @@ from __future__ import annotations
 import gc
 import math
 import threading
-import time
 from types import SimpleNamespace
 from weakref import ref
 
@@ -191,6 +190,8 @@ def test_builtin_exporter_merges_exact_output_chunk_histogram(
         telemetry_dev.start_span("filtered", type="generation").record_output_chunk(
             1000
         ).record_output_chunk(9000).end(error=RuntimeError("filtered failure"))
+        telemetry_dev.start_span("zero", type="generation").end()
+        telemetry_dev.start_span("one", type="generation").record_output_chunk(1000).end()
         handle = telemetry_dev.start_span(
             "stream", type="generation", model="gpt-4o", provider="openai"
         )
@@ -288,22 +289,6 @@ def test_builtin_exporter_merges_exact_output_chunk_histogram(
         client.shutdown()
 
 
-def test_output_chunk_zero_or_one_and_filter_rejection_emit_nothing(make: MakeClient) -> None:
-    def keep(span: ReadableSpan) -> bool:
-        return span.name != "rejected"
-
-    errors: list[BaseException] = []
-    env = make(span_filter=keep, on_error=errors.append)
-    telemetry_dev.start_span("zero", type="generation").end()
-    one = telemetry_dev.start_span("one", type="generation")
-    one.record_output_chunk(1000).end()
-    rejected = telemetry_dev.start_span("rejected", type="generation")
-    rejected.record_output_chunk(1000).record_output_chunk(1020).end()
-
-    assert env.client._output_chunks is None
-    assert errors == []
-
-
 def test_rejected_chunk_state_does_not_retain_abandoned_handles(make: MakeClient) -> None:
     def reject(span: ReadableSpan) -> bool:
         return False
@@ -318,15 +303,15 @@ def test_rejected_chunk_state_does_not_retain_abandoned_handles(make: MakeClient
 
 
 def test_output_chunk_attribute_cardinality_is_bounded() -> None:
-    aggregation = OutputChunkAggregation(max_attribute_sets=2)
+    aggregation = OutputChunkAggregation()
     value = (1, 0.01, 0.01, 0.01, (1, *([0] * len(DURATION_BUCKETS))))
-    for model in ("a", "b", "c", "d"):
-        aggregation.add({"gen_ai.request.model": model}, value)
+    for index in range(2001):
+        aggregation.add({"gen_ai.request.model": f"model-{index}"}, value)
 
     points = aggregation.drain_points()
-    assert len(points) == 2
+    assert len(points) == 2000
     overflow = next(point for point in points if point.attributes == {"otel.metric.overflow": True})
-    assert overflow.count == 3
+    assert overflow.count == 2
 
 
 def test_ended_child_metrics_reference_child_not_active_parent(memory: SimpleNamespace) -> None:
@@ -393,24 +378,27 @@ def test_plain_span_records_nothing(memory: SimpleNamespace) -> None:
 def test_quiet_interval_emits_zero_metric_posts(
     monkeypatch: pytest.MonkeyPatch, internal_metrics: bool
 ) -> None:
-    # Empty-datapoint guard: collections with no data points are never POSTed, even when
-    # OpenTelemetry records its own metric-reader metrics on the provider.
+    # Quiet collections are never POSTed, even when OpenTelemetry records its own metric-reader
+    # metrics on the provider: the otel.sdk.* drop View keeps them out, and the reader skips
+    # the exporter when a collection is empty. The second flush would carry the internal
+    # metrics that the first one recorded.
     # Same exporter, reader, and provider wiring the client uses, against a real local server.
     if internal_metrics:
         monkeypatch.setenv("OTEL_PYTHON_SDK_INTERNAL_METRICS_ENABLED", "true")
     with otlp_capture_server() as server:
         exporter = GuardedOTLPMetricExporter(endpoint=f"{server.url}/v1/metrics")
-        reader = PeriodicExportingMetricReader(exporter, export_interval_millis=50)
+        reader = PeriodicExportingMetricReader(exporter, export_interval_millis=2**31 - 1)
         provider = sdk_meter_provider(reader, Resource.create())
         meter = provider.get_meter("quiet")
         histogram = meter.create_histogram("gen_ai.client.operation.duration", unit="s")
 
-        time.sleep(0.3)  # several quiet collection intervals
+        provider.force_flush()
+        provider.force_flush()
         assert server.requests_for("/v1/metrics") == []
 
         histogram.record(0.5, {"gen_ai.operation.name": "chat"})
         provider.force_flush()
-        assert len(server.requests_for("/v1/metrics")) >= 1
+        assert len(server.requests_for("/v1/metrics")) == 1
         provider.shutdown()
 
 

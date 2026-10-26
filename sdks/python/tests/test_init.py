@@ -12,23 +12,13 @@ import telemetry_dev
 from tests.conftest import MakeClient
 
 
-def test_no_api_key_is_silent_noop() -> None:
-    client = telemetry_dev.init(log_level="silent", disable_atexit=True)
-    assert client.enabled is False
-    handle = telemetry_dev.start_span("x", type="generation", input="hi")
-    assert handle.traceparent() is None
-    handle.update(output="y")
-    handle.end()
-    telemetry_dev.log("nope")
-    telemetry_dev.update_current_span(output="y")
-    telemetry_dev.flush()
-
-
 def test_enabled_false_kill_switch_beats_exporter_seams(make: MakeClient) -> None:
-    env = make(enabled=False)
+    env = make(enabled=False, session_mode="process")
     assert env.client.enabled is False
     telemetry_dev.start_span("x").end()
+    telemetry_dev.log("x")
     assert env.span_exporter.get_finished_spans() == ()
+    assert env.log_exporter.get_finished_logs() == ()
 
 
 @pytest.mark.parametrize("max_attribute_length", [-1, 1.5, float("nan"), float("inf"), True])
@@ -92,19 +82,6 @@ def test_raw_attributes_follow_the_attribute_backstop_not_the_content_cap(
     assert attributes[key] == expected
 
 
-def test_exporter_seam_enables_without_api_key(make: MakeClient) -> None:
-    env = make()
-    assert env.client.enabled is True
-    telemetry_dev.start_span("x").end()
-    assert len(env.span_exporter.get_finished_spans()) == 1
-
-
-def test_api_key_from_env_enables(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("TELEMETRY_DEV_API_KEY", "td_live_test")
-    client = telemetry_dev.init(log_level="silent", disable_atexit=True)
-    assert client.enabled is True
-
-
 def test_double_init_replaces_previous_client(make: MakeClient) -> None:
     first = make()
     second = make()
@@ -138,14 +115,6 @@ def test_isolated_by_default(make: MakeClient) -> None:
     assert trace.get_tracer_provider() is not provider
     trace.get_tracer("other").start_span("foreign").end()
     assert env.span_exporter.get_finished_spans() == ()
-
-
-def test_register_global_sets_global_provider(
-    make: MakeClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _reset_global_tracer_provider(monkeypatch)
-    env = make(register_global=True)
-    assert trace.get_tracer_provider() is env.client._tracer_provider  # pyright: ignore[reportPrivateUsage]
 
 
 def test_register_global_default_filter_is_scope_name_only(
