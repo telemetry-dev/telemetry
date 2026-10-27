@@ -1,6 +1,6 @@
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 
-import { flush, log, shutdown, startActiveSpan } from "../src/index.ts";
+import { flush, init, log, shutdown, startActiveSpan } from "../src/index.ts";
 import { setup } from "./helpers.ts";
 
 afterEach(async () => {
@@ -92,4 +92,51 @@ test("log records carry the resource", async () => {
   const record = logs.getFinishedLogRecords()[0]!;
   expect(record.resource.attributes["service.name"]).toBe("svc");
   expect(record.resource.attributes["deployment.environment.name"]).toBe("test");
+});
+
+test("logs keep reaching /v1/logs after a flush starts during a scheduled export", async () => {
+  vi.useFakeTimers();
+
+  try {
+    const bodies: string[] = [];
+    const errors: Error[] = [];
+    let release: (() => void) | undefined;
+
+    init({
+      apiKey: "td_live_test",
+      baseUrl: "https://ingest.test",
+      logLevel: "silent",
+      onError: (error) => errors.push(error),
+      fetch: async (input, request) => {
+        if (!new Request(input).url.endsWith("/v1/logs"))
+          return new Response(null, { status: 200 });
+        bodies.push(new TextDecoder().decode(request?.body as Uint8Array));
+
+        if (bodies.length === 1) {
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+        }
+
+        return new Response(null, { status: 200 });
+      },
+    });
+
+    log("scheduled record");
+    // The batch log processor exports 1000 ms after the first record.
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(release).toBeDefined();
+    const overlapping = flush();
+    release?.();
+    await overlapping;
+    log("record after the flush");
+    await flush();
+
+    expect(errors).toEqual([]);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toContain("scheduled record");
+    expect(bodies[1]).toContain("record after the flush");
+  } finally {
+    vi.useRealTimers();
+  }
 });
