@@ -1039,17 +1039,34 @@ def test_terminal_transcription_capture_is_incrementally_bounded(
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("capture_output", [False, True])
 async def test_transcription_capture_uses_the_policy_that_created_its_span(
-    make: Any, monkeypatch: pytest.MonkeyPatch, streaming: bool, async_mode: bool
+    make: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    streaming: bool,
+    async_mode: bool,
+    capture_output: bool,
 ) -> None:
-    memory = make(capture_output=True)
+    memory = make(capture_output=capture_output)
+    text_reads = 0
+    original_getattribute = BaseModel.__getattribute__
+
+    def counted_getattribute(self: BaseModel, name: str) -> Any:
+        nonlocal text_reads
+        if name == "text":
+            text_reads += 1
+        return original_getattribute(self, name)
+
+    monkeypatch.setattr(BaseModel, "__getattribute__", counted_getattribute)
 
     def response() -> httpx.Response:
         # The span has started by now; a later global policy must not apply to it.
         monkeypatch.setattr(
             telemetry_dev,
             "get_client",
-            lambda: SimpleNamespace(capture_output=False, capture_input=False, mask=None),
+            lambda: SimpleNamespace(
+                capture_output=not capture_output, capture_input=False, mask=None
+            ),
         )
         if streaming:
             return sse_response([{"type": "transcript.text.done", "text": "sensitive transcript"}])
@@ -1076,7 +1093,8 @@ async def test_transcription_capture_uses_the_policy_that_created_its_span(
             list(result)
 
     a = attrs(only_span(memory))
-    assert a["gen_ai.output.messages"] == "sensitive transcript"
+    assert a.get("gen_ai.output.messages") == ("sensitive transcript" if capture_output else None)
+    assert (text_reads > 0) is capture_output
     assert "telemetry.dev.capture.truncated" not in a
 
 
