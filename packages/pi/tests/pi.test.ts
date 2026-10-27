@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +22,7 @@ import {
 import { afterEach, expect, test, vi } from "vitest";
 
 import { resetForTesting } from "../src/config.ts";
+import { drainErrorLogForTesting, writeErrorLog } from "../src/error-log.ts";
 import { telemetryDevExtension, type TelemetryDevExtensionOptions } from "../src/extension.ts";
 
 interface Exporters extends ClientOverrides {
@@ -753,10 +755,11 @@ test("errors go to a private, rotated telemetry-dev.log in the agent directory, 
     // An earlier log of more than 5 MB moves to telemetry-dev.log.1.
     await writeFile(path, "x".repeat(5 * 1024 * 1024 + 1));
     const handlers = new Map<string, (event: object, ctx: ExtensionContext) => unknown>();
+    let status = 200;
     telemetryDevExtension({
       apiKey: "td_live_test",
       exportMode: "immediate",
-      fetch: async () => new Response(null, { status: 400 }),
+      fetch: async () => new Response(null, { status }),
     })({ on: (type: string, handler: never) => handlers.set(type, handler) });
 
     await handlers.get("session_start")?.({ reason: "startup" }, makeContext());
@@ -769,6 +772,9 @@ test("errors go to a private, rotated telemetry-dev.log in the agent directory, 
       },
       makeContext(),
     );
+    // The export that shutdown flushes fails; its report must still reach the log.
+    status = 400;
+    await handlers.get("session_shutdown")?.({ reason: "quit" }, makeContext());
     await resetForTesting();
 
     const log = await readFile(path, "utf8");
@@ -777,6 +783,31 @@ test("errors go to a private, rotated telemetry-dev.log in the agent directory, 
     expect((await stat(`${path}.1`)).size).toBe(5 * 1024 * 1024 + 1);
     expect((await stat(path)).mode & 0o777).toBe(0o600);
     expect(consoleSpies.flatMap((spy) => spy.mock.calls)).toEqual([]);
+  } finally {
+    vi.unstubAllEnvs();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("the error log keeps call order and drops entries past the pending limit", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "telemetry-pi-agent-"));
+  vi.stubEnv("PI_CODING_AGENT_DIR", directory);
+
+  try {
+    for (let index = 0; index < 150; index++) writeErrorLog(new Error(`entry-${index}`));
+
+    // writeErrorLog returns before touching the disk.
+    expect(existsSync(join(directory, "telemetry-dev.log"))).toBe(false);
+    await drainErrorLogForTesting();
+    const entries = [
+      ...(await readFile(join(directory, "telemetry-dev.log"), "utf8")).matchAll(/entry-(\d+)/g),
+    ].map((match) => Number(match[1]));
+
+    expect(entries).toEqual(Array.from({ length: 100 }, (_, index) => index));
+
+    writeErrorLog(new Error("after drain"));
+    await drainErrorLogForTesting();
+    expect(await readFile(join(directory, "telemetry-dev.log"), "utf8")).toContain("after drain");
   } finally {
     vi.unstubAllEnvs();
     await rm(directory, { recursive: true, force: true });
