@@ -132,7 +132,8 @@ Core SDK error recording keeps failure status, error type, and an exception even
 `capture_output` are true, including per-span overrides: exceptions can echo either inputs or
 outputs. The policy is per span: when an error propagates to an enclosing span whose capture is on,
 that span records its message and stack. Included fields pass through `mask` with their exception
-attribute keys, then serialization and truncation. Mask and serialization failures drop the affected field and report generic errors
+attribute keys, then serialization and truncation. A truncated `exception.stacktrace` keeps its
+end, where Python normally puts the innermost frame and the exception line. Mask and serialization failures drop the affected field and report generic errors
 to `on_error` and SDK diagnostics without the original message, traceback, or exception chain.
 The original application error is raised unchanged. These controls do not scrub error type names,
 metadata, identifiers, resource attributes, or events written directly through raw OpenTelemetry APIs.

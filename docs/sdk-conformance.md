@@ -164,8 +164,9 @@ eventName: "e2e.inside")` inside it
 Exception content follows the effective per-span capture policy in both SDKs. If either input
 or output capture is off, C14 retains error status/type and the exception event but omits its
 message and stack. With both enabled, C16 applies the content mask and truncation to
-`exception.message` and `exception.stacktrace` before export. Mask failures omit the affected
-field. The policy is per span, so an enclosing span with capture on records an error that propagates
+`exception.message` and `exception.stacktrace` before export. A truncated stack keeps the part where
+the exception line normally is: TypeScript keeps the start of the stack, and Python keeps the end
+of the traceback, with the marker first. Mask failures omit the affected field. The policy is per span, so an enclosing span with capture on records an error that propagates
 to it. These rules do not sanitize raw OpenTelemetry events or arbitrary attributes.
 
 | #   | Assertion                                                                                                                                                                                                                        |
