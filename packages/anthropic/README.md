@@ -66,8 +66,10 @@ Reconstructed output is bounded to 48 KiB and 1,000 items. The configured `maxAt
 exceeds a capture bound sets `telemetry.dev.capture.truncated`. With a mask configured, incomplete
 output is omitted because the mask cannot inspect the complete value. When output capture is
 disabled, response IDs and models, finish reasons, usage, timing, and errors may still be recorded.
-Capture flags do not gate stop sequences, caller-supplied metadata or raw attributes, or exception
-messages and stack traces; redact those separately when needed. Request tools and `tool_choice` are part of the captured input, so `captureInput: false` removes them.
+Capture flags do not gate stop sequences or caller-supplied metadata or raw attributes; redact those
+separately when needed. Exception messages and stack traces are recorded only when both
+`captureInput` and `captureOutput` are on, and pass through `mask`. Older `@telemetry-dev/sdk`
+versions record them regardless of capture flags. Request tools and `tool_choice` are part of the captured input, so `captureInput: false` removes them.
 
 ## Native Claude SDK spans
 

@@ -153,7 +153,7 @@ function resolveParent(parent: ParentRef | undefined): Context {
   return trace.setSpanContext(base, ref);
 }
 
-function applyError(span: Span, error: unknown): void {
+function applyError(span: Span, error: unknown, capture: FieldCaptureConfig): void {
   const err = error instanceof Error ? error : undefined;
 
   // Prefer the specific subclass name (Python parity: type(error).__name__) — many SDK
@@ -165,15 +165,21 @@ function applyError(span: Span, error: unknown): void {
         ? err.name
         : (err.constructor?.name ?? "Error") || "Error";
 
-  const message = err?.message ?? String(error);
   span.setStatus({ code: SpanStatusCode.ERROR });
   span.setAttribute("error.type", errorType);
+  // Exceptions can echo either inputs or outputs; both must allow content capture.
+  const captureContent = capture.captureInput && capture.captureOutput;
   span.addEvent(
     "exception",
     omitUndefined({
       "exception.type": errorType,
-      "exception.message": message,
-      "exception.stacktrace": err?.stack,
+      "exception.message": captureContent
+        ? prepareCaptureValue("exception.message", err?.message ?? String(error), capture)
+        : undefined,
+      "exception.stacktrace":
+        captureContent && err?.stack !== undefined
+          ? prepareCaptureValue("exception.stacktrace", err.stack, capture)
+          : undefined,
       "log.severity_number": SEVERITY_ERROR,
     }),
   );
@@ -185,7 +191,7 @@ function applyFields(span: Span, meta: SpanMeta, fields: SpanFields): void {
 
   if (Object.keys(attrs).length > 0) span.setAttributes(attrs);
 
-  if (fields.error !== undefined) applyError(span, fields.error);
+  if (fields.error !== undefined) applyError(span, fields.error, meta.capture);
 }
 
 function metaFor(core: ClientCore, options?: StartSpanOptions): SpanMeta {
@@ -246,7 +252,7 @@ export function createSpanHandle(
 
   if (options.name) span.updateName(options.name);
 
-  if (options.error !== undefined) applyError(span, options.error);
+  if (options.error !== undefined) applyError(span, options.error, meta.capture);
 
   const spanContext = span.spanContext();
   let previousOutputChunkTime: number | undefined;

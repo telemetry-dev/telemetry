@@ -270,8 +270,9 @@ export function prepareCaptureValue(
   if (cfg.mask) {
     try {
       masked = cfg.mask(value, { key });
-    } catch (error) {
-      reportError(cfg.onError, error);
+    } catch {
+      // Hook errors can contain the unmasked value or chain the application exception.
+      reportError(cfg.onError, new Error("mask hook raised; content dropped"));
 
       return undefined;
     }

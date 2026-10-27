@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 
-import { afterEach, describe, expect, test } from "vitest";
+import { SpanStatusCode } from "@opentelemetry/api";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
   boundedCapture,
@@ -8,8 +9,134 @@ import {
   truncate,
   TRUNCATION_MARKER,
 } from "../src/capture.ts";
-import { flush, observe, shutdown, startSpan } from "../src/index.ts";
+import {
+  flush,
+  observe,
+  shutdown,
+  startActiveSpan,
+  startSpan,
+  updateActiveSpan,
+} from "../src/index.ts";
 import { setup } from "./helpers.ts";
+
+test.each([
+  [false, true],
+  [true, false],
+  [false, false],
+])(
+  "exception content respects captureInput=%s captureOutput=%s and per-span overrides",
+  async (captureInput, captureOutput) => {
+    const { spans } = setup({ captureInput, captureOutput });
+    const error = new TypeError("PRIVATE_EXCEPTION");
+    startSpan("initial", { error }).end();
+    startSpan("ended").end({ error });
+    startActiveSpan("active", () => updateActiveSpan({ error }));
+    const failed = observe(async () => {
+      throw error;
+    });
+    await expect(failed()).rejects.toBe(error);
+    startSpan("override", { captureInput: true, captureOutput: true }).end({ error });
+    await flush();
+    expect(spans.getFinishedSpans()).toHaveLength(5);
+    for (const span of spans.getFinishedSpans()) {
+      expect(span.status.code).toBe(SpanStatusCode.ERROR);
+      expect(span.attributes["error.type"]).toBe("TypeError");
+      const event = span.events.find((event) => event.name === "exception")!;
+      expect(event.attributes?.["exception.type"]).toBe("TypeError");
+      if (span.name === "override") {
+        expect(event.attributes?.["exception.message"]).toBe("PRIVATE_EXCEPTION");
+      } else {
+        expect(event.attributes?.["exception.message"]).toBeUndefined();
+        expect(event.attributes?.["exception.stacktrace"]).toBeUndefined();
+        expect(JSON.stringify(span.events)).not.toContain("PRIVATE_EXCEPTION");
+      }
+    }
+  },
+);
+
+test.each(["redact", "drop", "throw", "truncate"] as const)(
+  "exception masking: %s",
+  async (mode) => {
+    const { spans } = setup({
+      maxAttributeLength: 50,
+      mask: (value, { key }) => {
+        if (mode === "throw") throw new Error("mask failed");
+        if (mode === "drop") return undefined;
+        if (mode === "truncate") return "x".repeat(100);
+        return key === "exception.message"
+          ? "safe message"
+          : key === "exception.stacktrace"
+            ? "safe stack"
+            : value;
+      },
+    });
+    const error = new Error("PRIVATE_EXCEPTION");
+    const failure = observe(() => {
+      throw error;
+    });
+    expect(failure).toThrow(error);
+    startSpan("private", { captureOutput: false }).end({ error: "PRIVATE_EXCEPTION" });
+    await flush();
+    const [span, privateSpan] = spans.getFinishedSpans();
+    expect(span!.status.code).toBe(SpanStatusCode.ERROR);
+    expect(span!.attributes["error.type"]).toBe("Error");
+    const attributes = span!.events[0]!.attributes;
+    expect(attributes?.["exception.message"]).toBe(
+      mode === "redact"
+        ? "safe message"
+        : mode === "truncate"
+          ? "x".repeat(36) + TRUNCATION_MARKER
+          : undefined,
+    );
+    expect(attributes?.["exception.stacktrace"]).toBe(
+      mode === "redact"
+        ? "safe stack"
+        : mode === "truncate"
+          ? "x".repeat(36) + TRUNCATION_MARKER
+          : undefined,
+    );
+    expect(privateSpan!.events[0]!.attributes?.["exception.message"]).toBeUndefined();
+    expect(JSON.stringify([span!.events, privateSpan!.events])).not.toContain("PRIVATE_EXCEPTION");
+  },
+);
+
+test.each([false, true])(
+  "mask failure diagnostics hide content (callback throws: %s)",
+  async (throws) => {
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+    const errors: Error[] = [];
+    const original = new Error("PRIVATE_APPLICATION");
+    try {
+      const { spans } = setup({
+        logLevel: "debug",
+        mask: () => {
+          throw new Error("PRIVATE_MASK", { cause: original });
+        },
+        onError: (error) => {
+          errors.push(error);
+          if (throws) throw new Error("PRIVATE_CALLBACK", { cause: original });
+        },
+      });
+      const failure = observe(() => {
+        throw original;
+      });
+      expect(failure).toThrow(original);
+      await flush();
+      expect(errors.length).toBeGreaterThan(0);
+      for (const error of errors) {
+        expect(error.message).toBe("mask hook raised; content dropped");
+        expect(error.cause).toBeUndefined();
+        expect(error.stack).not.toContain("PRIVATE_");
+      }
+      expect(diagnostic).toHaveBeenCalled();
+      for (const args of diagnostic.mock.calls)
+        expect(args.map(String).join(" ")).not.toContain("PRIVATE_");
+      expect(JSON.stringify(spans.getFinishedSpans()[0]!.events)).not.toContain("PRIVATE_");
+    } finally {
+      diagnostic.mockRestore();
+    }
+  },
+);
 
 // Shared with the Python SDK's capture tests. Read at runtime: the JSON module loader rejects
 // the lone surrogate escapes these cases need.
@@ -265,8 +392,8 @@ describe("capture integration", () => {
     expect(span.serializeContent?.("secret", "odd-throw")).toBeUndefined();
     expect(span.serializeContent?.(circular, "circular")).toBeUndefined();
     expect(errors.map((error) => error.message)).toEqual([
-      "mask broke",
-      "A value that cannot be converted to a string was thrown",
+      "mask hook raised; content dropped",
+      "mask hook raised; content dropped",
     ]);
     span.end();
   });

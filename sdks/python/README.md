@@ -127,6 +127,16 @@ the core SDK with provider integrations to enable the new metric.
 `SpanContext`), `start_time`, and per-call `capture_input` / `capture_output` overrides;
 `end()` additionally accepts `end_time`.
 
+Core SDK error recording keeps failure status, error type, and an exception event. It includes
+`exception.message` and `exception.stacktrace` only when both effective `capture_input` and
+`capture_output` are true, including per-span overrides: exceptions can echo either inputs or
+outputs. The policy is per span: when an error propagates to an enclosing span whose capture is on,
+that span records its message and stack. Included fields pass through `mask` with their exception
+attribute keys, then serialization and truncation. Mask and serialization failures drop the affected field and report generic errors
+to `on_error` and SDK diagnostics without the original message, traceback, or exception chain.
+The original application error is raised unchanged. These controls do not scrub error type names,
+metadata, identifiers, resource attributes, or events written directly through raw OpenTelemetry APIs.
+
 ### init() options
 
 | Option | Default | Purpose |
@@ -149,13 +159,15 @@ the core SDK with provider integrations to enable the new metric.
 
 `capture_input=False` and `capture_output=False` omit captured content. Provider integrations may
 still record non-content metadata such as response IDs and models, finish reasons, usage, timing,
-and errors. Capture flags do not gate stop sequences, tool descriptions and definitions (`gen_ai.tool.description`, `gen_ai.tool.definitions`), caller-supplied metadata or raw attributes,
-or exception messages and stack traces; redact those separately when needed.
+and error types. Capture flags do not gate stop sequences, tool descriptions and definitions
+(`gen_ai.tool.description`, `gen_ai.tool.definitions`), caller-supplied metadata or raw attributes;
+redact those separately when needed.
 
-`mask` receives input and output content, system instructions, log messages, and content that
+`mask` receives input and output content, system instructions, log messages, captured exception
+messages and stack traces, and content that
 integrations pass to `SpanHandle.serialize_content`. `MaskContext.key` names the attribute being
-written. It does not receive span or propagated `metadata`, raw `attributes`, log attributes, or
-exception messages and stack traces; redact those separately.
+written. It does not receive span or propagated `metadata`, raw `attributes`, or log attributes;
+redact those separately. Log masking is independent of span capture flags.
 
 Session roots share trace IDs from the API key and session ID. The hash matches the TypeScript SDK.
 The SDK uses the configured OTel sampling policy, not the synthetic parent's flags.

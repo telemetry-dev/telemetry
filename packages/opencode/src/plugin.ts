@@ -129,9 +129,8 @@ function failureError(name: string, message: string | undefined): Error {
 
 /**
  * Host error text can be tool output that the host also sends to the model,
- * and the SDK exports exception messages without the capture check or mask
- * that `output` gets, so the text is used only where the span captures output
- * unmasked.
+ * and older core versions export exception messages without capture checks or
+ * masking. Keep withholding that text unless the span captures output unmasked.
  */
 function hostError(
   span: SpanHandle,

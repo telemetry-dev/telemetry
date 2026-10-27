@@ -164,13 +164,16 @@ def serialize_content(
     if mask is not None:
         try:
             value = mask(value, MaskContext(key=key))
-        except BaseException as exc:
-            report_error(on_error, f"mask hook raised for attribute '{key}'", exc)
+        except BaseException:
+            # Raised hook errors can retain unmasked values and the application exception chain.
+            message = "mask hook raised; content dropped"
+            report_error(on_error, message, RuntimeError(message))
             return None
     try:
         return truncate(stringify(value), max_len)
-    except BaseException as exc:
-        report_error(on_error, f"failed to serialize attribute '{key}'", exc)
+    except BaseException:
+        message = "failed to serialize attribute; content dropped"
+        report_error(on_error, message, ValueError(message))
         return None
 
 
@@ -198,7 +201,7 @@ def coerce_attr_value(
             ):
                 return items
         return truncate(stringify(value), max_len)
-    except BaseException as exc:
-        suffix = f" '{key}'" if key is not None else ""
-        report_error(on_error, f"failed to serialize attribute{suffix}", exc)
+    except BaseException:
+        message = "failed to serialize attribute; content dropped"
+        report_error(on_error, message, ValueError(message))
         return None

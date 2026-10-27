@@ -14,8 +14,8 @@ export type { BatchOptions, ExportMode, LogLevel, SdkLogLevel } from "@telemetry
 
 /**
  * Redaction hook applied to captured content (input/output, log messages and attributes, and
- * content passed to `SpanHandle.serializeContent`) before JSON stringification. Not applied to
- * metadata or raw attributes.
+ * content passed to `SpanHandle.serializeContent`), including exception messages/stacks, before
+ * JSON stringification. Not applied to metadata or raw attributes.
  */
 export type MaskFn<T = unknown> = (value: T, ctx: { key: string }) => T;
 
@@ -38,9 +38,9 @@ export interface TelemetryOptions {
   exportMode?: ExportMode;
   /** OTel sampling policy. Defaults to OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG. */
   sampler?: Sampler;
-  /** Capture span inputs (args, prompts) by default. Default true. */
+  /** Capture span inputs (args, prompts). False also omits exception messages/stacks. Default true. */
   captureInput?: boolean;
-  /** Capture span outputs (results, completions) by default. Default true. */
+  /** Capture span outputs (results, completions). False also omits exception messages/stacks. Default true. */
   captureOutput?: boolean;
   /** Redaction hook run on captured content before stringify/truncate. */
   mask?: MaskFn;

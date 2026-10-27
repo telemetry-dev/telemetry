@@ -385,8 +385,8 @@ export function telemetryDevExtension(
 
         if (!span) return;
         toolSpans.delete(event.toolCallId);
-        // The SDK exports error messages without the capture check or mask
-        // that `output` gets, and a failed tool's result is its output.
+        // Older core versions do not gate or mask exception messages; a failed
+        // tool's result must still follow its output capture policy.
         const policy = span.capturePolicy;
         const message =
           policy?.output && !policy.mask

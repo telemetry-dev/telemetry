@@ -74,8 +74,10 @@ or exceeds a capture bound sets `telemetry.dev.capture.truncated`. With a mask c
 incomplete output is omitted because the mask cannot inspect the complete value. When output
 capture is disabled, response IDs and models, finish reasons, usage, timing, and errors may still
 be recorded.
-Capture flags do not gate stop sequences, caller-supplied metadata or raw attributes, or exception
-messages and stack traces; redact those separately when needed. Request tools and `tool_choice` are part of the captured input, so `capture_input=False` removes them.
+Capture flags do not gate stop sequences or caller-supplied metadata or raw attributes; redact those
+separately when needed. Exception messages and stack traces are recorded only when both
+`capture_input` and `capture_output` are on, and pass through `mask`. Older `telemetry-dev`
+versions record them regardless of capture flags. Request tools and `tool_choice` are part of the captured input, so `capture_input=False` removes them.
 
 `messages.stream()` starts the span when the context manager is entered, because that is when the Anthropic SDK opens the HTTP stream.
 

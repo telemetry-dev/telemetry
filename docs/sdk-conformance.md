@@ -132,11 +132,13 @@ eventName: "e2e.inside")` inside it
    - plain span `broken-step` ended with an error whose message contains "boom"
      (TypeError in TS, ValueError in Python)
    - embedding span `embed-query` (model `text-embedding-4`, usage input 3)
-   - plain span `private-step` (input "should-not-appear", captureInput false)
-   - plain span `big-payload` (input = 70000 × "x")
+   - plain span `private-step` (input "should-not-appear", captureInput false, error
+     "PRIVATE_EXCEPTION" whose message and stack are omitted)
+   - plain span `big-payload` (input = 10000 × "x" + 30000 × "🤖")
    - generation `priced-call` (custom-model-x/custom, usage 5/2, costUsd 0.5)
    - generation `openrouter-call` (provider openrouter, no usage)
-   - generation `masked-step` (input "SECRET stuff")
+   - generation `masked-step` (input "SECRET stuff", error "SECRET exception" whose message
+     and stack are masked to "[redacted exception]")
    - plain span `json-compat` (nested non-finite values, numeric key ordering, binary64 numbers,
      Unicode and lone surrogates; serialized bytes also stored as a custom attribute)
    - generation `advisor-call` (claude-sonnet-4-5/anthropic, executor usage 8/3 with 2 cache-read
@@ -158,6 +160,13 @@ eventName: "e2e.inside")` inside it
    `flush()` + `shutdown()` — must emit nothing and never throw
 
 ## Assertions (C1–C24)
+
+Exception content follows the effective per-span capture policy in both SDKs. If either input
+or output capture is off, C14 retains error status/type and the exception event but omits its
+message and stack. With both enabled, C16 applies the content mask and truncation to
+`exception.message` and `exception.stacktrace` before export. Mask failures omit the affected
+field. The policy is per span, so an enclosing span with capture on records an error that propagates
+to it. These rules do not sanitize raw OpenTelemetry events or arbitrary attributes.
 
 | #   | Assertion                                                                                                                                                                                                                        |
 | --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

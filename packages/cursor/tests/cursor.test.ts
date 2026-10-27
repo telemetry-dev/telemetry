@@ -835,7 +835,7 @@ describe("titles", () => {
       captureInput: false,
       turnName: "invoke_agent cursor",
       subName: "invoke_agent explore",
-      message: "SubagentError",
+      message: undefined,
     },
   ])(
     "captureInput $captureInput governs prompt, task and title text in span names and errors",
@@ -878,6 +878,7 @@ describe("titles", () => {
       expect(exception?.attributes?.["exception.message"]).toBe(message);
 
       if (!captureInput) {
+        expect(exception?.attributes?.["exception.stacktrace"]).toBeUndefined();
         const exported = JSON.stringify([
           finished(spans).map((s) => [s.name, s.attributes, s.events]),
           logs.getFinishedLogRecords().map((r) => [r.body, r.attributes]),

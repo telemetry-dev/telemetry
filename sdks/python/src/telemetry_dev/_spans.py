@@ -147,20 +147,29 @@ def _to_ns(value: TimeInput) -> int | None:
     return int(value)
 
 
-def _record_error_on_span(span: Span, error: BaseException) -> None:
+def _record_error_on_span(
+    client: Client, span: Span, state: _SpanState, error: BaseException
+) -> None:
     error_type = type(error).__name__
-    stacktrace = "".join(traceback.format_exception(type(error), error, error.__traceback__))
     span.set_attribute(ATTR_ERROR_TYPE, error_type)
-    span.add_event(
-        "exception",
-        {
-            "exception.type": error_type,
-            "exception.message": str(error),
-            "exception.stacktrace": stacktrace,
-            "log.severity_number": SEVERITY["error"],
-        },
-    )
     span.set_status(Status(StatusCode.ERROR))
+    attributes: dict[str, otel_types.AttributeValue] = {
+        "exception.type": error_type,
+        "log.severity_number": SEVERITY["error"],
+    }
+    # Exceptions can echo either inputs or outputs; both must allow content capture.
+    if state.capture_input and state.capture_output:
+        for key, value in (
+            ("exception.message", str(error)),
+            (
+                "exception.stacktrace",
+                "".join(traceback.format_exception(type(error), error, error.__traceback__)),
+            ),
+        ):
+            serialized = client.serialize(value, key)
+            if serialized is not None:
+                attributes[key] = serialized
+    span.add_event("exception", attributes)
 
 
 def _metadata_attrs(
@@ -288,7 +297,7 @@ def _apply_fields(client: Client, span: Span, state: _SpanState, fields: dict[st
 
     error = fields.get("error")
     if error is not None:
-        _record_error_on_span(span, error)
+        _record_error_on_span(client, span, state, error)
 
 
 def _collect_fields(

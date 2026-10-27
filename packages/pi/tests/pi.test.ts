@@ -616,7 +616,7 @@ test("a successful tool execution produces an execute_tool span with arguments a
 
 test.each([
   { name: "default capture", options: {}, message: "grep: .env:\nTOKEN=private-tool-output" },
-  { name: "captureOutput: false", options: { captureOutput: false }, message: "tool bash failed" },
+  { name: "captureOutput: false", options: { captureOutput: false }, message: undefined },
   {
     name: "a mask",
     options: {
@@ -651,9 +651,13 @@ test.each([
     expect(span.attributes["error.type"]).toBe("ToolExecutionError");
     expect(exception?.["exception.type"]).toBe("ToolExecutionError");
     expect(exception?.["exception.message"]).toBe(message);
-    const stack = String(exception?.["exception.stacktrace"]);
-    expect(stack.startsWith(`ToolExecutionError: ${message}\n`)).toBe(true);
-    expect(stack.includes("private-tool-output")).toBe(message.includes("private-tool-output"));
+    if (message === undefined) {
+      expect(exception?.["exception.stacktrace"]).toBeUndefined();
+    } else {
+      const stack = String(exception?.["exception.stacktrace"]);
+      expect(stack.startsWith(`ToolExecutionError: ${message}\n`)).toBe(true);
+      expect(stack.includes("private-tool-output")).toBe(message.includes("private-tool-output"));
+    }
   },
 );
 

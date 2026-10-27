@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import enum
 import json
+import logging
+import traceback
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.trace import StatusCode
 
 import telemetry_dev
 from telemetry_dev import MaskContext
@@ -134,7 +137,8 @@ def test_serialize_content_withholds_content_the_mask_cannot_handle(make: MakeCl
     assert span.serialize_content("secret", "broken") is None
     assert span.serialize_content(circular, "circular") is None
     assert span.serialize_content("\udcff" + "x" * 60, "lone-surrogate") is None
-    assert [type(error) for error in errors] == [RuntimeError, ValueError, UnicodeEncodeError]
+    assert [type(error) for error in errors] == [RuntimeError, ValueError, ValueError]
+    assert all(error.__context__ is None and error.__cause__ is None for error in errors)
     span.end()
 
 
@@ -295,3 +299,136 @@ def test_capture_input_gates_system_instructions(make: MakeClient) -> None:
     env = make(capture_input=False)
     telemetry_dev.start_span("gen", type="generation", system_instructions="secret").end()
     assert "gen_ai.system_instructions" not in attrs(only_span(env))
+
+
+@pytest.mark.parametrize(
+    "capture_input,capture_output", [(False, True), (True, False), (False, False)]
+)
+async def test_exception_capture_flags_and_overrides(
+    make: MakeClient, capture_input: bool, capture_output: bool
+) -> None:
+    env = make(capture_input=capture_input, capture_output=capture_output)
+    error = ValueError("PRIVATE_EXCEPTION")
+    telemetry_dev.start_span("ended").end(error=error)
+    with telemetry_dev.start_span("active"):
+        telemetry_dev.update_current_span(error=error)
+
+    @telemetry_dev.observe()
+    async def failed() -> None:
+        raise error
+
+    with pytest.raises(ValueError) as raised:
+        await failed()
+    assert raised.value is error
+    telemetry_dev.start_span("override", capture_input=True, capture_output=True).end(error=error)
+    exported = env.span_exporter.get_finished_spans()
+    assert len(exported) == 4
+    for span in exported:
+        assert span.status.status_code == StatusCode.ERROR
+        assert attrs(span)["error.type"] == "ValueError"
+        event_attrs = dict(span.events[0].attributes or {})
+        assert event_attrs["exception.type"] == "ValueError"
+        if span.name == "override":
+            assert event_attrs["exception.message"] == "PRIVATE_EXCEPTION"
+        else:
+            assert "exception.message" not in event_attrs
+            assert "exception.stacktrace" not in event_attrs
+            assert "PRIVATE_EXCEPTION" not in str(event_attrs)
+
+
+@pytest.mark.parametrize("mode", ["redact", "throw", "truncate"])
+def test_exception_masking(make: MakeClient, mode: str) -> None:
+    def mask(value: Any, ctx: MaskContext) -> Any:
+        if mode == "throw":
+            raise RuntimeError("mask failed")
+        if mode == "truncate":
+            return "x" * 100
+        if ctx.key == "exception.message":
+            return "safe message"
+        if ctx.key == "exception.stacktrace":
+            return "safe stack"
+        return value
+
+    env = make(mask=mask, max_attribute_length=50)
+    error = ValueError("PRIVATE_EXCEPTION")
+    with pytest.raises(ValueError) as raised, telemetry_dev.start_span("failure"):
+        raise error
+    assert raised.value is error
+    telemetry_dev.start_span("private", capture_output=False).end(
+        error=ValueError("PRIVATE_EXCEPTION")
+    )
+    span, private_span = env.span_exporter.get_finished_spans()
+    assert span.status.status_code == StatusCode.ERROR
+    assert attrs(span)["error.type"] == "ValueError"
+    event_attrs = dict(span.events[0].attributes or {})
+    assert event_attrs.get("exception.message") == (
+        "safe message"
+        if mode == "redact"
+        else "x" * 36 + TRUNCATION_MARKER
+        if mode == "truncate"
+        else None
+    )
+    assert event_attrs.get("exception.stacktrace") == (
+        "safe stack"
+        if mode == "redact"
+        else "x" * 36 + TRUNCATION_MARKER
+        if mode == "truncate"
+        else None
+    )
+    private_attrs = dict(private_span.events[0].attributes or {})
+    assert "exception.message" not in private_attrs
+    assert "PRIVATE_EXCEPTION" not in str([event_attrs, private_attrs])
+
+
+@pytest.mark.parametrize("callback_mode", ["return", "raise", "reraise"])
+@pytest.mark.parametrize("failure_mode", ["mask", "serialize", "metadata", "truncate"])
+def test_mask_failure_diagnostics_do_not_expose_content(
+    make: MakeClient, caplog: pytest.LogCaptureFixture, callback_mode: str, failure_mode: str
+) -> None:
+    errors: list[str] = []
+    chains: list[tuple[Any, Any, Any]] = []
+    original = ValueError("PRIVATE_APPLICATION")
+
+    class Unserializable:
+        def __repr__(self) -> str:
+            raise ValueError("PRIVATE_SERIALIZATION") from original
+
+    def mask(_value: Any, _ctx: MaskContext) -> Any:
+        if failure_mode == "serialize":
+            return Unserializable()
+        if failure_mode == "truncate":
+            return "\ud800" * 40
+        raise RuntimeError("PRIVATE_MASK") from original
+
+    def on_error(error: BaseException) -> None:
+        errors.append("".join(traceback.format_exception(error)))
+        chains.append((error.__context__, error.__cause__, error.__traceback__))
+        if callback_mode == "reraise":
+            raise error
+        if callback_mode == "raise":
+            raise RuntimeError("PRIVATE_CALLBACK") from original
+
+    env = make(mask=mask, on_error=on_error, log_level="debug", max_attribute_length=50)
+    with caplog.at_level(logging.DEBUG, logger="telemetry_dev"):
+        with pytest.raises(ValueError) as raised, telemetry_dev.start_span("failure"):
+            try:
+                raise original
+            except ValueError:
+                if failure_mode == "metadata":
+                    telemetry_dev.update_current_span(metadata={"private": Unserializable()})
+                raise
+    assert raised.value is original
+    assert errors
+    assert all(chain == (None, None, None) for chain in chains)
+    assert "content dropped" in caplog.text
+    assert "PRIVATE_" not in caplog.text
+    assert "PRIVATE_" not in "".join(errors)
+    span = only_span(env)
+    assert span.status.status_code == StatusCode.ERROR
+    assert attrs(span)["error.type"] == "ValueError"
+    assert len(span.events) == 1
+    event_attrs = dict(span.events[0].attributes or {})
+    assert event_attrs["exception.type"] == "ValueError"
+    assert "exception.message" not in event_attrs
+    assert "exception.stacktrace" not in event_attrs
+    assert "PRIVATE_" not in str(event_attrs)
