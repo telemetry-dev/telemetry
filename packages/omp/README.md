@@ -58,6 +58,19 @@ export default telemetryDevExtension({
 Initialization is one-shot; the first extension factory initialized in a process supplies the SDK
 options.
 
+## Errors
+
+The integration does not write to the terminal, because omp draws its TUI there. It sends SDK and
+extension errors to the omp log through `pi.logger`, with the message `telemetry.dev error`. The
+default location of the omp log is `~/.omp/logs`.
+
+A series of failed exports, for example during an ingest outage, is one entry. The next failure
+after an export reaches the ingest is a new entry.
+
+To receive the errors in your code, pass `onError` to `telemetryDevExtension()`. The callback
+replaces the omp log. To also write SDK diagnostics to the console, pass `logLevel`, for example
+`"warn"`.
+
 ## Trace shape
 
 A typical prompt produces this hierarchy:

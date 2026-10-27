@@ -3,7 +3,7 @@ import { InMemoryLogRecordExporter } from "@opentelemetry/sdk-logs";
 import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import { flush, type ClientOverrides } from "@telemetry-dev/sdk";
 import type { ExtensionContext, ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 
 import { resetForTesting } from "../src/config.ts";
 import { telemetryDevExtension, type TelemetryDevExtensionOptions } from "../src/extension.ts";
@@ -541,6 +541,46 @@ test("malformed events never throw and report through onError", async () => {
   // The rest of the pipeline still works after a poisoned event.
   await runAgentLoop(harness);
   expect(harness.exporters.spans.getFinishedSpans().length).toBeGreaterThan(0);
+});
+
+test("errors go to omp's file logger, not to the console", async () => {
+  const consoleSpies = (["error", "warn", "info", "debug", "log"] as const).map((method) =>
+    vi.spyOn(console, method).mockImplementation(() => {}),
+  );
+  const logged: [string, Record<string, unknown> | undefined][] = [];
+  const handlers = new Map<string, (event: object, ctx: ExtensionContext) => unknown>();
+
+  try {
+    telemetryDevExtension({
+      apiKey: "td_live_test",
+      exportMode: "immediate",
+      fetch: async () => new Response(null, { status: 400 }),
+    })({
+      on: (type: string, handler: never) => handlers.set(type, handler),
+      logger: { error: (message, context) => logged.push([message, context]) },
+    });
+
+    await handlers.get("session_start")?.({ type: "session_start" }, makeContext());
+    await flush();
+    await handlers.get("message_end")?.(
+      {
+        get message(): never {
+          throw new Error("poisoned event");
+        },
+      },
+      makeContext(),
+    );
+
+    expect(logged.map(([message]) => message)).toEqual([
+      "telemetry.dev error",
+      "telemetry.dev error",
+    ]);
+    expect(String(logged[0]?.[1]?.error)).toContain("telemetry.dev log ingest failed: 400");
+    expect(String(logged[1]?.[1]?.error)).toContain("poisoned event");
+    expect(consoleSpies.flatMap((spy) => spy.mock.calls)).toEqual([]);
+  } finally {
+    vi.restoreAllMocks();
+  }
 });
 
 test("each event reads the current session id", async () => {

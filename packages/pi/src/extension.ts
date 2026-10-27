@@ -4,16 +4,22 @@ import {
   startSpan,
   type LogLevel,
   type LogOptions,
+  type SdkLogLevel,
   type SpanHandle,
   type TokenUsage,
 } from "@telemetry-dev/sdk";
 
 import { ensureInit, type ClientOverrides, type TelemetryDevPiOptions } from "./config.ts";
+import { writeErrorLog } from "./error-log.ts";
 
 /** Options for {@link telemetryDevExtension}. */
 export interface TelemetryDevExtensionOptions extends TelemetryDevPiOptions {
   /** Value for `gen_ai.agent.name` on spans and logs. Defaults to `"pi"`. */
   agentName?: string;
+  /** SDK console output. Defaults to `"silent"`, because pi draws its TUI on the terminal. */
+  logLevel?: SdkLogLevel;
+  /** Receives SDK and extension errors. By default, the extension appends them to `telemetry-dev.log` in pi's agent directory. */
+  onError?: (cause: Error) => void;
 }
 
 /**
@@ -148,11 +154,13 @@ export function telemetryDevExtension(
   overrides?: ClientOverrides,
 ): TelemetryDevExtension {
   const { agentName = "pi", ...sdkOptions } = options;
-  const onError = sdkOptions.onError;
+  // pi draws its TUI on the terminal, so errors go to a log file and not to the console.
+  const onError = sdkOptions.onError ?? writeErrorLog;
+  const logLevel = sdkOptions.logLevel ?? "silent";
 
   return (pi) => {
     try {
-      ensureInit(sdkOptions, overrides);
+      ensureInit({ ...sdkOptions, logLevel, onError }, overrides);
     } catch (error) {
       reportError(onError, error);
     }

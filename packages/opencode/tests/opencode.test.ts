@@ -2,6 +2,7 @@ import { SpanStatusCode, trace } from "@opentelemetry/api";
 import { InMemoryLogRecordExporter } from "@opentelemetry/sdk-logs";
 import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import type { Hooks, Plugin, PluginModule } from "@opencode-ai/plugin";
+import { createOpencodeClient } from "@opencode-ai/sdk/client";
 import { flush, type ClientOverrides } from "@telemetry-dev/sdk";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
@@ -418,6 +419,49 @@ test("poisoned events report through onError without throwing", async () => {
   await event(harness.hooks, "session.idle", { sessionID: "session-1" });
   await flush();
   expect(spansByName(harness.exporters, "invoke_agent")).toHaveLength(1);
+});
+
+test("errors go to opencode's log through the plugin client, not to the console", async () => {
+  const consoleSpies = (["error", "warn", "info", "debug", "log"] as const).map((method) =>
+    vi.spyOn(console, method).mockImplementation(() => {}),
+  );
+  const logged: { method: string; path: string; body: Record<string, string> }[] = [];
+
+  const client = createOpencodeClient({
+    baseUrl: "http://localhost:4096",
+    fetch: async (request: Request) => {
+      const { method, url } = request;
+      const body = (await request.json()) as Record<string, string>;
+      logged.push({ method, path: new URL(url).pathname, body });
+
+      return Response.json(true);
+    },
+  });
+
+  const hooks = await telemetryDevPlugin({
+    apiKey: "td_live_test",
+    exportMode: "immediate",
+    fetch: async () => new Response(null, { status: 400 }),
+  })({ ...pluginInput, client });
+
+  await event(hooks, "session.created", { info: { id: "session-1" } });
+  await flush();
+  await hooks.event?.({
+    event: {
+      get type(): never {
+        throw new Error("poisoned event");
+      },
+    },
+  });
+
+  await vi.waitFor(() => expect(logged).toHaveLength(2));
+  expect(logged.map(({ method, path, body }) => [method, path, body.service, body.level])).toEqual([
+    ["POST", "/log", "telemetry-dev", "error"],
+    ["POST", "/log", "telemetry-dev", "error"],
+  ]);
+  expect(logged[0]?.body.message).toContain("telemetry.dev log ingest failed: 400");
+  expect(logged[1]?.body.message).toContain("poisoned event");
+  expect(consoleSpies.flatMap((spy) => spy.mock.calls)).toEqual([]);
 });
 
 test("tool spans nest under the session's open chat span", async () => {

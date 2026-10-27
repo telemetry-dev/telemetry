@@ -55,6 +55,20 @@ export default telemetryDevExtension({
 Initialization is one-shot; the first extension factory initialized in a process supplies the SDK
 options.
 
+## Errors
+
+The integration does not write to the terminal, because pi draws its TUI there. It appends SDK and
+extension errors to `telemetry-dev.log` in the pi agent directory: `~/.pi/agent`, or
+`PI_CODING_AGENT_DIR` when you set it. The file has mode `0600`. When the file is more than 5 MB,
+the integration moves it to `telemetry-dev.log.1`.
+
+A series of failed exports, for example during an ingest outage, is one entry. The next failure
+after an export reaches the ingest is a new entry.
+
+To receive the errors in your code, pass `onError` to `telemetryDevExtension()`. The callback
+replaces the log file. To also write SDK diagnostics to the console, pass `logLevel`, for example
+`"warn"`.
+
 ## Trace shape
 
 A typical session produces this hierarchy:
