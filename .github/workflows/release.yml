@@ -3,8 +3,6 @@ name: Release
 on:
   push:
     branches: [main]
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       release_tag:
@@ -13,7 +11,7 @@ on:
         type: string
 
 concurrency:
-  group: release-${{ github.event.release.tag_name || inputs.release_tag || github.ref }}
+  group: release-${{ inputs.release_tag || github.sha }}
   cancel-in-progress: false
 
 permissions: {}
@@ -21,11 +19,18 @@ permissions: {}
 jobs:
   release-please:
     if: github.event_name == 'push'
+    concurrency:
+      group: release-please-${{ github.ref }}
+      cancel-in-progress: false
+      # The default queue cancels a waiting release-please job when another push arrives, leaving that merge unpublished.
+      queue: max
     runs-on: ubuntu-24.04
     permissions:
       contents: write
       issues: write
       pull-requests: write
+    outputs:
+      paths: ${{ steps.release.outputs.paths_released }}
     steps:
       - env:
           RELEASE_PLEASE_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
@@ -34,14 +39,18 @@ jobs:
             echo "RELEASE_PLEASE_TOKEN is required" >&2
             exit 1
           fi
-      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7
+      - id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
 
   discover-release:
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    needs: release-please
+    if: >-
+      !cancelled() && (github.event_name == 'workflow_dispatch' ||
+      needs.release-please.result == 'success')
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -58,18 +67,14 @@ jobs:
       - id: packages
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASED_PATHS: ${{ needs.release-please.outputs.paths || '[]' }}
         run: |
           npm=()
           python=()
+          tags=()
           matches=0
-          source_sha=$(.github/scripts/release-source.sh)
-
-          draft=$(gh release view --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' -- "$RELEASE_TAG")
-          if [[ "$draft" != "false" ]]; then
-            echo "Release $RELEASE_TAG is still a draft" >&2
-            exit 1
-          fi
+          released_matches=0
 
           while IFS= read -r path; do
             component=$(jq -er --arg path "$path" '.packages[$path].component' release-please-config.json)
@@ -77,7 +82,14 @@ jobs:
             version=$(jq -er --arg path "$path" '.[$path]' .release-please-manifest.json)
             tag="$component-v$version"
 
-            [[ "$tag" == "$RELEASE_TAG" ]] || continue
+            if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+              [[ "$tag" == "$RELEASE_TAG" ]] || continue
+            elif jq -e --arg path "$path" 'any(.[]; . == $path)' <<< "$RELEASED_PATHS" > /dev/null; then
+              released_matches=$((released_matches + 1))
+            # A rerun after release-please failed partway omits releases it already created, so their tags select them.
+            elif [[ "$(git rev-parse -q --verify "refs/tags/$tag^{commit}" || true)" != "$GITHUB_SHA" ]]; then
+              continue
+            fi
 
             case "$release_type" in
               node) npm+=("$path") ;;
@@ -87,25 +99,42 @@ jobs:
                 exit 1
                 ;;
             esac
+            tags+=("$tag")
             matches=$((matches + 1))
           done < <(jq -r '.packages | to_entries[] | .key' release-please-config.json)
 
-          if [[ "$matches" != 1 ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$matches" != 1 ]]; then
             echo "Expected one package for $RELEASE_TAG, found $matches" >&2
             exit 1
           fi
+          released=$(jq -er 'length' <<< "$RELEASED_PATHS")
+          if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" && "$released_matches" != "$released" ]]; then
+            echo "Expected $released configured packages for released paths, found $released_matches" >&2
+            exit 1
+          fi
+
+          for tag in "${tags[@]}"; do
+            RELEASE_TAG="$tag" .github/scripts/release-source.sh > /dev/null
+            draft=$(gh release view --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' -- "$tag")
+            if [[ "$draft" != "false" ]]; then
+              echo "Release $tag is still a draft" >&2
+              exit 1
+            fi
+          done
 
           npm_json=$(printf '%s\n' "${npm[@]}" | jq --raw-input --slurp --compact-output 'split("\n") | map(select(length > 0))')
           python_json=$(printf '%s\n' "${python[@]}" | jq --raw-input --slurp --compact-output 'split("\n") | map(select(length > 0))')
           {
             echo "npm=$npm_json"
             echo "python=$python_json"
-            echo "sha=$source_sha"
+            echo "sha=$GITHUB_SHA"
           } >> "$GITHUB_OUTPUT"
 
   build-npm:
     needs: discover-release
-    if: needs.discover-release.outputs.npm-packages != '[]'
+    if: >-
+      !cancelled() && needs.discover-release.result == 'success' &&
+      needs.discover-release.outputs.npm-packages != '[]'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -143,7 +172,7 @@ jobs:
 
   publish-npm:
     needs: [discover-release, build-npm]
-    if: needs.discover-release.outputs.npm-packages != '[]'
+    if: "!cancelled() && needs.build-npm.result == 'success'"
     runs-on: ubuntu-24.04
     permissions:
       id-token: write
@@ -176,9 +205,9 @@ jobs:
               continue
             fi
             while IFS=$'\t' read -r dependency range; do
-              for attempt in {1..12}; do
+              for attempt in {1..60}; do
                 dependency_error=$(npm view "${dependency}@${range}" version --json 2>&1) && continue 2
-                [[ "$attempt" == 12 ]] || sleep 10
+                [[ "$attempt" == 60 ]] || sleep 10
               done
               echo "Cannot publish $name@$version: unable to verify that published $dependency satisfies $range" >&2
               printf '%s\n' "$dependency_error" >&2
@@ -193,7 +222,9 @@ jobs:
 
   build-python:
     needs: discover-release
-    if: needs.discover-release.outputs.python-packages != '[]'
+    if: >-
+      !cancelled() && needs.discover-release.result == 'success' &&
+      needs.discover-release.outputs.python-packages != '[]'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -217,8 +248,6 @@ jobs:
             for artifact in "$output/$name"/*; do
               .github/scripts/release-artifact.sh "$package" "$artifact"
             done
-            wheel=$(find "$output/$name" -maxdepth 1 -type f -name '*.whl' -print -quit)
-            .github/scripts/verify-python-release-dependencies.sh "$wheel"
             echo "$name" >> "$output/publish-order.txt"
           done < <(jq -r '.[]' <<< "$PACKAGES")
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -230,12 +259,18 @@ jobs:
 
   publish-python:
     needs: [discover-release, build-python]
-    if: needs.discover-release.outputs.python-packages != '[]'
+    if: "!cancelled() && needs.build-python.result == 'success'"
     runs-on: ubuntu-24.04
     environment: pypi
     permissions:
+      contents: read
       id-token: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.discover-release.outputs.source-sha }}
+          sparse-checkout: .github/scripts
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: python-packages
@@ -244,7 +279,11 @@ jobs:
         with:
           version: 0.12.5
           enable-cache: false
-      - run: |
+      - env:
+          RELEASE_DEPENDENCY_ATTEMPTS: 60
+        run: |
           while IFS= read -r package; do
+            wheel=$(find "python/$package" -maxdepth 1 -type f -name '*.whl' -print -quit)
+            .github/scripts/verify-python-release-dependencies.sh "$wheel"
             uv publish --trusted-publishing always --check-url https://pypi.org/simple "python/$package"/*
           done < python/publish-order.txt
