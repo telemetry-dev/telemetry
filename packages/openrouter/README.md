@@ -111,6 +111,8 @@ For every supported response, cost uses the first available value in this order:
 
 The selected value is recorded as `gen_ai.usage.cost`.
 
+When `usage.isByok` is `true`, the request uses your own provider key. Your provider bills the inference, and `usage.cost` is only the OpenRouter fee. The integration then records the sum of `usage.cost` and `usage.costDetails.upstreamInferenceCost`. If the response has no `upstreamInferenceCost`, the integration records no cost.
+
 ## Limitations
 
 - Streaming fields include only events consumed by the application. A returned stream that is never read or cancelled cannot produce a terminal span.

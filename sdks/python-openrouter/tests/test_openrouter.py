@@ -337,17 +337,37 @@ def test_model_backed_requests_capture_serialized_input(memory: SimpleNamespace)
     ]
 
 
-def test_chat_cost_falls_back_to_upstream_inference_cost(memory: SimpleNamespace) -> None:
-    usage = {
-        "prompt_tokens": 4,
-        "completion_tokens": 2,
-        "total_tokens": 6,
-        "cost_details": {
-            "upstream_inference_prompt_cost": 0.0003,
-            "upstream_inference_completions_cost": 0.0006,
-            "upstream_inference_cost": 0.0009,
-        },
+def _cost_details(upstream_inference_cost: float) -> dict[str, float]:
+    return {
+        "upstream_inference_prompt_cost": 0.0003,
+        "upstream_inference_completions_cost": 0.0006,
+        "upstream_inference_cost": upstream_inference_cost,
     }
+
+
+# For a request with the user's own provider key (BYOK), the provider bills the inference,
+# and `cost` is only the OpenRouter fee.
+@pytest.mark.parametrize(
+    ("cost_fields", "expected"),
+    [
+        pytest.param({"cost_details": _cost_details(0.0009)}, 0.0009, id="upstream without cost"),
+        pytest.param(
+            {"cost": 0.0005, "is_byok": True, "cost_details": _cost_details(0.01)},
+            0.0105,
+            id="BYOK fee and upstream",
+        ),
+        pytest.param({"cost": 0.0005, "is_byok": True}, None, id="BYOK fee without upstream"),
+        pytest.param(
+            {"cost": 0.012, "is_byok": False, "cost_details": _cost_details(0.011)},
+            0.012,
+            id="cost and upstream without BYOK",
+        ),
+    ],
+)
+def test_chat_cost(
+    memory: SimpleNamespace, cost_fields: dict[str, Any], expected: float | None
+) -> None:
+    usage = {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6, **cost_fields}
 
     def handler(request: httpx.Request) -> httpx.Response:
         return json_response(chat_payload(usage=usage))
@@ -355,7 +375,7 @@ def test_chat_cost_falls_back_to_upstream_inference_cost(memory: SimpleNamespace
     client = wrap_open_router(sync_client(handler))
     client.chat.send(model="openai/gpt-4o-mini", messages=CHAT_MESSAGES)
 
-    assert attrs(only_span(memory))["gen_ai.usage.cost"] == 0.0009
+    assert attrs(only_span(memory)).get("gen_ai.usage.cost") == expected
 
 
 def test_chat_explicit_zero_max_completion_tokens_takes_precedence(

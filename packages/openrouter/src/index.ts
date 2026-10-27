@@ -365,15 +365,23 @@ function stopSequences<T>(value: T): string[] | undefined {
   return strings.length > 0 ? strings : undefined;
 }
 
+// `cost` is the OpenRouter charge. For a request with the user's own provider
+// key (BYOK), the provider bills the inference, and the charge is only the
+// OpenRouter fee. The cost of such a request is the fee and the provider's
+// inference cost. Without the inference cost, the span has no cost.
 function usageCost<T>(usage: T): number | undefined {
   const u = asRecord(usage);
   const details = asRecord(u?.costDetails) ?? asRecord(u?.cost_details);
+  const cost = readNumber(u?.cost);
 
-  return (
-    readNumber(u?.cost) ??
-    readNumber(details?.upstreamInferenceCost) ??
-    readNumber(details?.upstream_inference_cost)
-  );
+  const upstreamCost =
+    readNumber(details?.upstreamInferenceCost) ?? readNumber(details?.upstream_inference_cost);
+
+  if ((u?.isByok ?? u?.is_byok) === true) {
+    return upstreamCost === undefined ? undefined : upstreamCost + (cost ?? 0);
+  }
+
+  return cost ?? upstreamCost;
 }
 
 function chatRequest(request: JsonRecord): RequestMapping {
