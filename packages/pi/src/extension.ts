@@ -10,7 +10,7 @@ import {
 } from "@telemetry-dev/sdk";
 
 import { ensureInit, type ClientOverrides, type TelemetryDevPiOptions } from "./config.ts";
-import { writeErrorLog } from "./error-log.ts";
+import { flushErrorLog, writeErrorLog } from "./error-log.ts";
 
 /** Options for {@link telemetryDevExtension}. */
 export interface TelemetryDevExtensionOptions extends TelemetryDevPiOptions {
@@ -454,6 +454,9 @@ export function telemetryDevExtension(
         } catch (error) {
           reportError(onError, error);
         }
+
+        // pi can exit right after shutdown; land the errors that flush just reported.
+        await flushErrorLog();
       },
     );
   };
