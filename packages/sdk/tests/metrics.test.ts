@@ -1,8 +1,4 @@
-import {
-  AggregationTemporality,
-  DataPointType,
-  type HistogramMetricData,
-} from "@opentelemetry/sdk-metrics";
+import { DataPointType, type HistogramMetricData } from "@opentelemetry/sdk-metrics";
 import { afterEach, expect, test } from "vitest";
 
 import { flush, shutdown, startSpan } from "../src/index.ts";
@@ -203,7 +199,7 @@ test("plain function spans record no metrics", async () => {
   expect(histogramPoints(batches, "gen_ai.client.token.usage")).toHaveLength(0);
 });
 
-test("histograms use DELTA temporality and the GenAI bucket boundaries", async () => {
+test("histograms use the GenAI bucket boundaries", async () => {
   const { batches, exporter } = makeMetricCapture();
   setup({}, { metricExporter: exporter });
   startSpan("gen", { type: "generation", usage: { inputTokens: 10 } }).end();
@@ -214,7 +210,6 @@ test("histograms use DELTA temporality and the GenAI bucket boundaries", async (
     .flatMap((sm) => sm.metrics)
     .find((m) => m.descriptor.name === "gen_ai.client.token.usage")!;
 
-  expect(metric.aggregationTemporality).toBe(AggregationTemporality.DELTA);
   expect(metric.dataPointType).toBe(DataPointType.HISTOGRAM);
   const point = metric.dataPoints[0]!;
   expect(
@@ -246,15 +241,24 @@ test("filter-rejected spans record no metrics", async () => {
   expect(histogramPoints(batches, "gen_ai.client.operation.time_to_first_chunk")).toHaveLength(0);
 });
 
-test("quiet intervals collect zero data points", async () => {
-  const { batches, exporter } = makeMetricCapture();
-  setup({}, { metricExporter: exporter });
+test("the metric exporter sends DELTA intervals: idle flushes post nothing and points are not resent", async () => {
+  const urls: string[] = [];
+
+  setup({
+    baseUrl: "https://ingest.test",
+    fetch: async (input) => {
+      urls.push(new Request(input).url);
+
+      return new Response(null, { status: 200 });
+    },
+  });
+
   await flush();
-
-  const pointCount = batches
-    .flatMap((rm) => rm.scopeMetrics)
-    .flatMap((sm) => sm.metrics)
-    .reduce((total, metric) => total + metric.dataPoints.length, 0);
-
-  expect(pointCount).toBe(0);
+  expect(urls).toEqual([]);
+  startSpan("gen", { type: "generation", usage: { inputTokens: 10 } }).end();
+  await flush();
+  expect(urls).toEqual(["https://ingest.test/v1/metrics"]);
+  // A cumulative exporter would resend the duration and token series on every collection.
+  await flush();
+  expect(urls).toEqual(["https://ingest.test/v1/metrics"]);
 });

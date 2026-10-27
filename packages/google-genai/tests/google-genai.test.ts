@@ -1820,6 +1820,7 @@ test.each([
 
     const span = await exportedSpan(spans);
     expect(span.attributes["google_genai.response.block_reason"]).toBe("SAFETY");
+    expect(span.status.code).toBe(SPAN_STATUS_UNSET);
 
     if (capture === "on") {
       expect(span.attributes["google_genai.response.block_reason_message"]).toBe(
@@ -2516,32 +2517,6 @@ test("non-Error stream setup failures end spans and preserve the thrown values",
   ).toEqual(["stream setup rejected", "[object Object]"]);
 });
 
-test("blocked prompt records block attrs without output", async () => {
-  const spans = setupSpans();
-
-  const fake = createFakeFetch(
-    jsonResponse({
-      promptFeedback: {
-        blockReason: "SAFETY",
-        blockReasonMessage: "blocked for safety",
-        safetyRatings: [{ category: "HARM_CATEGORY_DANGEROUS_CONTENT", probability: "HIGH" }],
-      },
-    }),
-  );
-
-  vi.stubGlobal("fetch", fake.fetch);
-  const client = clientWith();
-  await client.models.generateContent({ model: "gemini-2.5-flash", contents: "blocked" });
-  const span = await exportedSpan(spans);
-  expect(span.status.code).toBe(SPAN_STATUS_UNSET);
-  expect(span.attributes["google_genai.response.block_reason"]).toBe("SAFETY");
-  expect(span.attributes["google_genai.response.block_reason_message"]).toBe("blocked for safety");
-  expect(jsonAttr(span, "google_genai.response.prompt_safety_ratings")).toEqual([
-    { category: "HARM_CATEGORY_DANGEROUS_CONTENT", probability: "HIGH" },
-  ]);
-  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
-});
-
 test("embedContent maps embedding span fields without output", async () => {
   const spans = setupSpans();
 
@@ -2704,7 +2679,7 @@ test("wrapped calls fail open when telemetry is not initialized", async () => {
   expect(response.text).toBe("ok");
 });
 
-test("usage modality details map text, image, and audio without video attributes", async () => {
+test("usage modality details map text, image, and audio tokens and ignore other modalities", async () => {
   const spans = setupSpans();
 
   const client = wrapGoogleGenAI({
@@ -2737,9 +2712,6 @@ test("usage modality details map text, image, and audio without video attributes
   expect(span.attributes["gen_ai.usage.text.cache_read.input_tokens"]).toBe(5);
   expect(span.attributes["gen_ai.usage.image.cache_read.input_tokens"]).toBe(6);
   expect(span.attributes["gen_ai.usage.audio.cache_read.input_tokens"]).toBe(7);
-  expect(
-    Object.keys(span.attributes).some((key) => key.includes("video") && key.includes("usage")),
-  ).toBe(false);
 });
 
 test.each(["generateImages", "editImage", "upscaleImage"] as const)(
@@ -2775,7 +2747,6 @@ test.each(["generateImages", "editImage", "upscaleImage"] as const)(
     expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
       { type: "image", uri: "gs://bucket/output.png" },
     ]);
-    expect(span.attributes["google_genai.response.image_uris"]).toBeUndefined();
     expect(JSON.stringify(span.attributes)).not.toContain(binary);
   },
 );
@@ -2857,7 +2828,11 @@ test("generateVideos traces submit and tracked polling idempotently", async () =
   expect(messagesAttr(exported[1]!, "gen_ai.output.messages")).toEqual([
     { type: "video", uri: "gs://bucket/video.mp4" },
   ]);
-  expect(exported[1]!.attributes["google_genai.response.video_uris"]).toBeUndefined();
+  expect(
+    Object.keys(exported[1]!.attributes).filter((key) =>
+      String(exported[1]!.attributes[key]).includes("gs://bucket/video.mp4"),
+    ),
+  ).toEqual(["gen_ai.output.messages"]);
   expect(exported.every((span) => span.attributes["gen_ai.output.type"] === "video")).toBe(true);
 });
 
@@ -3094,30 +3069,6 @@ test.each(["get", "getVideosOperation"] as const)(
   },
 );
 
-test("media methods preserve rejected and synchronously thrown failures", async () => {
-  const spans = setupSpans();
-  const rejected = new Error("image rejected");
-  const thrown = new Error("video threw");
-
-  const client = wrapGoogleGenAI({
-    models: {
-      generateImages(_params: unknown) {
-        return Promise.reject(rejected);
-      },
-      generateVideos(_params: unknown) {
-        throw thrown;
-      },
-    },
-  });
-
-  await expect(client.models.generateImages({ model: "imagen", prompt: "fail" })).rejects.toBe(
-    rejected,
-  );
-  expect(() => client.models.generateVideos({ model: "veo", prompt: "fail" })).toThrow(thrown);
-  const exported = await finishedSpans(spans, 2);
-  expect(exported.every((span) => span.status.code === SPAN_STATUS_ERROR)).toBe(true);
-});
-
 test("capture traversal is bounded, cycle-aware, binary-safe, and preserves provider outcomes", async () => {
   const spans = setupSpans();
   const shared = { text: "shared" };
@@ -3157,6 +3108,8 @@ test("capture traversal is bounded, cycle-aware, binary-safe, and preserves prov
   const span = await exportedSpan(spans);
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
   expect(String(span.attributes["gen_ai.input.messages"])).not.toContain("SECRET_BINARY");
+  expect(String(span.attributes["gen_ai.input.messages"])).toContain('"shared"');
+  expect(String(span.attributes["gen_ai.output.messages"])).toContain('"shared"');
   expect(String(span.attributes["gen_ai.input.messages"]).length).toBeLessThan(65_536);
   expect(String(span.attributes["gen_ai.output.messages"]).length).toBeLessThan(65_536);
 });

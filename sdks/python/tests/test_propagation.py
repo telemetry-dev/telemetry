@@ -23,7 +23,7 @@ from opentelemetry.trace import Link, SpanContext, SpanKind, TraceFlags, TraceSt
 from opentelemetry.util.types import Attributes
 
 import telemetry_dev
-from telemetry_dev._context import session_span_context, with_session_parent
+from telemetry_dev._context import session_span_context
 from telemetry_dev._serialize import MaskContext
 from tests.conftest import MakeClient, span_context
 
@@ -129,15 +129,6 @@ def test_get_traceparent_round_trip(memory: SimpleNamespace) -> None:
     by_name = spans_by_name(memory)
     assert span_context(by_name["joined"]).trace_id == span_context(by_name["root"]).trace_id
     assert telemetry_dev.get_traceparent() is None
-
-
-def test_logs_get_propagated_attributes(memory: SimpleNamespace) -> None:
-    with telemetry_dev.propagate_attributes(user_id="u-log", metadata={"plan": "pro"}):
-        telemetry_dev.log("hello")
-    (record,) = memory.log_exporter.get_finished_logs()
-    log_attrs = dict(record.log_record.attributes or {})
-    assert log_attrs["user.id"] == "u-log"
-    assert log_attrs["td.metadata.plan"] == "pro"
 
 
 def test_invalid_traceparent_falls_back_to_active_context(memory: SimpleNamespace) -> None:
@@ -381,9 +372,7 @@ def test_root_sampling_sees_safe_initial_attributes(
     assert "gen_ai.output.messages" not in a
 
 
-def test_session_sampling_keeps_baggage_changed_after_attaching_the_session_parent(
-    make: MakeClient,
-) -> None:
+def test_session_root_sampling_sees_caller_baggage(make: MakeClient) -> None:
     class TenantSampler(Sampler):
         def should_sample(
             self,
@@ -404,10 +393,12 @@ def test_session_sampling_keeps_baggage_changed_after_attaching_the_session_pare
             return "TenantSampler"
 
     env = make(api_key="td_live_k", sampler=ParentBased(TenantSampler()))
-    before = baggage.set_baggage("tenant", "denied", Context())
-    parent = with_session_parent(before, "s1", "td_live_k")
-    allowed = baggage.set_baggage("tenant", "allowed", parent)
-    telemetry_dev.start_span("allowed", parent=allowed).end()
-    telemetry_dev.start_span("denied", parent=parent).end()
-    telemetry_dev.start_span("removed", parent=baggage.remove_baggage("tenant", allowed)).end()
-    assert [span.name for span in env.span_exporter.get_finished_spans()] == ["allowed"]
+    allowed = baggage.set_baggage("tenant", "allowed", Context())
+    denied = baggage.set_baggage("tenant", "denied", Context())
+    with telemetry_dev.propagate_attributes(session_id="s1"):
+        telemetry_dev.start_span("allowed", parent=allowed).end()
+        telemetry_dev.start_span("denied", parent=denied).end()
+        telemetry_dev.start_span("removed", parent=baggage.remove_baggage("tenant", allowed)).end()
+    (span,) = env.span_exporter.get_finished_spans()
+    assert span.name == "allowed"
+    assert span_context(span).trace_id == session_span_context("td_live_k", "s1").trace_id

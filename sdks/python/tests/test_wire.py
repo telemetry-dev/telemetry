@@ -110,13 +110,33 @@ def test_log_export_wire_format(server: CaptureServer) -> None:
 
 def test_no_posts_when_disabled() -> None:
     with otlp_capture_server() as capture:
-        telemetry_dev.init(
+        client = telemetry_dev.init(
             base_url=capture.url,
             log_level="silent",
             disable_atexit=True,
         )
-        telemetry_dev.start_span("nope", type="generation", input="x").end()
+        assert client.enabled is False
+        handle = telemetry_dev.start_span("nope", type="generation", input="x")
+        assert handle.traceparent() is None
+        handle.update(output="y")
+        handle.end()
+        telemetry_dev.update_current_span(output="y")
         telemetry_dev.log("nope")
         telemetry_dev.flush()
         telemetry_dev.shutdown()
         assert capture.requests == []
+
+
+def test_env_api_key_and_base_url_reach_the_wire(monkeypatch: pytest.MonkeyPatch) -> None:
+    with otlp_capture_server() as capture:
+        monkeypatch.setenv("TELEMETRY_DEV_API_KEY", "td_live_env")
+        monkeypatch.setenv("TELEMETRY_DEV_BASE_URL", f"{capture.url}//")
+        client = telemetry_dev.init(
+            export_mode="immediate", log_level="silent", disable_atexit=True
+        )
+        assert client.enabled is True
+        telemetry_dev.start_span("env").end()
+        telemetry_dev.flush()
+        (request,) = capture.requests_for("/v1/traces")
+        assert request.headers["authorization"] == "Bearer td_live_env"
+        telemetry_dev.shutdown()

@@ -9,14 +9,9 @@ import {
   TraceIdRatioBasedSampler,
 } from "@opentelemetry/sdk-trace-base";
 import { sessionSpanContext } from "@telemetry-dev/otel";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 
 import { telemetryDev } from "../src/index.ts";
-import { unknownErrorMessage } from "../src/shared.ts";
-
-test("unknown errors do not expose structured payloads", () => {
-  expect(unknownErrorMessage({ code: "tool_failed", secret: "private" })).toBe("[object Object]");
-});
 
 interface MetricRecord {
   metric: "duration" | "tokens";
@@ -299,40 +294,30 @@ test("missing or empty runtimeContext emits no identity or metadata attributes",
   }
 });
 
-test("onStepFinish is not implemented, so ai@7's step-end fan-out cannot double spans", async () => {
+test("ai@7 step-end fan-out records each step once", async () => {
+  const { generateText } = await import("ai");
+  const { MockLanguageModelV4 } = await import("ai/test");
   const { spanBatches, metrics, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
-  const callId = "call-dedupe";
 
-  const stepResult = {
-    callId,
-    stepNumber: 0,
-    model,
-    text: "once",
-    finishReason: "stop",
-    response: { id: "r1", modelId: "gpt-4o" },
-    usage: { inputTokens: 4, outputTokens: 2 },
-    performance: { responseTimeMs: 1000 },
-  };
-
-  integ.onStart?.({
-    callId,
-    operationId: "ai.generateText",
-    provider: "openai",
-    modelId: "gpt-4o",
-    messages: [{ role: "user", content: "x" }],
-  });
-  integ.onStepStart?.({ callId, stepNumber: 0 });
-  integ.onStepEnd?.(stepResult);
-  // ai@7 fans step-end out to BOTH onStepEnd and the deprecated onStepFinish, calling each
-  // implemented hook once. The integration must not declare onStepFinish, or every step would be
-  // recorded twice.
-  expect(Object.keys(integ)).not.toContain("onStepFinish");
-  await integ.onEnd?.({
-    callId,
-    text: "once",
-    finishReason: "stop",
-    usage: stepResult.usage,
+  // ai@7 fans step-end out to both onStepEnd and the deprecated onStepFinish, so an integration
+  // that implemented both would record every step twice.
+  await generateText({
+    model: new MockLanguageModelV4({
+      provider: "openai",
+      modelId: "gpt-4o",
+      doGenerate: {
+        content: [{ type: "text", text: "once" }],
+        finishReason: { unified: "stop", raw: "stop" },
+        usage: {
+          inputTokens: { total: 4, noCache: 4, cacheRead: undefined, cacheWrite: undefined },
+          outputTokens: { total: 2, text: 2, reasoning: undefined },
+        },
+        warnings: [],
+      },
+    }),
+    prompt: "x",
+    telemetry: { integrations: [integ] },
   });
 
   expect(spanBatches).toHaveLength(1);
@@ -340,6 +325,53 @@ test("onStepFinish is not implemented, so ai@7's step-end fan-out cannot double 
     byOperation(spanBatches[0]!, "chat").filter((s) => s.kind === SpanKind.CLIENT),
   ).toHaveLength(1);
   expect(metrics.filter((m) => m.metric === "duration")).toHaveLength(1);
+});
+
+test("no apiKey is a complete no-op (transport never invoked)", async () => {
+  vi.stubEnv("TELEMETRY_DEV_API_KEY", undefined);
+
+  try {
+    let calls = 0;
+
+    const integ = telemetryDev({
+      environment: "test",
+      serviceName: "svc",
+      fetch: async () => {
+        calls += 1;
+
+        return new Response(null, { status: 200 });
+      },
+    });
+
+    const callId = "no-key";
+
+    integ.onStart?.({
+      callId,
+      operationId: "ai.generateText",
+      provider: "openai",
+      modelId: "gpt-4o",
+      messages: [{ role: "user", content: "x" }],
+    });
+    integ.onStepStart?.({ callId, stepNumber: 0 });
+    integ.onStepEnd?.({
+      callId,
+      stepNumber: 0,
+      model,
+      text: "y",
+      finishReason: "stop",
+      usage: { inputTokens: 1, outputTokens: 1 },
+    });
+    await integ.onEnd?.({
+      callId,
+      text: "y",
+      finishReason: "stop",
+      usage: { inputTokens: 1, outputTokens: 1 },
+    });
+
+    expect(calls).toBe(0);
+  } finally {
+    vi.unstubAllEnvs();
+  }
 });
 
 test("two interleaved callIds on one integration produce disjoint traces per flush", async () => {
@@ -1147,10 +1179,25 @@ test("provider results recover the latest matching input from a later generation
   );
 });
 
-test("provider results recover inputs from prepareStep message replacements", async () => {
+test.each([
+  {
+    name: "prepareStep message replacements",
+    mutate: (call: { input: { query: string } }) => {
+      call.input = { query: "prepared" };
+    },
+    query: "prepared",
+  },
+  {
+    name: "nested history mutations",
+    mutate: (call: { input: { query: string } }) => {
+      call.input.query = "mutated";
+    },
+    query: "mutated",
+  },
+])("provider results recover inputs from $name", async ({ mutate, query }) => {
   const { spanBatches, overrides } = makeCapture();
   const integ = telemetryDev(baseOptions, overrides);
-  const callId = "call-provider-prepare-step-history";
+  const callId = `call-provider-history-${query}`;
 
   const providerCall = {
     type: "tool-call",
@@ -1166,7 +1213,7 @@ test("provider results recover inputs from prepareStep message replacements", as
     type: "tool-result",
     toolCallId: "deferred-tool",
     toolName: "web_search",
-    output: { result: "prepared result" },
+    output: { result: `${query} result` },
     providerExecuted: true,
   };
 
@@ -1177,7 +1224,7 @@ test("provider results recover inputs from prepareStep message replacements", as
     modelId: "gpt-4o",
     messages,
   });
-  providerCall.input = { query: "prepared" };
+  mutate(providerCall);
   integ.onStepStart?.({ callId, stepNumber: 0, messages });
   integ.onLanguageModelCallEnd?.({ callId, content: [providerResult] });
   integ.onStepEnd?.({
@@ -1199,71 +1246,9 @@ test("provider results recover inputs from prepareStep message replacements", as
   const tools = byOperation(spanBatches[0]!, "execute_tool");
 
   expect(tools).toHaveLength(1);
-  expect(tools[0]!.attributes["gen_ai.tool.call.arguments"]).toBe(
-    JSON.stringify({ query: "prepared" }),
-  );
+  expect(tools[0]!.attributes["gen_ai.tool.call.arguments"]).toBe(JSON.stringify({ query }));
   expect(tools[0]!.attributes["gen_ai.tool.call.result"]).toBe(
-    JSON.stringify({ result: "prepared result" }),
-  );
-});
-
-test("provider results recover inputs from nested history mutations", async () => {
-  const { spanBatches, overrides } = makeCapture();
-  const integ = telemetryDev(baseOptions, overrides);
-  const callId = "call-provider-history-nested-mutation";
-
-  const providerCall = {
-    type: "tool-call",
-    toolCallId: "deferred-tool",
-    toolName: "web_search",
-    input: { query: "initial" },
-    providerExecuted: true,
-  };
-
-  const messages = [{ role: "assistant", content: [providerCall] }];
-
-  const providerResult = {
-    type: "tool-result",
-    toolCallId: "deferred-tool",
-    toolName: "web_search",
-    output: { result: "mutated result" },
-    providerExecuted: true,
-  };
-
-  integ.onStart?.({
-    callId,
-    operationId: "ai.generateText",
-    provider: "openai",
-    modelId: "gpt-4o",
-    messages,
-  });
-  providerCall.input.query = "mutated";
-  integ.onStepStart?.({ callId, stepNumber: 0, messages });
-  integ.onLanguageModelCallEnd?.({ callId, content: [providerResult] });
-  integ.onStepEnd?.({
-    callId,
-    stepNumber: 0,
-    model,
-    content: [providerResult],
-    text: "done",
-    finishReason: "stop",
-    usage: { inputTokens: 1, outputTokens: 1 },
-  });
-  await integ.onEnd?.({
-    callId,
-    text: "done",
-    finishReason: "stop",
-    usage: { inputTokens: 1, outputTokens: 1 },
-  });
-
-  const tools = byOperation(spanBatches[0]!, "execute_tool");
-
-  expect(tools).toHaveLength(1);
-  expect(tools[0]!.attributes["gen_ai.tool.call.arguments"]).toBe(
-    JSON.stringify({ query: "mutated" }),
-  );
-  expect(tools[0]!.attributes["gen_ai.tool.call.result"]).toBe(
-    JSON.stringify({ result: "mutated result" }),
+    JSON.stringify({ result: `${query} result` }),
   );
 });
 
@@ -3840,6 +3825,13 @@ test.each([
           : undefined,
       );
     }
+
+    const exported = JSON.stringify(
+      spanBatches[0]!.map((span) => ({ attributes: span.attributes, events: span.events })),
+    );
+
+    expect(/private-action|private-policy/.test(exported)).toBe(recordInputs);
+    expect(exported.includes("probability")).toBe(recordOutputs);
   },
 );
 
@@ -3981,43 +3973,6 @@ test("evaluation hooks emit correlated root and model spans without duplicate to
     expect.objectContaining({ tokenType: "input", value: 12 }),
     expect.objectContaining({ tokenType: "output", value: 3 }),
   ]);
-});
-
-test("evaluation capture flags redact payloads while preserving identity and usage", async () => {
-  const { spanBatches, overrides } = makeCapture();
-  const integ = telemetryDev(baseOptions, overrides);
-  const callId = "evaluation-redacted";
-
-  integ.experimental_onEvaluateStart?.({
-    callId,
-    provider: "openai",
-    modelId: "judge",
-    state: { secret: "input" },
-    questions: { secret: { type: "score", question: "private" } },
-    recordInputs: false,
-    recordOutputs: false,
-  });
-  integ.experimental_onEvaluationModelCallStart?.({ callId });
-  integ.experimental_onEvaluationModelCallEnd?.({
-    callId,
-    answers: { secret: { type: "score", score: 1 } },
-    usage: { inputTokens: 4, outputTokens: 2 },
-  });
-  await integ.experimental_onEvaluateEnd?.({
-    callId,
-    provider: "openai",
-    modelId: "judge",
-    answers: { secret: { type: "score", score: 1 } },
-    usage: { inputTokens: 4, outputTokens: 2 },
-  });
-
-  const spans = spanBatches[0]!;
-  expect(JSON.stringify(spans.map((span) => span.attributes))).not.toContain("secret");
-  expect(spans.every((span) => span.attributes["gen_ai.input.messages"] === undefined)).toBe(true);
-  expect(spans.every((span) => span.attributes["gen_ai.output.messages"] === undefined)).toBe(true);
-  expect(
-    spans.find((span) => span.kind === SpanKind.CLIENT)?.attributes["gen_ai.usage.input_tokens"],
-  ).toBe(4);
 });
 
 test("overlapping evaluations stay isolated and errors clean up their call state", async () => {

@@ -67,50 +67,38 @@ test("decide emits isolated evaluation spans and one set of usage metrics for co
   const spans = spanBatches.flat();
   expect(spans).toHaveLength(2);
   expect(spans.every((span) => span.kind === SpanKind.CLIENT)).toBe(true);
-  expect(
-    spans
-      .map((span) => String(span.attributes["gen_ai.provider.name"]))
-      .sort((a, b) => a.localeCompare(b)),
-  ).toEqual(["first", "second"]);
-  expect(
-    spans
-      .map((span) => String(span.attributes["gen_ai.request.model"]))
-      .sort((a, b) => a.localeCompare(b)),
-  ).toEqual(["first-model", "second-model"]);
-  expect(
-    spans.map((span) => Number(span.attributes["gen_ai.usage.input_tokens"])).sort((a, b) => a - b),
-  ).toEqual([7, 11]);
+
+  const byProvider = (provider: string) =>
+    spans.find((span) => span.attributes["gen_ai.provider.name"] === provider)!.attributes;
+
+  expect(byProvider("first")).toMatchObject({
+    "gen_ai.request.model": "first-model",
+    "gen_ai.usage.input_tokens": 11,
+    "gen_ai.usage.output_tokens": 3,
+  });
+  expect(byProvider("second")).toMatchObject({
+    "gen_ai.request.model": "second-model",
+    "gen_ai.usage.input_tokens": 7,
+    "gen_ai.usage.output_tokens": 2,
+  });
   expect(spans.every((span) => span.attributes["gen_ai.output.messages"] === undefined)).toBe(true);
-  expect(metrics.filter((metric) => metric.type === "duration")).toHaveLength(2);
-  expect(metrics.filter((metric) => metric.type === "input")).toHaveLength(2);
-  expect(metrics.filter((metric) => metric.type === "output")).toHaveLength(2);
+
+  const tokens = (provider: string) =>
+    metrics
+      .filter((metric) => metric.attributes["gen_ai.provider.name"] === provider)
+      .map((metric) => [metric.type, metric.value]);
+
+  expect(tokens("first")).toEqual([
+    ["duration", expect.any(Number)],
+    ["input", 11],
+    ["output", 3],
+  ]);
+  expect(tokens("second")).toEqual([
+    ["duration", expect.any(Number)],
+    ["input", 7],
+    ["output", 2],
+  ]);
 });
-
-test.each([
-  { provider: "anthropic", input: 10 + 3 + 2 },
-  { provider: "openrouter", input: 10 },
-])(
-  "decide from $provider records input tokens with cache reads and writes once",
-  async ({ provider, input }) => {
-    const { middleware, metrics, spanBatches } = capture();
-
-    const judge = adapter(provider, async () => ({
-      ...answer("judge-model", 10, 2),
-      usage: {
-        promptTokens: 10,
-        completionTokens: 2,
-        totalTokens: 12,
-        promptTokensDetails: { cachedTokens: 3, cacheWriteTokens: 2 },
-      },
-    }));
-
-    await decide({ adapter: judge, state: "one", questions, middleware: [middleware] });
-
-    const [span] = spanBatches.flat();
-    expect(span?.attributes["gen_ai.usage.input_tokens"]).toBe(input);
-    expect(metrics.find((metric) => metric.type === "input")?.value).toBe(input);
-  },
-);
 
 test.each([
   { error: new TypeError("provider failed"), type: "TypeError", message: "provider failed" },

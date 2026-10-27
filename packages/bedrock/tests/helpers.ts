@@ -4,6 +4,7 @@ import {
   type ReadableSpan,
   type Sampler,
 } from "@opentelemetry/sdk-trace-base";
+import { HttpResponse } from "@smithy/protocol-http";
 
 import { init, shutdown, type MaskFn } from "@telemetry-dev/sdk";
 
@@ -60,6 +61,19 @@ export class FakeClient {
 
     return response;
   }
+}
+
+/** A Smithy request handler that answers every request with one JSON body, so a real client runs its own send. */
+export function jsonRequestHandler(requestId: string, body: unknown) {
+  return {
+    handle: async () => ({
+      response: new HttpResponse({
+        statusCode: 200,
+        headers: { "content-type": "application/json", "x-amzn-requestid": requestId },
+        body: new TextEncoder().encode(JSON.stringify(body)),
+      }),
+    }),
+  };
 }
 
 export async function collect<T>(iterable: AsyncIterable<T>, limit?: number): Promise<T[]> {

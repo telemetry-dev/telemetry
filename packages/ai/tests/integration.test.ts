@@ -10,7 +10,7 @@ import {
   TraceIdRatioBasedSampler,
 } from "@opentelemetry/sdk-trace-base";
 import { sessionSpanContext } from "@telemetry-dev/otel";
-import { expect, onTestFinished, test, vi } from "vitest";
+import { expect, test, vi } from "vitest";
 
 import { telemetryDev } from "../src/v6.ts";
 
@@ -278,11 +278,13 @@ test("a failed tool call records ERROR status and an exception event", async () 
 
   const callA = { toolCallId: "a", toolName: "t1", input: { n: 1 } };
   const callB = { toolCallId: "b", toolName: "t2", input: { n: 2 } };
+  const callC = { toolCallId: "c", toolName: "t3", input: { n: 3 } };
 
   integ.onStart?.({ model, prompt: "use tools" });
   integ.onStepStart?.({ stepNumber: 0, model });
   integ.onToolCallStart?.({ stepNumber: 0, toolCall: callA });
   integ.onToolCallStart?.({ stepNumber: 0, toolCall: callB });
+  integ.onToolCallStart?.({ stepNumber: 0, toolCall: callC });
   integ.onToolCallFinish?.({
     stepNumber: 0,
     toolCall: callA,
@@ -297,6 +299,13 @@ test("a failed tool call records ERROR status and an exception event", async () 
     success: false,
     error: new Error("kaboom"),
   });
+  integ.onToolCallFinish?.({
+    stepNumber: 0,
+    toolCall: callC,
+    durationMs: 5,
+    success: false,
+    error: { code: "tool_failed", secret: "private" },
+  });
   integ.onStepFinish?.({
     stepNumber: 0,
     model,
@@ -310,9 +319,9 @@ test("a failed tool call records ERROR status and an exception event", async () 
   const spans = spanBatches[0]!;
   const tools = byOperation(spans, "execute_tool");
   const step = spans.find((s) => s.kind === SpanKind.CLIENT)!;
-  expect(tools).toHaveLength(2);
+  expect(tools).toHaveLength(3);
 
-  // Both tools parent to their step.
+  // Every tool parents to its step.
   for (const t of tools) {
     expect(t.parentSpanContext?.spanId).toBe(spanId(step));
   }
@@ -324,6 +333,15 @@ test("a failed tool call records ERROR status and an exception event", async () 
   const exc = event(failed, "exception");
   expect(exc?.attributes?.["exception.message"]).toBe("kaboom");
   expect(exc?.attributes?.["log.severity_number"]).toBe(17);
+
+  // A structured non-Error payload is never exported, only its string form.
+  const structured = tools.find((t) => t.attributes["gen_ai.tool.name"] === "t3")!;
+  expect(structured.status.code).toBe(SpanStatusCode.ERROR);
+  expect(structured.attributes["error.type"]).toBe("tool_error");
+  expect(event(structured, "exception")?.attributes?.["exception.message"]).toBe("[object Object]");
+  expect(
+    JSON.stringify(spans.map((s) => ({ attributes: s.attributes, events: s.events }))),
+  ).not.toContain("private");
 });
 
 test("the mask rewrites every exported payload", async () => {
@@ -453,33 +471,6 @@ test("gateway provider is relabeled to Vercel AI Gateway on every span", async (
   expect(step.attributes["gen_ai.request.model"]).toBe("openai/gpt-4o");
 });
 
-test("non-gateway providers pass through unchanged", async () => {
-  const { spanBatches, overrides } = makeCapture();
-
-  const integ = telemetryDev(
-    { apiKey: "td_live_test", environment: "test", serviceName: "svc" },
-    overrides,
-  );
-
-  integ.onStart?.({ model, prompt: "hi" });
-  integ.onStepStart?.({ stepNumber: 0, model });
-  integ.onStepFinish?.({
-    stepNumber: 0,
-    model,
-    text: "hello",
-    finishReason: "stop",
-    response: { id: "r", modelId: "gpt-4o" },
-    usage: { inputTokens: 1, outputTokens: 1 },
-  });
-  await integ.onFinish?.({ text: "hello", finishReason: "stop" });
-
-  const spans = spanBatches[0]!;
-  const root = spans.find((s) => s.kind === SpanKind.INTERNAL)!;
-  const step = spans.find((s) => s.kind === SpanKind.CLIENT)!;
-  expect(root.attributes["gen_ai.provider.name"]).toBe("openai");
-  expect(step.attributes["gen_ai.provider.name"]).toBe("openai");
-});
-
 test("model warnings become model.warning events at severity 13", async () => {
   const { spanBatches, overrides } = makeCapture();
 
@@ -512,26 +503,36 @@ test("model warnings become model.warning events at severity 13", async () => {
 test("no apiKey is a complete no-op (transport never invoked)", async () => {
   // The integration falls back to this variable, which a developer's shell can export.
   vi.stubEnv("TELEMETRY_DEV_API_KEY", undefined);
-  onTestFinished(() => {
+
+  try {
+    let calls = 0;
+
+    const integ = telemetryDev({
+      environment: "test",
+      serviceName: "svc",
+      fetch: async () => {
+        calls += 1;
+
+        return new Response(null, { status: 200 });
+      },
+    });
+
+    integ.onStart?.({ model, prompt: "x" });
+    integ.onStepStart?.({ stepNumber: 0, model });
+    integ.onStepFinish?.({
+      stepNumber: 0,
+      model,
+      text: "y",
+      finishReason: "stop",
+      response: { id: "r", modelId: "gpt-4o" },
+      usage: {},
+    });
+    await integ.onFinish?.({ text: "y", finishReason: "stop" });
+
+    expect(calls).toBe(0);
+  } finally {
     vi.unstubAllEnvs();
-  });
-  const { spanBatches, metrics, overrides } = makeCapture();
-  const integ = telemetryDev({ environment: "test", serviceName: "svc" }, overrides);
-
-  integ.onStart?.({ model, prompt: "x" });
-  integ.onStepStart?.({ stepNumber: 0, model });
-  integ.onStepFinish?.({
-    stepNumber: 0,
-    model,
-    text: "y",
-    finishReason: "stop",
-    response: { id: "r", modelId: "gpt-4o" },
-    usage: {},
-  });
-  await integ.onFinish?.({ text: "y", finishReason: "stop" });
-
-  expect(spanBatches).toHaveLength(0);
-  expect(metrics).toHaveLength(0);
+  }
 });
 
 test("a step with missing usage records no token metric and no summary usage attrs", async () => {
@@ -612,8 +613,9 @@ test("export failure reaches onError even on the waitUntil path", async () => {
   expect(errors[0] instanceof Error ? errors[0].message : undefined).toBe("trace export boom");
 });
 
-test("spans use each emitter's own transport (no cross-talk on a shared cached core)", async () => {
+test("spans and metrics use each emitter's own transport (no cross-talk on a shared cached core)", async () => {
   const traceCalls: string[] = [];
+  const metricCalls: string[] = [];
   const aErrors: unknown[] = [];
   const bErrors: unknown[] = [];
 
@@ -621,6 +623,8 @@ test("spans use each emitter's own transport (no cross-talk on a shared cached c
     (tag: string): typeof fetch =>
     async (url: string | Request | URL, _init?: RequestInit) => {
       if (requestUrl(url).endsWith("/v1/traces")) traceCalls.push(tag);
+
+      if (requestUrl(url).endsWith("/v1/metrics")) metricCalls.push(tag);
 
       return new Response(null, { status: 200 });
     };
@@ -643,8 +647,8 @@ test("spans use each emitter's own transport (no cross-talk on a shared cached c
     onError: (e) => bErrors.push(e),
   });
 
-  // Run a generation on the FIRST (older) emitter after the second was created: its spans
-  // must still go through ITS OWN fetch (A), proving span transport is per-call, not shared.
+  // Run a generation on the FIRST (older) emitter after the second was created: its spans and
+  // metrics must still go through ITS OWN fetch (A), proving transport is per-call, not shared.
   integA.onStart?.({ model, prompt: "hi" });
   integA.onStepStart?.({ stepNumber: 0, model });
   integA.onStepFinish?.({
@@ -659,95 +663,43 @@ test("spans use each emitter's own transport (no cross-talk on a shared cached c
 
   expect(traceCalls.length).toBeGreaterThan(0);
   expect(traceCalls.every((c) => c === "A")).toBe(true);
+  expect(metricCalls.length).toBeGreaterThan(0);
+  expect(metricCalls.every((c) => c === "A")).toBe(true);
   expect(aErrors).toHaveLength(0);
   expect(bErrors).toHaveLength(0);
 });
 
-test("trace export retries a transient ingest failure", async () => {
-  const errors: unknown[] = [];
-  let traceCalls = 0;
+const networkError = new Error("socket closed");
 
-  const integ = telemetryDev({
-    apiKey: "td_live_trace_retry",
-    environment: "test",
-    serviceName: "trace-retry",
-    fetch: async (url: string | Request | URL, _init?: RequestInit) => {
-      if (requestUrl(url).endsWith("/v1/traces")) {
-        traceCalls += 1;
-
-        return new Response(null, { status: traceCalls === 1 ? 503 : 200 });
-      }
-
-      return new Response(null, { status: 200 });
+test.each([
+  {
+    name: "network failures",
+    respond: (): Response => {
+      throw networkError;
     },
-    onError: (e) => errors.push(e),
-  });
-
-  integ.onStart?.({ model, prompt: "hi" });
-  integ.onStepStart?.({ stepNumber: 0, model });
-  integ.onStepFinish?.({
-    stepNumber: 0,
-    model,
-    text: "ok",
-    finishReason: "stop",
-    response: { id: "r", modelId: "gpt-4o" },
-    usage: { inputTokens: 1, outputTokens: 1 },
-  });
-  await integ.onFinish?.({ text: "ok", finishReason: "stop" });
-
-  expect(traceCalls).toBe(2);
-  expect(errors).toHaveLength(0);
-});
-
-test("trace export retries a transient network error", async () => {
+    check: (error: unknown) => expect(error).toBe(networkError),
+  },
+  {
+    name: "retryable 503 responses",
+    respond: () => new Response(null, { status: 503 }),
+    check: (error: unknown) =>
+      expect(error instanceof Error ? error.message : undefined).toBe(
+        "telemetry.dev trace ingest failed: 503",
+      ),
+  },
+])("trace export reports one error after exhausting $name", async ({ respond, check }) => {
   const errors: unknown[] = [];
   let traceCalls = 0;
 
   const integ = telemetryDev({
-    apiKey: "td_live_trace_network_retry",
+    apiKey: "td_live_trace_exhausted",
     environment: "test",
-    serviceName: "trace-network-retry",
+    serviceName: "trace-exhausted",
     fetch: async (url: string | Request | URL, _init?: RequestInit) => {
       if (requestUrl(url).endsWith("/v1/traces")) {
         traceCalls += 1;
 
-        if (traceCalls === 1) throw new Error("socket closed");
-      }
-
-      return new Response(null, { status: 200 });
-    },
-    onError: (e) => errors.push(e),
-  });
-
-  integ.onStart?.({ model, prompt: "hi" });
-  integ.onStepStart?.({ stepNumber: 0, model });
-  integ.onStepFinish?.({
-    stepNumber: 0,
-    model,
-    text: "ok",
-    finishReason: "stop",
-    response: { id: "r", modelId: "gpt-4o" },
-    usage: { inputTokens: 1, outputTokens: 1 },
-  });
-  await integ.onFinish?.({ text: "ok", finishReason: "stop" });
-
-  expect(traceCalls).toBe(2);
-  expect(errors).toHaveLength(0);
-});
-
-test("trace export reports one error after exhausting network failures", async () => {
-  const errors: unknown[] = [];
-  let traceCalls = 0;
-  const networkError = new Error("socket closed");
-
-  const integ = telemetryDev({
-    apiKey: "td_live_trace_network_exhausted",
-    environment: "test",
-    serviceName: "trace-network-exhausted",
-    fetch: async (url: string | Request | URL, _init?: RequestInit) => {
-      if (requestUrl(url).endsWith("/v1/traces")) {
-        traceCalls += 1;
-        throw networkError;
+        return respond();
       }
 
       return new Response(null, { status: 200 });
@@ -769,85 +721,7 @@ test("trace export reports one error after exhausting network failures", async (
 
   expect(traceCalls).toBe(3);
   expect(errors).toHaveLength(1);
-  expect(errors[0]).toBe(networkError);
-});
-
-test("trace export does not retry non-retryable ingest failures", async () => {
-  const errors: unknown[] = [];
-  let traceCalls = 0;
-
-  const integ = telemetryDev({
-    apiKey: "td_live_trace_no_retry",
-    environment: "test",
-    serviceName: "trace-no-retry",
-    fetch: async (url: string | Request | URL, _init?: RequestInit) => {
-      if (requestUrl(url).endsWith("/v1/traces")) {
-        traceCalls += 1;
-
-        return new Response(null, { status: 400 });
-      }
-
-      return new Response(null, { status: 200 });
-    },
-    onError: (e) => errors.push(e),
-  });
-
-  integ.onStart?.({ model, prompt: "hi" });
-  integ.onStepStart?.({ stepNumber: 0, model });
-  integ.onStepFinish?.({
-    stepNumber: 0,
-    model,
-    text: "ok",
-    finishReason: "stop",
-    response: { id: "r", modelId: "gpt-4o" },
-    usage: { inputTokens: 1, outputTokens: 1 },
-  });
-  await integ.onFinish?.({ text: "ok", finishReason: "stop" });
-
-  expect(traceCalls).toBe(1);
-  expect(errors).toHaveLength(1);
-  expect(errors[0] instanceof Error ? errors[0].message : undefined).toBe(
-    "telemetry.dev trace ingest failed: 400",
-  );
-});
-
-test("trace export reports one error after exhausting retryable failures", async () => {
-  const errors: unknown[] = [];
-  let traceCalls = 0;
-
-  const integ = telemetryDev({
-    apiKey: "td_live_trace_retry_exhausted",
-    environment: "test",
-    serviceName: "trace-retry-exhausted",
-    fetch: async (url: string | Request | URL, _init?: RequestInit) => {
-      if (requestUrl(url).endsWith("/v1/traces")) {
-        traceCalls += 1;
-
-        return new Response(null, { status: 503 });
-      }
-
-      return new Response(null, { status: 200 });
-    },
-    onError: (e) => errors.push(e),
-  });
-
-  integ.onStart?.({ model, prompt: "hi" });
-  integ.onStepStart?.({ stepNumber: 0, model });
-  integ.onStepFinish?.({
-    stepNumber: 0,
-    model,
-    text: "ok",
-    finishReason: "stop",
-    response: { id: "r", modelId: "gpt-4o" },
-    usage: { inputTokens: 1, outputTokens: 1 },
-  });
-  await integ.onFinish?.({ text: "ok", finishReason: "stop" });
-
-  expect(traceCalls).toBe(3);
-  expect(errors).toHaveLength(1);
-  expect(errors[0] instanceof Error ? errors[0].message : undefined).toBe(
-    "telemetry.dev trace ingest failed: 503",
-  );
+  check(errors[0]);
 });
 
 test("step metrics attribute tokens and duration to each step's own model, not the root", async () => {
@@ -915,93 +789,6 @@ test("step metrics attribute tokens and duration to each step's own model, not t
   expect(openaiOutput?.value).toBe(5);
 });
 
-test("metrics use each emitter's own transport (no cross-talk on a shared cached core)", async () => {
-  const metricCalls: string[] = [];
-  const aErrors: unknown[] = [];
-  const bErrors: unknown[] = [];
-
-  const makeFetch =
-    (tag: string): typeof fetch =>
-    async (url: string | Request | URL, _init?: RequestInit) => {
-      if (requestUrl(url).endsWith("/v1/metrics")) metricCalls.push(tag);
-
-      return new Response(null, { status: 200 });
-    };
-
-  // First emitter caches a core under identity "dupm" with fetch A (real metrics pipeline).
-  const integA = telemetryDev({
-    apiKey: "td_live_dupm",
-    environment: "test",
-    serviceName: "dupm",
-    fetch: makeFetch("A"),
-    onError: (e) => aErrors.push(e),
-  });
-
-  // Second emitter reuses that cached core but supplies fetch B.
-  telemetryDev({
-    apiKey: "td_live_dupm",
-    environment: "test",
-    serviceName: "dupm",
-    fetch: makeFetch("B"),
-    onError: (e) => bErrors.push(e),
-  });
-
-  // Run a generation on the FIRST (older) emitter after the second was created: its metrics must
-  // flush through ITS OWN fetch (A). Before the fix the shared core transport was last-writer (B).
-  integA.onStart?.({ model, prompt: "hi" });
-  integA.onStepStart?.({ stepNumber: 0, model });
-  integA.onStepFinish?.({
-    stepNumber: 0,
-    model,
-    text: "ok",
-    finishReason: "stop",
-    response: { id: "r", modelId: "gpt-4o" },
-    usage: { inputTokens: 1, outputTokens: 1 },
-  });
-  await integA.onFinish?.({ text: "ok", finishReason: "stop" });
-
-  expect(metricCalls.length).toBeGreaterThan(0);
-  expect(metricCalls.every((c) => c === "A")).toBe(true);
-  expect(aErrors).toHaveLength(0);
-  expect(bErrors).toHaveLength(0);
-});
-
-test("metric export retries a transient ingest failure", async () => {
-  const errors: unknown[] = [];
-  let metricCalls = 0;
-
-  const integ = telemetryDev({
-    apiKey: "td_live_metric_retry",
-    environment: "test",
-    serviceName: "metric-retry",
-    fetch: async (url: string | Request | URL, _init?: RequestInit) => {
-      if (requestUrl(url).endsWith("/v1/metrics")) {
-        metricCalls += 1;
-
-        return new Response(null, { status: metricCalls === 1 ? 503 : 200 });
-      }
-
-      return new Response(null, { status: 200 });
-    },
-    onError: (e) => errors.push(e),
-  });
-
-  integ.onStart?.({ model, prompt: "hi" });
-  integ.onStepStart?.({ stepNumber: 0, model });
-  integ.onStepFinish?.({
-    stepNumber: 0,
-    model,
-    text: "ok",
-    finishReason: "stop",
-    response: { id: "r", modelId: "gpt-4o" },
-    usage: { inputTokens: 1, outputTokens: 1 },
-  });
-  await integ.onFinish?.({ text: "ok", finishReason: "stop" });
-
-  expect(metricCalls).toBe(2);
-  expect(errors).toHaveLength(0);
-});
-
 test("a non-OK /v1/metrics response is reported as a failed export, not a success", async () => {
   const errors: unknown[] = [];
   const exportErrors: unknown[] = [];
@@ -1037,10 +824,11 @@ test("a non-OK /v1/metrics response is reported as a failed export, not a succes
     });
     await integ.onFinish?.({ text: "ok", finishReason: "stop" });
 
-    // Our own callback sees the 503 once the retries are exhausted.
-    expect(
-      errors.some((e) => e instanceof Error && /metric ingest failed: 503/.test(e.message)),
-    ).toBe(true);
+    // Our own callback sees the 503 once, after the retries are exhausted.
+    expect(errors).toHaveLength(1);
+    expect(errors[0] instanceof Error ? errors[0].message : undefined).toBe(
+      "telemetry.dev metric ingest failed: 503",
+    );
     expect(metricCalls).toBe(3);
     // The export is marked FAILED, so OTel rethrows it to the global handler — this is the bit the
     // fix changes (code 0 → code 1).

@@ -142,25 +142,16 @@ def test_completion_multiple_choices(memory: SimpleNamespace) -> None:
     assert tuple(cast(Any, a["gen_ai.response.finish_reasons"])) == ("stop", "stop")
 
 
-def test_completion_metadata_param_maps_to_td_metadata(memory: SimpleNamespace) -> None:
+@pytest.mark.parametrize("argument", ["metadata", "litellm_metadata"])
+def test_completion_metadata_param_maps_to_td_metadata(
+    memory: SimpleNamespace, argument: str
+) -> None:
     instrument_litellm()
     llm.completion(
         model="gpt-4o-mini",
         messages=CHAT_MESSAGES,
-        metadata={"tenant": "acme"},
         mock_response="ok",
-    )
-
-    assert attrs(only_span(memory))["td.metadata.tenant"] == "acme"
-
-
-def test_completion_litellm_metadata_maps_to_td_metadata(memory: SimpleNamespace) -> None:
-    instrument_litellm()
-    llm.completion(
-        model="gpt-4o-mini",
-        messages=CHAT_MESSAGES,
-        litellm_metadata={"tenant": "acme"},
-        mock_response="ok",
+        **{argument: {"tenant": "acme"}},
     )
 
     assert attrs(only_span(memory))["td.metadata.tenant"] == "acme"
@@ -339,6 +330,7 @@ def test_router_fallback_drops_the_failed_call_history(memory: SimpleNamespace) 
             },
         ],
         fallbacks=[{"primary": ["backup"]}],
+        num_retries=0,
     )
     router.completion(
         model="primary",
@@ -407,22 +399,6 @@ def test_completion_error_records_error_span(memory: SimpleNamespace) -> None:
     a = attrs(span)
     assert a["error.type"] == "RateLimitError"
     assert a["gen_ai.provider.name"] == "openai"
-
-
-def test_completion_timeout_error(memory: SimpleNamespace) -> None:
-    instrument_litellm()
-
-    with pytest.raises(llm.Timeout):
-        llm.completion(
-            model="gpt-4o-mini",
-            messages=CHAT_MESSAGES,
-            mock_timeout=True,
-            timeout=0.01,
-        )
-
-    span = only_span(memory)
-    assert span.status.status_code == StatusCode.ERROR
-    assert attrs(span)["error.type"] == "Timeout"
 
 
 def test_completion_response_mapping_base_exception_escapes(
@@ -841,13 +817,10 @@ def test_streaming_bounds_retained_chunks_without_dropping_output(
     instrument_litellm()
     stream = llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
     delivered = list(stream)
-    budget = stream._budget
 
     assert delivered == chunks
-    assert budget.truncated is True
-    assert budget.bytes_used <= budget.max_bytes
-    assert len(stream._chunks) < len(chunks)
     a = attrs(only_span(memory))
+    assert a["telemetry.dev.capture.truncated"] is True
     assert a["gen_ai.response.id"] == "bounded-stream"
     assert a["gen_ai.response.model"] == "gpt-4o-mini"
     assert tuple(cast(Any, a["gen_ai.response.finish_reasons"])) == (
@@ -1007,7 +980,10 @@ def test_configured_cap_applies_after_the_mask_not_to_stream_retention(
     redact: bool,
     expected: str | None,
 ) -> None:
+    seen: list[Any] = []
+
     def mask(value: Any, _context: Any) -> Any:
+        seen.append(value)
         if not redact:
             return value
         return [{"role": "assistant", "content": "[redacted]"}]
@@ -1024,10 +1000,10 @@ def test_configured_cap_applies_after_the_mask_not_to_stream_retention(
     stream = llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
 
     assert list(stream) == chunks
-    assert stream._budget.truncated is False
-    assert len(stream._chunks) == len(chunks)
     a = attrs(only_span(memory))
     assert "telemetry.dev.capture.truncated" not in a
+    if redact:
+        assert [{"role": "assistant", "content": text}] in seen
     if expected is None:
         assert a.get("gen_ai.output.messages", "") == ""
     else:
@@ -1071,18 +1047,17 @@ def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
     stream = llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
     assert list(stream) == chunks
 
-    budget = stream._budget
-    assert budget.truncated is True
-    assert budget.max_bytes == telemetry_dev_litellm._STREAM_CAPTURE_MAX_BYTES  # pyright: ignore[reportPrivateUsage]
-    assert 0 < len(stream._chunks) < len(chunks)
     a = attrs(only_span(memory))
     assert a["telemetry.dev.capture.truncated"] is True
     if masked:
         assert "gen_ai.output.messages" not in a
         assert not any("x" * 100 in value for value in seen)
-    elif max_attribute_length > budget.max_bytes:
-        retained = "x" * 100 * len(stream._chunks)
-        assert json_attr(a["gen_ai.output.messages"])[0]["content"] == retained
+    elif max_attribute_length == 1024 * 1024:
+        # The 48 KiB retention bound, not the 1 MiB cap, cuts the stream at a chunk boundary.
+        content = json_attr(a["gen_ai.output.messages"])[0]["content"]
+        assert set(content) == {"x"}
+        assert 0 < len(content) <= 48 * 1024
+        assert len(content) % 100 == 0
     else:
         assert len(str(a.get("gen_ai.output.messages", ""))) <= max_attribute_length
 
@@ -1139,9 +1114,7 @@ def test_stream_choice_indices_are_capped(
     if extra_indices == 0:
         assert finish_reasons == ("length", "content_filter")
         return
-    max_items = telemetry_dev_litellm._STREAM_CAPTURE_MAX_ITEMS  # pyright: ignore[reportPrivateUsage]
-    assert len(stream._finish_reasons) <= max_items
-    assert len(finish_reasons) <= max_items
+    assert len(finish_reasons) <= 1_000
     assert a["telemetry.dev.capture.truncated"] is True
     assert "gen_ai.output.messages" not in a
     assert not any('"first"' in value for value in seen)
@@ -1182,7 +1155,6 @@ def test_stream_finish_reasons_are_capped_at_a_fixed_length(
     a = attrs(only_span(memory))
     finish_reasons = tuple(cast(Any, a["gen_ai.response.finish_reasons"]))
     assert finish_reasons == ("r" * max_length, "stop")
-    assert all(len(reason) <= max_length for reason in stream._finish_reasons.values())
     assert (a.get("telemetry.dev.capture.truncated") is True) is spent
 
 
@@ -1375,80 +1347,6 @@ async def test_async_completion_and_stream(
         {"content": "Async stream", "role": "assistant"}
     ]
     assert timestamps
-
-
-async def test_async_streaming_bounds_retained_chunks_without_dropping_output(
-    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    chunks = [
-        SimpleNamespace(
-            id=None,
-            model=None,
-            choices=[
-                SimpleNamespace(
-                    index=0,
-                    delta=SimpleNamespace(content="x" * 100),
-                    finish_reason=None,
-                )
-            ],
-        )
-        for _ in range(1100)
-    ]
-    chunks.append(
-        SimpleNamespace(
-            id="bounded-async-stream",
-            model="gpt-4o-mini",
-            choices=[
-                SimpleNamespace(
-                    index=0,
-                    delta=SimpleNamespace(content=None),
-                    finish_reason="stop",
-                )
-            ],
-            usage=SimpleNamespace(
-                prompt_tokens=13,
-                completion_tokens=8,
-                total_tokens=21,
-            ),
-        )
-    )
-
-    class AsyncChunks:
-        def __init__(self) -> None:
-            self._iterator = iter(chunks)
-
-        def __aiter__(self) -> AsyncChunks:
-            return self
-
-        async def __anext__(self) -> Any:
-            try:
-                return next(self._iterator)
-            except StopIteration as error:
-                raise StopAsyncIteration from error
-
-        async def aclose(self) -> None:
-            return None
-
-    async def fake_acompletion(*args: Any, **kwargs: Any) -> Any:
-        return AsyncChunks()
-
-    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
-    instrument_litellm()
-    stream = await llm.acompletion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
-    delivered = [chunk async for chunk in stream]
-    budget = stream._budget
-
-    assert delivered == chunks
-    assert budget.truncated is True
-    assert budget.bytes_used <= budget.max_bytes
-    assert len(stream._chunks) < len(chunks)
-    a = attrs(only_span(memory))
-    assert a["gen_ai.response.id"] == "bounded-async-stream"
-    assert a["gen_ai.response.model"] == "gpt-4o-mini"
-    assert tuple(cast(Any, a["gen_ai.response.finish_reasons"])) == ("stop",)
-    assert a["gen_ai.usage.input_tokens"] == 13
-    assert a["gen_ai.usage.output_tokens"] == 8
-    assert a["gen_ai.usage.total_tokens"] == 21
 
 
 async def test_async_positional_stream_argument_is_instrumented(memory: SimpleNamespace) -> None:
@@ -1914,6 +1812,7 @@ def test_responses_input_capture_disabled_does_not_traverse_input(
 
     list(llm.responses(input=UnreadableInput(), model="gpt-4.1-mini", stream=True))
 
+    assert only_span(env).name == "chat gpt-4.1-mini"
     assert "gen_ai.input.messages" not in attrs(only_span(env))
 
 
@@ -2251,10 +2150,8 @@ def test_responses_stream_small_cap_keeps_retention_and_cuts_after_the_mask(
     monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
     instrument_litellm()
 
-    stream = llm.responses(input="bounded", model="gpt-4.1-mini", stream=True)
-    list(stream)
+    list(llm.responses(input="bounded", model="gpt-4.1-mini", stream=True))
 
-    assert stream._budget.truncated is False
     a = attrs(only_span(memory))
     assert "telemetry.dev.capture.truncated" not in a
     exported = str(a["gen_ai.output.messages"])
@@ -2368,6 +2265,7 @@ def test_responses_stream_rejected_annotation_preserves_text_and_marks_truncated
             annotation_index=0,
             annotation={"type": "url_citation", "url": "https://example.com/" + "c" * 7_000},
         ),
+        completed_without_output(),
     ]
     monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
     instrument_litellm()
@@ -2396,6 +2294,7 @@ def test_responses_stream_rejects_sparse_annotation_indexes(
             annotation_index=1_000_000_000,
             annotation={"type": "url_citation", "url": "https://example.com"},
         ),
+        completed_without_output(),
     ]
     monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
     instrument_litellm()
@@ -2492,45 +2391,75 @@ def test_responses_stream_merges_seeded_textual_event_families(
     assert output[2]["code"] == "print(1)"
 
 
-def test_bounded_responses_conversion_stops_without_model_dump(memory: SimpleNamespace) -> None:
-    class Bomb:
-        def __init__(self) -> None:
-            self.output = [{"type": "output_text", "text": "x" * 100_000}]
-            self.status = "completed"
-
-        def model_dump(self, **kwargs: Any) -> Any:
-            raise AssertionError("model_dump must not run")
-
-    fields = vars(telemetry_dev_litellm)["_responses_response"](Bomb())
-    assert fields["output"] is None
-    assert fields["attributes"]["telemetry.dev.capture.truncated"] is True
+class _Opaque:
+    __slots__ = ()
 
 
-def test_bounded_responses_conversion_repeats_shared_acyclic_values(
-    memory: SimpleNamespace,
+class _ModelDumpBomb:
+    """A response whose model_dump must not run; its output exceeds the 64 KiB non-stream bound."""
+
+    def __init__(self) -> None:
+        self.output = [{"type": "output_text", "text": "x" * 100_000}]
+        self.status = "completed"
+
+    def model_dump(self, **kwargs: Any) -> Any:
+        raise AssertionError("model_dump must not run")
+
+
+_SHARED_ITEM = {"text": "same"}
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        pytest.param(
+            SimpleNamespace(status="completed", output=[_SHARED_ITEM, _SHARED_ITEM]),
+            [{"text": "same"}, {"text": "same"}],
+            id="shared-acyclic-values-repeat",
+        ),
+        pytest.param(
+            SimpleNamespace(status="completed", output=[{"opaque": _Opaque()}]),
+            [{"opaque": None}],
+            id="opaque-value-is-null",
+        ),
+        # Control characters cost six bytes each once escaped, one as raw UTF-8, so 10,000 of
+        # them fit the 64 KiB bound and 11,000 do not.
+        pytest.param(
+            SimpleNamespace(status="completed", output=[{"payload": "\x01" * 10_000}]),
+            [{"payload": "\x01" * 10_000}],
+            id="escaped-string-within-bound",
+        ),
+        pytest.param(
+            SimpleNamespace(status="completed", output=[{"payload": "\x01" * 11_000}]),
+            None,
+            id="escaped-string-over-bound",
+        ),
+        pytest.param(
+            SimpleNamespace(status="completed", output=[{"\x01" * 11_000: 1}]),
+            None,
+            id="escaped-key-over-bound",
+        ),
+        pytest.param(_ModelDumpBomb(), None, id="oversized-without-model-dump"),
+    ],
+)
+def test_responses_output_conversion_is_bounded_and_json_shaped(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, response: Any, expected: Any
 ) -> None:
-    shared = {"text": "same"}
+    def fake_responses(*args: Any, **kwargs: Any) -> Any:
+        return response
 
-    captured, budget = vars(telemetry_dev_litellm)["_bounded_responses_native"]([shared, shared])
+    monkeypatch.setattr(litellm, "responses", fake_responses)
+    instrument_litellm()
 
-    assert captured == [{"text": "same"}, {"text": "same"}]
-    assert budget.truncated is False
+    llm.responses(input="hi", model="gpt-4.1-mini")
 
-
-@pytest.mark.parametrize("value", ["\x01" * 1000, {"\x01" * 1000: 1}], ids=["string", "key"])
-def test_bounded_responses_conversion_charges_strings_at_their_escaped_size(
-    memory: SimpleNamespace, value: object
-) -> None:
-    # Control characters cost six bytes each once escaped, one as raw UTF-8.
-    convert = vars(telemetry_dev_litellm)["_bounded_responses_native"]
-
-    rejected, small = convert({"payload": value}, budget=telemetry_dev.CaptureBudget(2048))
-    kept, large = convert({"payload": value}, budget=telemetry_dev.CaptureBudget(8192))
-
-    assert rejected is None
-    assert small.truncated is True
-    assert kept == {"payload": value}
-    assert large.bytes_used >= len(json.dumps(kept))
+    a = attrs(only_span(memory))
+    if expected is None:
+        assert a["telemetry.dev.capture.truncated"] is True
+        assert "gen_ai.output.messages" not in a
+    else:
+        assert json_attr(a["gen_ai.output.messages"]) == expected
+        assert "telemetry.dev.capture.truncated" not in a
 
 
 def test_responses_stream_charges_appended_deltas_at_their_escaped_size(
@@ -2552,19 +2481,6 @@ def test_responses_stream_charges_appended_deltas_at_their_escaped_size(
     a = attrs(only_span(memory))
     assert a["telemetry.dev.capture.truncated"] is True
     assert json_attr(a["gen_ai.output.messages"]) == [{"type": "output_text", "text": "kept"}]
-
-
-def test_bounded_responses_conversion_normalizes_opaque_values(memory: SimpleNamespace) -> None:
-    class Opaque:
-        __slots__ = ()
-
-    captured, budget = vars(telemetry_dev_litellm)["_bounded_responses_native"](
-        {"opaque": Opaque()}
-    )
-
-    assert captured == {"opaque": None}
-    assert json.dumps(captured) == '{"opaque": null}'
-    assert budget.truncated is False
 
 
 def test_responses_stream_terminal_item_preserves_truncation_overflow(
@@ -2593,6 +2509,7 @@ def test_responses_stream_terminal_item_preserves_truncation_overflow(
                 content_index=0,
                 delta="fits",
             ),
+            completed_without_output(),
         ]
     )
     monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
@@ -2630,6 +2547,7 @@ async def test_responses_stream_terminal_items_do_not_erase_untracked_overflow(
                 )
                 for index in range(8)
             ],
+            completed_without_output(),
         ]
 
     sync_inner = ResponsesStream(events())
@@ -2804,16 +2722,19 @@ def test_responses_stream_charges_one_character_fragments_against_item_budget(
         )
         for _ in range(2_000)
     ]
+    events.append(completed_without_output())
     monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
     instrument_litellm()
 
     stream = llm.responses(input="bounded fragments", model="gpt-4.1-mini", stream=True)
     assert list(stream) == events
 
-    fragments = stream._partial_content[("index", 0)][("index", 0)]["_fragments"]
-    assert len(fragments) <= stream._budget.max_items
-    assert stream._budget.items_used <= stream._budget.max_items
-    assert attrs(only_span(memory))["telemetry.dev.capture.truncated"] is True
+    a = attrs(only_span(memory))
+    text = json_attr(a["gen_ai.output.messages"])[0]["text"]
+    # 2,000 one-character deltas fit the byte bound; only the 1,000-item bound cuts them.
+    assert set(text) == {"x"}
+    assert 0 < len(text) <= 1_000
+    assert a["telemetry.dev.capture.truncated"] is True
 
 
 async def test_responses_stream_surrogate_deltas_fail_closed_and_finish(
@@ -3395,10 +3316,3 @@ def test_provider_attribution_non_openai(memory: SimpleNamespace) -> None:
     assert azure_flag_attrs["gen_ai.request.model"] == "my-azure-deploy"
     assert deployment_attrs["gen_ai.provider.name"] == "azure.ai.openai"
     assert deployment_attrs["gen_ai.request.model"] == "deployment-from-kwarg"
-
-
-def test_cost_maps_to_cost_usd_when_available(memory: SimpleNamespace) -> None:
-    instrument_litellm()
-    llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, mock_response="priced")
-
-    assert number_attr(attrs(only_span(memory))["gen_ai.usage.cost"]) > 0

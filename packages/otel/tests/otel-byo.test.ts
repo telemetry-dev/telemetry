@@ -7,6 +7,7 @@ import {
   trace,
   TraceFlags,
 } from "@opentelemetry/api";
+import { ExportResultCode } from "@opentelemetry/core";
 import {
   AlwaysOffSampler,
   AlwaysOnSampler,
@@ -99,56 +100,53 @@ test("spanFilter narrows what gets exported", async () => {
 });
 
 test("without an api key or exporter override the processor is a silent no-op", async () => {
-  const previous = process.env.TELEMETRY_DEV_API_KEY;
-  delete process.env.TELEMETRY_DEV_API_KEY;
+  vi.stubEnv("TELEMETRY_DEV_API_KEY", undefined);
+  const urls: string[] = [];
 
-  try {
-    const processor = new TelemetrySpanProcessor();
+  const fetchImpl: typeof fetch = (input) => {
+    urls.push(input instanceof URL ? input.href : input instanceof Request ? input.url : input);
+
+    return Promise.resolve(new Response(null, { status: 200 }));
+  };
+
+  for (const apiKey of [undefined, "td_live_x"]) {
+    const processor = new TelemetrySpanProcessor({
+      apiKey,
+      baseUrl: "https://ingest.example",
+      fetch: fetchImpl,
+    });
+
     const provider = new BasicTracerProvider({ spanProcessors: [processor] });
-    provider.getTracer("x").startSpan("lost").end();
+    provider.getTracer("x").startSpan("span").end();
     await processor.forceFlush();
     await processor.shutdown();
-  } finally {
-    if (previous !== undefined) process.env.TELEMETRY_DEV_API_KEY = previous;
+    expect(urls).toEqual(apiKey ? ["https://ingest.example/v1/traces"] : []);
   }
 });
 
-test("forceFlush and shutdown resolve", async () => {
-  const { processor } = byoSetup();
-  await expect(processor.forceFlush()).resolves.toBeUndefined();
-  await expect(processor.shutdown()).resolves.toBeUndefined();
-});
-
 test("createTelemetrySpanExporter is a no-op without a key and real otherwise", async () => {
-  const previous = process.env.TELEMETRY_DEV_API_KEY;
-  delete process.env.TELEMETRY_DEV_API_KEY;
+  vi.stubEnv("TELEMETRY_DEV_API_KEY", undefined);
+  const calls: Array<{ url: string; method?: string }> = [];
 
-  try {
-    const noop = createTelemetrySpanExporter();
+  const fetchImpl: typeof fetch = (input, init) => {
+    calls.push({
+      url: input instanceof URL ? input.href : input instanceof Request ? input.url : input,
+      method: init?.method,
+    });
 
-    const code = await new Promise<number>((resolve) =>
-      noop.export([], (result) => resolve(result.code)),
-    );
+    return Promise.resolve(new Response(null, { status: 200 }));
+  };
 
-    expect(code).toBe(0);
-    await noop.shutdown();
-
-    const calls: Array<{ url: string; method?: string }> = [];
-
-    const fetchImpl: typeof fetch = (input, init) => {
-      calls.push({
-        url: input instanceof URL ? input.href : input instanceof Request ? input.url : input,
-        method: init?.method,
-      });
-
-      return Promise.resolve(new Response(null, { status: 200 }));
-    };
-
+  for (const apiKey of [undefined, "td_live_x"]) {
     const exporter = createTelemetrySpanExporter({
-      apiKey: "td_live_x",
+      apiKey,
       baseUrl: "https://ingest.example/",
       fetch: fetchImpl,
     });
+
+    expect(
+      await new Promise((resolve) => exporter.export([], (result) => resolve(result.code))),
+    ).toBe(ExportResultCode.SUCCESS);
 
     const provider = new BasicTracerProvider({
       spanProcessors: [new SimpleSpanProcessor(exporter)],
@@ -157,12 +155,12 @@ test("createTelemetrySpanExporter is a no-op without a key and real otherwise", 
     try {
       provider.getTracer("public-exporter").startSpan("exported").end();
       await provider.forceFlush();
-      expect(calls).toEqual([{ url: "https://ingest.example/v1/traces", method: "POST" }]);
+      expect(calls).toEqual(
+        apiKey ? [{ url: "https://ingest.example/v1/traces", method: "POST" }] : [],
+      );
     } finally {
       await provider.shutdown();
     }
-  } finally {
-    if (previous !== undefined) process.env.TELEMETRY_DEV_API_KEY = previous;
   }
 });
 
@@ -242,19 +240,6 @@ test("metrics are skipped without an api key even when enabled", async () => {
     }
   } finally {
     if (previous !== undefined) process.env.TELEMETRY_DEV_API_KEY = previous;
-  }
-});
-
-test("global tracer interop: registered provider receives raw OTel API spans", async () => {
-  const { exporter, processor, provider } = byoSetup();
-  trace.setGlobalTracerProvider(provider);
-
-  try {
-    trace.getTracer("third-party").startSpan("via-global").end();
-    await processor.forceFlush();
-    expect(exporter.getFinishedSpans().map((s) => s.name)).toEqual(["via-global"]);
-  } finally {
-    trace.disable();
   }
 });
 

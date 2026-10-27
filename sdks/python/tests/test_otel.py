@@ -137,19 +137,10 @@ def test_create_span_exporter_posts_traces_with_bearer_gzip() -> None:
         assert request.headers["content-encoding"] == "gzip"
 
 
-def test_no_op_without_key(caplog: pytest.LogCaptureFixture) -> None:
+def test_no_posts_keyless_even_with_base_url_env(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     caplog.set_level(logging.DEBUG, logger="telemetry_dev")
-    processor = TelemetrySpanProcessor()
-    provider = provider_with(processor)
-    try:
-        end_span(provider, "noop")
-        assert processor.force_flush() is True
-    finally:
-        provider.shutdown()
-    assert "no-op" in caplog.text
-
-
-def test_no_posts_keyless_even_with_base_url_env(monkeypatch: pytest.MonkeyPatch) -> None:
     with otlp_capture_server() as server:
         monkeypatch.setenv("TELEMETRY_DEV_BASE_URL", server.url)
         processor = TelemetrySpanProcessor()
@@ -160,6 +151,7 @@ def test_no_posts_keyless_even_with_base_url_env(monkeypatch: pytest.MonkeyPatch
         finally:
             provider.shutdown()
         assert server.requests == []
+    assert "no-op" in caplog.text
 
 
 def test_env_var_fallbacks(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -185,7 +177,7 @@ def test_kwargs_beat_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("TELEMETRY_DEV_BASE_URL", f"{server.url}/env")
         processor = TelemetrySpanProcessor(
             api_key="td_live_kwarg",
-            base_url=server.url,
+            base_url=f"{server.url}//",
             export_mode="immediate",
             metrics=False,
         )

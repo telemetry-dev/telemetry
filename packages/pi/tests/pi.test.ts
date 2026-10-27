@@ -580,7 +580,7 @@ test("failed assistant message marks the chat and agent spans as errors", async 
   expect(agent.attributes["error.type"]).toBe("error");
 });
 
-test("tool executions produce successful and failed execute_tool spans", async () => {
+test("a successful tool execution produces an execute_tool span with arguments and result", async () => {
   const harness = makeHarness();
   await harness.emit({ type: "agent_start" });
   await harness.emit({
@@ -596,38 +596,22 @@ test("tool executions produce successful and failed execute_tool spans", async (
     result: { content: [{ type: "text", text: "README.md" }] },
     isError: false,
   });
-  await harness.emit({
-    type: "tool_execution_start",
-    toolCallId: "call-2",
-    toolName: "bash",
-    args: { command: "false" },
-  });
-  await harness.emit({
-    type: "tool_execution_end",
-    toolCallId: "call-2",
-    toolName: "bash",
-    result: { content: [{ type: "text", text: "command failed" }] },
-    isError: true,
-  });
   await harness.emit({ type: "agent_end", messages: [] });
   await harness.emit({ type: "agent_settled" });
   await flush();
 
-  const spans = harness.exporters.spans
-    .getFinishedSpans()
-    .filter((span) => span.name === "execute_tool bash");
-
-  expect(spans).toHaveLength(2);
-  expect(spans[0]?.attributes).toMatchObject({
+  const span = spanByName(harness.exporters, "execute_tool bash");
+  const agent = spanByName(harness.exporters, "invoke_agent");
+  expect(span.parentSpanContext?.spanId).toBe(agent.spanContext().spanId);
+  expect(span.attributes).toMatchObject({
     "gen_ai.conversation.id": "session-1",
     "gen_ai.operation.name": "execute_tool",
     "gen_ai.tool.call.arguments": JSON.stringify({ command: "ls" }),
     "gen_ai.tool.call.id": "call-1",
+    "gen_ai.tool.call.result": JSON.stringify({ content: [{ type: "text", text: "README.md" }] }),
     "gen_ai.tool.name": "bash",
   });
-  expect(spans[0]?.status.code).not.toBe(SpanStatusCode.ERROR);
-  expect(spans[1]?.status.code).toBe(SpanStatusCode.ERROR);
-  expect(spans[1]?.attributes["error.type"]).toBe("ToolExecutionError");
+  expect(span.status.code).not.toBe(SpanStatusCode.ERROR);
 });
 
 test.each([

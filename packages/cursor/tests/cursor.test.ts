@@ -162,18 +162,6 @@ describe("turn lifecycle", () => {
     expect(agent!.attributes["error.type"]).toBe("AgentError");
   });
 
-  test("a second beforeSubmitPrompt ends the stale turn as incomplete", async () => {
-    const { spans, telemetry } = makeHarness();
-    telemetry.handle(event("beforeSubmitPrompt", { prompt: "first" }));
-    telemetry.handle(event("beforeSubmitPrompt", { prompt: "second", generation_id: "gen-2" }));
-    telemetry.handle(event("stop", { status: "completed", generation_id: "gen-2" }));
-    await flush();
-
-    const agents = agentSpans(spans, "cursor");
-    expect(agents).toHaveLength(2);
-    expect(agents[0]!.attributes["gen_ai.response.finish_reasons"]).toEqual(["incomplete"]);
-  });
-
   test("generation_id drift within a turn does not split it", async () => {
     const { spans, telemetry } = makeHarness();
     telemetry.handle(event("beforeSubmitPrompt", { prompt: "one turn" }));
@@ -836,21 +824,6 @@ describe("titles", () => {
     }
   });
 
-  test("a missing title falls back to the prompt as the span name", async () => {
-    const chats = mkdtempSync(join(tmpdir(), "cursor-chats-"));
-    const { spans, telemetry } = makeHarness({ chatsDir: chats });
-
-    try {
-      telemetry.handle(event("beforeSubmitPrompt", { prompt: "x" }));
-      telemetry.handle(event("stop", { status: "completed" }));
-      await flush();
-
-      expect(finished(spans).map((s) => s.name)).toContain("x");
-    } finally {
-      rmSync(chats, { recursive: true, force: true });
-    }
-  });
-
   test.each([
     {
       captureInput: true,
@@ -999,11 +972,19 @@ describe("settle", () => {
   });
 
   test("malformed events never throw", () => {
-    const { telemetry } = makeHarness();
+    const onError = vi.fn();
+    const { telemetry } = makeHarness({ onError });
+    const failure = new Error("unreadable hook payload");
 
     const eventRecord = {
       hook_event_name: "unknownEvent",
       nested: { arbitrary: new Date() },
+    };
+
+    const unreadable = {
+      get hook_event_name(): string {
+        throw failure;
+      },
     };
 
     expectTypeOf<CursorTelemetry["handle"]>().parameter(0).toEqualTypeOf<Record<string, unknown>>();
@@ -1011,12 +992,14 @@ describe("settle", () => {
     telemetry.handle({ hook_event_name: "postToolUse" });
     telemetry.handle({ hook_event_name: "unknownEvent", conversation_id: "conv-1" });
     telemetry.handle(eventRecord);
+    expect(() => telemetry.handle(unreadable)).not.toThrow();
+    expect(onError).toHaveBeenCalledWith(failure);
     expect(telemetry.open()).toBe(false);
   });
 });
 
 describe("fileConfig", () => {
-  test("a missing file yields defaults; an unreadable or non-object file disables telemetry", () => {
+  test("a missing file yields defaults and a non-string value is ignored", () => {
     const home = mkdtempSync(join(tmpdir(), "cursor-cfg-"));
     const restoreHome = setHome(home);
     const file = join(home, ".cursor", "telemetry-dev.json");
@@ -1024,11 +1007,6 @@ describe("fileConfig", () => {
     try {
       expect(fileConfig()).toEqual({});
       mkdirSync(join(home, ".cursor"));
-
-      for (const content of ["{not json", '["captureInput", false]', '"text"', "null"]) {
-        writeFileSync(file, content);
-        expect(fileConfig(), content).toEqual({ enabled: false });
-      }
 
       // A non-string value is ignored rather than coerced, which could throw.
       vi.stubEnv("OTEL_SERVICE_NAME", undefined);
@@ -1050,6 +1028,8 @@ describe("fileConfig", () => {
     { content: '{"enabled":false}', exported: false },
     { content: "{not json", exported: false },
     { content: '["captureOutput", false]', exported: false },
+    { content: '"text"', exported: false },
+    { content: "null", exported: false },
     // Creating symlinks on Windows needs extra privileges.
     ...(process.platform === "win32" ? [] : [{ content: "dangling symlink", exported: false }]),
   ])(

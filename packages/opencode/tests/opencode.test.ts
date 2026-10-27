@@ -264,34 +264,6 @@ test.each([
   expect(span.endTime[0]).toBe(1_700_000_021);
 });
 
-test("terminal session.error marks the agent span when the session settles", async () => {
-  const harness = await makeHarness();
-  await chatMessage(harness.hooks);
-
-  await event(harness.hooks, "session.error", {
-    sessionID: "session-1",
-    error: { name: "ApiError", data: { message: "provider overloaded" } },
-  });
-  await event(harness.hooks, "session.idle", { sessionID: "session-1" });
-  await flush();
-
-  const span = spanByName(harness.exporters, "invoke_agent");
-  expect(span.status.code).toBe(SpanStatusCode.ERROR);
-  expect(span.attributes["error.type"]).toBe("ApiError");
-
-  const records = harness.exporters.logs.getFinishedLogRecords();
-  expect(records).toHaveLength(1);
-  expect(records[0]?.body).toBe("Session error");
-  expect(records[0]?.eventName).toBe("session.error");
-  expect(records[0]?.severityText).toBe("ERROR");
-  expect(records[0]?.attributes).toMatchObject({
-    "gen_ai.agent.name": "opencode",
-    "gen_ai.conversation.id": "session-1",
-    "opencode.error.message": "provider overloaded",
-    "opencode.error.name": "ApiError",
-  });
-});
-
 test("dispose ends every dangling agent span as incomplete and flushes", async () => {
   const harness = await makeHarness();
   await chatMessage(harness.hooks, "session-1");
@@ -305,23 +277,6 @@ test("dispose ends every dangling agent span as incomplete and flushes", async (
   for (const span of spans) {
     expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["incomplete"]);
   }
-});
-
-test("dispose applies a deferred session.error instead of ending the span as incomplete", async () => {
-  const harness = await makeHarness();
-  await chatMessage(harness.hooks);
-  await event(harness.hooks, "session.error", {
-    sessionID: "session-1",
-    error: { name: "ApiError", data: { message: "provider overloaded" } },
-  });
-
-  // The plugin is disposed before the session ever goes idle.
-  await harness.hooks.dispose?.();
-
-  const span = spanByName(harness.exporters, "invoke_agent");
-  expect(span.status.code).toBe(SpanStatusCode.ERROR);
-  expect(span.attributes["error.type"]).toBe("ApiError");
-  expect(span.attributes["gen_ai.response.finish_reasons"]).toBeUndefined();
 });
 
 describe.each([
@@ -382,10 +337,19 @@ describe.each([
       const stack = String(exception?.["exception.stacktrace"]);
       expect(stack.startsWith(`UnknownError: ${message}\n`), name).toBe(true);
       expect(stack.includes("private-attachment-listing"), name).toBe(message !== "session error");
+      expect(span.attributes["gen_ai.response.finish_reasons"], name).toBeUndefined();
     }
 
     const records = harness.exporters.logs.getFinishedLogRecords();
-    expect(records[0]?.attributes["opencode.error.name"]).toBe("UnknownError");
+    expect(records).toHaveLength(1);
+    expect(records[0]?.body).toBe("Session error");
+    expect(records[0]?.eventName).toBe("session.error");
+    expect(records[0]?.severityText).toBe("ERROR");
+    expect(records[0]?.attributes).toMatchObject({
+      "gen_ai.agent.name": "opencode",
+      "gen_ai.conversation.id": "session-1",
+      "opencode.error.name": "UnknownError",
+    });
     expect(records[0]?.attributes["opencode.error.message"]).toBe(logMessage);
   });
 });

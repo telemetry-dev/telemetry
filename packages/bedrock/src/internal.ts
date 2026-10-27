@@ -351,7 +351,7 @@ export function parseJson<T>(value: T): JsonValue {
 }
 
 // Retention uses fixed bounds; the core applies maxAttributeLength after the mask.
-export const STREAM_CAPTURE_MAX_BYTES = 48 * 1024;
+const STREAM_CAPTURE_MAX_BYTES = 48 * 1024;
 export const STREAM_CAPTURE_MAX_ITEMS = 1_000;
 const CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated";
 

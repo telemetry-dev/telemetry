@@ -41,7 +41,8 @@ def otlp_capture_server() -> Generator[CaptureServer]:
             body = self.rfile.read(length)
             captured.append(
                 CapturedRequest(
-                    path=self.path,
+                    # self.path collapses a leading "//" (gh-87389); keep the raw target.
+                    path=self.requestline.split(" ")[1],
                     headers={key.lower(): value for key, value in self.headers.items()},
                     body=body,
                 )
@@ -55,7 +56,9 @@ def otlp_capture_server() -> Generator[CaptureServer]:
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+    )
     thread.start()
     try:
         host, port = server.server_address[0], server.server_address[1]

@@ -12,12 +12,21 @@ import { afterEach, expect, test, vi } from "vitest";
 import type { MaskFn } from "@telemetry-dev/sdk";
 
 import { instrumentBedrock, uninstrumentBedrock, wrapBedrock } from "../src/index.ts";
-import { STREAM_CAPTURE_MAX_BYTES } from "../src/internal.ts";
-import { FakeClient, bytes, collect, jsonAttr, setup, streamOf, teardown } from "./helpers.ts";
+import {
+  FakeClient,
+  bytes,
+  collect,
+  jsonAttr,
+  jsonRequestHandler,
+  setup,
+  streamOf,
+  teardown,
+} from "./helpers.ts";
 
 afterEach(async () => {
   uninstrumentBedrock();
   await teardown();
+  vi.restoreAllMocks();
 });
 
 test("Converse captures normalized messages, usage, metadata, request id, and sampling", async () => {
@@ -267,22 +276,15 @@ test("masked ConverseStream early break withholds partial output", async () => {
   expect(seen.some((value) => value.includes("partial secret"))).toBe(false);
 });
 
-test.each([
-  [false, 0],
-  [false, 100],
-  [false, 1024 * 1024],
-  [true, 0],
-  [true, 100],
-  [true, 1024 * 1024],
-])(
-  "ConverseStream past the fixed bound is flagged (masked %s, maxAttributeLength %i)",
-  async (masked, maxAttributeLength) => {
+test.each([false, true])(
+  "ConverseStream past the fixed bound is flagged even when the cap is larger (masked %s)",
+  async (masked) => {
     const seen: string[] = [];
-    const options: NonNullable<Parameters<typeof setup>[0]> = { maxAttributeLength };
 
-    if (masked) options.mask = recordingMask(seen);
-
-    const spans = setup(options);
+    const spans = setup({
+      maxAttributeLength: 1024 * 1024,
+      ...(masked ? { mask: recordingMask(seen) } : {}),
+    });
 
     await streamedConverse(textStream("x".repeat(100), 1_100));
 
@@ -293,15 +295,11 @@ test.each([
     if (masked) {
       expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
       expect(seen.some((value) => value.includes("x".repeat(100)))).toBe(false);
-    } else if (maxAttributeLength > STREAM_CAPTURE_MAX_BYTES) {
+    } else {
       const retained = jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content as string;
       expect(retained.length).toBeGreaterThan(0);
-      expect(retained.length).toBeLessThan(1_100 * 100);
+      expect(retained.length).toBeLessThanOrEqual(48 * 1024);
       expect(retained).toBe("x".repeat(retained.length));
-    } else {
-      expect(String(span.attributes["gen_ai.output.messages"] ?? "").length).toBeLessThanOrEqual(
-        maxAttributeLength,
-      );
     }
   },
 );
@@ -462,6 +460,17 @@ test("InvokeModel captures provider-native bodies and embedding spans", async ()
   );
 
   const [chat, embedding] = spans.getFinishedSpans();
+  expect(jsonAttr(chat, "gen_ai.input.messages")).toEqual({
+    messages: [],
+    max_tokens: 10,
+    top_k: 3,
+  });
+  expect(jsonAttr(chat, "gen_ai.output.messages")).toEqual({
+    content: [{ type: "text", text: "answer" }],
+    usage: { input_tokens: 9, output_tokens: 4, cache_read_input_tokens: 1 },
+    stop_reason: "end_turn",
+  });
+  expect(chat.attributes["gen_ai.usage.input_tokens"]).toBe(9 + 1);
   expect(chat.attributes["gen_ai.request.top_k"]).toBe(3);
   expect(chat.attributes["gen_ai.usage.cache_read.input_tokens"]).toBe(1);
   expect(chat.attributes["gen_ai.response.id"]).toBe("invoke-1");
@@ -833,7 +842,6 @@ test("InvokeModelWithResponseStream parses each payload once and delivers malfor
 
   expect(await collect(response.body)).toEqual(events);
   expect(parse.mock.calls.length - before).toBe(4);
-  parse.mockRestore();
   const [span] = spans.getFinishedSpans();
   expect(span).toMatchObject({
     [Symbol.for("telemetry.dev.outputChunkHistogram")]: { count: 2 },
@@ -996,7 +1004,7 @@ test("ApplyGuardrail captures action metadata", async () => {
   expect(span.attributes["td.metadata.guardrail_action_reason"]).toBe("blocked");
 });
 
-test("errors, fail-open, idempotency, and prototype restore behave", async () => {
+test("send errors end one error span, double wrapping traces once, and shutdown passes through", async () => {
   const spans = setup();
 
   const error = Object.assign(new Error("throttled"), {
@@ -1017,11 +1025,10 @@ test("errors, fail-open, idempotency, and prototype restore behave", async () =>
 
   await teardown();
   const disabled = wrapBedrock(new FakeClient([{ output: { message: { content: [] } } }]));
-  await disabled.send(new ConverseCommand({ modelId: "m", messages: [] }));
+  await expect(disabled.send(new ConverseCommand({ modelId: "m", messages: [] }))).resolves.toEqual(
+    { output: { message: { content: [] } } },
+  );
   expect(disabled.calls).toHaveLength(1);
-
-  instrumentBedrock();
-  uninstrumentBedrock();
 });
 
 test("callback-style send creates a span while returning undefined", () => {
@@ -1066,67 +1073,66 @@ test("callback-style send creates a span while returning undefined", () => {
   expect(jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content).toBe("ok");
 });
 
-test("global instrumentation is idempotent", async () => {
+test("global instrumentation patches the real client once and restores its inherited send", async () => {
   const spans = setup();
+  const proto = BedrockRuntimeClient.prototype;
+  const command = new ConverseCommand({ modelId: "m", messages: [] });
 
-  const originalDescriptor = Object.getOwnPropertyDescriptor(
-    BedrockRuntimeClient.prototype,
-    "send",
-  );
-
-  const fakeSend = async () => ({
-    output: { message: { content: [] } },
-    $metadata: { requestId: "global-1" },
+  const client = new BedrockRuntimeClient({
+    region: "us-east-1",
+    credentials: { accessKeyId: "test", secretAccessKey: "test" },
+    maxAttempts: 1,
+    requestHandler: jsonRequestHandler("global-1", {
+      output: { message: { role: "assistant", content: [{ text: "ok" }] } },
+      stopReason: "end_turn",
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      metrics: { latencyMs: 1 },
+    }),
   });
 
-  Object.defineProperty(BedrockRuntimeClient.prototype, "send", {
-    configurable: true,
-    writable: true,
-    value: fakeSend,
-  });
+  // AWS clients inherit send from the Smithy base class.
+  expect(Object.hasOwn(proto, "send")).toBe(false);
 
   try {
     instrumentBedrock();
     instrumentBedrock();
 
-    const client = new BedrockRuntimeClient({
-      region: "us-east-1",
-      credentials: { accessKeyId: "test", secretAccessKey: "test" },
-    });
-
-    await client.send(new ConverseCommand({ modelId: "m", messages: [] }));
+    await client.send(command);
     expect(spans.getFinishedSpans()).toHaveLength(1);
     expect(spans.getFinishedSpans()[0]!.attributes["gen_ai.response.id"]).toBe("global-1");
 
-    const telemetryWrapper = Object.getOwnPropertyDescriptor(
-      BedrockRuntimeClient.prototype,
-      "send",
-    )?.value;
-
+    const telemetryWrapper = Object.getOwnPropertyDescriptor(proto, "send")?.value;
     const laterWrapper = async () => ({ output: { message: { content: [] } } });
-    Object.defineProperty(BedrockRuntimeClient.prototype, "send", {
+    Object.defineProperty(proto, "send", {
       configurable: true,
       writable: true,
       value: laterWrapper,
     });
     uninstrumentBedrock();
-    expect(Object.getOwnPropertyDescriptor(BedrockRuntimeClient.prototype, "send")?.value).toBe(
-      laterWrapper,
-    );
-    Object.defineProperty(BedrockRuntimeClient.prototype, "send", {
+    expect(Object.getOwnPropertyDescriptor(proto, "send")?.value).toBe(laterWrapper);
+    Object.defineProperty(proto, "send", {
       configurable: true,
       writable: true,
       value: telemetryWrapper,
     });
     uninstrumentBedrock();
-    expect(Object.getOwnPropertyDescriptor(BedrockRuntimeClient.prototype, "send")?.value).toBe(
-      fakeSend,
-    );
+    expect(Object.hasOwn(proto, "send")).toBe(false);
+
+    await client.send(command);
+    expect(spans.getFinishedSpans()).toHaveLength(1);
+
+    const priorOwner = async () => ({ output: { message: { content: [] } } });
+    Object.defineProperty(proto, "send", {
+      configurable: true,
+      writable: true,
+      value: priorOwner,
+    });
+    instrumentBedrock();
+    expect(Object.getOwnPropertyDescriptor(proto, "send")?.value).not.toBe(priorOwner);
+    uninstrumentBedrock();
+    expect(Object.getOwnPropertyDescriptor(proto, "send")?.value).toBe(priorOwner);
   } finally {
     uninstrumentBedrock();
-
-    if (originalDescriptor) {
-      Object.defineProperty(BedrockRuntimeClient.prototype, "send", originalDescriptor);
-    }
+    Reflect.deleteProperty(proto, "send");
   }
 });

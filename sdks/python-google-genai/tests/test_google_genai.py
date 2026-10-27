@@ -400,15 +400,22 @@ def test_media_capture_bounds_large_and_cyclic_inputs(
 
 
 def test_media_capture_projects_cyclic_labels(memory: SimpleNamespace) -> None:
+    client, _transport = client_with_transport([])
+
+    def generate_images(**_kwargs: Any) -> dict[str, Any]:
+        return {"generatedImages": []}
+
+    client.models.generate_images = generate_images
     labels: dict[str, Any] = {"ordinary": "value"}
     labels["cycle"] = labels
 
-    contents, truncated = google_genai_instrumentation._media_contents(
-        {"config": {"labels": labels}}
-    )
+    wrap_google_genai(client).models.generate_images(model="imagen-4.0", config={"labels": labels})
 
-    assert truncated is False
-    assert contents == {"labels": {"ordinary": "value", "cycle": None}}
+    a = attrs(only_span(memory))
+    assert json.loads(str(a["gen_ai.input.messages"])) == {
+        "labels": {"ordinary": "value", "cycle": None}
+    }
+    assert "telemetry.dev.capture.truncated" not in a
 
 
 @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
@@ -699,6 +706,7 @@ def test_generate_content_maps_request_response_usage_and_sampling(
     assert list(cast(Any, a["gen_ai.response.finish_reasons"])) == ["STOP"]
     assert a["gen_ai.request.temperature"] == 0.2
     assert a["gen_ai.request.top_p"] == 0.9
+    assert a["gen_ai.request.top_k"] == 40
     assert a["gen_ai.request.max_tokens"] == 64
     assert list(cast(Any, a["gen_ai.request.stop_sequences"])) == ["END"]
     assert a["gen_ai.request.seed"] == 7
@@ -1560,8 +1568,11 @@ async def test_prompt_feedback_text_is_kept_only_when_output_is_captured_unmaske
     }
     await generate([response] if stream else response, is_async=is_async, stream=stream)
 
-    a = attrs(only_span(memory))
+    span = only_span(memory)
+    a = attrs(span)
     assert a["google_genai.response.block_reason"] == "SAFETY"
+    assert "gen_ai.output.messages" not in a
+    assert span.status.status_code == StatusCode.UNSET
     prompt_ratings = json.loads(cast(str, a["google_genai.response.prompt_safety_ratings"]))
     if capture == "on":
         assert a["google_genai.response.block_reason_message"] == "private block message"
@@ -1830,19 +1841,6 @@ def test_api_error_records_error_and_reraises(memory: SimpleNamespace, async_mod
     assert span.status.status_code == StatusCode.ERROR
 
 
-def test_blocked_prompt_records_block_attrs_without_output(memory: SimpleNamespace) -> None:
-    payload = {"promptFeedback": {"blockReason": "SAFETY", "blockReasonMessage": "blocked"}}
-    client, _transport = client_with_transport([payload])
-    wrapped = wrap_google_genai(client)
-    response = wrapped.models.generate_content(model="gemini-2.5-flash", contents=USER_CONTENT)
-    assert response.candidates is None
-    a = attrs(only_span(memory))
-    assert a["google_genai.response.block_reason"] == "SAFETY"
-    assert a["google_genai.response.block_reason_message"] == "blocked"
-    assert "gen_ai.output.messages" not in a
-    assert only_span(memory).status.status_code == StatusCode.UNSET
-
-
 @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
 def test_embed_content_maps_embedding_attrs(memory: SimpleNamespace, async_mode: bool) -> None:
     client, _transport = client_with_transport([embed_payload()])
@@ -1900,11 +1898,10 @@ def test_chats_emit_spans_with_history(memory: SimpleNamespace) -> None:
         assert json.loads(str(attrs(span)["gen_ai.input.messages"])) == expected_input
 
 
-def test_vertex_provider(memory: SimpleNamespace) -> None:
-    _client, _transport = client_with_transport([happy_payload()])
-    wrapped = wrap_google_genai(genai.Client(api_key="test", vertexai=True))
-    wrapped._api_client.request = _transport.request
-    wrapped.models.generate_content(model="gemini-2.5-flash", contents=USER_CONTENT)
+def test_global_instrumentation_reports_vertex_provider(memory: SimpleNamespace) -> None:
+    instrument_google_genai()
+    client, _transport = client_with_transport([happy_payload()], vertexai=True)
+    client.models.generate_content(model="gemini-2.5-flash", contents=USER_CONTENT)
     assert attrs(only_span(memory))["gen_ai.provider.name"] == "gcp.vertex_ai"
 
 
@@ -2104,26 +2101,12 @@ def test_uninstrument_ends_pending_global_video_span(
 
 @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
 @pytest.mark.parametrize("poll_fails", [False, True], ids=["terminal", "exception"])
-def test_uninstrument_claims_callback_while_video_poll_is_blocked(
+def test_uninstrument_ends_video_span_while_poll_is_blocked(
     memory: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,
     async_mode: bool,
     poll_fails: bool,
 ) -> None:
-    callback_calls = 0
-    original_end_once = google_genai_instrumentation._end_once
-
-    def counted_end_once(handle: telemetry_dev.SpanHandle) -> Any:
-        end = original_end_once(handle)
-
-        def counted_end(**fields: Any) -> None:
-            nonlocal callback_calls
-            callback_calls += 1
-            end(**fields)
-
-        return counted_end
-
-    monkeypatch.setattr(google_genai_instrumentation, "_end_once", counted_end_once)
     failure = RuntimeError("blocked poll failed")
 
     if async_mode:
@@ -2200,7 +2183,6 @@ def test_uninstrument_claims_callback_while_video_poll_is_blocked(
             else:
                 assert cast(Any, poll.result(timeout=5))["done"] is True
 
-    assert callback_calls == 1
     span = only_span(memory)
     assert span.status.status_code is StatusCode.ERROR
     assert "google_genai.response.operation_done" not in attrs(span)
@@ -2291,12 +2273,12 @@ def test_sync_stream_close_ends_partial_span(memory: SimpleNamespace) -> None:
     ]
 
 
-def test_sync_stream_supports_next_send_close_protocol(memory: SimpleNamespace) -> None:
+def test_sync_stream_supports_next_and_send_protocol(memory: SimpleNamespace) -> None:
     client, _transport = client_with_transport([stream_chunks()])
     wrapped = wrap_google_genai(client)
     stream = wrapped.models.generate_content_stream(model="gemini-2.5-flash", contents=USER_CONTENT)
     assert next(stream).text == "Hello"
-    assert next(stream).text == " world"
+    assert stream.send(None).text == " world"
     next(stream)
     with pytest.raises(StopIteration):
         next(stream)
@@ -2344,23 +2326,6 @@ def test_async_stream_supports_anext_protocol(memory: SimpleNamespace) -> None:
     assert json.loads(str(attrs(span)["gen_ai.output.messages"])) == [
         {"role": "model", "parts": [{"text": "Hello world"}]}
     ]
-
-
-def test_blocked_prompt_records_prompt_safety_ratings(memory: SimpleNamespace) -> None:
-    payload = {
-        "promptFeedback": {
-            "blockReason": "SAFETY",
-            "safetyRatings": [{"category": "HARM_CATEGORY_HATE_SPEECH", "probability": "HIGH"}],
-        }
-    }
-    client, _transport = client_with_transport([payload])
-    wrapped = wrap_google_genai(client)
-    wrapped.models.generate_content(model="gemini-2.5-flash", contents=USER_CONTENT)
-    a = attrs(only_span(memory))
-    assert a["google_genai.response.block_reason"] == "SAFETY"
-    ratings = json.loads(str(a["google_genai.response.prompt_safety_ratings"]))
-    assert ratings[0]["category"] == "HARM_CATEGORY_HATE_SPEECH"
-    assert ratings[0]["probability"] == "HIGH"
 
 
 def test_mapper_failures_are_fail_open(

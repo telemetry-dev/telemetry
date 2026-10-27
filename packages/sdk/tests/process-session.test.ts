@@ -59,6 +59,8 @@ test("explicit sessions win and remain consistent on nested spans and logs", asy
     },
   );
   await flush();
+  expect(spans.getFinishedSpans()).toHaveLength(6);
+  expect(logs.getFinishedLogRecords()).toHaveLength(3);
 
   for (const span of spans.getFinishedSpans()) {
     expect(span.attributes["gen_ai.conversation.id"]).toBe(span.name.split("-")[0]);

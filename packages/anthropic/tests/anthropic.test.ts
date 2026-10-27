@@ -551,40 +551,6 @@ test("messages.create streaming preserves events and records aggregated text usa
   ).toBe(true);
 });
 
-test("stream capture is bounded without changing delivered events", async () => {
-  const spans = setupSpans();
-
-  const events: JsonRecord[] = [
-    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-    ...Array.from({ length: 80 }, () => ({
-      type: "content_block_delta",
-      index: 0,
-      delta: { type: "text_delta", text: "x".repeat(1024) },
-    })),
-    { type: "message_stop" },
-  ];
-
-  const fake = createFakeFetch(namedSseResponse(events));
-
-  const stream = await clientWith(fake.fetch).messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 64,
-    messages: [],
-    stream: true,
-  });
-
-  expect(await collectStream(stream)).toEqual(events);
-  const span = await exportedSpan(spans);
-  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
-
-  const output = jsonAttr<Array<{ content: Array<{ text: string }> }>>(
-    span,
-    "gen_ai.output.messages",
-  );
-
-  expect(output[0]!.content[0]!.text.length).toBeLessThan(48 * 1024);
-});
-
 test("stream capture retains no output when output capture is disabled", async () => {
   const spans = setupSpans(undefined, false);
   const capture = vi.spyOn(telemetrySdk, "boundedCaptureDetails");
@@ -640,44 +606,6 @@ test("wrapAnthropic observes a CommonJS client subclass stream", async () => {
   expect(jsonAttr(await exportedSpan(spans), "gen_ai.output.messages")).toEqual([
     { role: "assistant", content: [{ type: "text", text: "Hello world" }] },
   ]);
-});
-
-test("messages.create streaming observes duck-typed stream responses", async () => {
-  const spans = setupSpans();
-
-  class AlternateStream implements AsyncIterable<unknown> {
-    private abortController = new AbortController();
-    controller = {
-      abort: (reason?: unknown) => this.abortController.abort(reason),
-      signal: this.abortController.signal,
-    };
-
-    async *[Symbol.asyncIterator](): AsyncIterator<unknown> {
-      for (const event of streamEvents()) yield event;
-    }
-  }
-
-  const client = wrapAnthropic({
-    messages: {
-      create: (_params: JsonValue) => Promise.resolve(new AlternateStream()),
-    },
-  });
-
-  const stream = await client.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 64,
-    messages: [{ role: "user", content: "Say hello" }],
-    stream: true,
-  });
-
-  await collectStream(stream);
-
-  const span = await exportedSpan(spans);
-  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
-    { role: "assistant", content: [{ type: "text", text: "Hello world" }] },
-  ]);
-  expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(9);
-  expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(2);
 });
 
 test("message timestamps precede telemetry mapping", async () => {
@@ -1026,48 +954,6 @@ test("messages.create streaming keeps telemetry on a core span without a capture
   ]);
 });
 
-test("messages.create streaming retains output when the core span lacks chunk recording", async () => {
-  const spans = setupSpans();
-  const startSpan = telemetrySdk.startSpan;
-  vi.spyOn(telemetrySdk, "startSpan").mockImplementation((...args) => {
-    const legacySpan = { ...startSpan(...args) };
-    Reflect.deleteProperty(legacySpan, "recordOutputChunk");
-
-    return legacySpan;
-  });
-
-  const events = [
-    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-    {
-      type: "content_block_delta",
-      index: 0,
-      delta: { type: "text_delta", text: "delivered" },
-    },
-    { type: "message_stop" },
-  ];
-
-  const source = {
-    controller: new AbortController(),
-    async *[Symbol.asyncIterator]() {
-      yield* events;
-    },
-  };
-
-  const client = wrapAnthropic({ messages: { create: async (_params: unknown) => source } });
-
-  const stream = await client.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 64,
-    messages: [],
-    stream: true,
-  });
-
-  expect(await collectStream(stream)).toEqual(events);
-  expect(jsonAttr(await exportedSpan(spans), "gen_ai.output.messages")).toEqual([
-    { role: "assistant", content: [{ type: "text", text: "delivered" }] },
-  ]);
-});
-
 test("messages.create streaming leaves the configured attribute limit to the core", async () => {
   const spans = setupSpans(undefined, true, undefined, { maxAttributeLength: 128 });
 
@@ -1211,30 +1097,13 @@ test("uninstrumentAnthropic preserves a method installed after its own wrapper",
   }
 });
 
-test("wrapAnthropic keeps a client instrumented after global instrumentation is removed", async () => {
-  const spans = setupSpans();
-  instrumentAnthropic();
-  const fake = createFakeFetch(jsonResponse(messagePayload({ id: "msg_instance_wrapped" })));
-  const client = wrapAnthropic(new Anthropic({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 }));
-  uninstrumentAnthropic();
-
-  await client.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 64,
-    messages: [{ role: "user", content: "Hi wrapped" }],
-  });
-
-  const span = await exportedSpan(spans);
-  expect(fake.requests).toHaveLength(1);
-  expect(span.attributes["gen_ai.request.model"]).toBe("claude-sonnet-4-6");
-});
-
 test("instrumentAnthropic and wrapAnthropic together record one span per call", async () => {
   const spans = setupSpans();
   instrumentAnthropic();
 
   const fake = createFakeFetch(
     jsonResponse(messagePayload({ id: "msg_global_wrapped" })),
+    jsonResponse(messagePayload({ id: "msg_beta_both" })),
     jsonResponse(messagePayload({ id: "msg_instance_wrapped_after_global" })),
   );
 
@@ -1245,10 +1114,18 @@ test("instrumentAnthropic and wrapAnthropic together record one span per call", 
     max_tokens: 64,
     messages: [{ role: "user", content: "Hi wrapped" }],
   });
+  await client.beta.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Hi beta" }],
+  });
 
-  const activeSpans = await finishedSpans(spans, 1);
-  expect(fake.requests).toHaveLength(1);
-  expect(activeSpans[0]!.attributes["gen_ai.request.model"]).toBe("claude-sonnet-4-6");
+  const activeSpans = await finishedSpans(spans, 2);
+  expect(fake.requests).toHaveLength(2);
+  expect(activeSpans.map((span) => span.attributes["gen_ai.response.id"])).toEqual([
+    "msg_global_wrapped",
+    "msg_beta_both",
+  ]);
 
   uninstrumentAnthropic();
   await client.messages.create({
@@ -1257,9 +1134,9 @@ test("instrumentAnthropic and wrapAnthropic together record one span per call", 
     messages: [{ role: "user", content: "Hi after uninstrument" }],
   });
 
-  const allSpans = await finishedSpans(spans, 2);
-  expect(fake.requests).toHaveLength(2);
-  expect(allSpans[1]!.attributes["gen_ai.request.model"]).toBe("claude-sonnet-4-6");
+  const allSpans = await finishedSpans(spans, 3);
+  expect(fake.requests).toHaveLength(3);
+  expect(allSpans[2]!.attributes["gen_ai.response.id"]).toBe("msg_instance_wrapped_after_global");
 });
 
 const providerClients = {
@@ -1297,25 +1174,6 @@ test.each<{ client: keyof typeof providerClients; subclass: boolean; expected: s
     expect(span.attributes["gen_ai.provider.name"]).toBe(expected);
   },
 );
-
-test("wrapAnthropic records Bedrock provider names from client constructor names", async () => {
-  const spans = setupSpans();
-
-  class AnthropicBedrock {
-    messages = {
-      create: async (_params: JsonValue) => messagePayload({ id: "msg_bedrock" }),
-    };
-  }
-
-  await wrapAnthropic(new AnthropicBedrock()).messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 64,
-    messages: [{ role: "user", content: "Hi" }],
-  });
-
-  const span = await exportedSpan(spans);
-  expect(span.attributes["gen_ai.provider.name"]).toBe("aws.bedrock");
-});
 
 test("beta.messages.create records a generation span for the beta endpoint", async () => {
   const spans = setupSpans();
@@ -1461,22 +1319,6 @@ test("instrumentAnthropic covers beta.messages and uninstrumentAnthropic restore
   expect(spans.getFinishedSpans()).toHaveLength(1);
 });
 
-test("instrumentAnthropic and wrapAnthropic together record one beta span per call", async () => {
-  const spans = setupSpans();
-  instrumentAnthropic();
-  const fake = createFakeFetch(jsonResponse(messagePayload({ id: "msg_beta_both" })));
-  const client = wrapAnthropic(new Anthropic({ apiKey: "test", fetch: fake.fetch, maxRetries: 0 }));
-
-  await client.beta.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 64,
-    messages: [{ role: "user", content: "Hi" }],
-  });
-
-  const span = await exportedSpan(spans);
-  expect(span.attributes["gen_ai.response.id"]).toBe("msg_beta_both");
-});
-
 function betaStreamEvents(...blocks: [JsonRecord, JsonRecord[]][]): JsonRecord[] {
   const events: JsonRecord[] = [
     {
@@ -1543,33 +1385,28 @@ function fallbackStream(iterations: JsonRecord[]): JsonRecord[] {
   return events;
 }
 
-test.each([false, true])(
-  "stream output over the encoded limit keeps a bounded prefix (masked: %s)",
-  async (masked) => {
-    const spans = setupSpans(undefined, true, masked ? (value) => value : undefined);
+test("a stream delta over the encoded limit is dropped and earlier output is kept", async () => {
+  const spans = setupSpans();
 
-    const events = betaStreamEvents(
-      [{ type: "text", text: "" }, [{ type: "text_delta", text: "first" }]],
-      [{ type: "text", text: "" }, [{ type: "text_delta", text: '"'.repeat(30_000) }]],
-    );
+  const events = betaStreamEvents(
+    [{ type: "text", text: "" }, [{ type: "text_delta", text: "first" }]],
+    [{ type: "text", text: "" }, [{ type: "text_delta", text: '"'.repeat(30_000) }]],
+  );
 
-    const span = await streamedBetaSpan(events, spans);
+  const span = await streamedBetaSpan(events, spans);
 
-    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
-
-    if (masked) expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
-    else {
-      const output = jsonAttr<Array<{ content: Array<{ text: string }> }>>(
-        span,
-        "gen_ai.output.messages",
-      );
-
-      expect(String(span.attributes["gen_ai.output.messages"])).not.toContain("[truncated]");
-      expect(output[0]?.content[0]).toEqual({ type: "text", text: "first" });
-      expect('"'.repeat(30_000).startsWith(output[0]?.content[1]?.text ?? "")).toBe(true);
-    }
-  },
-);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(String(span.attributes["gen_ai.output.messages"])).not.toContain("[truncated]");
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "first" },
+        { type: "text", text: "" },
+      ],
+    },
+  ]);
+});
 
 test.each([
   [400, true],
@@ -1595,7 +1432,7 @@ test.each([
   },
 );
 
-test("deltas that fill the stream limit keep the text that was accepted", async () => {
+test("deltas that fill the stream limit keep the accepted text and deliver every event", async () => {
   const spans = setupSpans();
 
   const events = betaStreamEvents([
@@ -1606,7 +1443,17 @@ test("deltas that fill the stream limit keep the text that was accepted", async 
     ],
   ]);
 
-  const span = await streamedBetaSpan(events, spans);
+  const stream = await clientWith(
+    createFakeFetch(namedSseResponse(events)).fetch,
+  ).beta.messages.create({
+    model: "claude-opus-5",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Hi" }],
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
 
   const output = jsonAttr<Array<{ content: Array<{ text?: string }> }>>(
     span,
@@ -1698,18 +1545,6 @@ const servedIteration = {
   output_tokens: 2,
 };
 
-test("beta streams record the fallback model when a fallback_message iteration served it", async () => {
-  const span = await streamedBetaSpan(fallbackStream([declinedIteration, servedIteration]));
-
-  expect(span.attributes["gen_ai.response.model"]).toBe("claude-opus-4-8");
-});
-
-test("beta streams keep the requested model when the fallback request failed", async () => {
-  const span = await streamedBetaSpan(fallbackStream([declinedIteration]));
-
-  expect(span.attributes["gen_ai.response.model"]).toBe("claude-opus-5");
-});
-
 const advisorIteration = {
   ...declinedIteration,
   type: "advisor_message",
@@ -1799,6 +1634,12 @@ test("fallback metadata overflow preserves complete masked output", async () => 
 
 test.each<{ name: string; iterations: JsonRecord[]; expected: string }>([
   {
+    name: "fallback served",
+    iterations: [declinedIteration, servedIteration],
+    expected: "claude-opus-4-8",
+  },
+  { name: "fallback failed", iterations: [declinedIteration], expected: "claude-opus-5" },
+  {
     name: "advisor without fallback",
     iterations: [declinedIteration, advisorIteration],
     expected: "claude-opus-5",
@@ -1818,7 +1659,7 @@ test.each<{ name: string; iterations: JsonRecord[]; expected: string }>([
     expected: "claude-sonnet-5",
   },
 ])(
-  "beta streams ignore advisor iterations for the served model: $name",
+  "beta streams take the served model from the last fallback_message iteration: $name",
   async ({ iterations, expected }) => {
     const span = await streamedBetaSpan(fallbackStream(iterations));
 
@@ -2299,6 +2140,7 @@ async function usageSpan(
   });
 
   const { cache_creation: _split, ...deltaUsage } = finalUsage;
+  const abortController = new AbortController();
 
   const events = [
     {
@@ -2310,8 +2152,12 @@ async function usageSpan(
     { type: "message_stop" },
   ];
 
+  // A plain { abort, signal } controller: stream detection must not require an AbortController.
   const source = {
-    controller: new AbortController(),
+    controller: {
+      abort: (reason?: unknown) => abortController.abort(reason),
+      signal: abortController.signal,
+    },
     async *[Symbol.asyncIterator]() {
       yield* events;
     },

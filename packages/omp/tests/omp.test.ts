@@ -393,6 +393,7 @@ test("tool execution produces an execute_tool span with arguments and result", a
     "gen_ai.operation.name": "execute_tool",
     "gen_ai.tool.call.arguments": JSON.stringify({ command: "ls" }),
     "gen_ai.tool.call.id": "call-1",
+    "gen_ai.tool.call.result": JSON.stringify({ content: [{ type: "text", text: "README.md" }] }),
     "gen_ai.tool.name": "bash",
   });
   expect(span.status.code).not.toBe(SpanStatusCode.ERROR);
@@ -542,14 +543,17 @@ test("malformed events never throw and report through onError", async () => {
   expect(harness.exporters.spans.getFinishedSpans().length).toBeGreaterThan(0);
 });
 
-test("events for a different session carry that session's conversation id", async () => {
+test("each event reads the current session id", async () => {
   const harness = makeHarness();
-  const other = makeContext("session-2");
-  await harness.emit({ type: "session_start" }, other);
+  await harness.emit({ type: "session_start" }, makeContext("session-2"));
+  await harness.emit({ type: "session_shutdown" });
   await flush();
 
-  const record = harness.exporters.logs.getFinishedLogRecords()[0];
-  expect(record?.attributes["gen_ai.conversation.id"]).toBe("session-2");
+  const records = harness.exporters.logs.getFinishedLogRecords();
+  expect(records.map((record) => record.attributes["gen_ai.conversation.id"])).toEqual([
+    "session-2",
+    "session-1",
+  ]);
 });
 
 test("tool spans nest under the chat span that issued the tool call", async () => {

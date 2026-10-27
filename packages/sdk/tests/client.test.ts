@@ -36,7 +36,7 @@ test("enabled:false yields a no-op client even with a key", () => {
   const spans = new InMemorySpanExporter();
 
   const client = init(
-    { apiKey: "td_live_test", enabled: false, logLevel: "silent" },
+    { apiKey: "td_live_test", enabled: false, exportMode: "immediate", logLevel: "silent" },
     { spanExporter: spans },
   );
 

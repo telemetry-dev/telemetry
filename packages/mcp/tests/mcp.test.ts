@@ -251,7 +251,12 @@ test("completes responses before a per-request HTTP transport closes", async () 
   await handler.close();
 });
 
-test("applies asymmetric JSON-RPC error status rules", async () => {
+test.each([
+  { code: -32602, serverFault: false },
+  { code: -32021, serverFault: false },
+  { code: -32022, serverFault: false },
+  { code: -32603, serverFault: true },
+])("applies asymmetric JSON-RPC error status rules to $code", async ({ code, serverFault }) => {
   const spans = setup();
 
   const [client, server] = InMemoryTransport.createLinkedPair().map((transport) =>
@@ -260,59 +265,23 @@ test("applies asymmetric JSON-RPC error status rules", async () => {
 
   client.onmessage = () => undefined;
   server.onmessage = () => {
-    void server.send({
-      jsonrpc: "2.0",
-      id: 7,
-      error: { code: -32602, message: "Invalid params" },
-    });
+    void server.send({ jsonrpc: "2.0", id: 7, error: { code, message: "JSON-RPC error" } });
   };
 
   await client.start();
   await server.start();
-  await client.send({ jsonrpc: "2.0", id: 7, method: "prompts/get", params: { name: "review" } });
+  await client.send({ jsonrpc: "2.0", id: 7, method: "ping" });
 
   const finished = await exported(spans, 2);
   const clientSpan = finished.find((span) => span.kind === SpanKind.CLIENT)!;
   const serverSpan = finished.find((span) => span.kind === SpanKind.SERVER)!;
-  expect(clientSpan.attributes["rpc.response.status_code"]).toBe("-32602");
-  expect(clientSpan.attributes["error.type"]).toBe("-32602");
+  expect(clientSpan.attributes["rpc.response.status_code"]).toBe(String(code));
+  expect(serverSpan.attributes["rpc.response.status_code"]).toBe(String(code));
+  expect(clientSpan.attributes["error.type"]).toBe(String(code));
   expect(clientSpan.status.code).toBe(SpanStatusCode.ERROR);
-  expect(serverSpan.attributes["rpc.response.status_code"]).toBe("-32602");
-  expect(serverSpan.attributes["error.type"]).toBeUndefined();
-  expect(serverSpan.status.code).toBe(SpanStatusCode.UNSET);
+  expect(serverSpan.attributes["error.type"]).toBe(serverFault ? String(code) : undefined);
+  expect(serverSpan.status.code).toBe(serverFault ? SpanStatusCode.ERROR : SpanStatusCode.UNSET);
 });
-
-test.each([-32021, -32022])(
-  "treats MCP v2 caller error %i as a client failure only",
-  async (code) => {
-    const spans = setup();
-
-    const [client, server] = InMemoryTransport.createLinkedPair().map((transport) =>
-      instrumentMcpTransport(transport),
-    );
-
-    client.onmessage = () => undefined;
-    server.onmessage = () => {
-      void server.send({
-        jsonrpc: "2.0",
-        id: 8,
-        error: { code, message: "Client compatibility error" },
-      });
-    };
-
-    await client.start();
-    await server.start();
-    await client.send({ jsonrpc: "2.0", id: 8, method: "ping" });
-
-    const finished = await exported(spans, 2);
-    const clientSpan = finished.find((span) => span.kind === SpanKind.CLIENT)!;
-    const serverSpan = finished.find((span) => span.kind === SpanKind.SERVER)!;
-    expect(clientSpan.attributes["error.type"]).toBe(String(code));
-    expect(clientSpan.status.code).toBe(SpanStatusCode.ERROR);
-    expect(serverSpan.attributes["error.type"]).toBeUndefined();
-    expect(serverSpan.status.code).toBe(SpanStatusCode.UNSET);
-  },
-);
 
 test("marks CallToolResult errors and closes pending requests", async () => {
   const spans = setup();
@@ -348,12 +317,14 @@ test("marks CallToolResult errors and closes pending requests", async () => {
   };
 
   const transport = instrumentMcpTransport(rawTransport);
-  transport.onclose = () => undefined;
+  const hostClose = vi.fn();
+  transport.onclose = hostClose;
   await transport.send({ jsonrpc: "2.0", id: 10, method: "ping" } as never);
   transport.onclose?.();
   const [closed] = await exported(closeSpans, 1);
   expect(closed?.attributes["error.type"]).toBe("connection_error");
   expect(closed?.status.code).toBe(SpanStatusCode.ERROR);
+  expect(hostClose).toHaveBeenCalledOnce();
 });
 
 test("ends an outgoing request span when send fails", async () => {

@@ -65,7 +65,7 @@ test.each([
             id: "e1",
             model: "text-embedding-3-small",
             embeddings: [{ index: 0, vector: [0.1, 0.2] }],
-            usage: usage(8, 0),
+            usage: usage(8, 0, { promptTokensDetails: { cachedTokens: 4, cacheWriteTokens: 2 } }),
           }),
         }),
         input: "hello",
@@ -77,8 +77,10 @@ test.each([
     operation: "embeddings",
     outputType: undefined,
     responseModel: undefined,
+    // OpenAI reports promptTokens with cache reads and writes; the span total adds nothing.
     input: 8,
     output: 0,
+    modality: {},
   },
   {
     activity: "image",
@@ -106,6 +108,11 @@ test.each([
     responseModel: "gpt-image-1-2025",
     input: 12,
     output: 40,
+    modality: {
+      "gen_ai.usage.text.input_tokens": 10,
+      "gen_ai.usage.image.input_tokens": 2,
+      "gen_ai.usage.image.output_tokens": 40,
+    },
   },
   {
     activity: "tts",
@@ -131,6 +138,7 @@ test.each([
     responseModel: "eleven-v3",
     input: 5,
     output: 30,
+    modality: { "gen_ai.usage.audio.output_tokens": 30 },
   },
   {
     activity: "transcription",
@@ -155,6 +163,7 @@ test.each([
     responseModel: "whisper-1",
     input: 20,
     output: 4,
+    modality: { "gen_ai.usage.audio.input_tokens": 20 },
   },
   {
     activity: "summarize",
@@ -165,7 +174,9 @@ test.each([
             id: "m1",
             model: "claude-resolved",
             summary: "secret summary",
-            usage: usage(100, 10, { promptTokensDetails: { cachedTokens: 30 } }),
+            usage: usage(100, 10, {
+              promptTokensDetails: { cachedTokens: 30, cacheWriteTokens: 5 },
+            }),
           }),
         }),
         text: "long secret article",
@@ -177,9 +188,10 @@ test.each([
     operation: "chat",
     outputType: "text",
     responseModel: "claude-resolved",
-    // Anthropic reports promptTokens without cache reads; the span total includes them.
-    input: 130,
+    // Anthropic reports promptTokens without cache reads and writes; the span total includes them.
+    input: 135,
     output: 10,
+    modality: {},
   },
 ])(
   "$activity emits one $operation span with provider, model, and usage",
@@ -193,6 +205,7 @@ test.each([
     responseModel,
     input,
     output,
+    modality,
   }) => {
     const { middleware, spans, metrics, errors } = capture();
 
@@ -212,6 +225,13 @@ test.each([
     expect(span!.attributes["gen_ai.response.model"]).toBe(responseModel);
     expect(span!.attributes["gen_ai.usage.input_tokens"]).toBe(input);
     expect(span!.attributes["gen_ai.usage.output_tokens"]).toBe(output);
+    expect(
+      Object.fromEntries(
+        Object.entries(span!.attributes).filter(([key]) =>
+          /^gen_ai\.usage\.(text|image|audio)\./.test(key),
+        ),
+      ),
+    ).toEqual(modality);
 
     // Inputs and outputs (prompts, text, audio, image bytes) are never captured.
     const values = JSON.stringify(Object.values(span!.attributes));
@@ -228,33 +248,6 @@ test.each([
     ]);
   },
 );
-
-test("media usage records provider-reported modality token breakdowns", async () => {
-  const { middleware, spans } = capture();
-
-  await generateImage({
-    adapter: adapter<ImageAdapter>("image", "openai", {
-      generateImages: async () => ({
-        id: "i1",
-        model: "gpt-image-1",
-        images: [{ url: "https://example.com/i.png" }],
-        usage: usage(12, 40, {
-          promptTokensDetails: { textTokens: 10, imageTokens: 2 },
-          completionTokensDetails: { imageTokens: 40 },
-        }),
-      }),
-    }),
-    prompt: "p",
-    middleware: [middleware],
-  });
-
-  expect(spans[0]!.attributes).toMatchObject({
-    "gen_ai.usage.text.input_tokens": 10,
-    "gen_ai.usage.image.input_tokens": 2,
-    "gen_ai.usage.image.output_tokens": 40,
-  });
-  expect(spans[0]!.attributes["gen_ai.usage.audio.input_tokens"]).toBeUndefined();
-});
 
 test("a generation without reported usage omits token attributes and metrics", async () => {
   const { middleware, spans, metrics } = capture();

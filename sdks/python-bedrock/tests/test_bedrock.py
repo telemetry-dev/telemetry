@@ -489,6 +489,7 @@ def _streamed_converse(
     [
         (1_000, False, "東" * 400),
         (1_000, True, "[redacted]"),
+        (100, False, "...[truncated]"),
         (0, False, None),
     ],
 )
@@ -512,26 +513,15 @@ def test_configured_cap_applies_after_the_mask_not_to_stream_retention(
     assert state.budget.truncated is False
     assert state.blocks[0]["text"] == text
     assert "telemetry.dev.capture.truncated" not in span.attributes
+    exported = span.attributes.get("gen_ai.output.messages", "")
     if expected is None:
-        assert span.attributes.get("gen_ai.output.messages", "") == ""
+        assert exported == ""
+    elif expected == "...[truncated]":
+        assert isinstance(exported, str)
+        assert len(exported) <= max_attribute_length
+        assert exported.endswith(expected)
     else:
         assert _json_attr(span, "gen_ai.output.messages")[0]["parts"][0]["content"] == expected
-
-
-def test_small_configured_cap_cuts_the_exported_stream_output_not_retention(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    memory = make(max_attribute_length=100)
-    text = "x" * 5_000
-
-    state, span = _streamed_converse(memory, monkeypatch, _converse_text_stream(text))
-
-    assert state.blocks[0]["text"] == text
-    exported = span.attributes["gen_ai.output.messages"]
-    assert isinstance(exported, str)
-    assert len(exported) <= 100
-    assert exported.endswith("...[truncated]")
-    assert "telemetry.dev.capture.truncated" not in span.attributes
 
 
 @pytest.mark.parametrize("masked", [False, True])
@@ -662,7 +652,6 @@ def test_invoke_model_stream_bounds_content_but_keeps_terminal_metadata(
     assert state.budget.truncated is True
     assert state.budget.bytes_used <= state.budget.max_bytes
     span = memory.span_exporter.get_finished_spans()[0]
-    assert not hasattr(state, "text")
     retained_text = _json_attr(span, "gen_ai.output.messages")[0]["parts"][0]["content"]
     expected_prefix = "".join(f"{index:04d}" + "x" * 96 for index in range(len(state.chunks)))
     assert retained_text == expected_prefix
@@ -691,6 +680,7 @@ def test_unconsumed_stream_finishes_partial(
     spans = memory.span_exporter.get_finished_spans()
     assert len(spans) == 1
     assert spans[0].attributes["gen_ai.operation.name"] == "chat"
+    assert spans[0].attributes["telemetry.dev.capture.truncated"] is True
 
 
 @pytest.mark.parametrize("kind", ["absent", "compaction", "at-bound", "bounded"])
@@ -1586,36 +1576,42 @@ def test_invoke_model_stream_titan_counts_finish_and_unrewindable_body(
     assert list(titan_span.attributes["gen_ai.response.finish_reasons"]) == ["FINISHED"]
 
 
+@pytest.mark.parametrize(
+    ("chunks", "content", "usage"),
+    [
+        (
+            [
+                {
+                    "text": "choice",
+                    "finish_reason": "COMPLETE",
+                    "meta": {"billed_units": {"input_tokens": 8, "output_tokens": 3}},
+                }
+            ],
+            "choice",
+            (8, 3),
+        ),
+        (
+            [
+                {"generations": [{"text": "Cohere "}]},
+                {"generations": [{"text": "done", "finish_reason": "COMPLETE"}]},
+            ],
+            "Cohere done",
+            None,
+        ),
+    ],
+    ids=["text", "generations"],
+)
 def test_invoke_model_stream_cohere_generations_finish(
-    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    memory: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    chunks: list[dict[str, Any]],
+    content: str,
+    usage: tuple[int, int] | None,
 ) -> None:
     client = _client("bedrock-runtime")
     _stub_api_call(
         client,
-        [
-            {
-                "body": FakeEventStream(
-                    [
-                        {
-                            "chunk": {
-                                "bytes": _body(
-                                    {
-                                        "text": "choice",
-                                        "finish_reason": "COMPLETE",
-                                        "meta": {
-                                            "billed_units": {
-                                                "input_tokens": 8,
-                                                "output_tokens": 3,
-                                            }
-                                        },
-                                    }
-                                )
-                            }
-                        }
-                    ]
-                )
-            },
-        ],
+        [{"body": FakeEventStream([{"chunk": {"bytes": _body(chunk)}} for chunk in chunks])}],
         monkeypatch,
     )
     wrap_bedrock(client)
@@ -1628,11 +1624,13 @@ def test_invoke_model_stream_cohere_generations_finish(
     list(cohere_response["body"])
 
     cohere_span = memory.span_exporter.get_finished_spans()[0]
-    assert _json_attr(cohere_span, "gen_ai.output.messages")[0]["parts"][0]["content"] == "choice"
-    assert _json_attr(cohere_span, "gen_ai.output.messages")[0]["finish_reason"] == "COMPLETE"
-    assert cohere_span.attributes["gen_ai.usage.input_tokens"] == 8
-    assert cohere_span.attributes["gen_ai.usage.output_tokens"] == 3
+    output = _json_attr(cohere_span, "gen_ai.output.messages")[0]
+    assert output["parts"][0]["content"] == content
+    assert output["finish_reason"] == "COMPLETE"
     assert list(cohere_span.attributes["gen_ai.response.finish_reasons"]) == ["COMPLETE"]
+    if usage is not None:
+        assert cohere_span.attributes["gen_ai.usage.input_tokens"] == usage[0]
+        assert cohere_span.attributes["gen_ai.usage.output_tokens"] == usage[1]
 
 
 def test_embeddings_apply_guardrail_and_error(
