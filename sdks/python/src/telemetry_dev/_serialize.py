@@ -30,9 +30,14 @@ class MaskContext:
 Mask = Callable[[Any, MaskContext], Any]
 
 
-def truncate(text: str, max_len: int) -> str:
+def truncate(text: str, max_len: int, *, keep_end: bool = False) -> str:
+    """Cap ``text`` at ``max_len`` UTF-16 units, marking the cut.
+
+    ``keep_end`` keeps the tail and puts the marker first, for text whose most useful part
+    comes last.
+    """
     # Count UTF-16 units like JavaScript, but back off at a split surrogate pair
-    # rather than emitting the lone high surrogate that String.slice would retain.
+    # rather than emitting the lone surrogate that String.slice would retain.
     if len(text) * 2 <= max_len:
         return text
     encoded = text.encode("utf-16-le")
@@ -40,7 +45,14 @@ def truncate(text: str, max_len: int) -> str:
         return text
     if max_len < len(TRUNCATION_MARKER):
         return TRUNCATION_MARKER[: max(max_len, 0)]
-    head = encoded[: (max_len - len(TRUNCATION_MARKER)) * 2]
+    kept = (max_len - len(TRUNCATION_MARKER)) * 2
+    if keep_end:
+        tail = encoded[len(encoded) - kept :]
+        try:
+            return TRUNCATION_MARKER + tail.decode("utf-16-le")
+        except UnicodeDecodeError:
+            return TRUNCATION_MARKER + tail[2:].decode("utf-16-le")
+    head = encoded[:kept]
     try:
         return head.decode("utf-16-le") + TRUNCATION_MARKER
     except UnicodeDecodeError:
@@ -155,11 +167,12 @@ def serialize_content(
     mask: Mask | None,
     max_len: int,
     on_error: Callable[[BaseException], None] | None = None,
+    keep_end: bool = False,
 ) -> str | None:
     """The single content funnel: mask -> JSON stringify -> truncate.
 
     Returns None (content dropped, matching the TypeScript SDK) when the mask hook raises
-    or the value cannot be stringified.
+    or the value cannot be stringified. ``keep_end`` is passed to ``truncate``.
     """
     if mask is not None:
         try:
@@ -170,7 +183,7 @@ def serialize_content(
             report_error(on_error, message, RuntimeError(message))
             return None
     try:
-        return truncate(stringify(value), max_len)
+        return truncate(stringify(value), max_len, keep_end=keep_end)
     except BaseException:
         message = "failed to serialize attribute; content dropped"
         report_error(on_error, message, ValueError(message))

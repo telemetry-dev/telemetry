@@ -248,6 +248,31 @@ def test_truncation_counts_utf16_units(memory: SimpleNamespace) -> None:
 def test_truncation_never_splits_a_surrogate_pair() -> None:
     # keep = 6 UTF-16 units lands mid-emoji; the partial pair is dropped, not emitted.
     assert truncate("a" + "\U0001f916" * 40, 20) == "a" + "\U0001f916" * 2 + TRUNCATION_MARKER
+    assert truncate("\U0001f916" * 40 + "a", 20, keep_end=True) == (
+        TRUNCATION_MARKER + "\U0001f916" * 2 + "a"
+    )
+    marker_len = len(TRUNCATION_MARKER)
+    assert truncate("a" * 30, marker_len, keep_end=True) == TRUNCATION_MARKER
+    assert truncate("x" * 20 + "\U0001f916", marker_len + 1, keep_end=True) == TRUNCATION_MARKER
+
+
+def test_truncated_stacktrace_keeps_the_innermost_frame(make: MakeClient) -> None:
+    env = make(max_attribute_length=300)
+
+    def fail(depth: int) -> None:
+        if depth == 0:
+            raise ValueError("innermost failure")
+        fail(depth - 1)
+
+    with pytest.raises(ValueError), telemetry_dev.start_span("deep"):
+        fail(30)
+    event_attrs = dict(only_span(env).events[0].attributes or {})
+    stack = str(event_attrs["exception.stacktrace"])
+    assert len(stack) == 300
+    assert stack.startswith(TRUNCATION_MARKER)
+    assert stack.endswith("ValueError: innermost failure\n")
+    assert 'raise ValueError("innermost failure")' in stack
+    assert event_attrs["exception.message"] == "innermost failure"
 
 
 @pytest.mark.parametrize(
@@ -371,7 +396,7 @@ def test_exception_masking(make: MakeClient, mode: str) -> None:
     assert event_attrs.get("exception.stacktrace") == (
         "safe stack"
         if mode == "redact"
-        else "x" * 36 + TRUNCATION_MARKER
+        else TRUNCATION_MARKER + "x" * 36
         if mode == "truncate"
         else None
     )

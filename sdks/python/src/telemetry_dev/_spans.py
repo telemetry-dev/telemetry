@@ -159,14 +159,17 @@ def _record_error_on_span(
     }
     # Exceptions can echo either inputs or outputs; both must allow content capture.
     if state.capture_input and state.capture_output:
-        for key, value in (
-            ("exception.message", str(error)),
+        # A Python traceback ends with the innermost frame and the exception line, so a
+        # truncated one keeps its end.
+        for key, value, keep_end in (
+            ("exception.message", str(error), False),
             (
                 "exception.stacktrace",
                 "".join(traceback.format_exception(type(error), error, error.__traceback__)),
+                True,
             ),
         ):
-            serialized = client.serialize(value, key)
+            serialized = client.serialize(value, key, keep_end=keep_end)
             if serialized is not None:
                 attributes[key] = serialized
     span.add_event("exception", attributes)

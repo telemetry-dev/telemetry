@@ -216,13 +216,14 @@ class Client:
     def report(self, message: str, exc: BaseException) -> None:
         report_error(self.on_error, message, exc)
 
-    def serialize(self, value: Any, key: str) -> str | None:
+    def serialize(self, value: Any, key: str, *, keep_end: bool = False) -> str | None:
         return serialize_content(
             value,
             key=key,
             mask=self.mask,
             max_len=self.max_attribute_length,
             on_error=self.on_error,
+            keep_end=keep_end,
         )
 
     def flush(self, timeout_s: float = 10.0) -> None:
