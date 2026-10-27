@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/python-anthropic-v0.1.6...python-anthropic-v0.1.7) (2026-10-27)
+
+
+### Bug Fixes
+
+* **sdk-anthropic:** bound stream field alias inspection ([3b45e21](https://github.com/telemetry-dev/telemetry/commit/3b45e2173dbbecb0d06cbf9a401aaad18aec397f))
+* **sdk-anthropic:** record fallback blocks under their wire keys ([cb37f76](https://github.com/telemetry-dev/telemetry/commit/cb37f7671973ca08be464e0ea65296a3f5cb5796))
+* **sdk:** align captured JSON and provider usage ([#79](https://github.com/telemetry-dev/telemetry/issues/79)) ([1ec98d5](https://github.com/telemetry-dev/telemetry/commit/1ec98d5014ac810116402736cc7db420745eb9ef))
+* **sdk:** keep exception text behind capture flags ([#88](https://github.com/telemetry-dev/telemetry/issues/88)) ([e9e49c3](https://github.com/telemetry-dev/telemetry/commit/e9e49c33dfcff28c74f7a6e16126054dc32b0d90))
+
 ## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/python-anthropic-v0.1.5...python-anthropic-v0.1.6) (2026-10-19)
 
 

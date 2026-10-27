@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.10](https://github.com/telemetry-dev/telemetry/compare/cursor-v0.1.9...cursor-v0.1.10) (2026-10-27)
+
+
+### Bug Fixes
+
+* **sdk:** keep exception text behind capture flags ([#88](https://github.com/telemetry-dev/telemetry/issues/88)) ([e9e49c3](https://github.com/telemetry-dev/telemetry/commit/e9e49c33dfcff28c74f7a6e16126054dc32b0d90))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/sdk bumped to 0.1.10
+
 ## [0.1.9](https://github.com/telemetry-dev/telemetry/compare/cursor-v0.1.8...cursor-v0.1.9) (2026-10-19)
 
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.9](https://github.com/telemetry-dev/telemetry/compare/python-openai-v0.1.8...python-openai-v0.1.9) (2026-10-27)
+
+
+### Bug Fixes
+
+* **sdk:** align captured JSON and provider usage ([#79](https://github.com/telemetry-dev/telemetry/issues/79)) ([1ec98d5](https://github.com/telemetry-dev/telemetry/commit/1ec98d5014ac810116402736cc7db420745eb9ef))
+* **sdk:** keep exception text behind capture flags ([#88](https://github.com/telemetry-dev/telemetry/issues/88)) ([e9e49c3](https://github.com/telemetry-dev/telemetry/commit/e9e49c33dfcff28c74f7a6e16126054dc32b0d90))
+
 ## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/python-openai-v0.1.7...python-openai-v0.1.8) (2026-10-19)
 
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.11](https://github.com/telemetry-dev/telemetry/compare/opencode-v0.1.10...opencode-v0.1.11) (2026-10-27)
+
+
+### Bug Fixes
+
+* **sdk:** keep exception text behind capture flags ([#88](https://github.com/telemetry-dev/telemetry/issues/88)) ([e9e49c3](https://github.com/telemetry-dev/telemetry/commit/e9e49c33dfcff28c74f7a6e16126054dc32b0d90))
+* **sdk:** report export outages once and keep errors off agent TUIs ([d52effd](https://github.com/telemetry-dev/telemetry/commit/d52effd6f28b532a30d1be85cc5d36059e254604))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/sdk bumped to 0.1.10
+
 ## [0.1.10](https://github.com/telemetry-dev/telemetry/compare/opencode-v0.1.9...opencode-v0.1.10) (2026-10-19)
 
 
