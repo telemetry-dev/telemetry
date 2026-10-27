@@ -23,7 +23,7 @@ from anthropic.types import MessageParam, TextBlock
 from anthropic.types.beta import BetaMessageParam
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import StatusCode
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 import telemetry_dev_anthropic
 from telemetry_dev_anthropic import instrument_anthropic, uninstrument_anthropic, wrap_anthropic
@@ -2909,6 +2909,47 @@ def test_stream_capture_keeps_pydantic_extras_from_slot_storage() -> None:
     bounded = telemetry_dev_anthropic._bounded_native(model)  # pyright: ignore[reportPrivateUsage]
 
     assert bounded == {"type": "text", "citations_extra": "kept"}
+
+
+def test_stream_capture_alias_inspection_is_bounded(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    implementation = cast(Any, telemetry_dev_anthropic)
+    stored = implementation._stored
+    alias_reads = 0
+
+    def counted_stored(value: Any, name: str) -> Any:
+        nonlocal alias_reads
+        if name == "alias":
+            alias_reads += 1
+        return stored(value, name)
+
+    class SparseModel:
+        __pydantic_fields__ = {
+            f"unused_{index}": Field(alias=f"unused-{index}") for index in range(5_000)
+        } | {"from_": Field(alias="from")}
+
+        def __init__(self) -> None:
+            self.type = "fallback"
+            self.from_ = {"model": "claude-opus-5"}
+
+    monkeypatch.setattr(implementation, "_stored", counted_stored)
+    events = [
+        {"type": "content_block_start", "index": 0, "content_block": SparseModel()},
+        {"type": "message_stop"},
+    ]
+
+    def create(**_kwargs: Any) -> Iterator[Any]:
+        return iter(events)
+
+    client: Any = object.__new__(Anthropic)
+    client.messages = SimpleNamespace(create=create)
+    delivered = list(wrap_anthropic(client).messages.create(model="claude-opus-5", stream=True))
+
+    assert delivered == events
+    output = json.loads(str(attrs(only_span(memory))["gen_ai.output.messages"]))
+    assert output[0]["content"] == [{"type": "fallback", "from": {"model": "claude-opus-5"}}]
+    assert alias_reads <= 1_000
 
 
 def _spoofed_and_aliased_storage(calls: list[str]) -> list[Any]:

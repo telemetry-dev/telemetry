@@ -575,20 +575,18 @@ def _bounded_stream_native(
         remaining_items,
         depth,
         seen,
-        _field_aliases(value),
+        _model_fields(value),
     )
 
 
-def _field_aliases(value: Any) -> dict[str, str]:
+def _model_fields(value: Any) -> Mapping[str, Any]:
     # Pydantic keeps an aliased field under its Python name (`from_` for the wire key
     # `from`). Read the class's field table directly, so that no property runs.
     for klass in _TYPE_MRO.__get__(type(cast(object, value))):
         namespace = _TYPE_NAMESPACE.__get__(klass)
         fields = namespace.get("__pydantic_fields__", namespace.get("model_fields"))
         if type(fields) is dict:
-            items = cast(dict[str, Any], fields).items()
-            aliases = {name: _stored(field, "alias") for name, field in items}
-            return {name: alias for name, alias in aliases.items() if type(alias) is str}
+            return cast(dict[str, Any], fields)
     return {}
 
 
@@ -598,7 +596,7 @@ def _bounded_stream_mappings(
     remaining_items: list[int],
     depth: int,
     seen: set[int],
-    aliases: Mapping[str, str] | None = None,
+    fields: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if sum(len(mapping) for mapping in mappings) * 2 > remaining_items[0] or source_id in seen:
         raise _StreamCaptureLimit
@@ -611,8 +609,10 @@ def _bounded_stream_mappings(
                 if remaining_items[0] < 2:
                     raise _StreamCaptureLimit
                 remaining_items[0] -= 1
-                if aliases:
-                    key = aliases.get(key, key)
+                if fields:
+                    alias = _stored(fields.get(key), "alias")
+                    if type(alias) is str:
+                        key = alias
                 if key in seen_keys:
                     remaining_items[0] -= 1
                     continue
