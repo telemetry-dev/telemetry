@@ -1,8 +1,11 @@
+import { inspect } from "node:util";
+
 import {
   flush,
   log,
   startSpan,
   type LogLevel,
+  type SdkLogLevel,
   type SpanHandle,
   type TokenUsage,
 } from "@telemetry-dev/sdk";
@@ -13,6 +16,10 @@ import { ensureInit, type ClientOverrides, type TelemetryDevOmpOptions } from ".
 export interface TelemetryDevExtensionOptions extends TelemetryDevOmpOptions {
   /** Value for `gen_ai.agent.name` on spans and logs. Defaults to `"omp"`. */
   agentName?: string;
+  /** SDK console output. Defaults to `"silent"`, because omp draws its TUI on the terminal. */
+  logLevel?: SdkLogLevel;
+  /** Receives SDK and extension errors. Defaults to omp's log file, through `pi.logger`. */
+  onError?: (cause: Error) => void;
 }
 
 /**
@@ -38,6 +45,8 @@ export interface TelemetryDevExtensionContext {
  */
 export interface TelemetryDevExtensionHost {
   on(event: never, handler: never): void;
+  /** omp's file logger. */
+  logger?: { error(message: string, context?: Record<string, unknown>): void };
 }
 
 /** Structural stand-in for the host `ExtensionFactory` type. */
@@ -180,11 +189,16 @@ export function telemetryDevExtension(
   overrides?: ClientOverrides,
 ): TelemetryDevExtension {
   const { agentName = "omp", ...sdkOptions } = options;
-  const onError = sdkOptions.onError;
 
   return (pi) => {
+    // omp draws its TUI on the terminal, so errors go to omp's log file and not to the console.
+    const onError =
+      sdkOptions.onError ??
+      ((error: Error) => pi.logger?.error("telemetry.dev error", { error: inspect(error) }));
+    const logLevel = sdkOptions.logLevel ?? "silent";
+
     try {
-      ensureInit(sdkOptions, overrides);
+      ensureInit({ ...sdkOptions, logLevel, onError }, overrides);
     } catch (error) {
       reportError(onError, error);
     }

@@ -63,6 +63,14 @@ Use one route, not both. If the package is in `opencode.json` and also loaded fr
 
 All telemetry SDK options can also be passed to `telemetryDevPlugin`. The `agentName` integration option controls `gen_ai.agent.name` and defaults to `opencode`.
 
+## Errors
+
+The integration does not write to the console. opencode 1.x runs plugins in the process that draws its TUI, and console output from a plugin shows over the TUI. The integration sends SDK and plugin errors to the opencode log through `client.app.log`, with the service name `telemetry-dev`. The default location of the opencode log is `~/.local/share/opencode/log`.
+
+A series of failed exports, for example during an ingest outage, is one entry. The next failure after an export reaches the ingest is a new entry.
+
+To receive the errors in your code, pass `onError` to `telemetryDevPlugin()` in a plugin file. The callback replaces the opencode log. To also write SDK diagnostics to the console, set `logLevel`, for example `"warn"`.
+
 ## Trace shape
 
 Each opencode turn produces this hierarchy, correlated by `gen_ai.conversation.id`:

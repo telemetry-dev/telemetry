@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -735,6 +735,48 @@ test("malformed events never throw and report through onError", async () => {
 
   await runAgentLoop(harness);
   expect(harness.exporters.spans.getFinishedSpans().length).toBeGreaterThan(0);
+});
+
+test("errors go to a private, rotated telemetry-dev.log in the agent directory, not to the console", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "telemetry-pi-agent-"));
+  const path = join(directory, "telemetry-dev.log");
+  vi.stubEnv("PI_CODING_AGENT_DIR", directory);
+  const consoleSpies = (["error", "warn", "info", "debug", "log"] as const).map((method) =>
+    vi.spyOn(console, method).mockImplementation(() => {}),
+  );
+
+  try {
+    // An earlier log of more than 5 MB moves to telemetry-dev.log.1.
+    await writeFile(path, "x".repeat(5 * 1024 * 1024 + 1));
+    const handlers = new Map<string, (event: object, ctx: ExtensionContext) => unknown>();
+    telemetryDevExtension({
+      apiKey: "td_live_test",
+      exportMode: "immediate",
+      fetch: async () => new Response(null, { status: 400 }),
+    })({ on: (type: string, handler: never) => handlers.set(type, handler) });
+
+    await handlers.get("session_start")?.({ reason: "startup" }, makeContext());
+    await flush();
+    await handlers.get("message_end")?.(
+      {
+        get message(): never {
+          throw new Error("poisoned event");
+        },
+      },
+      makeContext(),
+    );
+    await resetForTesting();
+
+    const log = await readFile(path, "utf8");
+    expect(log).toContain("telemetry.dev log ingest failed: 400");
+    expect(log).toContain("poisoned event");
+    expect((await stat(`${path}.1`)).size).toBe(5 * 1024 * 1024 + 1);
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    expect(consoleSpies.flatMap((spy) => spy.mock.calls)).toEqual([]);
+  } finally {
+    vi.unstubAllEnvs();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("each event reads the current session id", async () => {

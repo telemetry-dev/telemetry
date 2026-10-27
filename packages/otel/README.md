@@ -121,7 +121,7 @@ When the SDK and the Claude API send the spans of a request to the same telemetr
 | `serviceName`  | `OTEL_SERVICE_NAME`                                           | `unknown_service`; used on the metrics resource.                                                                      |
 | `environment`  | `TELEMETRY_DEV_ENVIRONMENT`                                   | `production`; used as `deployment.environment.name` on the metrics resource.                                          |
 | `fetch`        | —                                                             | `globalThis.fetch`; override for tests or custom runtimes.                                                            |
-| `onError`      | —                                                             | Receives export and processor errors; errors are also reported through diagnostics.                                   |
+| `onError`      | —                                                             | Receives export and processor errors, which diagnostics also get. A series of failed exports is one report.           |
 | `spanExporter` | —                                                             | Advanced/test seam replacing the built-in OTLP trace exporter.                                                        |
 
 ## Missing API key behavior

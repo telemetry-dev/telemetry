@@ -24,6 +24,7 @@ import {
 } from "./metrics.ts";
 import { StampingSpanProcessor } from "./processor.ts";
 import {
+  createExportFailures,
   createMetricExporter,
   createTraceExporter,
   otlpHeaders,
@@ -74,6 +75,7 @@ export class TelemetrySpanProcessor implements SpanProcessor {
       fetchImpl: options.fetch ?? globalThis.fetch,
       onError: options.onError,
       exportTimeoutMillis: options.batch?.exportTimeoutMillis,
+      failures: createExportFailures(options.onError),
     };
 
     const exporter =

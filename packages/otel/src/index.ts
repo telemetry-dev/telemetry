@@ -60,9 +60,11 @@ export {
 } from "./session.ts";
 
 export {
+  createExportFailures,
   createLogExporter,
   createMetricExporter,
   createTraceExporter,
+  type ExportFailures,
   maybeGzip,
   otlpHeaders,
   type OtlpTarget,

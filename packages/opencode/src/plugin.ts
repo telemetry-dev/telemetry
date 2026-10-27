@@ -1,9 +1,12 @@
+import { inspect } from "node:util";
+
 import {
   captureEnabled,
   flush,
   log,
   startSpan,
   type LogLevel,
+  type SdkLogLevel,
   type SpanHandle,
   type TokenUsage,
 } from "@telemetry-dev/sdk";
@@ -15,6 +18,10 @@ import { asJsonObject, type JsonObject, type JsonValue } from "./type-guards.ts"
 export interface TelemetryDevPluginOptions extends TelemetryDevOpencodeOptions {
   /** Value for `gen_ai.agent.name` on spans and logs. Defaults to `"opencode"`. */
   agentName?: string;
+  /** SDK console output. Defaults to `"silent"`, because opencode can draw its TUI on the plugin's terminal. */
+  logLevel?: SdkLogLevel;
+  /** Receives SDK and plugin errors. Defaults to opencode's log, through `client.app.log`. */
+  onError?: (cause: Error) => void;
 }
 
 /**
@@ -71,6 +78,20 @@ function numberField(record: JsonObject | undefined, key: string): number | unde
   const parsed = Number(value);
 
   return parsed === value && Number.isFinite(parsed) ? parsed : undefined;
+}
+
+type AppLog = (options: { body: object }) => Promise<unknown>;
+
+/** Writes errors to opencode's log file through the plugin client, when the client has one. */
+function opencodeLog(input: unknown): ((error: Error) => void) | undefined {
+  const app = (input as { client?: { app?: { log?: AppLog } } } | undefined)?.client?.app;
+
+  if (typeof app?.log !== "function") return undefined;
+
+  return (error) => {
+    const body = { service: "telemetry-dev", level: "error", message: inspect(error) };
+    void app.log?.({ body }).catch(() => undefined);
+  };
 }
 
 function reportError(onError: ((cause: Error) => void) | undefined, cause: unknown): void {
@@ -172,7 +193,7 @@ export function telemetryDevPlugin(
   options: TelemetryDevPluginOptions = {},
   overrides?: ClientOverrides,
 ): TelemetryDevPlugin {
-  return async <Input, Options extends object>(_input: Input, configuredOptions?: Options) => {
+  return async <Input, Options extends object>(input: Input, configuredOptions?: Options) => {
     const mergedOptions = {
       ...options,
       ...configuredOptions,
@@ -185,10 +206,13 @@ export function telemetryDevPlugin(
         ? configuredAgentName
         : "opencode";
 
-    const onError = sdkOptions.onError;
+    // opencode 1.x runs plugins in the process that draws its TUI, so errors go to opencode's
+    // log and not to the console.
+    const onError = sdkOptions.onError ?? opencodeLog(input);
+    const logLevel = sdkOptions.logLevel ?? "silent";
 
     try {
-      ensureInit(sdkOptions, overrides);
+      ensureInit({ ...sdkOptions, logLevel, onError }, overrides);
     } catch (error) {
       reportError(onError, error);
     }
