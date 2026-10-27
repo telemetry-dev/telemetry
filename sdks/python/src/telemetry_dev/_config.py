@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -74,9 +75,12 @@ def report_error(
     exc: BaseException,
 ) -> None:
     """Route an internal SDK error to the on_error hook + leveled logger; never raises."""
+    # Snapshot before callbacks can re-raise exc and attach application exception chains.
+    if logger.isEnabledFor(logging.ERROR):
+        trace = "".join(traceback.format_exception(exc)).rstrip()
+        logger.error("telemetry-dev: %s\n%s", message, trace)
     if on_error is not None:
         try:
             on_error(exc)
         except BaseException:
-            logger.debug("telemetry-dev on_error hook raised", exc_info=True)
-    logger.error("telemetry-dev: %s", message, exc_info=exc)
+            logger.debug("telemetry-dev on_error hook raised")

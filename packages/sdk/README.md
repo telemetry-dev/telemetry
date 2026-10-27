@@ -78,16 +78,27 @@ other string attribute is cut at the cap without a marker, except that a cap of 
 `exportTimeoutMillis` 30000), `spanFilter`, `resourceAttributes`, `logLevel` (SDK diagnostics,
 default `"warn"`), `fetch`, `waitUntil`, `onError`.
 
+Core SDK error recording keeps failure status, error type, and an exception event. It includes
+`exception.message` and `exception.stacktrace` only when both effective `captureInput` and
+`captureOutput` are true, including per-span overrides: exceptions can echo either inputs or
+outputs. The policy is per span: when an error propagates to an enclosing span whose capture is on,
+that span records its message and stack. Included fields pass through `mask` with their exception
+attribute keys, then serialization and truncation. A throwing mask drops the affected field and reports a generic error to `onError`
+and SDK diagnostics without the hook's original message or cause. The original application error
+is rethrown unchanged. These controls do not scrub error type names, metadata, identifiers, resource
+attributes, or events written directly through raw OpenTelemetry APIs.
+
 `captureInput: false` and `captureOutput: false` omit captured content. Provider integrations may
 still record non-content metadata such as response IDs and models, finish reasons, usage, timing,
-and errors. Capture flags do not gate stop sequences, tool descriptions and definitions (`gen_ai.tool.description`, `gen_ai.tool.definitions`), caller-supplied metadata or raw attributes,
-or exception messages and stack traces; redact those separately when needed.
+and error types. Capture flags do not gate stop sequences, tool descriptions and definitions
+(`gen_ai.tool.description`, `gen_ai.tool.definitions`), caller-supplied metadata or raw attributes;
+redact those separately when needed.
 
 `mask` receives input and output content, system instructions, log messages, log attributes
 other than numbers and booleans, and content that integrations pass to
-`handle.serializeContent`. `ctx.key` names the attribute being written. It does not receive
-span or propagated `metadata`, raw `attributes`, or exception messages and stack traces; redact
-those separately.
+`handle.serializeContent`, including captured exception messages and stack traces. `ctx.key` names
+the attribute being written. It does not receive span or propagated `metadata` or raw `attributes`;
+redact those separately. Log masking is independent of span capture flags.
 
 Root spans remain independent by default. `init({ sessionMode: "process" })` groups otherwise
 uncorrelated spans and logs using a fresh opaque UUID for each enabled SDK initialization.

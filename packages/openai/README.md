@@ -88,7 +88,7 @@ Chat completion streams are traced. Requests are sent unchanged by default, so t
 
 Streamed chat output and finish reasons use separate budgets of up to 48 KiB and 1,000 items; the configured `maxAttributeLength` does not shrink these retention bounds; the core applies it to the exported attribute after the mask runs, with its `...[truncated]` marker, without setting `telemetry.dev.capture.truncated`. When present, `gen_ai.output.messages` contains bounded partial output. If output and/or finish-reason capture is incomplete, including when a choice ends without `finish_reason`, `telemetry.dev.capture.truncated` is `true`. With a mask configured, incomplete output is omitted because the mask cannot inspect the complete value. When output capture is disabled or omitted, response IDs and models, finish reasons, usage, timing, and errors may still be recorded.
 
-Capture flags do not gate stop sequences, caller-supplied metadata or raw attributes, or exception messages and stack traces; redact those separately when needed.
+Capture flags do not gate stop sequences or caller-supplied metadata or raw attributes; redact those separately when needed. Exception messages and stack traces are recorded only when both `captureInput` and `captureOutput` are on, and pass through `mask`. Older `@telemetry-dev/sdk` versions record them regardless of capture flags.
 
 ```ts
 const openai = wrapOpenAI(new OpenAI(), { injectStreamUsage: true });

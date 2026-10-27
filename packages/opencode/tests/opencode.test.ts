@@ -212,7 +212,7 @@ test("tool before and after create an execute_tool span with arguments, result, 
 
 test.each([
   { name: "default capture", options: {}, message: "grep: .env:\nTOKEN=private-tool-output" },
-  { name: "captureOutput: false", options: { captureOutput: false }, message: "tool bash failed" },
+  { name: "captureOutput: false", options: { captureOutput: false }, message: undefined },
   {
     name: "a mask",
     options: {
@@ -258,9 +258,13 @@ test.each([
   expect(exception?.["exception.type"]).toBe("ToolExecutionError");
   // The host error text is the tool result: only captured, unmasked output may reach the exception.
   expect(exception?.["exception.message"]).toBe(message);
-  const stack = String(exception?.["exception.stacktrace"]);
-  expect(stack.startsWith(`ToolExecutionError: ${message}\n`)).toBe(true);
-  expect(stack.includes("private-tool-output")).toBe(message.includes("private-tool-output"));
+  if (message === undefined) {
+    expect(exception?.["exception.stacktrace"]).toBeUndefined();
+  } else {
+    const stack = String(exception?.["exception.stacktrace"]);
+    expect(stack.startsWith(`ToolExecutionError: ${message}\n`)).toBe(true);
+    expect(stack.includes("private-tool-output")).toBe(message.includes("private-tool-output"));
+  }
   expect(span.startTime[0]).toBe(1_700_000_020);
   expect(span.endTime[0]).toBe(1_700_000_021);
 });
@@ -290,7 +294,7 @@ describe.each([
   {
     name: "captureOutput: false",
     options: { captureOutput: false },
-    message: "session error",
+    message: undefined,
     logMessage: undefined,
   },
   {
@@ -335,9 +339,15 @@ describe.each([
       expect(span.status.code, name).toBe(SpanStatusCode.ERROR);
       expect(span.attributes["error.type"], name).toBe("UnknownError");
       expect(exception?.["exception.message"], name).toBe(message);
-      const stack = String(exception?.["exception.stacktrace"]);
-      expect(stack.startsWith(`UnknownError: ${message}\n`), name).toBe(true);
-      expect(stack.includes("private-attachment-listing"), name).toBe(message !== "session error");
+      if (message === undefined) {
+        expect(exception?.["exception.stacktrace"], name).toBeUndefined();
+      } else {
+        const stack = String(exception?.["exception.stacktrace"]);
+        expect(stack.startsWith(`UnknownError: ${message}\n`), name).toBe(true);
+        expect(stack.includes("private-attachment-listing"), name).toBe(
+          message !== "session error",
+        );
+      }
       expect(span.attributes["gen_ai.response.finish_reasons"], name).toBeUndefined();
     }
 

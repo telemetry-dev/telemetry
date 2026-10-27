@@ -53,7 +53,12 @@ def format_output(text: str) -> dict[str, bool]:
 
 
 def mask(value: Any, ctx: MaskContext) -> Any:
-    """C16b: redact any string input containing SECRET (shared with the TS scenario)."""
+    if (
+        ctx.key in ("exception.message", "exception.stacktrace")
+        and isinstance(value, str)
+        and "SECRET" in value
+    ):
+        return "[redacted exception]"
     if ctx.key == "gen_ai.input.messages" and isinstance(value, str) and "SECRET" in value:
         return {"masked": True}
     return value
@@ -143,7 +148,9 @@ def main() -> int:
                 usage={"input_tokens": 3},
             ).end()
             # C14: per-call capture_input=False.
-            start_span("private-step", input="should-not-appear", capture_input=False).end()
+            start_span("private-step", input="should-not-appear", capture_input=False).end(
+                error=ValueError("PRIVATE_EXCEPTION")
+            )
             # C16: oversized content gets truncated at the shared UTF-16 cap with the marker.
             start_span("big-payload", input="x" * 10_000 + "\U0001f916" * 30_000).end()
             # C15: client-side cost override.
@@ -161,7 +168,9 @@ def main() -> int:
                 provider="openrouter",
             ).end()
             # C16b: mask hook redaction.
-            start_span("masked-step", type="generation", input="SECRET stuff").end()
+            start_span("masked-step", type="generation", input="SECRET stuff").end(
+                error=ValueError("SECRET exception")
+            )
             # C23: JSON.stringify-compatible serialization of the shared payload.
             with start_span("json-compat", input=JSON_COMPAT_PAYLOAD) as json_compat:
                 serialized = json_compat.serialize_content(

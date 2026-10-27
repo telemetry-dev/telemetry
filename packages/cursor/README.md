@@ -141,16 +141,19 @@ task, because Cursor generates chat titles from the prompt. A subagent that
 `subagentStop` reports with status `error` then records `SubagentError`
 without its task text.
 
+Span exception messages and stack traces, including the `error_message` of
+`sessionEnd` and of a failed tool or `Task` call, are recorded only when both
+settings are `true`. Older `@telemetry-dev/sdk` versions record them regardless of
+the settings.
+
 The two settings do not cover these values, which are always exported:
 
 - The user email, workspace and file paths, and conversation, generation,
   subagent, and tool call ids.
 - Model, tool, and subagent names, and lifecycle metadata such as statuses,
   durations, compaction counts, and edit counts.
-- Error messages from Cursor and exception stack traces. The `error_message`
-  of `sessionEnd` goes to the `cursor.error.message` log attribute and to a
-  `SessionError` exception. The `error_message` of a failed tool or `Task`
-  call becomes the exception message of its span.
+- The `error_message` of `sessionEnd` in the `cursor.error.message` log
+  attribute.
 
 To export none of this, set `enabled` to `false`.
 
