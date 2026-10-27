@@ -124,6 +124,36 @@ test("without an api key or exporter override the processor is a silent no-op", 
   }
 });
 
+test("an outage that stops traces and metrics reaches onError once", async () => {
+  const errors: Error[] = [];
+  const urls: string[] = [];
+
+  const processor = new TelemetrySpanProcessor({
+    apiKey: "td_live_x",
+    baseUrl: "https://ingest.example",
+    exportMode: "immediate",
+    onError: (error) => errors.push(error),
+    fetch: (input) => {
+      urls.push(input instanceof URL ? input.href : input instanceof Request ? input.url : input);
+
+      return Promise.resolve(new Response(null, { status: 400 }));
+    },
+  });
+
+  const provider = new BasicTracerProvider({ spanProcessors: [processor] });
+  const span = provider.getTracer("user-app").startSpan("chat");
+  span.setAttribute("gen_ai.operation.name", "chat");
+  span.end();
+  // Shutdown waits for the span export and sends the metrics.
+  await provider.shutdown();
+
+  expect(urls.sort()).toEqual([
+    "https://ingest.example/v1/metrics",
+    "https://ingest.example/v1/traces",
+  ]);
+  expect(errors).toHaveLength(1);
+});
+
 test("createTelemetrySpanExporter is a no-op without a key and real otherwise", async () => {
   vi.stubEnv("TELEMETRY_DEV_API_KEY", undefined);
   const calls: Array<{ url: string; method?: string }> = [];

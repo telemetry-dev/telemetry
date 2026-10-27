@@ -19,6 +19,7 @@ import {
   als,
   AlsContextManager,
   BATCHED_METRIC_INTERVAL_MS,
+  createExportFailures,
   createLogExporter,
   createMetricExporter,
   createMetricsPipeline,
@@ -156,7 +157,10 @@ function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): Tel
     ...config.resourceAttributes,
   });
 
-  const transport: Transport = { fetchImpl: config.fetchImpl, onError: config.onError };
+  // A failed flush repeats the failure of its export, so the flush and the exporters share one
+  // failure state.
+  const failures = createExportFailures(config.onError);
+  const transport: Transport = { fetchImpl: config.fetchImpl, onError: config.onError, failures };
   const headers = config.apiKey ? otlpHeaders(config.apiKey, config.sdkName) : undefined;
 
   const spanExporter =
@@ -274,7 +278,7 @@ function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): Tel
 
     return Promise.all(parts)
       .then(() => undefined)
-      .catch((error: Error) => reportError(config.onError, error));
+      .catch((error: Error) => failures.report(error));
   };
 
   const handoff = (p: Promise<void>): Promise<void> => {

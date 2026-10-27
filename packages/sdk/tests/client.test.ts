@@ -348,6 +348,57 @@ test("OTLP requests identify the calling SDK package", async () => {
   expect(requests[0]?.headers.get("x-telemetry-dev-sdk")).toBe("@telemetry-dev/cursor");
 });
 
+test("an ingest outage reaches onError once until an export gets through again", async () => {
+  vi.useFakeTimers();
+
+  try {
+    let ingestUp = false;
+    const requests: string[] = [];
+    const errors: Error[] = [];
+
+    init({
+      apiKey: "td_live_test",
+      baseUrl: "https://ingest.test",
+      logLevel: "silent",
+      onError: (error) => errors.push(error),
+      fetch: async (input) => {
+        requests.push(new URL(new Request(input).url).pathname);
+
+        if (!ingestUp) throw new TypeError("fetch failed");
+
+        return new Response(null, { status: 200 });
+      },
+    });
+
+    // The transport tries a failed request three times, with 600 ms of delays in total.
+    const flushThroughRetries = async () => {
+      const flushed = flush();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await flushed;
+    };
+
+    startSpan("first outage", { type: "tool" }).end();
+    log("first outage");
+    await flushThroughRetries();
+    log("still in the first outage");
+    await flushThroughRetries();
+
+    expect(new Set(requests)).toEqual(new Set(["/v1/traces", "/v1/logs", "/v1/metrics"]));
+    expect(errors.map((error) => error.message)).toEqual(["fetch failed"]);
+
+    ingestUp = true;
+    startSpan("ingest is back", { type: "tool" }).end();
+    await flushThroughRetries();
+    ingestUp = false;
+    startSpan("second outage", { type: "tool" }).end();
+    await flushThroughRetries();
+
+    expect(errors.map((error) => error.message)).toEqual(["fetch failed", "fetch failed"]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test("captureMasked reports whether the active client has a mask", () => {
   expect(captureMasked()).toBe(false);
 

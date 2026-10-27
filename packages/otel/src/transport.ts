@@ -19,6 +19,38 @@ export interface Transport {
   fetchImpl: typeof fetch;
   onError?: (error: Error) => void;
   exportTimeoutMillis?: number;
+  /**
+   * Failure state shared by the exporters of one SDK client or `TelemetrySpanProcessor`, so that
+   * an outage that stops traces, logs, and metrics is one report. Without it, each exporter keeps
+   * its own state.
+   */
+  failures?: ExportFailures;
+}
+
+export interface ExportFailures {
+  /** Sends the failure to onError if it is the first failure since an export reached the ingest. */
+  report(cause: unknown): void;
+  /** Records that an export reached the ingest, so that report() sends the next failure. */
+  clear(): void;
+}
+
+/**
+ * Reports the first failed export, then stays quiet until an export reaches the ingest again.
+ * During an outage every batch fails, and a report for each batch floods the console or onError.
+ */
+export function createExportFailures(onError?: (error: Error) => void): ExportFailures {
+  let reported = false;
+
+  return {
+    report(cause) {
+      if (reported) return;
+      reported = true;
+      reportError(onError, cause);
+    },
+    clear() {
+      reported = false;
+    },
+  };
 }
 
 export interface OtlpTarget {
@@ -281,6 +313,7 @@ async function postSerialized(
 
 const createExportLifecycle = (transport: Transport) => {
   const inFlight = new Set<Promise<void>>();
+  const failures = transport.failures ?? createExportFailures(transport.onError);
   let shutDown = false;
 
   const configuredTimeoutMillis =
@@ -302,7 +335,7 @@ const createExportLifecycle = (transport: Transport) => {
   };
 
   const exportBatch = (
-    send: (signal: AbortSignal) => Promise<void>,
+    send: (signal: AbortSignal) => Promise<boolean>,
     resultCallback: (result: ExportResult) => void,
   ) => {
     if (shutDown) {
@@ -325,10 +358,13 @@ const createExportLifecycle = (transport: Transport) => {
     let tracked: Promise<void>;
     tracked = Promise.race([Promise.resolve().then(() => send(controller.signal)), timeout])
       .then(
-        () => callback(resultCallback, { code: ExportResultCode.SUCCESS }),
+        (delivered) => {
+          if (delivered) failures.clear();
+          callback(resultCallback, { code: ExportResultCode.SUCCESS });
+        },
         (cause: unknown) => {
           const error = cause instanceof Error ? cause : new Error(String(cause));
-          reportError(transport.onError, error);
+          failures.report(error);
           callback(resultCallback, { code: ExportResultCode.FAILED, error });
         },
       )
@@ -357,24 +393,25 @@ interface Serializer<T> {
   serializeRequest(items: T[]): Uint8Array | undefined;
 }
 
+/** The sender resolves to true when at least one request reached the ingest. */
 function createOtlpBatchSender<T>(
   serializer: Serializer<T>,
   target: OtlpTarget,
   transport: Transport,
   label: string,
-): (items: T[], signal: AbortSignal) => Promise<void> {
-  const send = async (items: T[], signal: AbortSignal): Promise<void> => {
+): (items: T[], signal: AbortSignal) => Promise<boolean> {
+  const send = async (items: T[], signal: AbortSignal): Promise<boolean> => {
     const body = serializer.serializeRequest(items);
 
-    if (!body || body.byteLength === 0) return;
+    if (!body || body.byteLength === 0) return false;
 
     if (body.byteLength > MAX_BODY_BYTES) {
       if (items.length > 1) {
         const mid = Math.ceil(items.length / 2);
-        await send(items.slice(0, mid), signal);
-        await send(items.slice(mid), signal);
+        const first = await send(items.slice(0, mid), signal);
+        const second = await send(items.slice(mid), signal);
 
-        return;
+        return first || second;
       }
 
       // A single record beyond the limit can never be accepted; drop it instead of wedging the batch.
@@ -383,10 +420,12 @@ function createOtlpBatchSender<T>(
         new Error(`telemetry.dev: ${label} record exceeds max export size, dropped`),
       );
 
-      return;
+      return false;
     }
 
     await postSerialized(body, target, transport, label, signal);
+
+    return true;
   };
 
   return send;
@@ -444,9 +483,10 @@ export function createMetricExporter(target: OtlpTarget, transport: Transport): 
           ? ProtobufMetricsSerializer.serializeRequest(resourceMetrics)
           : undefined;
 
-        if (body !== undefined && body.byteLength > 0) {
-          await postSerialized(body, target, transport, "metric", signal);
-        }
+        if (body === undefined || body.byteLength === 0) return false;
+        await postSerialized(body, target, transport, "metric", signal);
+
+        return true;
       }, resultCallback);
     },
     selectAggregationTemporality: () => AggregationTemporality.DELTA,

@@ -63,7 +63,7 @@ export interface TelemetryOptions {
   fetch?: typeof fetch;
   /** Serverless extender (e.g. Cloudflare `ctx.waitUntil`). When provided, `flush()` does not await exports. */
   waitUntil?: (p: Promise<unknown>) => void;
-  /** Receives errors raised while emitting telemetry; repeated instrumentation failures from one stream may be coalesced into one report. The SDK never throws into user code. */
+  /** Receives errors raised while emitting telemetry; repeated instrumentation failures from one stream may be coalesced into one report. A series of failed exports is reported once, and the next failure after an export reaches the ingest is reported again. The SDK never throws into user code. */
   onError?: (cause: Error) => void;
   /** Header value for a custom telemetry.dev integration. */
   sdkName?: string;

@@ -137,9 +137,9 @@ test("retries on 429/503 then succeeds", async () => {
   expect(calls[0]!.headers["x-telemetry-dev-sdk"]).toBe("@telemetry-dev/otel");
 });
 
-test("does not retry non-retryable statuses and reports the failure", async () => {
+test("does not retry non-retryable statuses and reports a series of failures once", async () => {
   const errors: unknown[] = [];
-  const { calls, fetchImpl } = makeFetch([400]);
+  const { calls, fetchImpl } = makeFetch([400, 400, 200, 400]);
 
   const exporter = createTraceExporter(
     { url: "https://ingest.example/v1/traces", headers: otlpHeaders("td_live_x") },
@@ -149,7 +149,11 @@ test("does not retry non-retryable statuses and reports the failure", async () =
   const code = await exportSpans(exporter, makeSpans(1));
   expect(code).toBe(ExportResultCode.FAILED);
   expect(calls).toHaveLength(1);
+  expect(await exportSpans(exporter, makeSpans(1))).toBe(ExportResultCode.FAILED);
   expect(errors).toHaveLength(1);
+  expect(await exportSpans(exporter, makeSpans(1))).toBe(ExportResultCode.SUCCESS);
+  expect(await exportSpans(exporter, makeSpans(1))).toBe(ExportResultCode.FAILED);
+  expect(errors).toHaveLength(2);
 });
 
 test("exhausted retries surface as a failed export with onError", async () => {
