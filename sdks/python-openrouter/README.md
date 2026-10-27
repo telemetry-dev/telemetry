@@ -75,6 +75,11 @@ When OpenRouter returns cost information, the integration records `gen_ai.usage.
 `usage.cost_details.upstream_inference_cost`. The cost attribute is omitted when neither value is
 available.
 
+When `usage.is_byok` is `True`, the request uses your own provider key. Your provider bills the
+inference, and `usage.cost` is only the OpenRouter fee. The integration then records the sum of
+`usage.cost` and `usage.cost_details.upstream_inference_cost`. If the response has no
+`upstream_inference_cost`, the integration records no cost.
+
 ## Streaming
 
 Chat and Responses API streams are traced for sync and async callers. The integration accumulates

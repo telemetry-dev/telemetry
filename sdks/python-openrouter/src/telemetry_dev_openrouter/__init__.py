@@ -163,10 +163,15 @@ def _clean_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _cost_usd(raw_usage: Any) -> float | None:
+    # `cost` is the OpenRouter charge. For a request with the user's own provider key
+    # (BYOK), the provider bills the inference, and the charge is only the OpenRouter
+    # fee. The cost of such a request is the fee and the provider's inference cost.
+    # Without the inference cost, the span has no cost.
     cost = _number(_field(raw_usage, "cost"))
-    if cost is not None:
-        return cost
-    return _number(_field(_field(raw_usage, "cost_details"), "upstream_inference_cost"))
+    upstream_cost = _number(_field(_field(raw_usage, "cost_details"), "upstream_inference_cost"))
+    if _field(raw_usage, "is_byok") is True:
+        return None if upstream_cost is None else upstream_cost + (cost or 0)
+    return cost if cost is not None else upstream_cost
 
 
 def _chat_request(params: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:

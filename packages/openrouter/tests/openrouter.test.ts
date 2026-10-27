@@ -153,6 +153,7 @@ function chatBody(
     model?: string;
     cost?: number;
     upstreamCost?: number;
+    byok?: boolean;
     content?: string;
   } = {},
 ) {
@@ -165,6 +166,8 @@ function chatBody(
   };
 
   if (options.cost !== undefined) Object.assign(usage, { cost: options.cost });
+
+  if (options.byok !== undefined) Object.assign(usage, { is_byok: options.byok });
 
   if (options.upstreamCost !== undefined) {
     Object.assign(usage, {
@@ -390,12 +393,33 @@ test("chat maps request, response, usage, primary cost, provider, and sampling f
   expect(span.attributes["gen_ai.request.presence_penalty"]).toBe(0.2);
 });
 
-test("cost falls back to upstream inference cost when usage cost is absent", async () => {
+// For a request with the user's own provider key (BYOK), the provider bills the inference,
+// and `cost` is only OpenRouter's fee.
+test.each([
+  {
+    name: "upstream inference cost without usage cost",
+    usage: { upstreamCost: 0.009 },
+    want: 0.009,
+  },
+  {
+    name: "a BYOK fee and upstream inference cost",
+    usage: { cost: 0.0005, upstreamCost: 0.01, byok: true },
+    want: 0.0105,
+  },
+  {
+    name: "a BYOK fee without upstream inference cost",
+    usage: { cost: 0.0005, byok: true },
+    want: undefined,
+  },
+  {
+    name: "usage cost and upstream inference cost without BYOK",
+    usage: { cost: 0.012, upstreamCost: 0.011, byok: false },
+    want: 0.012,
+  },
+])("cost from $name", async ({ usage, want }) => {
   const spans = setupSpans();
 
-  const fake = createFakeFetcher(
-    jsonResponse(chatBody("chat_cost_fallback", { upstreamCost: 0.009 })),
-  );
+  const fake = createFakeFetcher(jsonResponse(chatBody("chat_cost", usage)));
 
   await clientWith(fake.fetcher).chat.send({
     chatRequest: {
@@ -405,7 +429,7 @@ test("cost falls back to upstream inference cost when usage cost is absent", asy
   });
 
   const span = await exportedSpan(spans);
-  expect(span.attributes["gen_ai.usage.cost"]).toBe(0.009);
+  expect(span.attributes["gen_ai.usage.cost"]).toBe(want);
 });
 
 test("chat output chunks recognize decoded reasoning text but not opaque metadata", async () => {
