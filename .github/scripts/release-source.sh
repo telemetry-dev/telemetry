@@ -10,7 +10,7 @@ if ! git check-ref-format "refs/tags/$RELEASE_TAG"; then
   echo "Invalid release tag" >&2
   exit 1
 fi
-if [[ "$GITHUB_EVENT_NAME" != "release" && "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+if [[ "$GITHUB_EVENT_NAME" != "push" && "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
   echo "Unsupported release event" >&2
   exit 1
 fi
@@ -58,8 +58,8 @@ if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
   exit 0
 fi
 
-if [[ "$GITHUB_REF" != "refs/tags/$RELEASE_TAG" ]]; then
-  echo "Package publication must run from a release tag" >&2
+if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+  echo "Package publication must run from main" >&2
   exit 1
 fi
 if [[ "$tag_sha" != "$GITHUB_SHA" || "$head_sha" != "$GITHUB_SHA" ]]; then
