@@ -22,6 +22,7 @@ from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
 from ._config import SDK_VERSION, logger, report_error, resolve_config
+from ._export import ExportFailures, ReportingSpanExporter
 from ._metrics import GuardedOTLPMetricExporter, MetricsRecorder, sdk_meter_provider
 from ._processor import ExportMode, StampingSpanProcessor
 from ._semconv import SCOPE_NAME
@@ -104,6 +105,9 @@ class TelemetrySpanProcessor(SpanProcessor):
             service_name=service_name,
         )
 
+        # The span and metric exporters use one failure state, as the exporters of a client do.
+        failures = ExportFailures(on_error)
+
         if span_exporter is None:
             span_exporter = create_telemetry_span_exporter(
                 api_key=config.api_key,
@@ -111,6 +115,7 @@ class TelemetrySpanProcessor(SpanProcessor):
             )
             if isinstance(span_exporter, _NoOpSpanExporter):
                 return
+            span_exporter = ReportingSpanExporter(span_exporter, failures)
 
         if metrics_recorder is None and metrics and config.api_key is not None:
             resource = Resource.create(
@@ -128,6 +133,7 @@ class TelemetrySpanProcessor(SpanProcessor):
                 compression=Compression.Gzip,
                 timeout=_EXPORTER_TIMEOUT_S,
                 preferred_temporality={Histogram: AggregationTemporality.DELTA},
+                failures=failures,
             )
             reader = PeriodicExportingMetricReader(
                 metric_exporter,

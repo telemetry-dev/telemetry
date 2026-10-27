@@ -23,6 +23,7 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import telemetry_dev
+from telemetry_dev._export import ExportFailures
 from telemetry_dev._metrics import (
     GuardedOTLPMetricExporter,
     OutputChunkAggregation,
@@ -386,7 +387,9 @@ def test_quiet_interval_emits_zero_metric_posts(
     if internal_metrics:
         monkeypatch.setenv("OTEL_PYTHON_SDK_INTERNAL_METRICS_ENABLED", "true")
     with otlp_capture_server() as server:
-        exporter = GuardedOTLPMetricExporter(endpoint=f"{server.url}/v1/metrics")
+        exporter = GuardedOTLPMetricExporter(
+            endpoint=f"{server.url}/v1/metrics", failures=ExportFailures(None)
+        )
         reader = PeriodicExportingMetricReader(exporter, export_interval_millis=2**31 - 1)
         provider = sdk_meter_provider(reader, Resource.create())
         meter = provider.get_meter("quiet")
