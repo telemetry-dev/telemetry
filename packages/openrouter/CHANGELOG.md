@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.10](https://github.com/telemetry-dev/telemetry/compare/openrouter-v0.1.9...openrouter-v0.1.10) (2026-10-27)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/otel bumped to 0.1.7
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.1.10
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.1.10
+
 ## [0.1.9](https://github.com/telemetry-dev/telemetry/compare/openrouter-v0.1.8...openrouter-v0.1.9) (2026-10-19)
 
 

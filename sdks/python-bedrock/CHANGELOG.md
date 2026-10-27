@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.1.6...python-bedrock-v0.1.7) (2026-10-27)
+
+
+### Bug Fixes
+
+* **bedrock:** count compaction usage on invoke model spans ([#77](https://github.com/telemetry-dev/telemetry/issues/77)) ([895456c](https://github.com/telemetry-dev/telemetry/commit/895456cab14e8f9fa1cf7fe26c36403cfbd91ae5))
+* **sdk:** align captured JSON and provider usage ([#79](https://github.com/telemetry-dev/telemetry/issues/79)) ([1ec98d5](https://github.com/telemetry-dev/telemetry/commit/1ec98d5014ac810116402736cc7db420745eb9ef))
+
 ## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.1.5...python-bedrock-v0.1.6) (2026-10-19)
 
 

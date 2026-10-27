@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.12](https://github.com/telemetry-dev/telemetry/compare/bedrock-v0.1.11...bedrock-v0.1.12) (2026-10-27)
+
+
+### Bug Fixes
+
+* **bedrock:** count compaction usage on invoke model spans ([#77](https://github.com/telemetry-dev/telemetry/issues/77)) ([895456c](https://github.com/telemetry-dev/telemetry/commit/895456cab14e8f9fa1cf7fe26c36403cfbd91ae5))
+* **sdk:** align captured JSON and provider usage ([#79](https://github.com/telemetry-dev/telemetry/issues/79)) ([1ec98d5](https://github.com/telemetry-dev/telemetry/commit/1ec98d5014ac810116402736cc7db420745eb9ef))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.1.10
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.1.10
+
 ## [0.1.11](https://github.com/telemetry-dev/telemetry/compare/bedrock-v0.1.10...bedrock-v0.1.11) (2026-10-19)
 
 

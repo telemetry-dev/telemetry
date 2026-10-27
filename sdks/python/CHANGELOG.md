@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.11](https://github.com/telemetry-dev/telemetry/compare/python-v0.2.10...python-v0.2.11) (2026-10-27)
+
+
+### Bug Fixes
+
+* **sdk-python:** keep the end of truncated tracebacks ([#89](https://github.com/telemetry-dev/telemetry/issues/89)) ([2404ae4](https://github.com/telemetry-dev/telemetry/commit/2404ae49677a8de4c5c64ea99866167c5431b1e1))
+* **sdk-python:** report a series of failed exports once ([#87](https://github.com/telemetry-dev/telemetry/issues/87)) ([06b75e9](https://github.com/telemetry-dev/telemetry/commit/06b75e905c640c2ca28b16ed16724f1457090eaf))
+* **sdk:** align captured JSON and provider usage ([#79](https://github.com/telemetry-dev/telemetry/issues/79)) ([1ec98d5](https://github.com/telemetry-dev/telemetry/commit/1ec98d5014ac810116402736cc7db420745eb9ef))
+* **sdk:** keep exception text behind capture flags ([#88](https://github.com/telemetry-dev/telemetry/issues/88)) ([e9e49c3](https://github.com/telemetry-dev/telemetry/commit/e9e49c33dfcff28c74f7a6e16126054dc32b0d90))
+
 ## [0.2.10](https://github.com/telemetry-dev/telemetry/compare/python-v0.2.9...python-v0.2.10) (2026-10-19)
 
 

@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/cursor",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Cursor coding-agent telemetry integration for telemetry.dev.",
   "keywords": [
     "agents",

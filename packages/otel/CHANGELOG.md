@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/otel-v0.1.6...otel-v0.1.7) (2026-10-27)
+
+
+### Bug Fixes
+
+* **sdk:** report export outages once and keep errors off agent TUIs ([d52effd](https://github.com/telemetry-dev/telemetry/commit/d52effd6f28b532a30d1be85cc5d36059e254604))
+
 ## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/otel-v0.1.5...otel-v0.1.6) (2026-10-19)
 
 

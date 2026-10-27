@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.12](https://github.com/telemetry-dev/telemetry/compare/openai-v0.1.11...openai-v0.1.12) (2026-10-27)
+
+
+### Bug Fixes
+
+* **sdk:** keep exception text behind capture flags ([#88](https://github.com/telemetry-dev/telemetry/issues/88)) ([e9e49c3](https://github.com/telemetry-dev/telemetry/commit/e9e49c33dfcff28c74f7a6e16126054dc32b0d90))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.1.10
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.1.10
+
 ## [0.1.11](https://github.com/telemetry-dev/telemetry/compare/openai-v0.1.10...openai-v0.1.11) (2026-10-19)
 
 
