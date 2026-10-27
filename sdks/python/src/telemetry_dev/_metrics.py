@@ -27,6 +27,7 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import INVALID_SPAN_CONTEXT, NonRecordingSpan, set_span_in_context
 
 from ._config import report_error
+from ._export import ExportFailures
 from ._semconv import (
     ATTR_ERROR_TYPE,
     ATTR_TIME_TO_FIRST_CHUNK,
@@ -166,16 +167,17 @@ def _has_data_points(metrics_data: MetricsData) -> bool:
 
 class GuardedOTLPMetricExporter(OTLPMetricExporter):
     """OTLP metric exporter that skips POSTs for collections with zero data points
-    (mirrors the TS emitter's empty-datapoint guard) and surfaces failures to on_error."""
+    (mirrors the TS emitter's empty-datapoint guard) and reports failures through its
+    ExportFailures."""
 
     def __init__(
         self,
         *args: Any,
-        on_error: Callable[[BaseException], None] | None = None,
+        failures: ExportFailures,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)  # pyright: ignore[reportUnknownMemberType]
-        self._td_on_error = on_error
+        self._td_failures = failures
         self.output_chunks: OutputChunkAggregation | None = None
 
     def export(
@@ -187,20 +189,22 @@ class GuardedOTLPMetricExporter(OTLPMetricExporter):
         if self.output_chunks is not None:
             metrics_data = _with_output_chunks(metrics_data, self.output_chunks)
         if not _has_data_points(metrics_data):
+            # No request reaches the ingest, so a series of failed exports continues.
             return MetricExportResult.SUCCESS
         try:
             result = super().export(  # pyright: ignore[reportUnknownMemberType]
                 metrics_data, timeout_millis=timeout_millis, **kwargs
             )
         except BaseException as exc:
-            report_error(self._td_on_error, "metric export failed", exc)
+            self._td_failures.report("metric export failed", exc)
             return MetricExportResult.FAILURE
         if result is MetricExportResult.FAILURE:
-            report_error(
-                self._td_on_error,
+            self._td_failures.report(
                 "metric export failed",
                 RuntimeError("OTLP metric export failed (check the API key and ingest URL)"),
             )
+        else:
+            self._td_failures.clear()
         return result
 
 

@@ -15,7 +15,6 @@ from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import (
     BatchLogRecordProcessor,
     LogRecordExporter,
-    LogRecordExportResult,
     SimpleLogRecordProcessor,
 )
 from opentelemetry.sdk.metrics import Histogram, MeterProvider
@@ -26,7 +25,7 @@ from opentelemetry.sdk.metrics.export import (
 )
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, SpanLimits, TracerProvider
-from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+from opentelemetry.sdk.trace.export import SpanExporter
 from opentelemetry.sdk.trace.sampling import Sampler
 from opentelemetry.trace import Tracer
 
@@ -41,6 +40,7 @@ from ._config import (
     resolve_config,
 )
 from ._context import SessionSampler
+from ._export import ExportFailures, ReportingLogExporter, ReportingSpanExporter
 from ._metrics import (
     GuardedOTLPMetricExporter,
     MetricsRecorder,
@@ -58,68 +58,6 @@ _client: Client | None = None
 def _default_scope_filter(span: ReadableSpan) -> bool:
     scope = span.instrumentation_scope
     return scope is not None and scope.name == SCOPE_NAME
-
-
-class _ReportingSpanExporter(SpanExporter):
-    """Surfaces transport failures to on_error (TS parity: exporters route errors to onError,
-    the stock OTLP exporter only logs them)."""
-
-    def __init__(
-        self, inner: SpanExporter, on_error: Callable[[BaseException], None] | None
-    ) -> None:
-        self._inner = inner
-        self._on_error = on_error
-
-    def export(self, spans: Any) -> SpanExportResult:
-        try:
-            result = self._inner.export(spans)
-        except BaseException as exc:
-            report_error(self._on_error, "span export failed", exc)
-            return SpanExportResult.FAILURE
-        if result is SpanExportResult.FAILURE:
-            report_error(
-                self._on_error,
-                "span export failed",
-                RuntimeError("OTLP span export failed (check the API key and ingest URL)"),
-            )
-        return result
-
-    def force_flush(self, timeout_millis: int = 30000) -> bool:
-        return self._inner.force_flush(timeout_millis)
-
-    def shutdown(self) -> None:
-        self._inner.shutdown()
-
-
-class _ReportingLogExporter(LogRecordExporter):
-    """Log-exporter twin of _ReportingSpanExporter."""
-
-    def __init__(
-        self, inner: LogRecordExporter, on_error: Callable[[BaseException], None] | None
-    ) -> None:
-        self._inner = inner
-        self._on_error = on_error
-
-    def export(self, batch: Any) -> LogRecordExportResult:
-        try:
-            result = self._inner.export(batch)
-        except BaseException as exc:
-            report_error(self._on_error, "log export failed", exc)
-            return LogRecordExportResult.FAILURE
-        if result is LogRecordExportResult.FAILURE:
-            report_error(
-                self._on_error,
-                "log export failed",
-                RuntimeError("OTLP log export failed (check the API key and ingest URL)"),
-            )
-        return result
-
-    def force_flush(self, timeout_millis: int = 30000) -> bool:
-        inner_flush = getattr(self._inner, "force_flush", None)
-        return inner_flush(timeout_millis) if inner_flush is not None else True
-
-    def shutdown(self) -> None:
-        self._inner.shutdown()
 
 
 class Client:
@@ -195,6 +133,7 @@ class Client:
             ),
         )
         self._tracer_provider.sampler = SessionSampler(self._tracer_provider.sampler)
+        failures = ExportFailures(on_error)
 
         # Without an api key (enabled via a test seam), never construct real network
         # exporters — they would POST to the ingest with a bogus Authorization header.
@@ -206,7 +145,7 @@ class Client:
                 compression=Compression.Gzip,
                 timeout=timeout,
                 preferred_temporality={Histogram: AggregationTemporality.DELTA},
-                on_error=on_error,
+                failures=failures,
             )
             metric_exporter.output_chunks = self._output_chunks
             metric_reader = PeriodicExportingMetricReader(
@@ -221,14 +160,14 @@ class Client:
             )
 
         if span_exporter is None:
-            span_exporter = _ReportingSpanExporter(
+            span_exporter = ReportingSpanExporter(
                 OTLPSpanExporter(
                     endpoint=f"{config.base_url}/v1/traces",
                     headers=headers,
                     compression=Compression.Gzip,
                     timeout=timeout,
                 ),
-                on_error,
+                failures,
             )
         if span_filter is None and register_global:
             span_filter = _default_scope_filter
@@ -243,14 +182,14 @@ class Client:
         self.tracer = self._tracer_provider.get_tracer(SCOPE_NAME, SDK_VERSION)
 
         if log_exporter is None and config.api_key is not None:
-            log_exporter = _ReportingLogExporter(
+            log_exporter = ReportingLogExporter(
                 OTLPLogExporter(
                     endpoint=f"{config.base_url}/v1/logs",
                     headers=headers,
                     compression=Compression.Gzip,
                     timeout=timeout,
                 ),
-                on_error,
+                failures,
             )
         if log_exporter is not None:
             self._logger_provider = LoggerProvider(resource=resource, shutdown_on_exit=False)

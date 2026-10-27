@@ -142,7 +142,7 @@ the core SDK with provider integrations to enable the new metric.
 | `max_attribute_length` | `65536` | Non-negative integer per-content-attribute cap. Invalid values call `on_error`, do not raise into application code, and install a disabled client; truncated values use the ASCII `...[truncated]` marker, or its prefix when the cap is shorter than the marker. The cap also applies, with the marker, to string metadata and log attributes; any other string attribute is cut at the cap without a marker, except that a cap of `0` leaves those at 65536. |
 | `span_filter` | `None` | Export predicate `Callable[[ReadableSpan], bool]`. |
 | `sampler` | OTel environment configuration | OTel `Sampler` that overrides environment settings. Session roots use its root policy. Real parents keep their sampling decisions. |
-| `on_error` | `None` | Receives internal SDK errors; repeated instrumentation failures from one stream may be coalesced into one report. The SDK never raises them into application code. |
+| `on_error` | `None` | Receives internal SDK errors; repeated instrumentation failures from one stream may be coalesced into one report. The SDK never raises them into application code. A series of failed exports, for example during an ingest outage, is one report to `on_error` and the `telemetry_dev` logger. After an export reaches the ingest, the next failure is a new report. |
 | `disable_atexit` | `False` | Skip the automatic atexit shutdown. |
 | `timeout` | `10.0` | OTLP HTTP timeout in seconds. |
 | `span_exporter`, `log_exporter`, `metric_reader` | `None` | Test seams / offline mode; any of them enables the client without an API key. |
@@ -229,7 +229,7 @@ from telemetry_dev import TelemetrySpanProcessor
 | `metrics` | `True` | Auto-record GenAI duration/token histograms for exported spans when an API key is available. |
 | `service_name` | `OTEL_SERVICE_NAME` or `unknown_service` | `service.name` on the metrics resource. |
 | `environment` | `TELEMETRY_DEV_ENVIRONMENT` or `production` | `deployment.environment.name` on the metrics resource. |
-| `on_error` | `None` | Receives internal processor errors; errors are never raised into your code. |
+| `on_error` | `None` | Receives export errors of the telemetry.dev exporters and internal processor errors; errors are never raised into your code. A series of failed exports is one report. After an export reaches the ingest, the next failure is a new report. |
 | `span_exporter` | `None` | Advanced/test seam replacing the telemetry.dev OTLP trace exporter. |
 
 Without an API key and without `span_exporter`, `TelemetrySpanProcessor()` is an inert no-op:

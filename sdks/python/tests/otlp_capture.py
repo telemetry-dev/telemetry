@@ -26,6 +26,8 @@ class CapturedRequest:
 class CaptureServer:
     url: str
     requests: list[CapturedRequest]
+    # The HTTP status of each response. To make an ingest outage, set an error status such as 503.
+    status: int = 200
 
     def requests_for(self, path: str) -> list[CapturedRequest]:
         return [request for request in self.requests if request.path == path]
@@ -47,7 +49,7 @@ def otlp_capture_server() -> Generator[CaptureServer]:
                     body=body,
                 )
             )
-            self.send_response(200)
+            self.send_response(capture.status)
             self.send_header("content-type", "application/x-protobuf")
             self.send_header("content-length", "0")
             self.end_headers()
@@ -59,10 +61,11 @@ def otlp_capture_server() -> Generator[CaptureServer]:
     thread = threading.Thread(
         target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
     )
+    host, port = server.server_address[0], server.server_address[1]
+    capture = CaptureServer(url=f"http://{host}:{port}", requests=captured)
     thread.start()
     try:
-        host, port = server.server_address[0], server.server_address[1]
-        yield CaptureServer(url=f"http://{host}:{port}", requests=captured)
+        yield capture
     finally:
         server.shutdown()
         server.server_close()
