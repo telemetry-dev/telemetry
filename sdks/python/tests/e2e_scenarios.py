@@ -1,7 +1,7 @@
 """E2E scenario driver for the cross-SDK conformance suite.
 
 This script EMITS the shared conformance scenario against a real ingest endpoint; the
-ClickHouse row assertions live in apps/ingest/src/sdk_conformance.ts (C1-C24), keyed by the
+ClickHouse row assertions live in apps/ingest/src/sdk_conformance.ts (C1-C25), keyed by the
 session id below. Keep the scenario in lockstep with apps/ingest/tests/sdk_otlp_e2e_test.ts and
 docs/sdk-conformance.md.
 
@@ -198,6 +198,23 @@ def main() -> int:
                     "anthropic.advisor.usage.output_tokens": 7,
                     "anthropic.advisor.usage.cache_read_input_tokens": 11,
                     "anthropic.advisor.usage.cache_creation_input_tokens": 13,
+                },
+            ).end()
+            # C25: offered tool names are kept with input capture off; the description is not.
+            start_span(
+                "tool-offer",
+                type="generation",
+                model="claude-sonnet-4-5",
+                provider="anthropic",
+                input={
+                    "tools": [{"name": "issue_refund", "description": "PRIVATE_TOOL_DESCRIPTION"}]
+                },
+                capture_input=False,
+                attributes={
+                    "gen_ai.tool.definitions": (
+                        '[{"type":"function","name":"issue_refund"},'
+                        '{"type":"web_search_20250305","name":"web_search"}]'
+                    ),
                 },
             ).end()
             streamed = start_span(
