@@ -83,6 +83,8 @@ later `init()` generates a new ID. It is not persisted across processes.
 | `propagate_attributes(*, user_id=, session_id=, metadata=)` | Context manager stamping `user.id` / `gen_ai.conversation.id` / `td.metadata.*` on every span and log record started inside (threads/asyncio included via contextvars). |
 | `log(message, *, level="info", event_name=None, attributes=None)` | Emit an OTLP log record to `/v1/logs`, correlated with the current trace. Levels: `debug`/`info`/`warn`/`error` (`"warning"` is accepted as an alias of `warn`). |
 | `get_traceparent() -> str \| None` | W3C traceparent of the current context. |
+| `get_prompt(name, *, label=, version=, type="chat", cache_ttl_seconds=60, fallback=, api_key=, base_url=)` / `get_prompt_async(...)` | Fetch a prompt by label or version; see [Prompts](#prompts). |
+| `with_prompt(prompt)` | Context manager recording the prompt on each model call started inside. |
 | `flush(timeout_s=10.0)` / `shutdown(timeout_s=10.0)` | Force-flush / tear down traces + logs + metrics. Shutdown also runs atexit unless `disable_atexit=True`. |
 | `TelemetrySpanProcessor` / `telemetry_dev.otel.create_telemetry_span_exporter` | Bring-your-own-OTel helpers (below). |
 | `MaskContext`, `Usage`, `SpanHandle`, `Client`, `NOT_GIVEN` | Supporting types. |
@@ -175,6 +177,72 @@ The SDK uses the configured OTel sampling policy, not the synthetic parent's fla
 For example, `init(sampler=ParentBased(TraceIdRatioBased(0.1)))` samples sessions with OTel's ratio sampler.
 These classes come from `opentelemetry.sdk.trace.sampling`.
 The built-in Python and TypeScript ratio samplers can select different sessions because the OTel algorithms differ.
+
+## Prompts
+
+`get_prompt` fetches a prompt that you manage in telemetry.dev. Fetch it by its label, so that you
+deploy a version when you move the label, without a change to the code:
+
+```python
+import telemetry_dev
+from openai import OpenAI
+from telemetry_dev_openai import wrap_openai
+
+telemetry_dev.init()
+client = wrap_openai(OpenAI())
+
+prompt = telemetry_dev.get_prompt("support/reply", label="production")
+messages = prompt.compile(customer_message=customer_message, tone=tone)
+
+with telemetry_dev.with_prompt(prompt):
+    response = client.chat.completions.create(
+        model=prompt.model["name"] if prompt.model else "gpt-4o", messages=messages
+    )
+
+# Pin one version, as in a test:
+pinned = telemetry_dev.get_prompt("support/reply", version=13)
+```
+
+- Without `label` and `version`, `get_prompt` fetches the `production` label. A text prompt needs
+  `type="text"`; `get_prompt` raises for a prompt of the other type.
+- `compile(variables)` or `compile(**variables)` puts the values in place of `{{name}}`. A missing
+  value or `None` becomes an empty text, and a value that is not a string becomes JSON. In a chat
+  prompt, a placeholder message becomes the list of messages in its variable. A text prompt
+  compiles to a string.
+- The prompt also has `model`, `parameters`, `tools`, and `response_format` of its version. The
+  keys inside them are the API's (`maxTokens`, `topP`, ...).
+- `get_prompt` keeps each prompt. When the copy is older than `cache_ttl_seconds` (default 60), a
+  call returns it at once and fetches a new copy in a background thread. Only a call with no copy
+  waits for a fetch, for 10 seconds at most, also when the network stops. Calls for the same
+  prompt share one fetch. `get_prompt_async` runs the same function in a worker thread.
+- If a fetch fails, `get_prompt` returns the last copy that it fetched and reports the error
+  through `on_error`. With no copy, it returns the `fallback` (`version` is `None` and
+  `is_fallback` is `True`). With no fallback, it raises `PromptError` whose `code` tells why, for
+  example `prompt_not_found`, `label_not_found`, `insufficient_scope`, `missing_api_key`, or
+  `timeout`. A response with a different status and no API error gives `http_<status>`, for
+  example `http_302` for a redirect. `get_prompt` does not send the request to the location of a
+  redirect, thus your key does not go to a different host. With no copy, the calls of the next 10
+  seconds (or the TTL, if it is shorter) get the same result without a fetch. This is the one SDK
+  function that can raise: your app cannot run without its prompt.
+- `get_prompt` uses the API key and base URL of an enabled `init()`, or `TELEMETRY_DEV_API_KEY`
+  and `TELEMETRY_DEV_BASE_URL`, or its own `api_key` and `base_url`. The key needs the read scope
+  for prompts.
+- When a label sends part of the traffic to a second version, each session keeps one version: the
+  choice uses the session id of `propagate_attributes` (or of `session_mode="process"`). Without a
+  session id, each call chooses at random.
+
+`with_prompt(prompt)` records the prompt on each model call that starts inside it:
+`td.prompt.name`, `td.prompt.version`, and `td.prompt.label` (only for a prompt fetched by label).
+When input capture is on, `td.prompt.variables` holds the JSON of the variables of the last
+`compile()` of that prompt object before `with_prompt` starts, or of the last `compile()` inside
+it, after `mask` and truncation. If threads or tasks that run at the same time share one prompt
+object, call `compile()` in `with_prompt`, or call `get_prompt` in each thread or task.
+`get_prompt` returns a new object from the cache. If you do not, a thread can record the variables
+of a different thread. Model calls are the spans of type `generation` (operations `chat`,
+`text_completion`, and `generate_content`), including the spans of the provider integrations:
+OpenAI, Anthropic, Amazon Bedrock, Google GenAI, LiteLLM, and OpenRouter. Spans from other
+OpenTelemetry tracers do not get the attributes. Messages from `compile()` that you pass to a
+model call outside `with_prompt` are not recorded.
 
 ## Auto-metrics
 
