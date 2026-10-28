@@ -41,6 +41,7 @@ import {
 import { prepareCaptureValue } from "./capture.ts";
 import { type ClientCore, currentClient } from "./client.ts";
 import { NOOP_SPAN_HANDLE } from "./noop.ts";
+import { promptAttributes } from "./prompts.ts";
 
 export type ParentRef = string /* W3C traceparent */ | SpanHandle | SpanContext | Context;
 
@@ -229,6 +230,7 @@ export function createSpanHandle(
 
   const parentCtx = withSessionParent(sessionContext, sessionId, core.config.apiKey);
   const attrs = fieldsToAttributes(options, meta.type, meta.capture);
+  const operation = attrs["gen_ai.operation.name"] ?? SPAN_TYPE_OPERATIONS[meta.type];
 
   const span = core.tracer.startSpan(
     name,
@@ -239,6 +241,7 @@ export function createSpanHandle(
       attributes: {
         "gen_ai.operation.name": SPAN_TYPE_OPERATIONS[meta.type],
         ...propagatedFromContext(parentCtx),
+        ...promptAttributes(parentCtx, operation, meta.capture),
         ...attrs,
       },
     },
