@@ -160,7 +160,7 @@ function setupSpans(
   metricExporter?: PushMetricExporter,
   captureOutput = true,
   mask?: TelemetryOptions["mask"],
-  options: Pick<TelemetryOptions, "maxAttributeLength" | "onError"> = {},
+  options: Pick<TelemetryOptions, "captureInput" | "maxAttributeLength" | "onError"> = {},
 ): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
   init(
@@ -430,6 +430,12 @@ test("messages.create preserves request tools and tool-use blocks in output", as
     input_schema: { type: "object", properties: { location: { type: "string" } } },
   } as const;
 
+  const tools = [
+    tool,
+    { type: "custom", name: "issue_refund", input_schema: { type: "object" } },
+    { type: "web_search_20250305", name: "web_search" },
+  ] as const;
+
   const fake = createFakeFetch(
     jsonResponse(
       messagePayload({
@@ -445,18 +451,49 @@ test("messages.create preserves request tools and tool-use blocks in output", as
     model: "claude-sonnet-4-6",
     max_tokens: 64,
     messages: [{ role: "user", content: "Weather in Paris?" }],
-    tools: [tool],
+    tools: [...tools],
   });
 
   const span = await exportedSpan(spans);
+  // The dashboard lists these names as the tools offered; schemas stay in the captured input.
+  expect(jsonAttr(span, "gen_ai.tool.definitions")).toEqual([
+    { type: "function", name: "get_weather" },
+    { type: "function", name: "issue_refund" },
+    { type: "web_search_20250305", name: "web_search" },
+  ]);
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
     { role: "assistant", content: [toolUse] },
   ]);
   expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["tool_use"]);
   expect(jsonAttr(span, "gen_ai.input.messages")).toEqual({
     messages: [{ role: "user", content: "Weather in Paris?" }],
-    tools: [tool],
+    tools,
   });
+});
+
+test("messages.create records offered tool names with capture off", async () => {
+  const spans = setupSpans(undefined, false, undefined, { captureInput: false });
+  const fake = createFakeFetch(jsonResponse(messagePayload({ id: "msg_private" })));
+
+  await clientWith(fake.fetch).messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Refund order 42" }],
+    tools: [
+      {
+        name: "issue_refund",
+        description: "Refund an order",
+        input_schema: { type: "object", properties: { order: { type: "string" } } },
+      },
+    ],
+  });
+
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.tool.definitions"]).toBe(
+    JSON.stringify([{ type: "function", name: "issue_refund" }]),
+  );
+  expect(span.attributes["gen_ai.input.messages"]).toBeUndefined();
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
 });
 
 test.each<{ name: string; start: JsonRecord; delta: JsonRecord; input: number | undefined }>([

@@ -74,6 +74,11 @@ Counters sum advisor entries in the last 1,000 iterations; longer lists also set
 Streaming replaces cumulative usage snapshots rather than adding them. Absent counters stay absent;
 zero counters remain zero. Advisor tokens do not change executor usage or its model.
 
+Anthropic integrations record each request tool's type and name in `gen_ai.tool.definitions` as a
+JSON array of `{type, name}`, with `type` `function` for custom tools and the tool's own type for
+server tools. They record it regardless of capture flags and `mask`; descriptions and input schemas stay in
+the captured input.
+
 Shared constants: env vars `TELEMETRY_DEV_API_KEY` / `TELEMETRY_DEV_BASE_URL` (default
 `https://ingest.telemetry.dev`) / `TELEMETRY_DEV_ENVIRONMENT` (default `production`) /
 `OTEL_SERVICE_NAME` (default `unknown_service`); truncation cap 65536 chars **including** the

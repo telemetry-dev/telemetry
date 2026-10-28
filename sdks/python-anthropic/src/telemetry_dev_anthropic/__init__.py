@@ -227,13 +227,30 @@ def _tool_definitions(value: Any) -> Any:
     ]
 
 
+def _offered_tools(tools: Any) -> dict[str, str] | None:
+    # Names are recorded regardless of capture flags, as on tool spans; descriptions and schemas
+    # stay in the input.
+    definitions: list[dict[str, str]] = []
+    for tool in _sequence_items(tools):
+        if not isinstance(tool, Mapping):
+            continue
+        fields = cast(Mapping[str, Any], tool)
+        name = _string(fields.get("name"))
+        kind = _string(fields.get("type"))
+        if name is not None:
+            definitions.append(
+                {"type": "function" if kind in (None, "custom") else kind, "name": name}
+            )
+    return {"gen_ai.tool.definitions": json_dumps(definitions)} if definitions else None
+
+
 def _messages_request(params: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     params = _sent_params(params)
     model = _string(params.get("model"))
     input_value: Any
+    tools = _tool_definitions(params.get("tools"))
     if "tools" in params or "tool_choice" in params:
         input_value = {"messages": _native(params.get("messages"))}
-        tools = _tool_definitions(params.get("tools"))
         tool_choice = _native(params.get("tool_choice"))
         if tools is not None:
             input_value["tools"] = tools
@@ -247,6 +264,7 @@ def _messages_request(params: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
             "type": "generation",
             "model": model,
             "input": input_value,
+            "attributes": _offered_tools(tools),
             "system_instructions": _native(params.get("system")),
             "temperature": _number(params.get("temperature")),
             "top_p": _number(params.get("top_p")),
