@@ -76,8 +76,8 @@ zero counters remain zero. Advisor tokens do not change executor usage or its mo
 
 Anthropic integrations record each request tool's type and name in `gen_ai.tool.definitions` as a
 JSON array of `{type, name}`, with `type` `function` for custom tools and the tool's own type for
-server tools. They record it regardless of capture flags and `mask`; descriptions and input schemas stay in
-the captured input.
+server tools. They record it regardless of capture flags and `mask`; descriptions and input
+schemas stay in the captured input.
 
 Shared constants: env vars `TELEMETRY_DEV_API_KEY` / `TELEMETRY_DEV_BASE_URL` (default
 `https://ingest.telemetry.dev`) / `TELEMETRY_DEV_ENVIRONMENT` (default `production`) /
@@ -149,6 +149,9 @@ eventName: "e2e.inside")` inside it
    - generation `advisor-call` (claude-sonnet-4-5/anthropic, executor usage 8/3 with 2 cache-read
      and 1 cache-write; separate claude-opus-4-1 advisor counters 5/7 with 11 cache-read and
      13 cache-write, emitted through the core SDK)
+   - generation `tool-offer` (claude-sonnet-4-5/anthropic, captureInput false, input with the
+     tool description "PRIVATE_TOOL_DESCRIPTION", raw `gen_ai.tool.definitions` attribute
+     naming `issue_refund` (function) and `web_search` (web_search_20250305))
    - generation `streamed-chat` (gpt-4o/openai, input "Stream please", bounded partial output
      "chunk...", `telemetry.dev.capture.truncated = true`, four output chunk calls at
      1000/1010/1050/1210 ms, timeToFirstChunkMs 250)
@@ -164,7 +167,7 @@ eventName: "e2e.inside")` inside it
 7. fail-open phase: re-`init()` WITHOUT an api key, run an observed function + `log()`,
    `flush()` + `shutdown()` — must emit nothing and never throw
 
-## Assertions (C1–C24)
+## Assertions (C1–C25)
 
 Exception content follows the effective per-span capture policy in both SDKs. If either input
 or output capture is off, C14 retains error status/type and the exception event but omits its
@@ -192,7 +195,7 @@ to it. These rules do not sanitize raw OpenTelemetry events or arbitrary attribu
 | C14 | captureInput:false strips content from inputJson and attributesJson                                                                                                                                                              |
 | C15 | `costUsd` client override stored verbatim (0.5)                                                                                                                                                                                  |
 | C16 | Oversized content truncated to 65536 chars ending with `...[truncated]`, extracted into inputJson and stored once (source attribute stripped from the attribute columns); mask hook output replaces SECRET-bearing input         |
-| C17 | Exact span census (16) — the fail-open no-key phase contributes nothing                                                                                                                                                          |
+| C17 | Exact span census (17) — the fail-open no-key phase contributes nothing                                                                                                                                                          |
 | C18 | Streaming generation: `timeToFirstChunkMs` stored as 250 ms; wire attribute `gen_ai.response.time_to_first_chunk` = 0.25 s                                                                                                       |
 | C19 | OpenRouter generation: provider stored as `openrouter`                                                                                                                                                                           |
 | C20 | Session trace: `follow-up-turn` (a second root call of the same session) lands in the same trace, parented to the session parent, started at or after the agent ended                                                            |
@@ -200,6 +203,7 @@ to it. These rules do not sanitize raw OpenTelemetry events or arbitrary attribu
 | C22 | Streaming truncation: `telemetry.dev.capture.truncated = true` survives OTLP transport and ingest on the streamed generation                                                                                                     |
 | C23 | Captured JSON matches an independently specified JSON.stringify byte sequence, including number spelling, key ordering, non-finite values and Unicode                                                                            |
 | C24 | Advisor model and native counters survive transport and storage without changing executor usage or rollup totals; provider extraction is covered in the integration packages' tests                                              |
+| C25 | Offered tool names in `gen_ai.tool.definitions` are stored byte-for-byte with input capture off, and the tool description is not; the Anthropic integration tests cover building them from request tools                         |
 
 ## Modality publication gate
 
