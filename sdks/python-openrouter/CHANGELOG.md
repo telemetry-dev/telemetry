@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.9](https://github.com/telemetry-dev/telemetry/compare/python-openrouter-v0.1.8...python-openrouter-v0.1.9) (2026-10-28)
+
+
+### Bug Fixes
+
+* **sdk-openrouter:** count the provider cost of byok requests ([#92](https://github.com/telemetry-dev/telemetry/issues/92)) ([ac4773d](https://github.com/telemetry-dev/telemetry/commit/ac4773d96869723cf8ecb8c0faae829eb556a601))
+
 ## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/python-openrouter-v0.1.7...python-openrouter-v0.1.8) (2026-10-27)
 
 
