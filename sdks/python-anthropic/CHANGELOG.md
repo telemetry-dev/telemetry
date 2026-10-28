@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/python-anthropic-v0.1.7...python-anthropic-v0.1.8) (2026-10-28)
+
+
+### Features
+
+* **sdk-anthropic:** record request tool names as tool definitions ([#95](https://github.com/telemetry-dev/telemetry/issues/95)) ([f075e8c](https://github.com/telemetry-dev/telemetry/commit/f075e8cf5db664ddaf0fc4a9e690a1a4582a216e))
+
 ## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/python-anthropic-v0.1.6...python-anthropic-v0.1.7) (2026-10-27)
 
 
