@@ -600,6 +600,11 @@ def test_tool_use_response_output_is_preserved(memory: SimpleNamespace) -> None:
         "description": "Get weather",
         "input_schema": {"type": "object", "properties": {"location": {"type": "string"}}},
     }
+    tools: list[Any] = [
+        tool,
+        {"type": "custom", "name": "issue_refund", "input_schema": {"type": "object"}},
+        {"type": "web_search_20250305", "name": "web_search"},
+    ]
 
     def handler(request: httpx.Request) -> httpx.Response:
         return json_response(message_payload(content=[tool_use], stop_reason="tool_use"))
@@ -609,15 +614,46 @@ def test_tool_use_response_output_is_preserved(memory: SimpleNamespace) -> None:
         model="claude-sonnet-4-6",
         max_tokens=64,
         messages=MESSAGES,
-        tools=[tool],
+        tools=tools,
     )
 
     a = attrs(only_span(memory))
+    # The dashboard lists these names as the tools offered; schemas stay in the captured input.
+    assert json.loads(str(a["gen_ai.tool.definitions"])) == [
+        {"type": "function", "name": "get_weather"},
+        {"type": "function", "name": "issue_refund"},
+        {"type": "web_search_20250305", "name": "web_search"},
+    ]
     assert json.loads(str(a["gen_ai.output.messages"])) == [
         {"role": "assistant", "content": [tool_use]}
     ]
     assert list(cast(Any, a["gen_ai.response.finish_reasons"])) == ["tool_use"]
-    assert json.loads(str(a["gen_ai.input.messages"])) == {"messages": MESSAGES, "tools": [tool]}
+    assert json.loads(str(a["gen_ai.input.messages"])) == {"messages": MESSAGES, "tools": tools}
+
+
+def test_offered_tool_names_are_recorded_with_capture_off(make: Any) -> None:
+    memory = make(capture_input=False, capture_output=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(message_payload())
+
+    wrapped_sync_client(handler).messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=64,
+        messages=MESSAGES,
+        tools=[
+            {
+                "name": "issue_refund",
+                "description": "Refund an order",
+                "input_schema": {"type": "object", "properties": {"order": {"type": "string"}}},
+            }
+        ],
+    )
+
+    a = attrs(only_span(memory))
+    assert a["gen_ai.tool.definitions"] == '[{"type":"function","name":"issue_refund"}]'
+    assert "gen_ai.input.messages" not in a
+    assert "gen_ai.output.messages" not in a
 
 
 @pytest.mark.skipif(
@@ -642,9 +678,13 @@ def test_beta_create_records_tool_objects_as_the_definitions_it_sends(
         model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES, tools=[get_weather]
     )
 
-    captured = json.loads(str(attrs(only_span(memory))["gen_ai.input.messages"]))
+    a = attrs(only_span(memory))
+    captured = json.loads(str(a["gen_ai.input.messages"]))
     assert captured["tools"] == requests[0]["tools"]
     assert captured["tools"][0]["name"] == "get_weather"
+    assert json.loads(str(a["gen_ai.tool.definitions"])) == [
+        {"type": "function", "name": "get_weather"}
+    ]
 
 
 def test_create_streaming_preserves_events_and_records_aggregate(

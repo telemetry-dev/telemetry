@@ -125,6 +125,28 @@ function stopSequences<T>(value: T): string[] | undefined {
   return strings.length > 0 ? strings : undefined;
 }
 
+/**
+ * The type and name of each request tool as `gen_ai.tool.definitions`. Names are recorded
+ * regardless of capture flags, as on tool spans; descriptions and schemas stay in the input.
+ */
+function toolDefinitions<T>(tools: T): Record<string, string> | undefined {
+  if (!Array.isArray(tools)) return undefined;
+
+  const definitions = tools.flatMap((tool) => {
+    const record = asRecord(tool);
+    const name = readString(record?.name);
+
+    if (name === undefined) return [];
+    const type = readString(record?.type);
+
+    return [{ type: type === undefined || type === "custom" ? "function" : type, name }];
+  });
+
+  return definitions.length > 0
+    ? { "gen_ai.tool.definitions": JSON.stringify(definitions) }
+    : undefined;
+}
+
 function messagesRequest(body: ValueRecord): RequestMapping {
   const model = readString(body.model);
 
@@ -139,6 +161,7 @@ function messagesRequest(body: ValueRecord): RequestMapping {
       type: "generation",
       model,
       input,
+      attributes: toolDefinitions(body.tools),
       systemInstructions: body.system,
       temperature: readNumber(body.temperature),
       topP: readNumber(body.top_p),
