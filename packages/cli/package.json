@@ -1,0 +1,50 @@
+{
+  "name": "@telemetry-dev/cli",
+  "version": "0.1.0",
+  "description": "The telemetry.dev command line: search traces, sessions, logs, and AI usage from your terminal or an agent's shell.",
+  "keywords": [
+    "cli",
+    "llm",
+    "observability",
+    "opentelemetry",
+    "telemetry",
+    "tracing"
+  ],
+  "homepage": "https://telemetry.dev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/telemetry-dev/telemetry.git",
+    "directory": "packages/cli"
+  },
+  "bin": {
+    "telemetry": "./dist/cli.mjs"
+  },
+  "files": [
+    "dist",
+    "THIRD_PARTY_LICENSES.md"
+  ],
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "pnpm exec vp pack",
+    "dev": "pnpm exec vp pack --watch",
+    "test": "vp test",
+    "check": "vp check",
+    "prepublishOnly": "vp run build"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.4.0",
+    "@modelcontextprotocol/server": "2.4.0",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite-plus": "catalog:",
+    "vitest": "catalog:",
+    "zod": "catalog:"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

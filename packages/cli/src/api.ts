@@ -1,0 +1,130 @@
+import type { Client } from "@modelcontextprotocol/client";
+
+import { SessionAuthProvider } from "./auth.ts";
+import { CliError, EXIT, notSignedIn } from "./errors.ts";
+import { mcpUrl, type Session } from "./session.ts";
+import { withSpinner } from "./terminal.ts";
+
+import packageJson from "../package.json" with { type: "json" };
+
+export const VERSION = packageJson.version;
+
+// The server gives each query 25 seconds, so this only catches a stalled connection.
+const REQUEST_TIMEOUT_MS = 40_000;
+
+/**
+ * The telemetry.dev MCP server, called as an API. The CLI reads through the same
+ * tools and permissions agents get, so a JSON result has the shape the tool documents.
+ */
+export class Api {
+  #client: Promise<Client> | undefined;
+
+  readonly session: Session;
+
+  constructor(session: Session) {
+    if (!session.tokens) throw notSignedIn();
+
+    this.session = session;
+  }
+
+  #connect() {
+    this.#client ??= (async () => {
+      // Loaded on first use: the client is most of the CLI's code, and help, status, and
+      // usage errors should answer without parsing it.
+      const { Client, StreamableHTTPClientTransport } =
+        await import("@modelcontextprotocol/client");
+
+      const transport = new StreamableHTTPClientTransport(mcpUrl(this.session.server), {
+        authProvider: new SessionAuthProvider(this.session),
+        // MCP requests carry the client's own signal and its timeout; this bounds the
+        // token refresh and discovery requests, which carry none.
+        fetch: (url, init) =>
+          fetch(url, { ...init, signal: init?.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS) }),
+      });
+
+      // The modern protocol connects with one request instead of initialize plus its
+      // notification, which halves a command's time on a distant connection. Servers
+      // without it get the classic handshake.
+      const client = new Client(
+        { name: "telemetry-cli", version: VERSION },
+        { versionNegotiation: { mode: "auto" } },
+      );
+      await client.connect(transport, { timeout: REQUEST_TIMEOUT_MS });
+
+      return client;
+    })();
+
+    return this.#client;
+  }
+
+  /** Calls one tool and returns its parsed JSON result. A tool error becomes a CliError. */
+  async call<T>(tool: string, args: Record<string, unknown> = {}, label = "Loading"): Promise<T> {
+    const result = await withSpinner(
+      label,
+      (async () => {
+        const client = await this.#connect();
+
+        return client.callTool({ name: tool, arguments: args }, { timeout: REQUEST_TIMEOUT_MS });
+      })(),
+    ).catch(async (error: unknown) => {
+      const { OAuthError, UnauthorizedError } = await import("@modelcontextprotocol/client");
+
+      return translateError(error, [OAuthError, UnauthorizedError]);
+    });
+
+    const text = result.content.find((block) => block.type === "text")?.text ?? "";
+
+    if (result.isError)
+      throw new CliError(text || "telemetry.dev could not complete this request.");
+
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      // The server cuts results over its size cap, which leaves the JSON unterminated.
+      throw new CliError(
+        "The result was too large to read. Narrow it with filters or a smaller --limit.",
+      );
+    }
+  }
+
+  async close() {
+    const client = await this.#client?.catch(() => undefined);
+    await client?.close().catch(() => {});
+  }
+}
+
+// Each is a refresh or authorization the server refused for good.
+type AuthErrors = readonly (abstract new (...args: never[]) => Error)[];
+
+const translateError = (error: unknown, authErrors: AuthErrors): never => {
+  if (error instanceof CliError) throw error;
+
+  if (authErrors.some((type) => error instanceof type)) {
+    throw new CliError(
+      "Your sign-in has expired or was disconnected. Run `telemetry login` again.",
+      EXIT.auth,
+    );
+  }
+
+  const cause = error instanceof Error && error.cause instanceof Error ? error.cause : error;
+  const message = cause instanceof Error ? cause.message : String(cause);
+  const code = (cause as { code?: unknown } | null)?.code;
+
+  if (
+    typeof code === "string" &&
+    ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ECONNRESET", "ETIMEDOUT"].includes(code)
+  ) {
+    throw new CliError(
+      `Couldn't reach telemetry.dev (${code}). Check your connection and try again.`,
+    );
+  }
+
+  if (
+    (error as { code?: unknown } | null)?.code === "REQUEST_TIMEOUT" ||
+    (cause instanceof Error && (cause.name === "TimeoutError" || cause.name === "AbortError"))
+  ) {
+    throw new CliError("telemetry.dev took too long to answer. Try again shortly.");
+  }
+
+  throw new CliError(`telemetry.dev request failed: ${message}`);
+};
