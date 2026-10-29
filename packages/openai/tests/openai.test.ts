@@ -2912,7 +2912,7 @@ test.each([
 
     const prompt = await getPrompt("support/reply", {
       apiKey: "td_live_a",
-      apiUrl: "https://prompts.openai.test",
+      baseUrl: "https://prompts.openai.test",
       fetch: async () =>
         Response.json({
           name: "support/reply",

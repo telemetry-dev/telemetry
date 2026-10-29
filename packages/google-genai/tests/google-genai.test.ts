@@ -253,7 +253,7 @@ test.each([
 
     const prompt = await getPrompt("support/reply", {
       apiKey: "td_live_a",
-      apiUrl: "https://prompts.google-genai.test",
+      baseUrl: "https://prompts.google-genai.test",
       fetch: async () =>
         Response.json({
           name: "support/reply",

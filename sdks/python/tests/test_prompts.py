@@ -931,8 +931,8 @@ def test_a_rollout_with_two_versions_of_the_same_messages_records_the_version_of
         return next(draws)
 
     monkeypatch.setattr(prompts_module.random, "randrange", draw)
-    rollout = get_prompt("support/reply", api_key="td_live_a", api_url=server.url)
-    production = get_prompt("support/reply", api_key="td_live_a", api_url=server.url)
+    rollout = get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+    production = get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
     from_rollout = rollout.compile(team="billing", order="#4")
     from_production = production.compile(team="billing", order="#4")
 

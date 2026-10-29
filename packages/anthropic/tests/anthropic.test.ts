@@ -298,7 +298,7 @@ test.each([
 
     const prompt = await getPrompt("support/reply", {
       apiKey: "td_live_a",
-      apiUrl: "https://prompts.anthropic.test",
+      baseUrl: "https://prompts.anthropic.test",
       fetch: async () =>
         Response.json({
           name: "support/reply",

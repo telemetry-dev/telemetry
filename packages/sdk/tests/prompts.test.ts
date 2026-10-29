@@ -740,7 +740,7 @@ async function promptOf(overrides: Record<string, unknown>): Promise<Prompt> {
 
   return getPrompt("support/reply", {
     apiKey: "td_live_a",
-    apiUrl: newApiUrl(),
+    baseUrl: newBaseUrl(),
     fetch,
     type: overrides.type as "chat",
   });
@@ -836,7 +836,7 @@ test("a rollout with two versions of the same messages records the version of ea
       },
     }),
   );
-  const options = { apiKey: "td_live_a", apiUrl: newApiUrl(), fetch };
+  const options = { apiKey: "td_live_a", baseUrl: newBaseUrl(), fetch };
   vi.spyOn(Math, "random").mockReturnValueOnce(0.159).mockReturnValueOnce(0.16);
 
   const rollout = await getPrompt("support/reply", options);
@@ -1099,7 +1099,7 @@ test("withPrompt wins over a compiled message of another prompt, through a paren
   );
   const other = await getPrompt("other/prompt", {
     apiKey: "td_live_a",
-    apiUrl: newApiUrl(),
+    baseUrl: newBaseUrl(),
     version: 3,
     fetch,
   });

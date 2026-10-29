@@ -443,7 +443,7 @@ test.each([
 
     const prompt = await getPrompt("support/reply", {
       apiKey: "td_live_a",
-      apiUrl: "https://prompts.bedrock.test",
+      baseUrl: "https://prompts.bedrock.test",
       fetch: async () =>
         Response.json({
           name: "support/reply",

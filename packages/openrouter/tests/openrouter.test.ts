@@ -329,7 +329,7 @@ test.each([
 
     const prompt = await getPrompt("support/reply", {
       apiKey: "td_live_a",
-      apiUrl: "https://prompts.openrouter.test",
+      baseUrl: "https://prompts.openrouter.test",
       fetch: async () =>
         Response.json({
           name: "support/reply",
