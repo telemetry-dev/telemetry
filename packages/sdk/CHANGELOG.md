@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.12](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.1.11...sdk-v0.1.12) (2026-10-29)
+
+
+### Bug Fixes
+
+* **sdk:** honor retry-after for prompts and keep python task variables ([#102](https://github.com/telemetry-dev/telemetry/issues/102)) ([6ad4a0c](https://github.com/telemetry-dev/telemetry/commit/6ad4a0c1714d8849f9a5561016bd84f3959d534c))
+
 ## [0.1.11](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.1.10...sdk-v0.1.11) (2026-10-29)
 
 

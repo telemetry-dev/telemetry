@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.13](https://github.com/telemetry-dev/telemetry/compare/google-genai-v0.1.12...google-genai-v0.1.13) (2026-10-29)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.1.12
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.1.12
+
 ## [0.1.12](https://github.com/telemetry-dev/telemetry/compare/google-genai-v0.1.11...google-genai-v0.1.12) (2026-10-29)
 
 

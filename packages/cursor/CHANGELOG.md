@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.12](https://github.com/telemetry-dev/telemetry/compare/cursor-v0.1.11...cursor-v0.1.12) (2026-10-29)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/sdk bumped to 0.1.12
+
 ## [0.1.11](https://github.com/telemetry-dev/telemetry/compare/cursor-v0.1.10...cursor-v0.1.11) (2026-10-29)
 
 
