@@ -16,7 +16,7 @@ jobs:
         with:
           persist-credentials: false
       - run: bash .github/scripts/release_test.sh
-      - run: shellcheck .github/scripts/*.sh
+      - run: shellcheck .github/scripts/*.sh actions/experiment/*.sh
 
   typescript:
     runs-on: ubuntu-latest
