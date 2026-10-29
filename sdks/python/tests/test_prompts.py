@@ -145,7 +145,7 @@ def test_get_prompt_reads_the_host_that_telemetry_goes_to(server: CaptureServer)
 
 @pytest.mark.parametrize("env_base_url", [None, ""])
 @pytest.mark.parametrize("initialized", [False, True])
-def test_without_a_base_url_get_prompt_reads_the_ingest_host(
+def test_without_a_base_url_get_prompt_reads_the_default_host(
     make: MakeClient, monkeypatch: pytest.MonkeyPatch, initialized: bool, env_base_url: str | None
 ) -> None:
     urls: list[str] = []
@@ -164,7 +164,7 @@ def test_without_a_base_url_get_prompt_reads_the_ingest_host(
     with pytest.raises(PromptError):
         get_prompt("support/reply", api_key="td_live_a")
 
-    assert urls == ["https://ingest.telemetry.dev/v1/prompts?name=support%2Freply&label=production"]
+    assert urls == ["https://api.telemetry.dev/v1/prompts?name=support%2Freply&label=production"]
 
 
 def test_get_prompt_keeps_a_prompt_for_the_ttl_then_refreshes_it_in_the_background(

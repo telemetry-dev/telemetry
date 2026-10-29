@@ -22,7 +22,7 @@ export type MaskFn<T = unknown> = (value: T, ctx: { key: string }) => T;
 export interface TelemetryOptions {
   /** telemetry.dev ingest key (`td_live_…`). Falls back to `TELEMETRY_DEV_API_KEY`. When absent the SDK is a no-op. */
   apiKey?: string;
-  /** Base URL for telemetry export and getPrompt. Falls back to `TELEMETRY_DEV_BASE_URL`, then `https://ingest.telemetry.dev`. */
+  /** Base URL for telemetry export and getPrompt. Falls back to `TELEMETRY_DEV_BASE_URL`, then `https://api.telemetry.dev`. */
   baseUrl?: string;
   /** Deployment environment label. Falls back to `TELEMETRY_DEV_ENVIRONMENT`, then `production`. */
   environment?: string;

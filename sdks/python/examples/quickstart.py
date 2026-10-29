@@ -5,7 +5,7 @@ Run with your ingest credentials in the environment:
     TELEMETRY_DEV_API_KEY=td_live_... uv run examples/quickstart.py
 
 Optional:
-    TELEMETRY_DEV_BASE_URL    (default https://ingest.telemetry.dev)
+    TELEMETRY_DEV_BASE_URL    (default https://api.telemetry.dev)
     TELEMETRY_DEV_ENVIRONMENT (default production)
     OTEL_SERVICE_NAME         (default unknown_service)
 """

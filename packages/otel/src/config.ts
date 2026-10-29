@@ -15,7 +15,7 @@ export interface BatchOptions {
   exportTimeoutMillis?: number;
 }
 
-export const DEFAULT_BASE_URL = "https://ingest.telemetry.dev";
+export const DEFAULT_BASE_URL = "https://api.telemetry.dev";
 
 export const DEFAULT_BATCH: Required<BatchOptions> = {
   maxExportBatchSize: 64,

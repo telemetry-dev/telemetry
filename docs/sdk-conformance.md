@@ -84,7 +84,8 @@ server tools. They record it regardless of capture flags and `mask`; description
 schemas stay in the captured input.
 
 Shared constants: env vars `TELEMETRY_DEV_API_KEY` / `TELEMETRY_DEV_BASE_URL` (default
-`https://ingest.telemetry.dev`, for telemetry export and `getPrompt` / `get_prompt`) /
+`https://api.telemetry.dev`, for telemetry export and `getPrompt` / `get_prompt`; earlier releases
+used `https://ingest.telemetry.dev`, another hostname for the same service) /
 `TELEMETRY_DEV_ENVIRONMENT` (default `production`) /
 `OTEL_SERVICE_NAME` (default `unknown_service`); truncation cap 65536 chars **including** the
 `...[truncated]` marker (custom caps shorter than the marker retain its prefix); batch defaults
@@ -127,7 +128,7 @@ The metrics use DELTA temporality and the bucket boundaries in `packages/otel/sr
 `getPrompt(name, options)` / `get_prompt(name, ...)` send `GET {baseUrl}/v1/prompts?name=<name>`
 with `label=<label>` (default `production`) or `version=<n>`, the `Authorization: Bearer <key>`
 header, and the SDK header. `{baseUrl}` is the `baseUrl` / `base_url` option, then the base URL of
-an enabled `init()`, then `TELEMETRY_DEV_BASE_URL`, then `https://ingest.telemetry.dev`, so prompts
+an enabled `init()`, then `TELEMETRY_DEV_BASE_URL`, then `https://api.telemetry.dev`, so prompts
 come from the host that telemetry goes to. For the prompt request, an empty value counts as unset.
 The two SDKs keep one copy per base URL, API key fingerprint, name, and label or version.
 Concurrent calls share one fetch.

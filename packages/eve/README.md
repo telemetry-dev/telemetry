@@ -16,16 +16,19 @@ Requires `eve >=0.47.0 <1` and Node.js 24 or newer.
 
 ## Environment
 
-| Variable                    | Required | Default                        | Notes                                                                   |
-| --------------------------- | -------- | ------------------------------ | ----------------------------------------------------------------------- |
-| `TELEMETRY_DEV_API_KEY`     | yes      | —                              | Ingest key (`td_live_…`). No key ⇒ the integration is a complete no-op. |
-| `TELEMETRY_DEV_BASE_URL`    | no       | `https://ingest.telemetry.dev` | Trailing slashes are stripped.                                          |
-| `TELEMETRY_DEV_ENVIRONMENT` | no       | `production`                   | Environment label on every trace/log.                                   |
-| `OTEL_SERVICE_NAME`         | no       | SDK default                    | Server instrumentation falls back to the Eve agent name after this env. |
+| Variable                    | Required | Default                     | Notes                                                                   |
+| --------------------------- | -------- | --------------------------- | ----------------------------------------------------------------------- |
+| `TELEMETRY_DEV_API_KEY`     | yes      | —                           | Ingest key (`td_live_…`). No key ⇒ the integration is a complete no-op. |
+| `TELEMETRY_DEV_BASE_URL`    | no       | `https://api.telemetry.dev` | Trailing slashes are stripped.                                          |
+| `TELEMETRY_DEV_ENVIRONMENT` | no       | `production`                | Environment label on every trace/log.                                   |
+| `OTEL_SERVICE_NAME`         | no       | SDK default                 | Server instrumentation falls back to the Eve agent name after this env. |
 
 All four are also settable through SDK options. Pass SDK options to exactly one entry point in a
 process; whichever initializes first wins. If you only use `telemetryDevHook()` or
 `wrapEveClient()`, pass `serviceName` explicitly or set `OTEL_SERVICE_NAME`.
+
+Earlier versions sent data to `https://ingest.telemetry.dev` by default. That hostname reaches the
+same service and stays supported: if a firewall allows only it, set `TELEMETRY_DEV_BASE_URL` to it.
 
 ## Server instrumentation
 

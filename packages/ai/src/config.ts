@@ -14,7 +14,7 @@ export type TelemetryError =
 export interface TelemetryDevOptions {
   /** telemetry.dev ingest key (`td_live_…`). Falls back to `TELEMETRY_DEV_API_KEY`. When absent the integration is a no-op. */
   apiKey?: string;
-  /** Ingest base URL. Falls back to `TELEMETRY_DEV_BASE_URL`, then `https://ingest.telemetry.dev`. */
+  /** Base URL. Falls back to `TELEMETRY_DEV_BASE_URL`, then `https://api.telemetry.dev`. */
   baseUrl?: string;
   /** Deployment environment label. Falls back to `TELEMETRY_DEV_ENVIRONMENT`, then `production`. */
   environment?: string;
@@ -51,7 +51,7 @@ export interface ResolvedConfig {
   onError?: (error: TelemetryError) => void;
 }
 
-const DEFAULT_BASE_URL = "https://ingest.telemetry.dev";
+const DEFAULT_BASE_URL = "https://api.telemetry.dev";
 
 export function resolveConfig(options: TelemetryDevOptions = {}): ResolvedConfig {
   const env = globalThis.process?.env ?? {};

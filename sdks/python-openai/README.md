@@ -20,6 +20,10 @@ import telemetry_dev
 telemetry_dev.init(service_name="my-service")
 ```
 
+Versions of `telemetry-dev` before 0.3.0 sent data to `https://ingest.telemetry.dev` by default.
+That hostname reaches the same service and stays supported: if a firewall allows only it, set
+`TELEMETRY_DEV_BASE_URL` to it.
+
 ## Per-client wrapping
 
 ```py

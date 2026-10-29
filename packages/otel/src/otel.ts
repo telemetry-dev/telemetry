@@ -34,7 +34,7 @@ import {
 export interface TelemetrySpanProcessorOptions {
   /** telemetry.dev ingest key. Falls back to `TELEMETRY_DEV_API_KEY`; absent ⇒ no-op processor. */
   apiKey?: string;
-  /** Falls back to `TELEMETRY_DEV_BASE_URL`, then `https://ingest.telemetry.dev`. */
+  /** Falls back to `TELEMETRY_DEV_BASE_URL`, then `https://api.telemetry.dev`. */
   baseUrl?: string;
   /** "batched" (default) or "immediate". */
   exportMode?: ExportMode;
