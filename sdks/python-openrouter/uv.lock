@@ -603,7 +603,7 @@ wheels = [
 
 [[package]]
 name = "telemetry-dev"
-version = "0.2.11"
+version = "0.2.12"
 source = { editable = "../python" }
 dependencies = [
     { name = "opentelemetry-api" },

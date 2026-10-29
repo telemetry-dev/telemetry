@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.12](https://github.com/telemetry-dev/telemetry/compare/eve-v0.1.11...eve-v0.1.12) (2026-10-29)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/sdk bumped to 0.1.11
+
 ## [0.1.11](https://github.com/telemetry-dev/telemetry/compare/eve-v0.1.10...eve-v0.1.11) (2026-10-27)
 
 

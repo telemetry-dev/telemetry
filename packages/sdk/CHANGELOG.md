@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.11](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.1.10...sdk-v0.1.11) (2026-10-29)
+
+
+### Features
+
+* **sdk:** add getPrompt and withPrompt in TypeScript and Python ([#99](https://github.com/telemetry-dev/telemetry/issues/99)) ([b1a33e4](https://github.com/telemetry-dev/telemetry/commit/b1a33e446864f02c2fd050e754c81c875c7f9864))
+
 ## [0.1.10](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.1.9...sdk-v0.1.10) (2026-10-27)
 
 
