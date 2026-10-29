@@ -4,8 +4,11 @@ import itertools
 import socket
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Generator
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, NoReturn
 from urllib.parse import parse_qsl, urlsplit
 
 import pytest
@@ -96,7 +99,7 @@ def wait_for(check: Callable[[], bool]) -> None:
 def test_get_prompt_sends_query_with_key_and_sdk_header(
     server: CaptureServer, options: dict[str, Any], query: dict[str, str]
 ) -> None:
-    get_prompt("support/reply", api_key="td_live_a", base_url=f"{server.url}/", **options)
+    get_prompt("support/reply", api_key="td_live_a", api_url=f"{server.url}/", **options)
 
     [request] = server.requests
     assert urlsplit(request.path).path == "/v1/prompts"
@@ -108,16 +111,41 @@ def test_get_prompt_sends_query_with_key_and_sdk_header(
 def test_get_prompt_reads_the_initialized_client_then_the_environment(
     server: CaptureServer, make: MakeClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    make(api_key="td_live_client", base_url=server.url)
+    make(api_key="td_live_client", api_url=server.url)
     assert get_prompt("support/reply").version == 12
     assert server.requests[0].headers["authorization"] == "Bearer td_live_client"
 
     telemetry_dev.shutdown()
     telemetry_dev.init(api_key="td_live_disabled", enabled=False, disable_atexit=True)
     monkeypatch.setenv("TELEMETRY_DEV_API_KEY", "td_live_env")
-    monkeypatch.setenv("TELEMETRY_DEV_BASE_URL", server.url)
+    monkeypatch.setenv("TELEMETRY_DEV_API_URL", server.url)
     get_prompt("support/reply", label="staging")
     assert server.requests[1].headers["authorization"] == "Bearer td_live_env"
+
+
+@pytest.mark.parametrize("env_api_url", [None, ""])
+@pytest.mark.parametrize("initialized", [False, True])
+def test_without_an_api_url_get_prompt_reads_the_api_service_not_the_base_url(
+    make: MakeClient, monkeypatch: pytest.MonkeyPatch, initialized: bool, env_api_url: str | None
+) -> None:
+    urls: list[str] = []
+
+    # The default API URL is a real host: the opener records the request and does not send it.
+    def offline(request: urllib.request.Request, timeout: float) -> NoReturn:
+        urls.append(request.full_url)
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(prompts_module, "_opener", SimpleNamespace(open=offline))
+    monkeypatch.setenv("TELEMETRY_DEV_BASE_URL", "https://ingest-env.test")
+    if env_api_url is not None:
+        monkeypatch.setenv("TELEMETRY_DEV_API_URL", env_api_url)
+    if initialized:
+        make(base_url="https://ingest-init.test")
+
+    with pytest.raises(PromptError):
+        get_prompt("support/reply", api_key="td_live_a")
+
+    assert urls == ["https://api.telemetry.dev/v1/prompts?name=support%2Freply&label=production"]
 
 
 def test_get_prompt_keeps_a_prompt_for_the_ttl_then_refreshes_it_in_the_background(
@@ -126,7 +154,7 @@ def test_get_prompt_keeps_a_prompt_for_the_ttl_then_refreshes_it_in_the_backgrou
     server.replies = [(200, reply()), (200, reply(version=13))]
 
     def version() -> int | None:
-        return get_prompt("support/reply", api_key="td_live_a", base_url=server.url).version
+        return get_prompt("support/reply", api_key="td_live_a", api_url=server.url).version
 
     assert version() == 12
     clock[0] += 59
@@ -142,7 +170,7 @@ def test_get_prompt_keeps_a_prompt_for_the_ttl_then_refreshes_it_in_the_backgrou
 
     # A different key does not share the copy.
     server.delay = 0
-    get_prompt("support/reply", api_key="td_live_b", base_url=server.url)
+    get_prompt("support/reply", api_key="td_live_b", api_url=server.url)
     assert len(server.requests) == 3
 
 
@@ -152,7 +180,7 @@ def test_concurrent_calls_share_one_fetch(server: CaptureServer) -> None:
 
     def fetch() -> None:
         versions.append(
-            get_prompt("support/reply", api_key="td_live_a", base_url=server.url).version
+            get_prompt("support/reply", api_key="td_live_a", api_url=server.url).version
         )
 
     threads = [threading.Thread(target=fetch) for _ in range(5)]
@@ -169,7 +197,7 @@ def test_a_failed_refresh_returns_the_last_copy_and_reports_the_error(
     server: CaptureServer, make: MakeClient, clock: list[float]
 ) -> None:
     errors: list[BaseException] = []
-    make(api_key="td_live_a", base_url=server.url, on_error=errors.append)
+    make(api_key="td_live_a", api_url=server.url, on_error=errors.append)
     server.replies = [
         (200, reply()),
         api_error(503, "prompts_unavailable", "Prompts are unavailable"),
@@ -203,7 +231,7 @@ def test_with_no_copy_a_failed_fetch_returns_the_fallback_and_so_do_calls_for_10
         return get_prompt(
             "support/reply",
             api_key="td_live_a",
-            base_url=server.url,
+            api_url=server.url,
             cache_ttl_seconds=cache_ttl_seconds,
             fallback=[{"role": "user", "content": "Answer {{customer_message}}"}],
         )
@@ -237,7 +265,7 @@ def test_with_no_copy_and_no_fallback_get_prompt_raises_a_prompt_error(
     server.replies = [api_error(404, "label_not_found", "support/reply has no production label")]
 
     with pytest.raises(PromptError) as raised:
-        get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+        get_prompt("support/reply", api_key="td_live_a", api_url=server.url)
     assert (raised.value.code, raised.value.status, raised.value.message) == (
         "label_not_found",
         404,
@@ -246,14 +274,14 @@ def test_with_no_copy_and_no_fallback_get_prompt_raises_a_prompt_error(
 
     for api_key in (None, ""):
         with pytest.raises(PromptError) as missing:
-            get_prompt("support/reply", api_key=api_key, base_url=server.url)
+            get_prompt("support/reply", api_key=api_key, api_url=server.url)
         assert missing.value.code == "missing_api_key"
 
     with socket.socket() as closed:
         closed.bind(("127.0.0.1", 0))
         port = closed.getsockname()[1]
     with pytest.raises(PromptError) as offline:
-        get_prompt("support/reply", api_key="td_live_a", base_url=f"http://127.0.0.1:{port}")
+        get_prompt("support/reply", api_key="td_live_a", api_url=f"http://127.0.0.1:{port}")
     assert offline.value.code == "network_error"
 
 
@@ -264,7 +292,7 @@ def test_a_redirect_fails_and_does_not_send_the_key(server: CaptureServer) -> No
         server.location = f"{other.url}/v1/prompts?name=support%2Freply&label=production"
 
         with pytest.raises(PromptError) as raised:
-            get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+            get_prompt("support/reply", api_key="td_live_a", api_url=server.url)
 
         assert (raised.value.code, raised.value.status) == ("http_302", 302)
         assert other.requests == []
@@ -289,7 +317,7 @@ def test_a_fetch_that_takes_too_long_fails_with_timeout(
 
     started = time.monotonic()
     with pytest.raises(PromptError) as raised:
-        get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+        get_prompt("support/reply", api_key="td_live_a", api_url=server.url)
     assert raised.value.code == "timeout"
     assert time.monotonic() - started < 0.8
 
@@ -301,15 +329,15 @@ def test_get_prompt_rejects_a_prompt_of_the_other_type_and_bad_options(
     url = server.url
 
     with pytest.raises(PromptError) as raised:
-        get_prompt("support/reply", api_key="td_live_a", base_url=url)
+        get_prompt("support/reply", api_key="td_live_a", api_url=url)
     assert raised.value.code == "type_mismatch"
-    text = get_prompt("support/reply", type="text", api_key="td_live_a", base_url=url)
+    text = get_prompt("support/reply", type="text", api_key="td_live_a", api_url=url)
     assert text.compile(name=7) == "Hi 7"
 
     with pytest.raises(TypeError):
-        get_prompt("support/reply", label="a", version=2, api_key="td_live_a", base_url=url)
+        get_prompt("support/reply", label="a", version=2, api_key="td_live_a", api_url=url)
     with pytest.raises(ValueError):
-        get_prompt("support/reply", version=0, api_key="td_live_a", base_url=url)
+        get_prompt("support/reply", version=0, api_key="td_live_a", api_url=url)
 
 
 def test_one_session_keeps_one_version_of_a_gradual_rollout(
@@ -334,7 +362,7 @@ def test_one_session_keeps_one_version_of_a_gradual_rollout(
 
     def fetch() -> ChatPrompt:
         # A new key for each call skips the cache.
-        return get_prompt("support/reply", api_key=f"td_live_{next(keys)}", base_url=server.url)
+        return get_prompt("support/reply", api_key=f"td_live_{next(keys)}", api_url=server.url)
 
     # FNV-1a("support/reply:production:session-123") = 777154315, so the bucket is 15. The
     # TypeScript SDK test asserts the same vector.
@@ -357,7 +385,7 @@ def test_one_session_keeps_one_version_of_a_gradual_rollout(
 
 
 def test_compile_fills_variables_and_expands_placeholders(server: CaptureServer) -> None:
-    prompt = get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+    prompt = get_prompt("support/reply", api_key="td_live_a", api_url=server.url)
     history = [
         {"role": "user", "content": "Hi {{tone}}"},
         {"role": "assistant", "content": "Hello"},
@@ -388,7 +416,7 @@ def test_compile_fills_variables_and_expands_placeholders(server: CaptureServer)
 
     # The cached copy does not change when an app edits a prompt.
     prompt.messages[0]["content"] = "changed"
-    again = get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+    again = get_prompt("support/reply", api_key="td_live_a", api_url=server.url)
     assert again.messages[0]["content"] == "Use a {{tone}} tone."
 
 
@@ -396,7 +424,7 @@ def test_with_prompt_stamps_model_call_spans_in_scope_and_no_others(
     server: CaptureServer, make: MakeClient
 ) -> None:
     memory = make()
-    prompt = get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+    prompt = get_prompt("support/reply", api_key="td_live_a", api_url=server.url)
 
     with start_span("before", type="generation"):
         pass
@@ -440,7 +468,7 @@ def test_each_thread_records_its_own_variables_when_it_compiles_a_shared_prompt(
     server: CaptureServer, make: MakeClient, where: str
 ) -> None:
     memory = make()
-    prompt = get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+    prompt = get_prompt("support/reply", api_key="td_live_a", api_url=server.url)
 
     def task(name: str, customer_message: str, ready: threading.Event, go: threading.Event) -> None:
         if where == "before":
@@ -483,7 +511,7 @@ def test_variables_are_omitted_when_input_capture_is_off(
 
     memory = make(mask=mask)
     server.replies = [(200, reply(label=None, version=7))]
-    prompt = get_prompt("support/reply", version=7, api_key="td_live_a", base_url=server.url)
+    prompt = get_prompt("support/reply", version=7, api_key="td_live_a", api_url=server.url)
     prompt.compile(tone="SECRET")
 
     with with_prompt(prompt):
@@ -517,7 +545,7 @@ def test_a_fallback_prompt_records_its_name_and_label_but_no_version(
     prompt = get_prompt(
         "support/reply",
         api_key="td_live_a",
-        base_url=server.url,
+        api_url=server.url,
         fallback=[{"role": "user", "content": "Hi"}],
     )
 
@@ -532,7 +560,7 @@ def test_a_fallback_prompt_records_its_name_and_label_but_no_version(
 
 
 async def test_get_prompt_async_fetches_in_a_worker_thread(server: CaptureServer) -> None:
-    prompt = await get_prompt_async("support/reply", api_key="td_live_a", base_url=server.url)
+    prompt = await get_prompt_async("support/reply", api_key="td_live_a", api_url=server.url)
 
     assert prompt.version == 12
     assert query_of(server.requests[0].path)["label"] == "production"

@@ -23,6 +23,7 @@ def span_context(span: ReadableSpan) -> SpanContext:
 
 ENV_VARS = (
     "TELEMETRY_DEV_API_KEY",
+    "TELEMETRY_DEV_API_URL",
     "TELEMETRY_DEV_BASE_URL",
     "TELEMETRY_DEV_ENVIRONMENT",
     "OTEL_SERVICE_NAME",

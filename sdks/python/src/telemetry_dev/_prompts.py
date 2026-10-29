@@ -147,7 +147,7 @@ def get_prompt(
     cache_ttl_seconds: float = 60,
     fallback: list[dict[str, Any]] | None = None,
     api_key: str | None = None,
-    base_url: str | None = None,
+    api_url: str | None = None,
 ) -> ChatPrompt: ...
 
 
@@ -161,7 +161,7 @@ def get_prompt(
     cache_ttl_seconds: float = 60,
     fallback: str | None = None,
     api_key: str | None = None,
-    base_url: str | None = None,
+    api_url: str | None = None,
 ) -> TextPrompt: ...
 
 
@@ -174,7 +174,7 @@ def get_prompt(
     cache_ttl_seconds: float = 60,
     fallback: list[dict[str, Any]] | str | None = None,
     api_key: str | None = None,
-    base_url: str | None = None,
+    api_url: str | None = None,
 ) -> Prompt:
     """Fetch a prompt version from telemetry.dev and keep it.
 
@@ -189,7 +189,7 @@ def get_prompt(
     A label with a gradual rollout gives each session one version: the choice uses the session
     id of ``propagate_attributes``, or a random choice per call without one.
     """
-    return _get_prompt(name, type, label, version, cache_ttl_seconds, fallback, api_key, base_url)
+    return _get_prompt(name, type, label, version, cache_ttl_seconds, fallback, api_key, api_url)
 
 
 @overload
@@ -202,7 +202,7 @@ async def get_prompt_async(
     cache_ttl_seconds: float = 60,
     fallback: list[dict[str, Any]] | None = None,
     api_key: str | None = None,
-    base_url: str | None = None,
+    api_url: str | None = None,
 ) -> ChatPrompt: ...
 
 
@@ -216,7 +216,7 @@ async def get_prompt_async(
     cache_ttl_seconds: float = 60,
     fallback: str | None = None,
     api_key: str | None = None,
-    base_url: str | None = None,
+    api_url: str | None = None,
 ) -> TextPrompt: ...
 
 
@@ -229,11 +229,11 @@ async def get_prompt_async(
     cache_ttl_seconds: float = 60,
     fallback: list[dict[str, Any]] | str | None = None,
     api_key: str | None = None,
-    base_url: str | None = None,
+    api_url: str | None = None,
 ) -> Prompt:
     """``get_prompt`` in a worker thread, so a fetch does not block the event loop."""
     return await asyncio.to_thread(
-        _get_prompt, name, type, label, version, cache_ttl_seconds, fallback, api_key, base_url
+        _get_prompt, name, type, label, version, cache_ttl_seconds, fallback, api_key, api_url
     )
 
 
@@ -282,14 +282,14 @@ def _get_prompt(
     cache_ttl_seconds: float,
     fallback: list[dict[str, Any]] | str | None,
     api_key: str | None,
-    base_url: str | None,
+    api_url: str | None,
 ) -> Prompt:
     _check(name, type, label, version, cache_ttl_seconds, fallback)
     client = get_client()
     enabled = client if client is not None and client.enabled else None
     config = enabled.config if enabled is not None else resolve_config()
     key = api_key if api_key is not None else config.api_key
-    url = (base_url or config.base_url).rstrip("/")
+    url = (api_url or config.api_url).rstrip("/")
     asked_label = (label if label is not None else "production") if version is None else None
     on_error = enabled.on_error if enabled is not None else None
 

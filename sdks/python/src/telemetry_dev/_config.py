@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 DEFAULT_BASE_URL = "https://ingest.telemetry.dev"
+DEFAULT_API_URL = "https://api.telemetry.dev"
 
 
 def _resolve_version() -> str:
@@ -40,6 +41,7 @@ _LOG_LEVELS: dict[str, int] = {
 class ResolvedConfig:
     api_key: str | None
     base_url: str
+    api_url: str
     environment: str
     service_name: str
 
@@ -48,6 +50,7 @@ def resolve_config(
     *,
     api_key: str | None = None,
     base_url: str | None = None,
+    api_url: str | None = None,
     environment: str | None = None,
     service_name: str | None = None,
 ) -> ResolvedConfig:
@@ -55,6 +58,9 @@ def resolve_config(
     return ResolvedConfig(
         api_key=api_key or os.environ.get("TELEMETRY_DEV_API_KEY") or None,
         base_url=re.sub(r"/+$", "", url),
+        api_url=re.sub(
+            r"/+$", "", api_url or os.environ.get("TELEMETRY_DEV_API_URL") or DEFAULT_API_URL
+        ),
         environment=environment or os.environ.get("TELEMETRY_DEV_ENVIRONMENT") or "production",
         service_name=service_name or os.environ.get("OTEL_SERVICE_NAME") or "unknown_service",
     )
