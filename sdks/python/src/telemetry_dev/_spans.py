@@ -38,6 +38,7 @@ from ._semconv import (
     ATTR_FINISH_REASONS,
     ATTR_OPERATION,
     ATTR_OUTPUT_TYPE,
+    ATTR_PROMPT_VARIABLES,
     ATTR_PROVIDER,
     ATTR_REQUEST_MODEL,
     ATTR_RESPONSE_ID,
@@ -279,6 +280,9 @@ def _fields_to_attributes(
     raw = fields.get("attributes")
     if raw is not None:
         for key, value in raw.items():
+            # The variables are input, also when the app passes them from prompt_attributes_for().
+            if key == ATTR_PROMPT_VARIABLES and not state.capture_input:
+                continue
             attr = coerce_attr_value(
                 value,
                 max_len=sys.maxsize,

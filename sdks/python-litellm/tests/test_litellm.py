@@ -74,44 +74,43 @@ SUPPORT_PROMPT = telemetry_dev.ChatPrompt(
 
 
 @pytest.mark.parametrize(
-    ("api", "capture_input", "older_core"),
+    ("api", "messages", "capture_input", "older_core"),
     [
-        ("completion", False, False),
-        ("responses instructions", True, False),
-        ("responses input", True, False),
-        ("completion", True, True),
+        ("completion", "compiled", False, False),
+        ("responses", "compiled", True, False),
+        ("completion", "copied", True, False),
+        ("completion", "compiled", True, True),
     ],
 )
 def test_calls_outside_with_prompt_record_the_prompt_of_compiled_messages(
-    make: Any, monkeypatch: pytest.MonkeyPatch, api: str, capture_input: bool, older_core: bool
+    make: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    api: str,
+    messages: str,
+    capture_input: bool,
+    older_core: bool,
 ) -> None:
     memory = make(capture_input=capture_input)
     if older_core:
         monkeypatch.delattr(telemetry_dev, "prompt_attributes_for")
-    system, user = SUPPORT_PROMPT.compile(team="billing", order="#4")
+    compiled = SUPPORT_PROMPT.compile(team="billing", order="#4")
+    sent = compiled if messages == "compiled" else [dict(message) for message in compiled]
 
     if api == "completion":
-        telemetry_dev_litellm.completion(
-            model="gpt-4o-mini", messages=[system, user], mock_response="Soon."
-        )
+        telemetry_dev_litellm.completion(model="gpt-4o-mini", messages=sent, mock_response="Soon.")
     else:
 
         def fake_responses(*_args: Any, **_kwargs: Any) -> SimpleNamespace:
             return responses_result()
 
         monkeypatch.setattr(litellm, "responses", fake_responses)
-        in_input = api == "responses input"
-        telemetry_dev_litellm.responses(
-            [{"role": "user", "content": user["content"] if in_input else "Hi"}],
-            "openai/gpt-4.1-mini",
-            instructions="Be terse." if in_input else system["content"],
-        )
+        telemetry_dev_litellm.responses(sent, "openai/gpt-4.1-mini")
 
     a = attrs(only_span(memory))
     assert a["gen_ai.request.model"] == ("gpt-4o-mini" if api == "completion" else "gpt-4.1-mini")
     assert {key: value for key, value in a.items() if key.startswith("td.prompt.")} == (
         {}
-        if older_core
+        if older_core or messages == "copied"
         else {
             "td.prompt.name": "support/reply",
             "td.prompt.version": 12,

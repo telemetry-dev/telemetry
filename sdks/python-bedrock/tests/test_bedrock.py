@@ -14,6 +14,7 @@ import telemetry_dev
 from botocore.client import BaseClient
 from botocore.exceptions import ClientError, EventStreamError
 from botocore.response import StreamingBody
+from botocore.stub import Stubber
 
 import telemetry_dev_bedrock._streams as bedrock_streams
 from telemetry_dev_bedrock import instrument_bedrock, uninstrument_bedrock, wrap_bedrock
@@ -130,75 +131,56 @@ SUPPORT_PROMPT = telemetry_dev.ChatPrompt(
 )
 
 
-@pytest.mark.parametrize("older_core", [False, True])
-def test_converse_and_invoke_model_outside_with_prompt_record_the_prompt_of_a_compiled_text(
-    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, older_core: bool
+@pytest.mark.parametrize(
+    ("messages", "older_core"),
+    [("changed in place", False), ("new", False), ("changed in place", True)],
+)
+def test_converse_outside_with_prompt_records_the_prompt_of_compiled_messages(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, messages: str, older_core: bool
 ) -> None:
     if older_core:
         monkeypatch.delattr(telemetry_dev, "prompt_attributes_for")
     system, user = SUPPORT_PROMPT.compile(team="billing", order="#4")
-    converse_reply = {
-        "output": {"message": {"role": "assistant", "content": [{"text": "Soon."}]}},
-        "stopReason": "end_turn",
-    }
-    answer = _body({"content": [{"type": "text", "text": "Soon."}], "stop_reason": "end_turn"})
-    embedding = _body({"embedding": [0.1, 0.2], "inputTextTokenCount": 6})
+    blocks = [{"text": user["content"]}]
+    # Converse takes content blocks: a message changed in place keeps its tag, a new one has none.
+    if messages == "new":
+        message = {"role": "user", "content": blocks}
+    else:
+        user["content"] = blocks
+        message = user
     client = _client("bedrock-runtime")
-    _stub_api_call(
-        client,
-        [
-            converse_reply,
-            converse_reply,
-            {
-                "body": StreamingBody(io.BytesIO(answer), len(answer)),
-                "contentType": "application/json",
-            },
-            {
-                "body": StreamingBody(io.BytesIO(embedding), len(embedding)),
-                "contentType": "application/json",
-            },
-        ],
-        monkeypatch,
+    # The stubber runs botocore's validation of the request.
+    stubber = Stubber(client)
+    stubber.add_response(
+        "converse",
+        {
+            "output": {"message": {"role": "assistant", "content": [{"text": "Soon."}]}},
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+            "metrics": {"latencyMs": 1},
+        },
     )
-    wrapped = cast(Any, wrap_bedrock(client))
 
-    wrapped.converse(
-        modelId="anthropic.claude-3-haiku",
-        system=[{"text": system["content"]}],
-        messages=[{"role": "user", "content": [{"text": "Hi"}]}],
-    )
-    wrapped.converse(
-        modelId="anthropic.claude-3-haiku",
-        messages=[{"role": "user", "content": [{"text": user["content"]}]}],
-    )
-    wrapped.invoke_model(
-        modelId="anthropic.claude-3-haiku",
-        contentType="application/json",
-        body=_body({"max_tokens": 64, "messages": [{"role": "user", "content": user["content"]}]}),
-    )["body"].read()
-    wrapped.invoke_model(
-        modelId="amazon.titan-embed-text-v2:0",
-        contentType="application/json",
-        body=_body({"inputText": user["content"]}),
-    )["body"].read()
-
-    system_span, messages_span, invoke_span, embed_span = (
-        dict(span.attributes or {}) for span in memory.span_exporter.get_finished_spans()
-    )
-    for span in (system_span, messages_span, invoke_span):
-        assert span["gen_ai.request.model"] == "anthropic.claude-3-haiku"
-        assert {key: value for key, value in span.items() if key.startswith("td.prompt.")} == (
-            {}
-            if older_core
-            else {
-                "td.prompt.name": "support/reply",
-                "td.prompt.version": 12,
-                "td.prompt.label": "production",
-                "td.prompt.variables": '{"team":"billing","order":"#4"}',
-            }
+    with stubber:
+        cast(Any, wrap_bedrock(client)).converse(
+            modelId="anthropic.claude-3-haiku",
+            system=[{"text": system["content"]}],
+            messages=[message],
         )
-    assert embed_span["gen_ai.operation.name"] == "embeddings"
-    assert "td.prompt.name" not in embed_span
+
+    [span] = memory.span_exporter.get_finished_spans()
+    a = dict(span.attributes or {})
+    assert a["gen_ai.request.model"] == "anthropic.claude-3-haiku"
+    assert {key: value for key, value in a.items() if key.startswith("td.prompt.")} == (
+        {}
+        if older_core or messages == "new"
+        else {
+            "td.prompt.name": "support/reply",
+            "td.prompt.version": 12,
+            "td.prompt.label": "production",
+            "td.prompt.variables": '{"team":"billing","order":"#4"}',
+        }
+    )
 
 
 def test_converse_happy_path(memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:

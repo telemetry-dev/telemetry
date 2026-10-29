@@ -312,13 +312,13 @@ afterEach(async () => {
 });
 
 test.each([
-  { api: "chat", olderCore: false },
-  { api: "streamed responses instructions", olderCore: false },
-  { api: "responses input", olderCore: false },
-  { api: "chat", olderCore: true },
+  { api: "chat", messages: "compiled", olderCore: false },
+  { api: "streamed responses", messages: "compiled", olderCore: false },
+  { api: "chat", messages: "copied", olderCore: false },
+  { api: "chat", messages: "compiled", olderCore: true },
 ])(
-  "$api outside withPrompt record the prompt of compiled messages, older core $olderCore",
-  async ({ api, olderCore }) => {
+  "$api outside withPrompt records the prompt of $messages messages, older core $olderCore",
+  async ({ api, messages: kind, olderCore }) => {
     if (olderCore) {
       vi.spyOn(
         telemetrySdk as { promptAttributesFor: unknown },
@@ -348,22 +348,13 @@ test.each([
           rollout: null,
         }),
     });
-    const [system, user] = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+    const compiled = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+    const messages = kind === "compiled" ? compiled : compiled.map((message) => ({ ...message }));
     const spans = setupSpans();
 
     if (api === "chat") {
       const client = clientWith(createFakeFetcher(jsonResponse(chatBody("chat_1"))).fetcher);
-      await client.chat.send({
-        chatRequest: { model: "openai/gpt-4o", messages: [system!, user!] },
-      });
-    } else if (api === "responses input") {
-      const client = clientWith(createFakeFetcher(jsonResponse(responsesBody("resp_1"))).fetcher);
-      await client.responses.send({
-        responsesRequest: {
-          model: "openai/gpt-4o",
-          input: [{ type: "message", role: "user", content: user!.content }],
-        },
-      });
+      await client.chat.send({ chatRequest: { model: "openai/gpt-4o", messages } });
     } else {
       const client = clientWith(
         createFakeFetcher(
@@ -371,12 +362,7 @@ test.each([
         ).fetcher,
       );
       const stream = await client.responses.send({
-        responsesRequest: {
-          model: "openai/gpt-4o",
-          instructions: system!.content,
-          input: "Hi",
-          stream: true,
-        },
+        responsesRequest: { model: "openai/gpt-4o", input: messages, stream: true },
       });
 
       if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
@@ -386,7 +372,7 @@ test.each([
     const { attributes } = await exportedSpan(spans);
     expect(attributes["gen_ai.request.model"]).toBe("openai/gpt-4o");
 
-    if (olderCore) {
+    if (olderCore || kind === "copied") {
       expect(attributes["td.prompt.name"]).toBeUndefined();
 
       return;

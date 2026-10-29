@@ -349,10 +349,10 @@ def _capture_text(value: str, budget: telemetry_dev.CaptureBudget) -> str:
     return value
 
 
-def _prompt_attributes(request: object) -> dict[str, Any]:
+def _prompt_attributes(messages: object) -> dict[str, Any]:
     # Older cores have no prompt_attributes_for and record a prompt only inside with_prompt.
     read = getattr(telemetry_dev, "prompt_attributes_for", None)
-    return cast("dict[str, Any]", read(request)) if callable(read) else {}
+    return cast("dict[str, Any]", read(messages)) if callable(read) else {}
 
 
 def _chat_request(params: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -441,7 +441,7 @@ def _chat_response(response: Any) -> dict[str, Any]:
 
 def _responses_request(params: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     model = _string(params.get("model"))
-    attributes = _prompt_attributes([params.get("instructions"), params.get("input")])
+    attributes = _prompt_attributes(params.get("input"))
     captured, truncated = _bounded_responses_capture(params.get("input"), "input")
     if truncated:
         attributes["telemetry.dev.capture.truncated"] = True

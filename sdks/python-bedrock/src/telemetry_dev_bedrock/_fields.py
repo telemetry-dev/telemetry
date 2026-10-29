@@ -12,10 +12,10 @@ def clean(fields: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in fields.items() if value is not None}
 
 
-def prompt_attributes(request: object) -> dict[str, Any]:
+def prompt_attributes(messages: object) -> dict[str, Any]:
     # Older cores have no prompt_attributes_for and record a prompt only inside with_prompt.
     read = getattr(telemetry_dev, "prompt_attributes_for", None)
-    return cast("dict[str, Any]", read(request)) if callable(read) else {}
+    return cast("dict[str, Any]", read(messages)) if callable(read) else {}
 
 
 def metadata_fields(response: dict[str, Any] | BaseException | None) -> dict[str, Any]:

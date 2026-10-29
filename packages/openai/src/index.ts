@@ -246,7 +246,7 @@ function chatResponse<T>(response: T): SpanFields {
 function responsesRequest(body: JsonRecord): RequestMapping {
   const model = readString(body.model);
   const capture = captureEnabled("input") ? sanitizeResponsesCapture(body.input) : undefined;
-  const prompt = promptAttributes([body.instructions, body.input]);
+  const prompt = promptAttributes(body.input);
 
   return {
     name: `chat ${model ?? "unknown"}`,
@@ -1634,12 +1634,12 @@ function captureMaskedBeforeStart(): boolean {
 
 // Cores older than promptAttributesFor record a prompt only inside withPrompt. A namespace read
 // keeps them loadable without the export.
-function promptAttributes(request: unknown): SpanFields["attributes"] {
+function promptAttributes(messages: unknown): SpanFields["attributes"] {
   const read = (
-    telemetrySdk as { promptAttributesFor?: (request: unknown) => SpanFields["attributes"] }
+    telemetrySdk as { promptAttributesFor?: (messages: unknown) => SpanFields["attributes"] }
   ).promptAttributesFor;
 
-  return typeof read === "function" ? read(request) : undefined;
+  return typeof read === "function" ? read(messages) : undefined;
 }
 
 // The decision is made before the span starts so samplers see the same attributes as before.

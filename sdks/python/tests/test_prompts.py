@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import copy
+import gc
 import itertools
 import json
-import os
-import signal
+import pickle
 import socket
 import threading
 import time
 import urllib.error
 import urllib.request
+import weakref
 from collections.abc import Callable, Generator
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
@@ -81,14 +83,9 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
 
 @pytest.fixture(autouse=True)
-def empty_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+def empty_cache() -> None:
     # A fetch that runs on after its test must not answer a later test on a reused port.
     prompts_module._cache.clear()  # pyright: ignore[reportPrivateUsage]
-    monkeypatch.setattr(
-        prompts_module,
-        "_compiled_texts",
-        prompts_module._CompiledTexts(),  # pyright: ignore[reportPrivateUsage]
-    )
 
 
 def chat_prompt(*messages: dict[str, Any], name: str = "support/reply") -> ChatPrompt:
@@ -831,102 +828,153 @@ def test_variables_are_omitted_when_input_capture_is_off(
     assert "td.prompt.variables" not in (span.attributes or {})
 
 
-class Part:
-    def __init__(self, text: str) -> None:
-        self.text = text
+DESK_MESSAGES = [
+    {"role": "system", "content": "Answer as the {{team}} desk."},
+    {"role": "user", "content": "Order {{order}}: where is it?"},
+]
 
 
-def test_prompt_attributes_for_finds_a_compiled_text_in_the_request_shapes_of_the_providers(
+def test_prompt_attributes_for_names_the_compile_of_a_message_dict_and_a_copy_names_nothing(
+    make: MakeClient,
+) -> None:
+    make()
+    compiled = chat_prompt(*DESK_MESSAGES).compile(team="billing", order="#4")
+    attributes = {
+        "td.prompt.name": "support/reply",
+        "td.prompt.version": 12,
+        "td.prompt.label": "production",
+        "td.prompt.variables": '{"team":"billing","order":"#4"}',
+    }
+
+    assert prompt_attributes_for(compiled) == attributes
+    assert prompt_attributes_for(tuple(compiled)) == attributes
+    assert prompt_attributes_for(compiled[0]) == attributes
+    assert json.dumps(compiled[0]) == '{"role": "system", "content": "Answer as the billing desk."}'
+
+    copies: list[object] = [
+        [dict(message) for message in compiled],
+        [message.copy() for message in compiled],
+        [copy.copy(message) for message in compiled],
+        copy.deepcopy(compiled),
+        pickle.loads(pickle.dumps(compiled)),
+        json.loads(json.dumps(compiled)),
+        [message["content"] for message in compiled],
+    ]
+    for messages in copies:
+        assert prompt_attributes_for(messages) == {}
+
+    summary = text_prompt("Summarize {{doc}}.").compile(doc="the policy")
+    assert prompt_attributes_for([summary]) == {}
+
+
+def test_an_unrelated_message_with_the_text_of_a_compiled_message_is_not_tagged(
+    make: MakeClient,
+) -> None:
+    make()
+    chat_prompt({"role": "system", "content": "You are a helpful assistant."}).compile()
+
+    unrelated = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is 2 + 2?"},
+    ]
+    assert prompt_attributes_for(unrelated) == {}
+
+
+def test_two_tasks_with_one_text_and_different_other_variables_each_record_their_own(
+    make: MakeClient,
+) -> None:
+    memory = make()
+    prompt = chat_prompt(*DESK_MESSAGES)
+
+    # Both compiles make the system text "Answer as the billing desk.", and each task sends only it.
+    system_a = prompt.compile(team="billing", order="#A")[0]
+    system_b = prompt.compile(team="billing", order="#B")[0]
+    start_span("a", type="generation", attributes=prompt_attributes_for([system_a])).end()
+    start_span("b", type="generation", attributes=prompt_attributes_for([system_b])).end()
+
+    assert {
+        span.name: (span.attributes or {})["td.prompt.variables"]
+        for span in memory.span_exporter.get_finished_spans()
+    } == {
+        "a": '{"team":"billing","order":"#A"}',
+        "b": '{"team":"billing","order":"#B"}',
+    }
+
+
+def test_a_rollout_with_two_versions_of_the_same_messages_records_the_version_of_each_call(
+    server: CaptureServer, make: MakeClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make()
+    server.replies = [
+        (
+            200,
+            reply(
+                messages=DESK_MESSAGES,
+                rollout={
+                    "percent": 16,
+                    "version": 13,
+                    "messages": DESK_MESSAGES,
+                    "text": None,
+                    "model": {"provider": "openai", "name": "gpt-4o-mini"},
+                    "parameters": {},
+                    "tools": [],
+                    "responseFormat": {"type": "text"},
+                },
+            ),
+        )
+    ]
+    draws = iter([15, 16])
+
+    def draw(_stop: int) -> int:
+        return next(draws)
+
+    monkeypatch.setattr(prompts_module.random, "randrange", draw)
+    rollout = get_prompt("support/reply", api_key="td_live_a", api_url=server.url)
+    production = get_prompt("support/reply", api_key="td_live_a", api_url=server.url)
+    from_rollout = rollout.compile(team="billing", order="#4")
+    from_production = production.compile(team="billing", order="#4")
+
+    assert prompt_attributes_for(from_rollout)["td.prompt.version"] == 13
+    assert prompt_attributes_for(from_production)["td.prompt.version"] == 12
+
+
+def test_the_newest_compiled_message_wins_also_after_170_messages_of_history(
     make: MakeClient,
 ) -> None:
     make()
     prompt = chat_prompt(
         {"role": "system", "content": "Answer as the {{team}} desk."},
-        {"role": "user", "content": "Order {{order}}: where is it?"},
+        {"role": "placeholder", "name": "history"},
+        {"role": "user", "content": "{{question}}"},
     )
-    compiled = prompt.compile(team="billing", order="#4")
-    system, user = (message["content"] for message in compiled)
+    history = [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"message {index}"}
+        for index in range(170)
+    ]
 
-    requests = {
-        "same": compiled,
-        "copy": [dict(message) for message in compiled],
-        "json": json.loads(json.dumps(compiled)),
-        "anthropic": [system, compiled[1:]],
-        "bedrock": [[{"text": system}], [{"role": "user", "content": [{"text": user}]}]],
-        "objects": (Part(system), [SimpleNamespace(role="user", parts=[Part(user)])]),
-    }
-    for request in requests.values():
-        assert prompt_attributes_for(request) == {
-            "td.prompt.name": "support/reply",
-            "td.prompt.version": 12,
-            "td.prompt.label": "production",
-            "td.prompt.variables": '{"team":"billing","order":"#4"}',
-        }
+    first_turn = prompt.compile(team="billing", question="Where is #4?", history=history)
+    second_turn = prompt.compile(team="returns", question="Can I return it?")
+    chat = [*first_turn, {"role": "assistant", "content": "On its way."}, *second_turn[1:]]
 
-    assert prompt_attributes_for([{"role": "user", "content": "Order #5: where is it?"}]) == {}
+    assert '"team":"billing"' in str(prompt_attributes_for(first_turn)["td.prompt.variables"])
+    assert '"team":"billing"' in str(
+        prompt_attributes_for([first_turn[0], *history])["td.prompt.variables"]
+    )
+    assert (
+        prompt_attributes_for(chat)["td.prompt.variables"]
+        == '{"team":"returns","question":"Can I return it?"}'
+    )
 
 
-def test_a_static_text_gives_no_variables_and_a_template_of_only_a_variable_tag_is_not_kept(
-    make: MakeClient,
-) -> None:
+def test_prompt_attributes_for_looks_at_the_last_1000_messages(make: MakeClient) -> None:
     make()
-    chat = chat_prompt(
-        {"role": "system", "content": "You are the refunds agent."},
-        {"role": "user", "content": "{{ question }}"},
-    )
-    compiled = chat.compile(question="Where is my refund?")
+    system = chat_prompt(*DESK_MESSAGES).compile(team="billing", order="#4")[0]
 
-    assert prompt_attributes_for(compiled) == {
-        "td.prompt.name": "support/reply",
-        "td.prompt.version": 12,
-        "td.prompt.label": "production",
-    }
-    assert prompt_attributes_for([{"role": "user", "content": "Where is my refund?"}]) == {}
-
-    summary = text_prompt("Summarize {{doc}} in a line.").compile(doc="the refund policy")
-    assert prompt_attributes_for(summary)["td.prompt.variables"] == '{"doc":"the refund policy"}'
+    assert prompt_attributes_for([system, *[{"role": "user"}] * 999]) != {}
+    assert prompt_attributes_for([system, *[{"role": "user"}] * 1000]) == {}
 
 
-def test_a_text_with_variables_wins_over_a_static_text_and_the_first_one_wins_over_a_later_one(
-    make: MakeClient,
-) -> None:
-    make()
-    system = chat_prompt(
-        {"role": "system", "content": "You are the refunds agent, v2."}, name="refunds/system"
-    ).compile()
-    question = chat_prompt(
-        {"role": "user", "content": "Where is order {{order}}?"}, name="orders/question"
-    ).compile(order="#4")
-    style = chat_prompt(
-        {"role": "system", "content": "Reply in {{language}}."}, name="style/language"
-    ).compile(language="French")
-
-    first = prompt_attributes_for([*system, *question])
-    assert (first["td.prompt.name"], first["td.prompt.variables"]) == (
-        "orders/question",
-        '{"order":"#4"}',
-    )
-    second = prompt_attributes_for([*system, *style, *question])
-    assert (second["td.prompt.name"], second["td.prompt.variables"]) == (
-        "style/language",
-        '{"language":"French"}',
-    )
-
-
-def test_each_compile_keeps_its_own_values_so_two_threads_with_one_prompt_get_their_own(
-    make: MakeClient,
-) -> None:
-    make()
-    prompt = chat_prompt({"role": "user", "content": "Track parcel {{parcel}}."})
-
-    first = prompt.compile(parcel="A-1")
-    second = prompt.compile(parcel="B-2")
-
-    assert prompt_attributes_for(first)["td.prompt.variables"] == '{"parcel":"A-1"}'
-    assert prompt_attributes_for(second)["td.prompt.variables"] == '{"parcel":"B-2"}'
-
-
-def test_with_prompt_wins_over_a_compiled_text_of_another_prompt(make: MakeClient) -> None:
+def test_with_prompt_wins_over_a_compiled_message_of_another_prompt(make: MakeClient) -> None:
     memory = make()
     scoped = chat_prompt({"role": "user", "content": "Hi"}, name="scoped/prompt")
     compiled = chat_prompt(
@@ -940,7 +988,7 @@ def test_with_prompt_wins_over_a_compiled_text_of_another_prompt(make: MakeClien
     assert (span.attributes or {})["td.prompt.name"] == "scoped/prompt"
 
 
-def test_prompt_attributes_for_omits_variables_when_input_capture_is_off_and_masks_them(
+def test_prompt_variables_follow_the_input_capture_of_the_client_and_of_the_span(
     make: MakeClient,
 ) -> None:
     compiled = chat_prompt({"role": "user", "content": "My card is {{card}}."}).compile(
@@ -959,68 +1007,25 @@ def test_prompt_attributes_for_omits_variables_when_input_capture_is_off_and_mas
     def mask(value: Any, context: telemetry_dev.MaskContext) -> Any:
         return {"card": "[masked]"} if context.key == "td.prompt.variables" else value
 
-    make(mask=mask)
-    assert prompt_attributes_for(compiled)["td.prompt.variables"] == '{"card":"[masked]"}'
+    memory = make(mask=mask)
+    attributes = prompt_attributes_for(compiled)
+    assert attributes["td.prompt.variables"] == '{"card":"[masked]"}'
+
+    start_span("private", type="generation", capture_input=False, attributes=attributes).end()
+    with start_span("updated", type="generation", capture_input=False):
+        telemetry_dev.update_current_span(attributes=attributes)
+
+    for span in memory.span_exporter.get_finished_spans():
+        assert (span.attributes or {})["td.prompt.name"] == "support/reply"
+        assert "td.prompt.variables" not in (span.attributes or {})
 
 
-def test_the_kept_texts_stop_at_1000_and_at_2000000_characters_oldest_out_first(
-    make: MakeClient,
-) -> None:
-    make()
-    ticket = text_prompt("Ticket {{n}} is open.")
-    for n in range(1001):
-        ticket.compile(n=n)
-
-    assert prompt_attributes_for("Ticket 0 is open.") == {}
-    assert prompt_attributes_for("Ticket 1 is open.")["td.prompt.variables"] == '{"n":1}'
-
-    note = text_prompt("Note: {{body}}")
-    notes = [note.compile(body=letter * (500_000 - len("Note: "))) for letter in "abcde"]
-
-    assert prompt_attributes_for(notes[0]) == {}
-    assert prompt_attributes_for(notes[1])["td.prompt.name"] == "support/reply"
-
-    # A text over the character limit is not kept, and it does not push the others out.
-    note.compile(body="f" * 2_000_001)
-    assert prompt_attributes_for(notes[1])["td.prompt.name"] == "support/reply"
-
-    # A text compiled again counts once.
-    for _ in range(5):
-        note.compile(body="e" * (500_000 - len("Note: ")))
-    assert prompt_attributes_for(notes[4])["td.prompt.name"] == "support/reply"
-
-
-def test_prompt_attributes_for_looks_6_levels_and_500_values_deep(make: MakeClient) -> None:
-    make()
-    [message] = chat_prompt({"role": "user", "content": "Find invoice {{invoice}}."}).compile(
-        invoice="INV-7"
-    )
-    content = message["content"]
-
-    def nest(value: object, levels: int) -> object:
-        return value if levels == 0 else nest([value], levels - 1)
-
-    assert prompt_attributes_for(nest(content, 6)) != {}
-    assert prompt_attributes_for(nest(content, 7)) == {}
-
-    # The request list, 498 strings, and the text are 500 values.
-    assert prompt_attributes_for([*["filler"] * 498, content]) != {}
-    assert prompt_attributes_for([*["filler"] * 499, content]) == {}
-
-
-def test_prompt_attributes_for_runs_no_property_or_override_of_the_app(make: MakeClient) -> None:
+def test_prompt_attributes_for_runs_no_code_of_the_app(make: MakeClient) -> None:
     make()
     [message] = chat_prompt({"role": "user", "content": "Refund order {{order}}."}).compile(
         order="#3"
     )
-    content = message["content"]
     reads: list[str] = []
-
-    class Message:
-        @property
-        def content(self) -> str:
-            reads.append("property")
-            return content
 
     class Messages(list[object]):
         def __getitem__(self, index: Any) -> Any:
@@ -1031,47 +1036,36 @@ def test_prompt_attributes_for_runs_no_property_or_override_of_the_app(make: Mak
             reads.append("__iter__")
             return super().__iter__()
 
-    assert prompt_attributes_for([Message(), Messages([content])]) == {}
+        def __reversed__(self) -> Any:
+            reads.append("__reversed__")
+            return super().__reversed__()
+
+    assert prompt_attributes_for(Messages([message])) == {}
     assert reads == []
 
 
-@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
-# Python 3.12+ warns on fork() in a process with threads.
-@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
-def test_a_fork_while_a_thread_keeps_a_compiled_text_leaves_compile_usable_in_the_child() -> None:
-    prompt = text_prompt("Ship order {{order}}.")
-    texts = prompts_module._compiled_texts  # pyright: ignore[reportPrivateUsage]
-    holding, release = threading.Event(), threading.Event()
+def test_the_variables_of_a_compile_are_freed_with_its_messages(make: MakeClient) -> None:
+    make()
+    prompt = chat_prompt(
+        {"role": "system", "content": "Answer as the {{team}} desk."},
+        {"role": "placeholder", "name": "history"},
+    )
 
-    def hold() -> None:
-        with texts.lock:
-            holding.set()
-            release.wait(0.2)
+    class History(list[dict[str, str]]):
+        """A list that a weak reference can point to."""
 
-    holder = threading.Thread(target=hold)
-    holder.start()
-    holding.wait()
-    read_end, write_end = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        try:
-            os.close(read_end)
-            os.write(write_end, prompt.compile(order="#1").encode())
-        finally:
-            os._exit(0)
-    os.close(write_end)
-    release.set()
-    holder.join()
+    history = History([{"role": "user", "content": "Hi"}])
+    freed = weakref.ref(history)
+    messages = prompt.compile(team="billing", history=history)
+    del history
+    # with_prompt keeps the variables of the last compile of a prompt object.
+    prompt.compile(team="returns")
+    gc.collect()
+    assert freed() is not None
 
-    deadline = time.monotonic() + 5
-    while os.waitpid(pid, os.WNOHANG) == (0, 0):
-        if time.monotonic() > deadline:
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
-            pytest.fail("compile() in the child waited for a lock held at the fork")
-        time.sleep(0.01)
-    with os.fdopen(read_end, "rb") as child:
-        assert child.read() == b"Ship order #1."
+    del messages
+    gc.collect()
+    assert freed() is None
 
 
 def test_a_fallback_prompt_records_its_name_and_label_but_no_version(

@@ -150,12 +150,12 @@ function toolDefinitions<T>(tools: T): Record<string, string> | undefined {
 
 // Cores older than promptAttributesFor record a prompt only inside withPrompt. A namespace read
 // keeps them loadable without the export.
-function promptAttributes(request: unknown): SpanFields["attributes"] {
+function promptAttributes(messages: unknown): SpanFields["attributes"] {
   const read = (
-    telemetrySdk as { promptAttributesFor?: (request: unknown) => SpanFields["attributes"] }
+    telemetrySdk as { promptAttributesFor?: (messages: unknown) => SpanFields["attributes"] }
   ).promptAttributesFor;
 
-  return typeof read === "function" ? read(request) : undefined;
+  return typeof read === "function" ? read(messages) : undefined;
 }
 
 function messagesRequest(body: ValueRecord): RequestMapping {
@@ -174,7 +174,7 @@ function messagesRequest(body: ValueRecord): RequestMapping {
       input,
       attributes: {
         ...toolDefinitions(body.tools),
-        ...promptAttributes([body.system, body.messages]),
+        ...promptAttributes(body.messages),
       },
       systemInstructions: body.system,
       temperature: readNumber(body.temperature),

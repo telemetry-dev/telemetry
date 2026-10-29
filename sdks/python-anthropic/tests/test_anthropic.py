@@ -437,12 +437,29 @@ SUPPORT_PROMPT = telemetry_dev.ChatPrompt(
 )
 
 
-@pytest.mark.parametrize(
-    ("field", "capture_input", "older_core"),
-    [("system", False, False), ("messages", True, False), ("messages", True, True)],
+SCOPED_PROMPT = telemetry_dev.ChatPrompt(
+    name="scoped/prompt",
+    version=3,
+    label="production",
+    messages=[{"role": "user", "content": "Hi"}],
+    model=None,
+    parameters={},
+    tools=[],
+    response_format={"type": "text"},
+    is_fallback=False,
 )
-def test_create_outside_with_prompt_records_the_prompt_of_a_compiled_text(
-    make: Any, monkeypatch: pytest.MonkeyPatch, field: str, capture_input: bool, older_core: bool
+
+
+@pytest.mark.parametrize(
+    ("messages", "capture_input", "older_core"),
+    [("compiled", False, False), ("copied", True, False), ("compiled", True, True)],
+)
+def test_create_outside_with_prompt_records_the_prompt_of_compiled_messages(
+    make: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    messages: str,
+    capture_input: bool,
+    older_core: bool,
 ) -> None:
     memory = make(capture_input=capture_input)
     if older_core:
@@ -453,21 +470,74 @@ def test_create_outside_with_prompt_records_the_prompt_of_a_compiled_text(
     client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=64,
-        system=system["content"] if field == "system" else "Be terse.",
-        messages=[{"role": "user", "content": user["content"] if field == "messages" else "Hi"}],
+        system=system["content"],
+        messages=[user if messages == "compiled" else dict(user)],
     )
 
     a = attrs(only_span(memory))
     assert a["gen_ai.request.model"] == "claude-sonnet-4-6"
     assert {key: value for key, value in a.items() if key.startswith("td.prompt.")} == (
         {}
-        if older_core
+        if older_core or messages == "copied"
         else {
             "td.prompt.name": "support/reply",
             "td.prompt.version": 12,
             "td.prompt.label": "production",
             **({"td.prompt.variables": '{"team":"billing","order":"#4"}'} if capture_input else {}),
         }
+    )
+
+
+@pytest.mark.parametrize("scope_around", ["stream()", "__enter__"])
+def test_messages_stream_takes_the_prompt_from_the_context_where_its_span_starts(
+    memory: SimpleNamespace, scope_around: str
+) -> None:
+    _system, user = SUPPORT_PROMPT.compile(team="billing", order="#4")
+    client = wrapped_sync_client(lambda _request: named_sse_response(stream_events()))
+    request: dict[str, Any] = {"model": "claude-sonnet-4-6", "max_tokens": 64, "messages": [user]}
+
+    if scope_around == "stream()":
+        with telemetry_dev.with_prompt(SCOPED_PROMPT):
+            manager = client.messages.stream(**request)
+        with manager as stream:
+            "".join(stream.text_stream)
+    else:
+        manager = client.messages.stream(**request)
+        with telemetry_dev.with_prompt(SCOPED_PROMPT), manager as stream:
+            "".join(stream.text_stream)
+
+    # The span starts at __enter__, so the scope there wins, and without one the message names it.
+    assert attrs(only_span(memory))["td.prompt.name"] == (
+        "support/reply" if scope_around == "stream()" else "scoped/prompt"
+    )
+
+
+@pytest.mark.parametrize("scope_around", ["stream()", "__aenter__"])
+async def test_async_messages_stream_takes_the_prompt_from_the_context_where_its_span_starts(
+    memory: SimpleNamespace, scope_around: str
+) -> None:
+    _system, user = SUPPORT_PROMPT.compile(team="billing", order="#4")
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return named_sse_response(stream_events())
+
+    client = wrapped_async_client(handler)
+    request: dict[str, Any] = {"model": "claude-sonnet-4-6", "max_tokens": 64, "messages": [user]}
+
+    if scope_around == "stream()":
+        with telemetry_dev.with_prompt(SCOPED_PROMPT):
+            manager = client.messages.stream(**request)
+        async with manager as stream:
+            [text async for text in stream.text_stream]
+    else:
+        manager = client.messages.stream(**request)
+        with telemetry_dev.with_prompt(SCOPED_PROMPT):
+            async with manager as stream:
+                [text async for text in stream.text_stream]
+    await client.close()
+
+    assert attrs(only_span(memory))["td.prompt.name"] == (
+        "support/reply" if scope_around == "stream()" else "scoped/prompt"
     )
 
 

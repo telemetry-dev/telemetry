@@ -424,10 +424,15 @@ test("ConverseStream records stream errors with partial output", async () => {
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
-test.each([false, true])(
-  "Converse and InvokeModel outside withPrompt record the prompt of a compiled text; embeddings do not; older core %s",
-  async (olderCore) => {
+test.each([
+  { messages: "changed in place", olderCore: false },
+  { messages: "new", olderCore: false },
+  { messages: "changed in place", olderCore: true },
+])(
+  "Converse outside withPrompt records the prompt of $messages messages, older core $olderCore",
+  async ({ messages: kind, olderCore }) => {
     const spans = setup();
+
     if (olderCore) {
       vi.spyOn(
         telemetrySdk as { promptAttributesFor: unknown },
@@ -435,6 +440,7 @@ test.each([false, true])(
         "get",
       ).mockReturnValue(undefined);
     }
+
     const prompt = await getPrompt("support/reply", {
       apiKey: "td_live_a",
       apiUrl: "https://prompts.bedrock.test",
@@ -457,78 +463,48 @@ test.each([false, true])(
         }),
     });
     const [system, user] = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
-    const converseReply = {
-      output: { message: { role: "assistant", content: [{ text: "Soon." }] } },
-      stopReason: "end_turn",
-    };
+    const blocks = [{ text: user!.content }];
+    // Converse takes content blocks: a message changed in place keeps its tag, a new one has none.
+    const message =
+      kind === "new"
+        ? { role: "user", content: blocks }
+        : Object.assign(user!, { content: blocks });
 
     const client = wrapBedrock(
-      new FakeClient([
-        converseReply,
-        converseReply,
-        {
-          body: bytes({ content: [{ type: "text", text: "Soon." }], stop_reason: "end_turn" }),
-          contentType: "application/json",
-        },
-        {
-          body: bytes({ embedding: [0.1, 0.2], inputTextTokenCount: 6 }),
-          contentType: "application/json",
-        },
-      ]),
+      new BedrockRuntimeClient({
+        region: "us-east-1",
+        credentials: { accessKeyId: "test", secretAccessKey: "test" },
+        maxAttempts: 1,
+        requestHandler: jsonRequestHandler("prompt-1", {
+          output: { message: { role: "assistant", content: [{ text: "Soon." }] } },
+          stopReason: "end_turn",
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        }),
+      }),
     );
 
     await client.send(
       new ConverseCommand({
         modelId: "anthropic.claude-3-haiku",
         system: [{ text: system!.content }],
-        messages: [{ role: "user", content: [{ text: "Hi" }] }],
-      }),
-    );
-    await client.send(
-      new ConverseCommand({
-        modelId: "anthropic.claude-3-haiku",
-        messages: [{ role: "user", content: [{ text: user!.content }] }],
-      }),
-    );
-    await client.send(
-      new InvokeModelCommand({
-        modelId: "anthropic.claude-3-haiku",
-        contentType: "application/json",
-        body: bytes({
-          anthropic_version: "bedrock-2023-05-31",
-          max_tokens: 64,
-          messages: [{ role: "user", content: user!.content }],
-        }),
-      }),
-    );
-    await client.send(
-      new InvokeModelCommand({
-        modelId: "amazon.titan-embed-text-v2:0",
-        contentType: "application/json",
-        body: bytes({ inputText: user!.content }),
+        messages: [message] as ConverseCommandInput["messages"],
       }),
     );
 
-    const [systemSpan, messagesSpan, invokeSpan, embedSpan] = spans.getFinishedSpans();
-
-    for (const span of [systemSpan, messagesSpan, invokeSpan]) {
-      expect(span!.attributes["gen_ai.request.model"]).toBe("anthropic.claude-3-haiku");
-      expect(
-        Object.entries(span!.attributes).filter(([key]) => key.startsWith("td.prompt.")),
-      ).toEqual(
-        olderCore
-          ? []
-          : [
-              ["td.prompt.name", "support/reply"],
-              ["td.prompt.version", 12],
-              ["td.prompt.label", "production"],
-              ["td.prompt.variables", '{"team":"billing","order":"#4"}'],
-            ],
-      );
-    }
-
-    expect(embedSpan!.attributes["gen_ai.operation.name"]).toBe("embeddings");
-    expect(embedSpan!.attributes["td.prompt.name"]).toBeUndefined();
+    const [span] = spans.getFinishedSpans();
+    expect(span!.attributes["gen_ai.response.id"]).toBe("prompt-1");
+    expect(
+      Object.entries(span!.attributes).filter(([key]) => key.startsWith("td.prompt.")),
+    ).toEqual(
+      olderCore || kind === "new"
+        ? []
+        : [
+            ["td.prompt.name", "support/reply"],
+            ["td.prompt.version", 12],
+            ["td.prompt.label", "production"],
+            ["td.prompt.variables", '{"team":"billing","order":"#4"}'],
+          ],
+    );
   },
 );
 

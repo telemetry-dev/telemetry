@@ -353,10 +353,10 @@ def _request_attributes(config: Any) -> dict[str, Any]:
     return attrs
 
 
-def _prompt_attributes(request: object) -> dict[str, Any]:
+def _prompt_attributes(messages: object) -> dict[str, Any]:
     # Older cores have no prompt_attributes_for and record a prompt only inside with_prompt.
     read = getattr(telemetry_dev, "prompt_attributes_for", None)
-    return cast("dict[str, Any]", read(request)) if callable(read) else {}
+    return cast("dict[str, Any]", read(messages)) if callable(read) else {}
 
 
 def _generate_request_fields(model: Any, contents: Any, config: Any) -> tuple[str, dict[str, Any]]:
@@ -389,7 +389,7 @@ def _generate_request_fields(model: Any, contents: Any, config: Any) -> tuple[st
     output_type = _output_type(config)
     if output_type is not None:
         fields["output_type"] = output_type
-    attrs = {**_request_attributes(config), **_prompt_attributes([system_instruction, contents])}
+    attrs = {**_request_attributes(config), **_prompt_attributes(contents)}
     if attrs:
         fields["attributes"] = attrs
     return f"chat {model_name}", fields

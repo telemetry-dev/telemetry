@@ -35,7 +35,7 @@ export function converseRequestFields(input: JsonRecord): SpanFields {
     model: stringValue(input.modelId),
     input: normalizeMessages(input.messages),
     systemInstructions: normalizeSystem(input.system),
-    attributes: promptAttributes([input.system, input.messages]),
+    attributes: promptAttributes(input.messages),
     temperature: numberValue(inference.temperature),
     topP: numberValue(inference.topP),
     maxTokens: numberValue(inference.maxTokens),

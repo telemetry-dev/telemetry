@@ -673,36 +673,49 @@ SUPPORT_PROMPT = telemetry_dev.ChatPrompt(
 
 
 @pytest.mark.parametrize(
-    ("field", "capture_input", "older_core"),
-    [("system_instruction", True, False), ("contents", False, False), ("contents", True, True)],
+    ("contents", "capture_input", "older_core"),
+    [
+        ("changed in place", True, False),
+        ("changed in place", False, False),
+        ("new", True, False),
+        ("changed in place", True, True),
+    ],
 )
-def test_generate_content_outside_with_prompt_records_the_prompt_of_a_compiled_text(
-    make: Any, monkeypatch: pytest.MonkeyPatch, field: str, capture_input: bool, older_core: bool
+def test_generate_content_outside_with_prompt_records_the_prompt_of_compiled_messages(
+    make: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    contents: str,
+    capture_input: bool,
+    older_core: bool,
 ) -> None:
     memory = make(capture_input=capture_input)
     if older_core:
         monkeypatch.delattr(telemetry_dev, "prompt_attributes_for")
     system, user = SUPPORT_PROMPT.compile(team="billing", order="#4")
-    client, _transport = client_with_transport([happy_payload()])
+    parts = [{"text": user["content"]}]
+    # Gemini takes parts: a message changed in place keeps its tag, a new one has none.
+    if contents == "new":
+        content: dict[str, Any] = {"role": "user", "parts": parts}
+    else:
+        del user["content"]
+        user["parts"] = parts
+        content = user
+    client, transport = client_with_transport([happy_payload()])
 
     wrap_google_genai(client).models.generate_content(
         model="gemini-2.5-flash",
-        contents=[
-            types.Content(
-                role="user",
-                parts=[types.Part(text=user["content"] if field == "contents" else "Hi")],
-            )
-        ],
-        config=types.GenerateContentConfig(
-            system_instruction=system["content"] if field == "system_instruction" else "Be terse."
-        ),
+        contents=[content],
+        config=types.GenerateContentConfig(system_instruction=system["content"]),
     )
 
+    assert cast(Any, transport.calls[0])["contents"] == [
+        {"role": "user", "parts": [{"text": "Where is order #4?"}]}
+    ]
     a = attrs(only_span(memory))
     assert a["gen_ai.request.model"] == "gemini-2.5-flash"
     assert {key: value for key, value in a.items() if key.startswith("td.prompt.")} == (
         {}
-        if older_core
+        if older_core or contents == "new"
         else {
             "td.prompt.name": "support/reply",
             "td.prompt.version": 12,

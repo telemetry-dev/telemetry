@@ -236,12 +236,13 @@ afterEach(async () => {
 });
 
 test.each([
-  { field: "systemInstruction", captureInput: true, olderCore: false },
-  { field: "contents", captureInput: false, olderCore: false },
-  { field: "contents", captureInput: true, olderCore: true },
+  { contents: "changed in place", captureInput: true, olderCore: false },
+  { contents: "changed in place", captureInput: false, olderCore: false },
+  { contents: "new", captureInput: true, olderCore: false },
+  { contents: "changed in place", captureInput: true, olderCore: true },
 ])(
-  "generateContent outside withPrompt records the prompt of a compiled text in $field, input capture $captureInput, older core $olderCore",
-  async ({ field, captureInput, olderCore }) => {
+  "generateContent outside withPrompt records the prompt of $contents contents, input capture $captureInput, older core $olderCore",
+  async ({ contents: kind, captureInput, olderCore }) => {
     if (olderCore) {
       vi.spyOn(
         telemetrySdk as { promptAttributesFor: unknown },
@@ -272,31 +273,32 @@ test.each([
         }),
     });
     const [system, user] = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+    const parts = [{ text: user!.content }];
+    // Gemini takes parts: a message changed in place keeps its tag, a new one has none.
+    const content = kind === "new" ? { role: "user", parts } : Object.assign(user!, { parts });
     const spans = setupSpans({ captureInput });
-    vi.stubGlobal(
-      "fetch",
-      createFakeFetch(
-        jsonResponse({
-          candidates: [
-            { content: { role: "model", parts: [{ text: "Soon." }] }, finishReason: "STOP" },
-          ],
-        }),
-      ).fetch,
+    const fake = createFakeFetch(
+      jsonResponse({
+        candidates: [
+          { content: { role: "model", parts: [{ text: "Soon." }] }, finishReason: "STOP" },
+        ],
+      }),
     );
+    vi.stubGlobal("fetch", fake.fetch);
 
     await clientWith().models.generateContent({
       model: "gemini-2.5-flash",
-      contents: [{ role: "user", parts: [{ text: field === "contents" ? user!.content : "Hi" }] }],
-      config: {
-        temperature: 0.2,
-        systemInstruction: field === "systemInstruction" ? system!.content : "Be terse.",
-      },
+      contents: [content],
+      config: { temperature: 0.2, systemInstruction: system!.content },
     });
 
     const { attributes } = await exportedSpan(spans);
     expect(attributes["gen_ai.request.temperature"]).toBe(0.2);
+    expect(fake.requests[0]!.body).toMatchObject({
+      contents: [{ role: "user", parts: [{ text: "Where is order #4?" }] }],
+    });
 
-    if (olderCore) {
+    if (olderCore || kind === "new") {
       expect(attributes["td.prompt.name"]).toBeUndefined();
 
       return;

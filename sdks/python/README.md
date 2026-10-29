@@ -253,19 +253,23 @@ for code that has not compiled in its own task. Model calls are the spans of typ
 integrations: OpenAI, Anthropic, Amazon Bedrock, Google GenAI, LiteLLM, and OpenRouter. Spans from
 other OpenTelemetry tracers do not get the attributes.
 
-Outside `with_prompt`, those provider integrations find the prompt in the request: `compile()`
-keeps the texts that it makes (the last 1000, at most 2,000,000 characters), and a chat call
-whose request holds one of them gets `td.prompt.name`, `td.prompt.version`, and
-`td.prompt.label`, also when input capture is off. A text from a template with a variable also
-gives `td.prompt.variables`, and it wins over a text from a template with none. A message of only
-a variable tag, for example `{{ question }}`, is not kept, because its text is your user's input.
-The text in the request must be equal to the compiled text. `with_prompt` wins over this. The
-integrations do it for OpenAI chat completions and responses, Anthropic messages, Bedrock
-Converse and InvokeModel, Google GenAI `generate_content`, LiteLLM completion and responses, and
-OpenRouter chat and responses, but not for images, audio, video, or OpenAI Realtime. With an
-older `telemetry-dev` that has no `prompt_attributes_for`, a provider integration records the
-prompt only in `with_prompt`. For your own spans, `prompt_attributes_for(request)` gives the
-attributes to pass as `attributes`; it gives `{}` inside `with_prompt`.
+Outside `with_prompt`, those provider integrations record the prompt of the message dicts that
+`compile()` returned. `compile()` of a chat prompt returns instances of a `dict` subclass that
+also name its prompt and variables: the keys and the JSON of the message do not change. A chat
+call that sends such a message gets `td.prompt.name`, `td.prompt.version`, and `td.prompt.label`
+of the newest one (of the last 1000 messages), also when input capture is off, and
+`td.prompt.variables` when it is on. A copy of a message (`dict()`, `.copy()`, `copy.copy`,
+`copy.deepcopy`, pickle, or JSON) and a new message with the same text do not name the prompt, so
+the SDK does not record them. Bedrock Converse and Google GenAI take another message shape: change
+the compiled dicts in place, or use `with_prompt`. A text prompt compiles to a string, which
+cannot name its prompt: use `with_prompt`. `with_prompt` wins over the message. The integrations
+do it for OpenAI chat completions and responses, Anthropic messages (for `messages.stream()`, at
+`__enter__`), Bedrock Converse, Google GenAI `generate_content`, LiteLLM completion and responses,
+and OpenRouter chat and responses, but not for Bedrock InvokeModel (its body is bytes), embeddings,
+images, audio, video, or OpenAI Realtime. With an older `telemetry-dev` that has no
+`prompt_attributes_for`, a provider integration records the prompt only in `with_prompt`. For your
+own spans, `prompt_attributes_for(messages)` gives the attributes to pass as `attributes`; it gives
+`{}` inside `with_prompt`, and a span with `capture_input=False` drops `td.prompt.variables`.
 
 ## Auto-metrics
 

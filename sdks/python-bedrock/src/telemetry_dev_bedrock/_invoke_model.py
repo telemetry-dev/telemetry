@@ -4,7 +4,7 @@ import json
 import math
 from typing import Any
 
-from ._fields import clean, prompt_attributes
+from ._fields import clean
 
 _USAGE_ITERATION_LIMIT = 1000
 _CLAUDE_USAGE_KEYS = (
@@ -93,8 +93,6 @@ def request_fields(params: dict[str, Any]) -> dict[str, Any]:
     fields = {"provider": "amazon-bedrock", "model": model, "input": body}
     if is_embedding_model(model):
         fields["output_type"] = "embedding"
-    else:
-        fields["attributes"] = prompt_attributes(body) or None
     fields.update(sampling_fields(model, body))
     return clean(fields)
 

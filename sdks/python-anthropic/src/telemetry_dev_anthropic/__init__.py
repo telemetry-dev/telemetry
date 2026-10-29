@@ -244,10 +244,16 @@ def _offered_tools(tools: Any) -> dict[str, str] | None:
     return {"gen_ai.tool.definitions": json_dumps(definitions)} if definitions else None
 
 
-def _prompt_attributes(request: object) -> dict[str, Any]:
+def _add_prompt(fields: Mapping[str, Any], messages: object) -> dict[str, Any]:
+    """``fields`` plus the prompt tag of ``messages``, the list that the app passed: the copy that
+    ``_normalize_request_params`` makes has no tag. Call it where the span starts, so that a
+    ``with_prompt`` scope there wins."""
     # Older cores have no prompt_attributes_for and record a prompt only inside with_prompt.
     read = getattr(telemetry_dev, "prompt_attributes_for", None)
-    return cast("dict[str, Any]", read(request)) if callable(read) else {}
+    prompt = cast("dict[str, Any]", read(messages)) if callable(read) else {}
+    if not prompt:
+        return dict(fields)
+    return {**fields, "attributes": {**(fields.get("attributes") or {}), **prompt}}
 
 
 def _messages_request(params: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -270,11 +276,7 @@ def _messages_request(params: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
             "type": "generation",
             "model": model,
             "input": input_value,
-            "attributes": {
-                **(_offered_tools(tools) or {}),
-                **_prompt_attributes([params.get("system"), params.get("messages")]),
-            }
-            or None,
+            "attributes": _offered_tools(tools),
             "system_instructions": _native(params.get("system")),
             "temperature": _number(params.get("temperature")),
             "top_p": _number(params.get("top_p")),
@@ -1462,16 +1464,21 @@ class _InstrumentedAsyncStream:
 
 
 class _InstrumentedMessageStreamManager:
-    def __init__(self, inner: Any, name: str, fields: Mapping[str, Any], provider: str) -> None:
+    def __init__(
+        self, inner: Any, name: str, fields: Mapping[str, Any], messages: object, provider: str
+    ) -> None:
         self._inner = inner
         self._name = name
         self._fields = fields
+        self._messages = messages
         self._provider = provider
         self._proxy: _InstrumentedStream | None = None
 
     def __enter__(self) -> Any:
         handle = telemetry_dev.start_span(
-            self._name, provider=self._provider, **_clean_fields(self._fields)
+            self._name,
+            provider=self._provider,
+            **_clean_fields(_add_prompt(self._fields, self._messages)),
         )
         end = _end_once(handle)
         started_at = time.perf_counter()
@@ -1501,16 +1508,21 @@ class _InstrumentedMessageStreamManager:
 
 
 class _InstrumentedAsyncMessageStreamManager:
-    def __init__(self, inner: Any, name: str, fields: Mapping[str, Any], provider: str) -> None:
+    def __init__(
+        self, inner: Any, name: str, fields: Mapping[str, Any], messages: object, provider: str
+    ) -> None:
         self._inner = inner
         self._name = name
         self._fields = fields
+        self._messages = messages
         self._provider = provider
         self._proxy: _InstrumentedAsyncStream | None = None
 
     async def __aenter__(self) -> Any:
         handle = telemetry_dev.start_span(
-            self._name, provider=self._provider, **_clean_fields(self._fields)
+            self._name,
+            provider=self._provider,
+            **_clean_fields(_add_prompt(self._fields, self._messages)),
         )
         end = _end_once(handle)
         started_at = time.perf_counter()
@@ -1543,9 +1555,10 @@ class _InstrumentedAsyncMessageStreamManager:
 
 
 def _start_span(
-    params: Mapping[str, Any], provider: str
+    params: Mapping[str, Any], messages: object, provider: str
 ) -> tuple[telemetry_dev.SpanHandle, Callable[..., None], float]:
     name, fields = _messages_request(params)
+    fields = _add_prompt(fields, messages)
     handle = telemetry_dev.start_span(name, provider=provider, **_clean_fields(fields))
     return handle, _end_once(handle), time.perf_counter()
 
@@ -1558,7 +1571,9 @@ def _wrap_sync(original: Callable[..., Any], provider: ProviderResolver) -> Call
         if _raw_response_requested(call_kwargs):
             return original(*args, **call_kwargs)
         streaming = call_kwargs.get("stream") is True
-        handle, end, started_at = _start_span(call_kwargs, provider(resource))
+        handle, end, started_at = _start_span(
+            call_kwargs, _sent_params(kwargs).get("messages"), provider(resource)
+        )
         try:
             result = original(*args, **call_kwargs)
         except BaseException as exc:
@@ -1582,7 +1597,9 @@ def _wrap_async(original: Callable[..., Any], provider: ProviderResolver) -> Cal
         if _raw_response_requested(call_kwargs):
             return await original(*args, **call_kwargs)
         streaming = call_kwargs.get("stream") is True
-        handle, end, started_at = _start_span(call_kwargs, provider(resource))
+        handle, end, started_at = _start_span(
+            call_kwargs, _sent_params(kwargs).get("messages"), provider(resource)
+        )
         try:
             result = await original(*args, **call_kwargs)
         except BaseException as exc:
@@ -1606,8 +1623,11 @@ def _wrap_stream_manager_sync(
         resource = args[0] if args else None
         call_kwargs = _normalize_request_params(kwargs)
         name, fields = _messages_request(call_kwargs)
+        messages = _sent_params(kwargs).get("messages")
         manager = original(*args, **call_kwargs)
-        return _InstrumentedMessageStreamManager(manager, name, fields, provider(resource))
+        return _InstrumentedMessageStreamManager(
+            manager, name, fields, messages, provider(resource)
+        )
 
     setattr(wrapper, _WRAPPED_ATTR, True)
     setattr(wrapper, _ORIGINAL_ATTR, original)
@@ -1622,8 +1642,11 @@ def _wrap_stream_manager_async(
         resource = args[0] if args else None
         call_kwargs = _normalize_request_params(kwargs)
         name, fields = _messages_request(call_kwargs)
+        messages = _sent_params(kwargs).get("messages")
         manager = original(*args, **call_kwargs)
-        return _InstrumentedAsyncMessageStreamManager(manager, name, fields, provider(resource))
+        return _InstrumentedAsyncMessageStreamManager(
+            manager, name, fields, messages, provider(resource)
+        )
 
     setattr(wrapper, _WRAPPED_ATTR, True)
     setattr(wrapper, _ORIGINAL_ATTR, original)

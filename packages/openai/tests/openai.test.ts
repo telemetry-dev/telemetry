@@ -2895,13 +2895,13 @@ test("chat streams preserve caller-requested usage chunks", async () => {
 });
 
 test.each([
-  { api: "chat completions", captureInput: false, olderCore: false },
-  { api: "responses instructions", captureInput: true, olderCore: false },
-  { api: "responses input", captureInput: true, olderCore: false },
-  { api: "chat completions", captureInput: true, olderCore: true },
+  { api: "chat completions", messages: "compiled", captureInput: false, olderCore: false },
+  { api: "responses", messages: "compiled", captureInput: true, olderCore: false },
+  { api: "chat completions", messages: "copied", captureInput: true, olderCore: false },
+  { api: "chat completions", messages: "compiled", captureInput: true, olderCore: true },
 ])(
-  "$api outside withPrompt record the prompt of compiled messages, input capture $captureInput, older core $olderCore",
-  async ({ api, captureInput, olderCore }) => {
+  "$api outside withPrompt records the prompt of $messages messages, input capture $captureInput, older core $olderCore",
+  async ({ api, messages: kind, captureInput, olderCore }) => {
     if (olderCore) {
       vi.spyOn(
         telemetrySdk as { promptAttributesFor: unknown },
@@ -2931,12 +2931,13 @@ test.each([
           rollout: null,
         }),
     });
-    const [system, user] = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+    const compiled = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+    const messages = kind === "compiled" ? compiled : compiled.map((message) => ({ ...message }));
     const spans = setupSpans(undefined, { captureInput });
     const client = clientWith(
       createFakeFetch(
         jsonResponse(
-          api.startsWith("responses")
+          api === "responses"
             ? {
                 id: "resp_1",
                 object: "response",
@@ -2963,22 +2964,16 @@ test.each([
       ).fetch,
     );
 
-    if (api.startsWith("responses")) {
-      const inInput = api === "responses input";
-
-      await client.responses.create({
-        model: "gpt-4.1",
-        instructions: inInput ? "Be terse." : system!.content,
-        input: [{ role: "user", content: inInput ? user!.content : "Hi" }],
-      });
+    if (api === "responses") {
+      await client.responses.create({ model: "gpt-4.1", input: messages });
     } else {
-      await client.chat.completions.create({ model: "gpt-4o", messages: [system!, user!] });
+      await client.chat.completions.create({ model: "gpt-4o", messages });
     }
 
     const { attributes } = await exportedSpan(spans);
     expect(attributes["gen_ai.input.messages"] !== undefined).toBe(captureInput);
 
-    if (olderCore) {
+    if (olderCore || kind === "copied") {
       expect(attributes["td.prompt.name"]).toBeUndefined();
 
       return;

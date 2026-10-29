@@ -174,10 +174,10 @@ def _cost_usd(raw_usage: Any) -> float | None:
     return cost if cost is not None else upstream_cost
 
 
-def _prompt_attributes(request: object) -> dict[str, Any]:
+def _prompt_attributes(messages: object) -> dict[str, Any]:
     # Older cores have no prompt_attributes_for and record a prompt only inside with_prompt.
     read = getattr(telemetry_dev, "prompt_attributes_for", None)
-    return cast("dict[str, Any]", read(request)) if callable(read) else {}
+    return cast("dict[str, Any]", read(messages)) if callable(read) else {}
 
 
 def _chat_request(params: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -267,8 +267,7 @@ def _responses_request(params: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
             "max_tokens": _number(params.get("max_output_tokens")),
             "frequency_penalty": _number(params.get("frequency_penalty")),
             "presence_penalty": _number(params.get("presence_penalty")),
-            "attributes": _prompt_attributes([params.get("instructions"), params.get("input")])
-            or None,
+            "attributes": _prompt_attributes(params.get("input")) or None,
         },
     )
 

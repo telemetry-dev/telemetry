@@ -180,17 +180,21 @@ compiles its own. Model calls are the spans of type `generation` (operations `ch
 use this SDK: OpenAI, Anthropic, Amazon Bedrock, Google GenAI, and OpenRouter. Spans from the AI SDK
 and TanStack AI integrations, and from other OpenTelemetry tracers, do not get the attributes.
 
-Outside `withPrompt`, those provider integrations find the prompt in the request:
-`compile()` keeps the texts that it makes (the last 1000, at most 2,000,000 characters), and a
-chat call whose request holds one of them gets `td.prompt.name`, `td.prompt.version`, and
-`td.prompt.label`, also when input capture is off. A text from a template with a variable also
-gives `td.prompt.variables`, and it wins over a text from a template with none. A message of only
-a variable tag, for example `{{ question }}`, is not kept, because its text is your user's input.
-The text in the request must be equal to the compiled text. `withPrompt` wins over this. The
-integrations do it for OpenAI chat completions and responses, Anthropic messages, Bedrock Converse
-and InvokeModel, Google GenAI `generateContent`, and OpenRouter chat and responses, but not for
-images, audio, video, or OpenAI Realtime. For your own spans, `promptAttributesFor(request)`
-gives the attributes to pass as `attributes`; it gives nothing inside `withPrompt`.
+Outside `withPrompt`, those provider integrations record the prompt of the message objects that
+`compile()` returned. `compile()` of a chat prompt tags each message that it makes with its prompt
+and variables, in a non-enumerable symbol property: the keys and the JSON of the message do not
+change. A chat call that sends a tagged message gets `td.prompt.name`, `td.prompt.version`, and
+`td.prompt.label` of the newest one (of the last 1000 messages), also when input capture is off,
+and `td.prompt.variables` when it is on. A copy of a message (a spread, `structuredClone`, or
+JSON) and a new message with the same text have no tag, so the SDK does not record them. Bedrock
+Converse and Google GenAI take another message shape: change the compiled messages in place, or
+use `withPrompt`. A text prompt compiles to a string, which cannot carry a tag: use `withPrompt`.
+`withPrompt` wins over the tag. The integrations do it for OpenAI chat completions and responses,
+Anthropic messages, Bedrock Converse, Google GenAI `generateContent`, and OpenRouter chat and
+responses, but not for Bedrock InvokeModel (its body is bytes), embeddings, images, audio, video,
+or OpenAI Realtime. For your own spans, `promptAttributesFor(messages)` gives the attributes to
+pass as `attributes`; it gives nothing inside `withPrompt`, and a span with `captureInput: false`
+drops `td.prompt.variables`.
 
 ## API
 

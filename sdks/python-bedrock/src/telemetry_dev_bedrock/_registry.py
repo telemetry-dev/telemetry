@@ -57,7 +57,7 @@ def _converse_request(params: dict[str, Any]) -> dict[str, Any]:
             "model": _model(params),
             "input": normalize_messages(params.get("messages")),
             "system_instructions": normalize_content_list(params.get("system")) or None,
-            "attributes": prompt_attributes([params.get("system"), params.get("messages")]) or None,
+            "attributes": prompt_attributes(params.get("messages")) or None,
             "temperature": inference.get("temperature"),
             "top_p": inference.get("topP"),
             "max_tokens": inference.get("maxTokens"),

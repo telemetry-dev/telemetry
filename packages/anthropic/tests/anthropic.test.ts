@@ -282,12 +282,12 @@ afterEach(async () => {
 });
 
 test.each([
-  { field: "system", olderCore: false },
-  { field: "messages", olderCore: false },
-  { field: "messages", olderCore: true },
+  { messages: "compiled", olderCore: false },
+  { messages: "copied", olderCore: false },
+  { messages: "compiled", olderCore: true },
 ])(
-  "messages.create outside withPrompt records the prompt of a compiled text in $field, older core $olderCore",
-  async ({ field, olderCore }) => {
+  "messages.create outside withPrompt records the prompt of $messages messages, older core $olderCore",
+  async ({ messages: kind, olderCore }) => {
     if (olderCore) {
       vi.spyOn(
         telemetrySdk as { promptAttributesFor: unknown },
@@ -318,20 +318,21 @@ test.each([
         }),
     });
     const [system, user] = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+    const message = user as { role: "user"; content: string };
     const spans = setupSpans();
     const client = clientWith(createFakeFetch(jsonResponse(messagePayload())).fetch);
 
     await client.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 64,
-      system: field === "system" ? system!.content : "Be terse.",
-      messages: [{ role: "user", content: field === "messages" ? user!.content : "Hi" }],
+      system: system!.content,
+      messages: [kind === "compiled" ? message : { ...message }],
     });
 
     const { attributes } = await exportedSpan(spans);
     expect(attributes["gen_ai.input.messages"]).toBeDefined();
 
-    if (olderCore) {
+    if (olderCore || kind === "copied") {
       expect(attributes["td.prompt.name"]).toBeUndefined();
 
       return;

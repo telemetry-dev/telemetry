@@ -41,10 +41,10 @@ repository, not this SDK workspace. Paths below refer to that product repository
 | error                                                                                                                                                                                                                                                                                                                                                                                                                 | span status ERROR + `error.type` + `exception` event (`exception.type/message/stacktrace`, `log.severity_number: 17`)                |                                                                                                                         |
 | `log()`                                                                                                                                                                                                                                                                                                                                                                                                               | OTLP log record to `/v1/logs` (always; never span events)                                                                            | severity debug=5/info=9/warn=13/error=17; trace-correlated via active context                                           |
 | `withPrompt(prompt, fn)` / `with with_prompt(prompt):` → `prompt.name`                                                                                                                                                                                                                                                                                                                                                | `td.prompt.name`                                                                                                                     | on model-call spans that start in scope: operation `chat`, `text_completion`, or `generate_content`                     |
-| outside a scope: a text that `prompt.compile()` made, in the request of a provider integration                                                                                                                                                                                                                                                                                                                        | `td.prompt.name`, `td.prompt.version`, `td.prompt.label`                                                                             | on the `chat` spans of the provider integrations listed in [Prompts](#prompts); the scope wins                          |
+| outside a scope: a message object that `compile()` of a chat prompt returned, in the request messages of a provider integration                                                                                                                                                                                                                                                                                       | `td.prompt.name`, `td.prompt.version`, `td.prompt.label`                                                                             | on the `chat` spans of the provider integrations listed in [Prompts](#prompts); the scope wins                          |
 | `prompt.version`                                                                                                                                                                                                                                                                                                                                                                                                      | `td.prompt.version` (int)                                                                                                            | omitted for a fallback prompt (`version` null / None)                                                                   |
 | `prompt.label`                                                                                                                                                                                                                                                                                                                                                                                                        | `td.prompt.label`                                                                                                                    | only for a fetch by label; a fetch without label or version is the `production` label                                   |
-| variables of the last `prompt.compile()` before `withPrompt` / `with_prompt` starts, or in its scope; outside a scope, of the `compile()` that made the text, when its template has a variable                                                                                                                                                                                                                        | `td.prompt.variables` (JSON object)                                                                                                  | mask → JSON stringify → truncate; gated by the effective captureInput of the span                                       |
+| variables of the last `prompt.compile()` before `withPrompt` / `with_prompt` starts, or in its scope; outside a scope, of the `compile()` that returned the message                                                                                                                                                                                                                                                   | `td.prompt.variables` (JSON object)                                                                                                  | mask → JSON stringify → truncate; gated by the effective captureInput of the span                                       |
 
 `SpanHandle.serializeContent(value, key)` / `SpanHandle.serialize_content(value, key)` returns
 what `input` / `output` would emit for `value` under `key`: mask → JSON stringify → truncate. It
@@ -179,27 +179,39 @@ cannot tell a concurrent task from an awaited helper, so in TypeScript all spans
 its last `compile()`; concurrent tasks that compile their own variables call `withPrompt` in each
 task.
 
-Outside a scope, the SDKs find the prompt from the text of the request:
+Outside a scope, the SDKs find the prompt from the message objects of the request, not from
+their text:
 
-- `compile()` keeps each text that it makes (each message of a chat prompt, the text of a text
-  prompt), with the prompt and the variables. It keeps at most 1000 texts and 2,000,000
-  characters, and drops the oldest first. A text that `compile()` makes again becomes the newest.
-  It does not keep a text whose template has only variable tags, for example `{{ question }}`:
-  that text is input of the app, and an unrelated request can hold it too.
-- `promptAttributesFor(request)` / `prompt_attributes_for(request)` look for a kept text in
-  `request`: strings in arrays and plain objects (Python: `list`, `tuple`, and `dict` but not their
-  subclasses, and the fields that an object stores in `__dict__` or `__pydantic_extra__`), 6
-  levels deep and 500 values in all. They run no getter or property. A string matches only when it is equal to a kept text.
-- The first text from a template with a variable gives the name, version, label, and variables
-  of its `compile()`. Without one, the first text from a template with no variable gives the
-  name, version, and label, but no variables: the same static text comes from each `compile()`.
+- `compile()` of a chat prompt tags each message object that it makes with the prompt and the
+  variables of that call. It does not tag the messages of a placeholder variable: the app passes
+  those. TypeScript: a non-enumerable symbol property. Python: the messages are instances of a
+  `dict` subclass that holds the tag in a slot. The keys and the JSON of a message do not change.
+- A copy has no tag: a spread, `structuredClone`, or a JSON round trip (TypeScript); `dict()`,
+  `.copy()`, `copy.copy`, `copy.deepcopy`, pickle, or a JSON round trip (Python). A new message
+  with the same text has no tag either, thus a message from another call, task, or prompt version
+  is never recorded.
+- `promptAttributesFor(messages)` / `prompt_attributes_for(messages)` take a list of messages or
+  one message (Python: a `list` or `tuple`, not a subclass, so no code of the app runs). They
+  look at the last 1000 items, from the end, and give the name, version, label, and variables of
+  the newest tagged message. They do not look inside a message.
 - In a `withPrompt` / `with_prompt` scope they give nothing, thus the span gets the prompt of the
   scope. They never throw.
-- The provider integrations call them with the request of the app before the span starts, also
-  when input capture is off: OpenAI chat completions and responses, Anthropic messages, Amazon
-  Bedrock Converse and InvokeModel (not embedding models), Google GenAI `generateContent`,
-  LiteLLM completion and responses (Python), and OpenRouter chat and responses. The other spans
-  of the integrations (images, audio, video, and OpenAI Realtime) do not look in the request.
+- They give `td.prompt.variables` only when input capture is on in the client. A span whose
+  effective captureInput is off drops `td.prompt.variables` from its attributes, also when the app
+  passes the result of these functions to its own span.
+- `compile()` of a text prompt returns a string, which cannot carry a tag. Outside a scope, the
+  SDKs do not record a text prompt: use `withPrompt` / `with_prompt`.
+- The provider integrations call them with the request messages before the span starts, also
+  when input capture is off: OpenAI chat completions (`messages`) and responses (`input`),
+  Anthropic messages (`messages`; the `system` string has no tag), Amazon Bedrock Converse
+  (`messages`), Google GenAI `generateContent` (`contents`), LiteLLM completion (`messages`) and
+  responses (`input`) (Python), and OpenRouter chat (`messages`) and responses (`input`). Bedrock
+  Converse and Google GenAI take another message shape: a compiled message that the app changes
+  in place keeps its tag, and a new message does not. Bedrock InvokeModel takes a serialized body
+  and is not recorded outside a scope. The other spans of the integrations (embeddings, images,
+  audio, video, and OpenAI Realtime) do not look at the request.
+- Python Anthropic `messages.stream()` starts its span at `__enter__`. It decides there, with the
+  messages that `.stream()` received, thus a scope around `__enter__` wins.
 - A provider integration reads the function from the core module when it runs, thus it also
   operates with an older core that does not have it. With such a core, the prompt is recorded
   only in a scope.
