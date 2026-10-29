@@ -1,5 +1,7 @@
 import { createServer, type RequestListener } from "node:http";
 import type { AddressInfo } from "node:net";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
@@ -880,31 +882,157 @@ test("the newest compiled message wins, also after 170 messages of history", asy
   );
 });
 
-test("promptAttributesFor looks at the last 1000 messages", async () => {
+test("a message that a placeholder brings from an older compile does not win", async () => {
+  setup();
+  const router = await promptOf({
+    name: "router",
+    version: 1,
+    messages: [{ role: "user", content: "{{question}}" }],
+  });
+  const answer = await promptOf({
+    name: "answer",
+    version: 7,
+    messages: [
+      { role: "system", content: "Answer for {{team}}." },
+      { role: "placeholder", name: "history" },
+    ],
+  });
+  const chat = await promptOf({
+    name: "chat",
+    messages: [{ role: "user", content: "{{question}}" }],
+  });
+  const summary = await promptOf({
+    name: "summary",
+    messages: [
+      { role: "system", content: "Summarize the chat." },
+      { role: "placeholder", name: "history" },
+    ],
+  });
+
+  const routed = answer.compile({
+    team: "billing",
+    history: router.compile({ question: "Where is #4?" }) as ChatMessage[],
+  });
+  // The last 1000 messages are all from chat; the summary message is the first.
+  const conversation = Array.from(
+    { length: 1500 },
+    (_, index) => chat.compile({ question: `question ${index}` }) as ChatMessage[],
+  ).flat();
+  const summarized = summary.compile({ history: conversation });
+
+  expect(promptAttributesFor(routed)).toEqual({
+    "td.prompt.name": "answer",
+    "td.prompt.version": 7,
+    "td.prompt.label": "production",
+    "td.prompt.variables":
+      '{"team":"billing","history":[{"role":"user","content":"Where is #4?"}]}',
+  });
+  expect(promptAttributesFor(summarized)?.["td.prompt.name"]).toBe("summary");
+});
+
+test("promptAttributesFor looks at the first and the last 1000 messages", async () => {
   setup();
   const prompt = await promptOf(DESK_PROMPT);
   const [system] = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
   const filler = (count: number) => Array.from({ length: count }, () => ({ role: "user" }));
 
-  expect(promptAttributesFor([system, ...filler(999)])).toBeDefined();
-  expect(promptAttributesFor([system, ...filler(1000)])).toBeUndefined();
+  expect(promptAttributesFor([...filler(1000), system, ...filler(999)])).toBeDefined();
+  expect(promptAttributesFor([...filler(999), system, ...filler(1001)])).toBeDefined();
+  expect(promptAttributesFor([...filler(1001), system, ...filler(999)])).toBeDefined();
+  expect(promptAttributesFor([...filler(1000), system, ...filler(1000)])).toBeUndefined();
 });
 
-test("withPrompt wins over a compiled message of another prompt", async () => {
+test("compile records its variables, not later changes of the object", async () => {
+  const { spans } = setup();
+  const prompt = await promptOf({ messages: [{ role: "user", content: "Order {{order}}" }] });
+  const variables = { order: "#A" };
+
+  const first = prompt.compile(variables);
+  variables.order = "#B";
+  const second = prompt.compile(variables);
+  variables.order = "#C";
+  withPrompt(prompt, () => startSpan("scope", { type: "generation" }).end());
+  await flush();
+
+  expect(promptAttributesFor(first)?.["td.prompt.variables"]).toBe('{"order":"#A"}');
+  expect(promptAttributesFor(second)?.["td.prompt.variables"]).toBe('{"order":"#B"}');
+  expect(spans.getFinishedSpans()[0]!.attributes["td.prompt.variables"]).toBe('{"order":"#B"}');
+});
+
+test("the variables of a compile are freed with its messages", async () => {
+  setFlagsFromString("--expose-gc");
+  const gc = runInNewContext("gc") as () => void;
+  // A WeakRef keeps its target until the current job ends, so collect in a new one.
+  const collect = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    gc();
+  };
+  setup();
+  const prompt = await promptOf({
+    messages: [
+      { role: "system", content: "Answer as the {{team}} desk." },
+      { role: "placeholder", name: "history" },
+    ],
+  });
+
+  let history: ChatMessage[] | undefined = [{ role: "user", content: "Hi" }];
+  const freed = new WeakRef(history);
+  let messages = prompt.compile({ team: "billing", history }) as ChatMessage[] | undefined;
+  history = undefined;
+  // withPrompt keeps the variables of the last compile of a prompt object.
+  prompt.compile({ team: "returns" });
+  await collect();
+  expect(freed.deref()).toBeDefined();
+
+  expect(messages).toHaveLength(2);
+  messages = undefined;
+  await collect();
+  expect(freed.deref()).toBeUndefined();
+});
+
+test("withPrompt wins over a compiled message of another prompt, also through a parent", async () => {
   const { spans } = setup();
   const scoped = await promptOf({ name: "scoped/prompt" });
-  const other = await promptOf({
-    name: "other/prompt",
-    messages: [{ role: "user", content: "Cancel order {{order}}." }],
+  // Fetched by version, so it has no label that the label of the scope could hide.
+  const { fetch } = fakeFetch(
+    reply({
+      name: "other/prompt",
+      label: null,
+      version: 3,
+      messages: [{ role: "user", content: "Cancel order {{order}}." }],
+    }),
+  );
+  const other = await getPrompt("other/prompt", {
+    apiKey: "td_live_a",
+    apiUrl: newApiUrl(),
+    version: 3,
+    fetch,
   });
   const compiled = other.compile({ order: "#9" });
 
-  withPrompt(scoped, () => {
-    startSpan("chat", { type: "generation", attributes: promptAttributesFor(compiled) }).end();
+  const parent = withPrompt(scoped, () => {
+    startSpan("in scope", { type: "generation", attributes: promptAttributesFor(compiled) }).end();
+
+    return startSpan("parent");
   });
+  const attributes = promptAttributesFor(compiled);
+  startSpan("with parent", { type: "generation", parent, attributes }).end();
+  parent.end();
   await flush();
 
-  expect(spans.getFinishedSpans()[0]!.attributes["td.prompt.name"]).toBe("scoped/prompt");
+  expect(attributes?.["td.prompt.name"]).toBe("other/prompt");
+  for (const name of ["in scope", "with parent"]) {
+    const span = spans.getFinishedSpans().find((finished) => finished.name === name)!;
+    expect(
+      Object.fromEntries(
+        Object.entries(span.attributes).filter(([key]) => key.startsWith("td.prompt.")),
+      ),
+    ).toEqual({
+      "td.prompt.name": "scoped/prompt",
+      "td.prompt.version": 12,
+      "td.prompt.label": "production",
+    });
+  }
 });
 
 test("td.prompt.variables follows the input capture of the client and of the span", async () => {

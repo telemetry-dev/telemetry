@@ -97,8 +97,9 @@ export interface ChatPrompt extends PromptBase {
   /**
    * Fills in the variables and replaces each placeholder message with the messages in its
    * variable. `withPrompt` records the variables of the last call before it starts or inside it.
-   * It tags each message object that it makes with this prompt and these variables, so that a
-   * model call outside `withPrompt` that sends the message records them; see `promptAttributesFor`.
+   * It tags each message object that it makes with this prompt and a copy of these variables, so
+   * that a model call outside `withPrompt` that sends the message records them; see
+   * `promptAttributesFor`. The message keeps the variables alive while it lives.
    */
   compile<M = ChatMessage>(variables?: PromptVariables<M>): (ChatMessage | M)[];
 }
@@ -205,6 +206,8 @@ interface PromptScope {
 interface CompileTag {
   readonly prompt: Prompt;
   readonly variables: PromptVariables<unknown>;
+  /** Counts the compiles of the process, so a higher one is newer. */
+  readonly serial: number;
 }
 
 const FETCH_TIMEOUT_MS = 10_000;
@@ -220,13 +223,14 @@ const MODEL_CALL_OPERATIONS = new Set<unknown>(["chat", "text_completion", "gene
 const PROMPT_KEY = createContextKey("telemetry.dev prompt");
 // Not enumerable, so JSON.stringify, spreads, and structuredClone leave the tag out of a copy.
 const COMPILED_BY = Symbol("telemetry.dev compiled by");
-/** How many messages promptAttributesFor looks at, from the end. */
-const MAX_TAG_LOOKUP = 1_000;
+/** How many messages promptAttributesFor looks at, at each end of the list. */
+const TAG_LOOKUP = 1_000;
 
 const cache = new Map<string, CacheEntry>();
 const compiledVariables = new WeakMap<Prompt, object>();
 /** The Retry-After of the response that failed with this error, in milliseconds. */
 const retryAfter = new WeakMap<PromptError, number>();
+let compiles = 0;
 
 /**
  * Fetches a prompt version from telemetry.dev and keeps it. When the copy is older than
@@ -368,11 +372,11 @@ export function promptAttributes(
 
 /**
  * The td.prompt.* attributes for a model call outside `withPrompt` that sends `messages` (a list
- * of messages, or one message): those of the newest message, of the last 1000, that `compile()`
- * of a chat prompt returned. The tag is on the message object, so a copy of it gives nothing. Gives
- * undefined inside `withPrompt`, whose prompt the span gets. `td.prompt.variables` needs input
- * capture on in the client, and the span drops it when its own input capture is off. It never
- * throws.
+ * of messages, or one message): those of the newest `compile()` of a chat prompt that made one of
+ * the messages. It looks at the first 1000 and the last 1000 messages. The tag is on the message
+ * object, so a copy of it gives nothing. Gives undefined inside `withPrompt`, whose prompt the span
+ * gets. `td.prompt.variables` needs input capture on in the client, and the span drops it when its
+ * own input capture is off. It never throws.
  */
 export function promptAttributesFor(messages: unknown): Record<string, AttributeValue> | undefined {
   const config = currentClient().core?.config;
@@ -408,17 +412,22 @@ function attributesOf(
   });
 }
 
+// The messages of a placeholder come from an older compile, so the newest compile, not the last
+// tagged message, names the prompt of the request. Its own messages are at the start or the end of
+// the list, unless placeholders put more than 1000 messages on each side of them.
 function newestTag(messages: unknown): CompileTag | undefined {
   if (!Array.isArray(messages)) return tagOf(messages);
-  const stop = Math.max(0, messages.length - MAX_TAG_LOOKUP);
+  const { length } = messages;
+  let newest: CompileTag | undefined;
 
-  for (let index = messages.length - 1; index >= stop; index -= 1) {
+  for (let index = 0; index < length; index += 1) {
+    if (index === TAG_LOOKUP && length > 2 * TAG_LOOKUP) index = length - TAG_LOOKUP;
     const tag = tagOf(messages[index]);
 
-    if (tag) return tag;
+    if (tag && (newest === undefined || tag.serial > newest.serial)) newest = tag;
   }
 
-  return undefined;
+  return newest;
 }
 
 function tagOf(message: unknown): CompileTag | undefined {
@@ -613,14 +622,20 @@ function createPrompt(input: {
     responseFormat: content.responseFormat,
     isFallback: input.isFallback,
     compile(variables: PromptVariables<unknown> = {}) {
-      compiledVariables.set(prompt, variables);
+      // A copy, so that a later change of the app's object does not change what a span records.
+      const values = { ...variables };
+      compiledVariables.set(prompt, values);
       const scope = activeContext().getValue(PROMPT_KEY) as PromptScope | undefined;
 
-      if (scope?.prompt === prompt) scope.variables = variables;
+      if (scope?.prompt === prompt) scope.variables = values;
 
-      return type === "chat"
-        ? compileMessages(content.messages, Object.freeze({ prompt, variables }))
-        : fill(content.text ?? "", variables);
+      if (type === "text") return fill(content.text ?? "", values);
+      compiles += 1;
+
+      return compileMessages(
+        content.messages,
+        Object.freeze({ prompt, variables: values, serial: compiles }),
+      );
     },
   }) as Prompt;
 

@@ -1222,10 +1222,6 @@ SUPPORT_PROMPT = telemetry_dev.ChatPrompt(
 )
 
 
-def prompt_attrs(span: ReadableSpan) -> dict[str, object]:
-    return {key: value for key, value in attrs(span).items() if key.startswith("td.prompt.")}
-
-
 @pytest.mark.parametrize(
     ("api", "messages", "capture_input", "older_core"),
     [

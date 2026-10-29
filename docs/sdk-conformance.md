@@ -44,7 +44,7 @@ repository, not this SDK workspace. Paths below refer to that product repository
 | outside a scope: a message object that `compile()` of a chat prompt returned, in the request messages of a provider integration                                                                                                                                                                                                                                                                                       | `td.prompt.name`, `td.prompt.version`, `td.prompt.label`                                                                             | on the `chat` spans of the provider integrations listed in [Prompts](#prompts); the scope wins                          |
 | `prompt.version`                                                                                                                                                                                                                                                                                                                                                                                                      | `td.prompt.version` (int)                                                                                                            | omitted for a fallback prompt (`version` null / None)                                                                   |
 | `prompt.label`                                                                                                                                                                                                                                                                                                                                                                                                        | `td.prompt.label`                                                                                                                    | only for a fetch by label; a fetch without label or version is the `production` label                                   |
-| variables of the last `prompt.compile()` before `withPrompt` / `with_prompt` starts, or in its scope; outside a scope, of the `compile()` that returned the message                                                                                                                                                                                                                                                   | `td.prompt.variables` (JSON object)                                                                                                  | mask → JSON stringify → truncate; gated by the effective captureInput of the span                                       |
+| variables of the last `prompt.compile()` before `withPrompt` / `with_prompt` starts, or in its scope; outside a scope, of the newest `compile()` that made a message of the request                                                                                                                                                                                                                                   | `td.prompt.variables` (JSON object)                                                                                                  | mask → JSON stringify → truncate; gated by the effective captureInput of the span                                       |
 
 `SpanHandle.serializeContent(value, key)` / `SpanHandle.serialize_content(value, key)` returns
 what `input` / `output` would emit for `value` under `key`: mask → JSON stringify → truncate. It
@@ -182,23 +182,38 @@ task.
 Outside a scope, the SDKs find the prompt from the message objects of the request, not from
 their text:
 
-- `compile()` of a chat prompt tags each message object that it makes with the prompt and the
-  variables of that call. It does not tag the messages of a placeholder variable: the app passes
-  those. TypeScript: a non-enumerable symbol property. Python: the messages are instances of a
-  `dict` subclass that holds the tag in a slot. The keys and the JSON of a message do not change.
+- `compile()` of a chat prompt tags each message object that it makes with the prompt, a copy of
+  the top level of the variables of that call, and a serial number that grows with each chat
+  compile in the process. It does not tag the messages of a placeholder variable: the app passes
+  those, and they keep the tag of their own compile. TypeScript: a non-enumerable symbol
+  property; the keys and the JSON of a message do not change. Python: the messages are instances
+  of a private `dict` subclass that holds the tag in a slot. `isinstance(message, dict)` is true
+  and the keys and the JSON do not change, but a check of the exact type
+  (`type(message) is dict`), `yaml.safe_dump`, and `marshal` reject it. Its constructor is the
+  one of `dict`.
 - A copy has no tag: a spread, `structuredClone`, or a JSON round trip (TypeScript); `dict()`,
-  `.copy()`, `copy.copy`, `copy.deepcopy`, pickle, or a JSON round trip (Python). A new message
-  with the same text has no tag either, thus a message from another call, task, or prompt version
-  is never recorded.
+  `.copy()`, `copy.copy`, `copy.deepcopy`, pickle, a JSON round trip, `type(message)(message)`, or
+  `dataclasses.asdict` (Python). A new message with the same text has no tag either, thus a
+  message from another call, task, or prompt version is never recorded.
 - `promptAttributesFor(messages)` / `prompt_attributes_for(messages)` take a list of messages or
-  one message (Python: a `list` or `tuple`, not a subclass, so no code of the app runs). They
-  look at the last 1000 items, from the end, and give the name, version, label, and variables of
-  the newest tagged message. They do not look inside a message.
-- In a `withPrompt` / `with_prompt` scope they give nothing, thus the span gets the prompt of the
-  scope. They never throw.
-- They give `td.prompt.variables` only when input capture is on in the client. A span whose
-  effective captureInput is off drops `td.prompt.variables` from its attributes, also when the app
-  passes the result of these functions to its own span.
+  one message (Python: a `list` or `tuple`, not a subclass, so the read runs no code of the app).
+  They look at the first 1000 and the last 1000 items and give the name, version, label, and
+  variables of the tag with the highest serial number: the newest compile. Thus a message that a
+  placeholder brings from an older compile does not win over the compile that put it in the list.
+  They do not look inside a message.
+- In a `withPrompt` / `with_prompt` scope they give nothing. A model-call span whose parent context
+  is in a scope gets the attributes of the scope and drops each `td.prompt.*` attribute that the
+  app passes, also when the app calls these functions outside the scope and passes an explicit
+  parent. They never throw: an error goes to `onError` / `on_error`.
+- They give `td.prompt.variables` only when input capture is on in the client. Then they
+  serialize the variables, which calls the `mask` of the client. A span whose effective
+  captureInput is off drops `td.prompt.variables` from its attributes, also when the app passes
+  the result of these functions to its own span.
+- A tagged message keeps the variables of its compile alive while the message lives, with the
+  lists of its placeholder variables. Thus a chat history that keeps a compiled message of each
+  turn keeps the history list of each turn. The SDKs keep no other reference to the variables,
+  except those of the last compile of each prompt object and of each running scope, for
+  `withPrompt` / `with_prompt`.
 - `compile()` of a text prompt returns a string, which cannot carry a tag. Outside a scope, the
   SDKs do not record a text prompt: use `withPrompt` / `with_prompt`.
 - The provider integrations call them with the request messages before the span starts, also

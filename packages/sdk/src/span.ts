@@ -231,6 +231,15 @@ export function createSpanHandle(
   const parentCtx = withSessionParent(sessionContext, sessionId, core.config.apiKey);
   const attrs = fieldsToAttributes(options, meta.type, meta.capture);
   const operation = attrs["gen_ai.operation.name"] ?? SPAN_TYPE_OPERATIONS[meta.type];
+  const prompt = promptAttributes(parentCtx, operation, meta.capture);
+
+  // The prompt of withPrompt replaces all td.prompt.* attributes of the app, so that a span never
+  // mixes two prompts, also when its parent is in withPrompt and promptAttributesFor ran outside.
+  if (prompt) {
+    for (const key of Object.keys(attrs)) {
+      if (key.startsWith("td.prompt.")) delete attrs[key];
+    }
+  }
 
   const span = core.tracer.startSpan(
     name,
@@ -241,7 +250,7 @@ export function createSpanHandle(
       attributes: {
         "gen_ai.operation.name": SPAN_TYPE_OPERATIONS[meta.type],
         ...propagatedFromContext(parentCtx),
-        ...promptAttributes(parentCtx, operation, meta.capture),
+        ...prompt,
         ...attrs,
       },
     },

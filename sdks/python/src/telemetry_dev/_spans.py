@@ -748,11 +748,15 @@ def start_span(
             ctx, session_id if isinstance(session_id, str) else None, client.config.api_key
         )
         initial.update(propagated)
-        initial.update(
-            prompt_attributes(
-                client, ctx, attrs.get(ATTR_OPERATION, operation), state.capture_input
-            )
+        prompt = prompt_attributes(
+            client, ctx, attrs.get(ATTR_OPERATION, operation), state.capture_input
         )
+        if prompt:
+            # The prompt of with_prompt replaces all td.prompt.* attributes of the app, so that a
+            # span never mixes two prompts, also when its parent is in with_prompt and
+            # prompt_attributes_for ran outside.
+            attrs = {key: value for key, value in attrs.items() if not key.startswith("td.prompt.")}
+        initial.update(prompt)
         initial.update(attrs)
         span = client.tracer.start_span(
             name,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import copy
+import dataclasses
 import gc
 import itertools
 import json
@@ -22,6 +23,7 @@ from typing import Any, NoReturn
 from urllib.parse import parse_qsl, urlsplit
 
 import pytest
+from opentelemetry import context as otel_context
 from opentelemetry import trace
 
 import telemetry_dev
@@ -966,26 +968,127 @@ def test_the_newest_compiled_message_wins_also_after_170_messages_of_history(
     )
 
 
-def test_prompt_attributes_for_looks_at_the_last_1000_messages(make: MakeClient) -> None:
+def test_a_message_that_a_placeholder_brings_from_an_older_compile_does_not_win(
+    make: MakeClient,
+) -> None:
+    make()
+    router = chat_prompt({"role": "user", "content": "{{question}}"}, name="router")
+    answer = chat_prompt(
+        {"role": "system", "content": "Answer for {{team}}."},
+        {"role": "placeholder", "name": "history"},
+        name="answer",
+    )
+    chat = chat_prompt({"role": "user", "content": "{{question}}"}, name="chat")
+    summary = chat_prompt(
+        {"role": "system", "content": "Summarize the chat."},
+        {"role": "placeholder", "name": "history"},
+        name="summary",
+    )
+
+    routed = answer.compile(team="billing", history=router.compile(question="Where is #4?"))
+    # The last 1000 messages are all from chat; the summary message is the first.
+    conversation = [chat.compile(question=f"question {index}")[0] for index in range(1500)]
+    summarized = summary.compile(history=conversation)
+
+    assert prompt_attributes_for(routed) == {
+        "td.prompt.name": "answer",
+        "td.prompt.version": 12,
+        "td.prompt.label": "production",
+        "td.prompt.variables": (
+            '{"team":"billing","history":[{"role":"user","content":"Where is #4?"}]}'
+        ),
+    }
+    assert prompt_attributes_for(summarized)["td.prompt.name"] == "summary"
+
+
+def test_prompt_attributes_for_looks_at_the_first_and_the_last_1000_messages(
+    make: MakeClient,
+) -> None:
     make()
     system = chat_prompt(*DESK_MESSAGES).compile(team="billing", order="#4")[0]
 
-    assert prompt_attributes_for([system, *[{"role": "user"}] * 999]) != {}
-    assert prompt_attributes_for([system, *[{"role": "user"}] * 1000]) == {}
+    def around(before: int, after: int) -> list[dict[str, Any]]:
+        return [*[{"role": "user"}] * before, system, *[{"role": "user"}] * after]
+
+    assert prompt_attributes_for(around(1000, 999)) != {}
+    assert prompt_attributes_for(around(999, 1001)) != {}
+    assert prompt_attributes_for(tuple(around(1001, 999))) != {}
+    assert prompt_attributes_for(around(1000, 1000)) == {}
 
 
-def test_with_prompt_wins_over_a_compiled_message_of_another_prompt(make: MakeClient) -> None:
+def test_compile_records_its_variables_not_later_changes_of_the_mapping(
+    make: MakeClient,
+) -> None:
+    memory = make()
+    prompt = chat_prompt({"role": "user", "content": "Order {{order}}"})
+    variables = {"order": "#A"}
+
+    first = prompt.compile(variables)
+    variables["order"] = "#B"
+    second = prompt.compile(variables)
+    variables["order"] = "#C"
+    with with_prompt(prompt):
+        start_span("scope", type="generation").end()
+
+    assert prompt_attributes_for(first)["td.prompt.variables"] == '{"order":"#A"}'
+    assert prompt_attributes_for(second)["td.prompt.variables"] == '{"order":"#B"}'
+    [span] = memory.span_exporter.get_finished_spans()
+    assert (span.attributes or {})["td.prompt.variables"] == '{"order":"#B"}'
+
+
+def test_a_compiled_message_rebuilds_like_a_dict_and_the_rebuilt_one_has_no_tag(
+    make: MakeClient,
+) -> None:
+    make()
+    compiled = chat_prompt(*DESK_MESSAGES).compile(team="billing", order="#4")
+
+    @dataclasses.dataclass
+    class Conversation:
+        messages: list[dict[str, Any]]
+
+    rebuilt = dataclasses.asdict(Conversation(messages=compiled))["messages"]
+    same_type = [type(message)(message) for message in compiled]
+    plain = [
+        {"role": "system", "content": "Answer as the billing desk."},
+        {"role": "user", "content": "Order #4: where is it?"},
+    ]
+
+    assert rebuilt == plain
+    assert same_type == plain
+    assert prompt_attributes_for(rebuilt) == {}
+    assert prompt_attributes_for(same_type) == {}
+
+
+def test_with_prompt_wins_over_a_compiled_message_of_another_prompt_also_through_a_parent(
+    make: MakeClient,
+) -> None:
     memory = make()
     scoped = chat_prompt({"role": "user", "content": "Hi"}, name="scoped/prompt")
-    compiled = chat_prompt(
-        {"role": "user", "content": "Cancel order {{order}}."}, name="other/prompt"
-    ).compile(order="#9")
+    # Fetched by version, so it has no label that the label of the scope could hide.
+    other = dataclasses.replace(
+        chat_prompt({"role": "user", "content": "Cancel order {{order}}."}, name="other/prompt"),
+        version=3,
+        label=None,
+    )
+    compiled = other.compile(order="#9")
 
     with with_prompt(scoped):
-        start_span("chat", type="generation", attributes=prompt_attributes_for(compiled)).end()
+        start_span("in scope", type="generation", attributes=prompt_attributes_for(compiled)).end()
+        parent = otel_context.get_current()
+    attributes = prompt_attributes_for(compiled)
+    start_span("with parent", type="generation", parent=parent, attributes=attributes).end()
 
-    [span] = memory.span_exporter.get_finished_spans()
-    assert (span.attributes or {})["td.prompt.name"] == "scoped/prompt"
+    assert attributes["td.prompt.name"] == "other/prompt"
+    for span in memory.span_exporter.get_finished_spans():
+        assert {
+            key: value
+            for key, value in dict(span.attributes or {}).items()
+            if key.startswith("td.prompt.")
+        } == {
+            "td.prompt.name": "scoped/prompt",
+            "td.prompt.version": 12,
+            "td.prompt.label": "production",
+        }
 
 
 def test_prompt_variables_follow_the_input_capture_of_the_client_and_of_the_span(

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import copy
 import hashlib
+import itertools
 import json
 import random
 import re
@@ -50,8 +51,8 @@ _HTTP_DATE = re.compile(r"[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\
 _VARIABLE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _MODEL_CALL_OPERATIONS = frozenset({"chat", "text_completion", "generate_content"})
 _PROMPT_KEY = otel_context.create_key("telemetry_dev.prompt")
-# How many messages prompt_attributes_for looks at, from the end.
-_MAX_TAG_LOOKUP = 1000
+# How many messages prompt_attributes_for looks at, at each end of the list.
+_TAG_LOOKUP = 1000
 
 
 class PromptModel(TypedDict):
@@ -100,16 +101,21 @@ class ChatPrompt:
     ) -> list[dict[str, Any]]:
         """Fill in the variables and replace each placeholder message with the list of messages
         in its variable. ``with_prompt`` records the variables of the last call before it starts
-        or inside it. It tags each message dict that it makes with this prompt and these
-        variables, so that a model call outside ``with_prompt`` that sends the message records
-        them; see ``prompt_attributes_for``."""
+        or inside it. Each message that it makes is a ``dict`` subclass that also holds this
+        prompt and a copy of these variables, so that a model call outside ``with_prompt`` that
+        sends the message records them; see ``prompt_attributes_for``. The message keeps the
+        variables alive while it lives. A check of the exact type (``type(message) is dict``),
+        ``yaml.safe_dump``, and ``marshal`` reject it: give them ``dict(message)``."""
         values = _record(self, variables, kwargs)
-        tag = _CompileTag(self, values)
+        tag = _CompileTag(self, values, next(_compiles))
         compiled: list[dict[str, Any]] = []
         for message in self.messages:
             if message.get("role") != "placeholder":
-                content = _fill(str(message["content"]), values)
-                compiled.append(_CompiledMessage(tag, role=message["role"], content=content))
+                tagged = _CompiledMessage(
+                    role=message["role"], content=_fill(str(message["content"]), values)
+                )
+                tagged.compiled_by = tag
+                compiled.append(tagged)
                 continue
             name = str(message["name"])
             value = values.get(name)
@@ -294,11 +300,16 @@ def prompt_attributes(
 
 def prompt_attributes_for(messages: object) -> dict[str, AttributeValue]:
     """The td.prompt.* attributes for a model call outside ``with_prompt`` that sends ``messages``
-    (a list or tuple of messages, or one message): those of the newest message, of the last 1000,
-    that ``compile()`` of a chat prompt returned. The tag is on the dict that ``compile()`` made, so
-    a copy of it gives ``{}``. Gives ``{}`` inside ``with_prompt``, whose prompt the span gets.
-    ``td.prompt.variables`` needs input capture on in the client, and the span drops it when its
-    own input capture is off. It runs no code of the app and never raises."""
+    (a list or tuple of messages, or one message): those of the newest ``compile()`` of a chat
+    prompt that made one of the messages. It looks at the first 1000 and the last 1000 messages.
+    The tag is on the dict that ``compile()`` made, so a copy of it gives ``{}``. Gives ``{}``
+    inside ``with_prompt``, whose prompt the span gets. ``td.prompt.variables`` needs input
+    capture on in the client, and the span drops it when its own input capture is off.
+
+    It reads only a ``list`` or ``tuple``, not a subclass, so the read runs no code of the app.
+    With input capture on, it serializes the variables, which calls the ``mask`` of the client and
+    can run code of a value, such as ``__repr__``. It never raises: it reports an error to
+    ``on_error`` and gives ``{}``."""
     client = get_client()
     try:
         if isinstance(otel_context.get_value(_PROMPT_KEY), _PromptScope):
@@ -443,32 +454,43 @@ class _CompileTag:
 
     prompt: ChatPrompt
     variables: dict[str, Any]
+    serial: int
+    """Counts the compiles of the process, so a higher one is newer."""
+
+
+_compiles = itertools.count()
 
 
 class _CompiledMessage(dict[str, Any]):
-    """A message that ``compile()`` made: a dict with the tag in a slot. A copy, pickle, or
-    ``copy.deepcopy`` of it is a plain dict without the tag."""
+    """A message that ``compile()`` made: a dict with the tag in a slot. The constructor is the one
+    of ``dict``, so ``type(message)(message)`` and ``dataclasses.asdict`` rebuild it, without the
+    tag. A copy, pickle, or ``copy.deepcopy`` of it is a plain dict without the tag."""
 
     __slots__ = ("compiled_by",)
-
-    def __init__(self, compiled_by: _CompileTag, **fields: Any) -> None:
-        super().__init__(**fields)
-        self.compiled_by = compiled_by
+    compiled_by: _CompileTag
 
     def __reduce__(self) -> tuple[type[dict[str, Any]], tuple[dict[str, Any]]]:
         return dict, (dict(self),)
 
 
 def _newest_tag(messages: object) -> _CompileTag | None:
-    # Exact types: a subclass of list or tuple could run code of the app on each read.
+    """The messages of a placeholder come from an older compile, so the newest compile, not the
+    last tagged message, names the prompt of the request. Its own messages are at the start or the
+    end of the list, unless placeholders put more than 1000 messages on each side of them."""
     if type(messages) is _CompiledMessage:
-        return messages.compiled_by
+        return getattr(messages, "compiled_by", None)
+    # Exact types: a subclass of list or tuple could run code of the app on each read.
     if type(messages) is not list and type(messages) is not tuple:
         return None
-    for message in reversed(cast("list[object]", messages)[-_MAX_TAG_LOOKUP:]):
-        if type(message) is _CompiledMessage:
-            return message.compiled_by
-    return None
+    items = cast("list[object]", messages)
+    if len(items) > 2 * _TAG_LOOKUP:
+        items = [*items[:_TAG_LOOKUP], *items[-_TAG_LOOKUP:]]
+    newest: _CompileTag | None = None
+    for item in items:
+        tag = getattr(item, "compiled_by", None) if type(item) is _CompiledMessage else None
+        if tag is not None and (newest is None or tag.serial > newest.serial):
+            newest = tag
+    return newest
 
 
 def _fill(text: str, values: Mapping[str, Any]) -> str:
