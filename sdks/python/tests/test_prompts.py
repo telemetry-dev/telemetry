@@ -110,6 +110,7 @@ def test_get_prompt_sends_query_with_key_and_sdk_header(
     assert query_of(request.path) == {"name": "support/reply", **query}
     assert request.headers["authorization"] == "Bearer td_live_a"
     assert request.headers["x-telemetry-dev-sdk"] == "telemetry-dev"
+    assert request.headers["user-agent"] == f"telemetry-dev-python/{telemetry_dev.__version__}"
 
 
 def test_get_prompt_reads_the_initialized_client_then_the_environment(
