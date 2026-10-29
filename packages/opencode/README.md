@@ -54,12 +54,15 @@ Use one route, not both. If the package is in `opencode.json` and also loaded fr
 
 ## Environment
 
-| Variable                    | Required | Default                        | Description                                               |
-| --------------------------- | -------- | ------------------------------ | --------------------------------------------------------- |
-| `TELEMETRY_DEV_API_KEY`     | Yes      | —                              | telemetry.dev API key. Without it, telemetry is disabled. |
-| `TELEMETRY_DEV_BASE_URL`    | No       | `https://ingest.telemetry.dev` | OTLP ingest base URL.                                     |
-| `TELEMETRY_DEV_ENVIRONMENT` | No       | `production`                   | Deployment environment attached to telemetry.             |
-| `OTEL_SERVICE_NAME`         | No       | `opencode`                     | OpenTelemetry service name.                               |
+| Variable                    | Required | Default                     | Description                                               |
+| --------------------------- | -------- | --------------------------- | --------------------------------------------------------- |
+| `TELEMETRY_DEV_API_KEY`     | Yes      | —                           | telemetry.dev API key. Without it, telemetry is disabled. |
+| `TELEMETRY_DEV_BASE_URL`    | No       | `https://api.telemetry.dev` | OTLP ingest base URL.                                     |
+| `TELEMETRY_DEV_ENVIRONMENT` | No       | `production`                | Deployment environment attached to telemetry.             |
+| `OTEL_SERVICE_NAME`         | No       | `opencode`                  | OpenTelemetry service name.                               |
+
+Earlier versions sent data to `https://ingest.telemetry.dev` by default. That hostname reaches the
+same service and stays supported: if a firewall allows only it, set `TELEMETRY_DEV_BASE_URL` to it.
 
 All telemetry SDK options can also be passed to `telemetryDevPlugin`. The `agentName` integration option controls `gen_ai.agent.name` and defaults to `opencode`.
 

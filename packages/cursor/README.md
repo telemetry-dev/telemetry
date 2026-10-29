@@ -56,15 +56,19 @@ The `install` command writes `~/.cursor/telemetry-dev.json`. Env vars have
 priority over the file. The last three settings exist only as keys in the
 file:
 
-| Variable / key                              | Required | Default                        | Notes                                                                                        |
-| ------------------------------------------- | -------- | ------------------------------ | -------------------------------------------------------------------------------------------- |
-| `TELEMETRY_DEV_API_KEY` / `apiKey`          | yes      | —                              | Ingest key (`td_live_…`). Without a key, the integration is a full no-op.                    |
-| `TELEMETRY_DEV_BASE_URL` / `baseUrl`        | no       | `https://ingest.telemetry.dev` | The integration removes trailing slashes.                                                    |
-| `TELEMETRY_DEV_ENVIRONMENT` / `environment` | no       | `production`                   | Environment label on each trace and log.                                                     |
-| `OTEL_SERVICE_NAME` / `serviceName`         | no       | `cursor`                       | OpenTelemetry service name.                                                                  |
-| `captureInput`                              | no       | `true`                         | Export prompts, subagent tasks, and tool arguments. See [Content capture](#content-capture). |
-| `captureOutput`                             | no       | `true`                         | Export assistant and thinking text and tool results.                                         |
-| `enabled`                                   | no       | `true`                         | `false` stops all export. The hooks and the daemon still run.                                |
+| Variable / key                              | Required | Default                     | Notes                                                                                        |
+| ------------------------------------------- | -------- | --------------------------- | -------------------------------------------------------------------------------------------- |
+| `TELEMETRY_DEV_API_KEY` / `apiKey`          | yes      | —                           | Ingest key (`td_live_…`). Without a key, the integration is a full no-op.                    |
+| `TELEMETRY_DEV_BASE_URL` / `baseUrl`        | no       | `https://api.telemetry.dev` | The integration removes trailing slashes.                                                    |
+| `TELEMETRY_DEV_ENVIRONMENT` / `environment` | no       | `production`                | Environment label on each trace and log.                                                     |
+| `OTEL_SERVICE_NAME` / `serviceName`         | no       | `cursor`                    | OpenTelemetry service name.                                                                  |
+| `captureInput`                              | no       | `true`                      | Export prompts, subagent tasks, and tool arguments. See [Content capture](#content-capture). |
+| `captureOutput`                             | no       | `true`                      | Export assistant and thinking text and tool results.                                         |
+| `enabled`                                   | no       | `true`                      | `false` stops all export. The hooks and the daemon still run.                                |
+
+Earlier versions sent data to `https://ingest.telemetry.dev` by default. That hostname reaches the
+same service and stays supported: if a firewall allows only it, set `TELEMETRY_DEV_BASE_URL` or
+`baseUrl` to it.
 
 The three boolean keys must be JSON `true` or `false`. Any other value, such
 as the string `"false"`, counts as `false`. If the file exists but is not a

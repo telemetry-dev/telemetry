@@ -24,6 +24,10 @@ telemetry_dev.init()  # reads TELEMETRY_DEV_API_KEY and OTLP settings
 instrument_litellm()
 ```
 
+Versions of `telemetry-dev` before 0.3.0 sent data to `https://ingest.telemetry.dev` by default.
+That hostname reaches the same service and stays supported: if a firewall allows only it, set
+`TELEMETRY_DEV_BASE_URL` to it.
+
 The core SDK fails open: without an API key, LiteLLM calls still run and telemetry is a no-op.
 
 ## Per-call drop-ins

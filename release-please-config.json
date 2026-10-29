@@ -35,7 +35,8 @@
     },
     "packages/cli": {
       "component": "cli",
-      "release-type": "node"
+      "release-type": "node",
+      "initial-version": "0.1.0"
     },
     "packages/cursor": {
       "component": "cursor",

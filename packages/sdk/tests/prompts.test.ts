@@ -190,7 +190,7 @@ test.each([
   { initialized: false, envBaseUrl: "" },
   { initialized: true, envBaseUrl: "" },
 ])(
-  "without a base URL, getPrompt reads https://ingest.telemetry.dev (initialized: $initialized, TELEMETRY_DEV_BASE_URL: $envBaseUrl)",
+  "without a base URL, getPrompt reads https://api.telemetry.dev (initialized: $initialized, TELEMETRY_DEV_BASE_URL: $envBaseUrl)",
   async ({ initialized, envBaseUrl }) => {
     const { fetch, calls } = fakeFetch(reply());
     vi.stubEnv("TELEMETRY_DEV_BASE_URL", envBaseUrl);
@@ -203,7 +203,7 @@ test.each([
     });
 
     expect(calls[0]!.url.href).toBe(
-      "https://ingest.telemetry.dev/v1/prompts?name=support%2Freply&label=production",
+      "https://api.telemetry.dev/v1/prompts?name=support%2Freply&label=production",
     );
   },
 );

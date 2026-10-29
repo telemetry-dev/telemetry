@@ -59,6 +59,10 @@ await bedrock.send(
 await shutdown();
 ```
 
+Versions of `@telemetry-dev/sdk` before 0.2.0 sent data to `https://ingest.telemetry.dev` by
+default. That hostname reaches the same service and stays supported: if a firewall allows only it,
+set `TELEMETRY_DEV_BASE_URL` to it.
+
 `wrapBedrock` is per-client and idempotent. It accepts any structural client with a `send(command, options?)` method, so it works with `BedrockRuntimeClient`, `BedrockRuntime`, and tests/fakes using real command objects.
 
 ## Global runtime instrumentation

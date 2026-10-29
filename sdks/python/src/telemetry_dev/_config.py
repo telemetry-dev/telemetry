@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
-DEFAULT_BASE_URL = "https://ingest.telemetry.dev"
+DEFAULT_BASE_URL = "https://api.telemetry.dev"
 
 
 def _resolve_version() -> str:
