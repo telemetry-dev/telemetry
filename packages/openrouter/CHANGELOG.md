@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.2.0](https://github.com/telemetry-dev/telemetry/compare/openrouter-v0.1.13...openrouter-v0.2.0) (2026-10-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* **sdk:** the default base URL for telemetry export and getPrompt/get_prompt is now https://api.telemetry.dev. https://ingest.telemetry.dev reaches the same service and stays supported; networks that allow only it should set TELEMETRY_DEV_BASE_URL to it.
+
+### Features
+
+* **sdk:** send to api.telemetry.dev by default ([#109](https://github.com/telemetry-dev/telemetry/issues/109)) ([ad8ccf3](https://github.com/telemetry-dev/telemetry/commit/ad8ccf3c41355683deb3b38dab4b604ecaa25a7a))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/otel bumped to 0.2.0
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.2.0
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.2.0
+
 ## [0.1.13](https://github.com/telemetry-dev/telemetry/compare/openrouter-v0.1.12...openrouter-v0.1.13) (2026-10-29)
 
 

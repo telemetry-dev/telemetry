@@ -745,7 +745,7 @@ wheels = [
 
 [[package]]
 name = "telemetry-dev"
-version = "0.2.13"
+version = "0.3.0"
 source = { editable = "../python" }
 dependencies = [
     { name = "opentelemetry-api" },
@@ -772,7 +772,7 @@ dev = [
 
 [[package]]
 name = "telemetry-dev-anthropic"
-version = "0.1.8"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
