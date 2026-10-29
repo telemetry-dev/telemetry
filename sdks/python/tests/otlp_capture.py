@@ -37,6 +37,8 @@ class CaptureServer:
     delay: float = 0
     # The location header of GET replies, for a redirect status.
     location: str | None = None
+    # The Retry-After header of GET replies.
+    retry_after: str | None = None
 
     def requests_for(self, path: str) -> list[CapturedRequest]:
         return [request for request in self.requests if request.path == path]
@@ -81,6 +83,8 @@ def otlp_capture_server() -> Generator[CaptureServer]:
             self.send_header("content-length", str(len(body)))
             if capture.location is not None:
                 self.send_header("location", capture.location)
+            if capture.retry_after is not None:
+                self.send_header("retry-after", capture.retry_after)
             self.end_headers()
             self.wfile.write(body)
 

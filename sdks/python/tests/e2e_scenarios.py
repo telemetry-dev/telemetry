@@ -1,7 +1,7 @@
 """E2E scenario driver for the cross-SDK conformance suite.
 
 This script EMITS the shared conformance scenario against a real ingest endpoint; the
-ClickHouse row assertions live in apps/ingest/src/sdk_conformance.ts (C1-C25), keyed by the
+ClickHouse row assertions live in apps/ingest/src/sdk_conformance.ts (C1-C26), keyed by the
 session id below. Keep the scenario in lockstep with apps/ingest/tests/sdk_otlp_e2e_test.ts and
 docs/sdk-conformance.md.
 
@@ -15,19 +15,26 @@ Run:
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
+import threading
+from collections.abc import Generator
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import telemetry_dev
 from telemetry_dev import (
     MaskContext,
+    get_prompt,
     get_traceparent,
     log,
     observe,
     propagate_attributes,
     start_span,
+    with_prompt,
 )
 
 # C23: inserted in this order; the expected bytes put array-index keys ("2", "10",
@@ -45,6 +52,46 @@ JSON_COMPAT_PAYLOAD: dict[str, Any] = {
     "s": "\u00e9\U0001f916",
     "lone": "\ud800",
 }
+
+
+# C26: the prompt that the scenario fetches, version 12 by the production label.
+PROMPT_REPLY: dict[str, Any] = {
+    "name": "support/reply",
+    "type": "chat",
+    "label": "production",
+    "version": 12,
+    "messages": [{"role": "user", "content": "Answer {{customer}}"}],
+    "text": None,
+    "model": {"provider": "openai", "name": "gpt-4o"},
+    "parameters": {},
+    "tools": [],
+    "responseFormat": {"type": "text"},
+    "rollout": None,
+}
+
+
+@contextmanager
+def prompt_server() -> Generator[str]:
+    """Serve PROMPT_REPLY on a local port; the e2e ingest does not serve prompts."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            body = json.dumps(PROMPT_REPLY).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
 
 
 @observe(name="format-output")  # C5: observed plain function -> operation "function"
@@ -231,6 +278,27 @@ def main() -> int:
                 output={"role": "assistant", "content": "chunk..."},
                 attributes={"telemetry.dev.capture.truncated": True},
             )
+            # C26: model calls in with_prompt record the prompt; only with input capture on do
+            # they record its variables.
+            with prompt_server() as prompt_url:
+                prompt = get_prompt("support/reply", base_url=prompt_url)
+            messages = prompt.compile(customer="Ada")
+            with with_prompt(prompt):
+                start_span(
+                    "prompted-call",
+                    type="generation",
+                    model="gpt-4o",
+                    provider="openai",
+                    input=messages,
+                ).end()
+                start_span(
+                    "prompted-private",
+                    type="generation",
+                    model="gpt-4o",
+                    provider="openai",
+                    input=messages,
+                    capture_input=False,
+                ).end()
 
         # C13: continue the trace from a serialized W3C traceparent.
         start_span("background-job", parent=agent_traceparent).end()

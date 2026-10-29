@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import itertools
 import socket
 import threading
@@ -7,6 +9,8 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Generator
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from types import SimpleNamespace
 from typing import Any, NoReturn
 from urllib.parse import parse_qsl, urlsplit
@@ -274,6 +278,91 @@ def test_with_no_copy_a_failed_fetch_returns_the_fallback_and_so_do_calls_for_10
     assert len(server.requests) == 3
 
 
+@pytest.mark.parametrize(
+    ("status", "retry_after", "wait"),
+    [
+        (429, "120", 120),
+        (503, "120", 120),
+        # An HTTP date 120 seconds from now; the test makes it when it runs.
+        (429, "date", 120),
+        (429, "86400", 3600),
+        # Not a Retry-After that get_prompt reads: the 10 second error wait applies.
+        (429, "soon", 10),
+        (429, "Thu, 01 Jan 2099 00:00:00", 10),
+        (429, "01 Jan 2099 00:00:00 GMT", 10),
+        (500, "120", 10),
+    ],
+)
+def test_with_no_copy_get_prompt_does_not_fetch_before_the_retry_after(
+    server: CaptureServer, clock: list[float], status: int, retry_after: str, wait: float
+) -> None:
+    server.replies = [api_error(status, "rate_limited", "Too many prompt requests")]
+    server.retry_after = (
+        format_datetime(datetime.now(timezone.utc) + timedelta(seconds=120), usegmt=True)
+        if retry_after == "date"
+        else retry_after
+    )
+
+    def fallback_prompt() -> ChatPrompt:
+        return get_prompt(
+            "support/reply",
+            api_key="td_live_a",
+            base_url=server.url,
+            fallback=[{"role": "user", "content": "Hi"}],
+        )
+
+    assert fallback_prompt().is_fallback
+    # The HTTP date counts from when the server answered, a moment before this.
+    clock[0] += wait - 2
+    assert fallback_prompt().is_fallback
+    assert len(server.requests) == 1
+
+    clock[0] += 2
+    fallback_prompt()
+    assert len(server.requests) == 2
+
+
+def test_a_refresh_that_gets_a_retry_after_keeps_the_copy_until_then(
+    server: CaptureServer, clock: list[float]
+) -> None:
+    server.replies = [
+        (200, reply()),
+        api_error(429, "rate_limited", "Too many prompt requests"),
+        (200, reply(version=13)),
+    ]
+    server.retry_after = "300"
+
+    def version() -> int | None:
+        return get_prompt("support/reply", api_key="td_live_a", base_url=server.url).version
+
+    assert version() == 12
+    clock[0] += 60
+    assert version() == 12
+    wait_for(
+        lambda: all(
+            entry.pending is None
+            for entry in prompts_module._cache.values()  # pyright: ignore[reportPrivateUsage]
+        )
+    )
+    assert len(server.requests) == 2
+
+    # The TTL ends after 60 seconds, but the server asked for 300.
+    clock[0] += 299
+    assert version() == 12
+    wait_for(
+        lambda: all(
+            entry.pending is None
+            for entry in prompts_module._cache.values()  # pyright: ignore[reportPrivateUsage]
+        )
+    )
+    assert len(server.requests) == 2
+
+    clock[0] += 1
+    version()
+    wait_for(lambda: version() == 13)
+    assert len(server.requests) == 3
+
+
 def test_with_no_copy_and_no_fallback_get_prompt_raises_a_prompt_error(
     server: CaptureServer,
 ) -> None:
@@ -298,6 +387,25 @@ def test_with_no_copy_and_no_fallback_get_prompt_raises_a_prompt_error(
     with pytest.raises(PromptError) as offline:
         get_prompt("support/reply", api_key="td_live_a", base_url=f"http://127.0.0.1:{port}")
     assert offline.value.code == "network_error"
+
+
+def test_a_reply_without_a_label_is_an_invalid_response(server: CaptureServer) -> None:
+    unlabeled = reply()
+    del unlabeled["label"]
+    server.replies = [(200, unlabeled)]
+
+    with pytest.raises(PromptError) as raised:
+        get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+    assert raised.value.code == "invalid_response"
+
+    fallback = get_prompt(
+        "support/reply",
+        label="staging",
+        api_key="td_live_a",
+        base_url=server.url,
+        fallback=[{"role": "user", "content": "Hi"}],
+    )
+    assert fallback.is_fallback
 
 
 def test_a_redirect_fails_and_does_not_send_the_key(server: CaptureServer) -> None:
@@ -515,6 +623,58 @@ def test_each_thread_records_its_own_variables_when_it_compiles_a_shared_prompt(
     }
 
 
+async def test_each_task_in_one_with_prompt_records_its_own_variables(
+    server: CaptureServer, make: MakeClient
+) -> None:
+    memory = make()
+    prompt = get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+    other = get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+    a_compiled, b_called = asyncio.Event(), asyncio.Event()
+
+    async def task_a() -> None:
+        prompt.compile(customer_message="from A")
+        # A compile in a nested with_prompt does not replace A's variables of the outer one.
+        with with_prompt(other):
+            other.compile(customer_message="nested")
+        a_compiled.set()
+        await b_called.wait()
+        start_span("a", type="generation").end()
+
+    async def task_b() -> None:
+        await a_compiled.wait()
+        prompt.compile(customer_message="from B")
+        start_span("b", type="generation").end()
+        b_called.set()
+
+    # A compiles and waits in the shared scope. Then B compiles and calls the model, and A calls
+    # it last.
+    with with_prompt(prompt):
+        await asyncio.gather(task_a(), task_b())
+
+    variables: dict[str, Any] = {
+        span.name: dict(span.attributes or {}).get("td.prompt.variables")
+        for span in memory.span_exporter.get_finished_spans()
+    }
+    assert variables == {
+        "a": '{"customer_message":"from A"}',
+        "b": '{"customer_message":"from B"}',
+    }
+
+
+def test_with_prompt_can_end_in_another_context(server: CaptureServer, make: MakeClient) -> None:
+    make()
+    prompt = get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+
+    # A generator that a framework closes in a different Context than the one it started in.
+    def stream() -> Generator[None]:
+        with with_prompt(prompt):
+            yield
+
+    steps = stream()
+    contextvars.copy_context().run(next, steps)
+    contextvars.copy_context().run(steps.close)
+
+
 def test_variables_are_omitted_when_input_capture_is_off(
     server: CaptureServer, make: MakeClient
 ) -> None:
@@ -575,7 +735,21 @@ def test_a_fallback_prompt_records_its_name_and_label_but_no_version(
 
 
 async def test_get_prompt_async_fetches_in_a_worker_thread(server: CaptureServer) -> None:
+    server.delay = 0.3
+    ticks = 0
+
+    async def tick() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    ticker = asyncio.create_task(tick())
     prompt = await get_prompt_async("support/reply", api_key="td_live_a", base_url=server.url)
+    ticker.cancel()
 
     assert prompt.version == 12
     assert query_of(server.requests[0].path)["label"] == "production"
+    # The event loop ran while the fetch waited for the slow reply. A fetch on the loop's thread
+    # would block it, and the ticker would not run until the fetch ended.
+    assert ticks >= 5

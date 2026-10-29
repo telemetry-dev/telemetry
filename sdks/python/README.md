@@ -222,8 +222,10 @@ pinned = telemetry_dev.get_prompt("support/reply", version=13)
   `timeout`. A response with a different status and no API error gives `http_<status>`, for
   example `http_302` for a redirect. `get_prompt` does not send the request to the location of a
   redirect, thus your key does not go to a different host. With no copy, the calls of the next 10
-  seconds (or the TTL, if it is shorter) get the same result without a fetch. This is the one SDK
-  function that can raise: your app cannot run without its prompt.
+  seconds (or the TTL, if it is shorter) get the same result without a fetch. After a 429 or 503
+  response with a `Retry-After` header, `get_prompt` does not fetch that prompt again before that
+  time (one hour at most). This is the one SDK function that can raise: your app cannot run
+  without its prompt.
 - `get_prompt` uses the API key and base URL of an enabled `init()`, or `TELEMETRY_DEV_API_KEY`
   and `TELEMETRY_DEV_BASE_URL`, or its own `api_key` and `base_url`. It reads the same host that
   telemetry goes to, `https://ingest.telemetry.dev` by default. The key needs the read scope for
@@ -239,10 +241,13 @@ When input capture is on, `td.prompt.variables` holds the JSON of the variables 
 it, after `mask` and truncation. If threads or tasks that run at the same time share one prompt
 object, call `compile()` in `with_prompt`, or call `get_prompt` in each thread or task.
 `get_prompt` returns a new object from the cache. If you do not, a thread can record the variables
-of a different thread. Model calls are the spans of type `generation` (operations `chat`,
-`text_completion`, and `generate_content`), including the spans of the provider integrations:
-OpenAI, Anthropic, Amazon Bedrock, Google GenAI, LiteLLM, and OpenRouter. Spans from other
-OpenTelemetry tracers do not get the attributes. Messages from `compile()` that you pass to a
+of a different thread. Inside one `with_prompt`, an asyncio task records the last `compile()` that
+ran in it, or before it started in the code that started it; with none, it records the last
+`compile()` in the block. A `compile()` in a worker thread, as with `asyncio.to_thread`, counts only
+for code that has not compiled in its own task. Model calls are the spans of type `generation`
+(operations `chat`, `text_completion`, and `generate_content`), including the spans of the provider
+integrations: OpenAI, Anthropic, Amazon Bedrock, Google GenAI, LiteLLM, and OpenRouter. Spans from
+other OpenTelemetry tracers do not get the attributes. Messages from `compile()` that you pass to a
 model call outside `with_prompt` are not recorded.
 
 ## Auto-metrics

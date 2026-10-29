@@ -143,6 +143,11 @@ Concurrent calls share one fetch.
   `onError` / `on_error`. With no copy, the call gets the fallback. With no fallback, the call gets
   a `PromptError`. With no copy, the calls of the next 10 seconds (or the TTL, if it is shorter)
   get the same result without a fetch.
+- Retry-After: when a 429 or 503 response has a `Retry-After` header, in seconds or as an HTTP
+  date (IMF-fixdate, `Sun, 06 Nov 1994 08:49:37 GMT`), no fetch of that prompt (the same base URL,
+  key, name, and label or version) starts before that time, even when the copy or the error is
+  older than its TTL. The SDKs cap the wait at one hour and ignore the header on other statuses
+  and when it does not parse.
 - Error codes: the `PromptError` code is the API error code, or `missing_api_key`, `timeout`,
   `network_error`, `invalid_response`, or `type_mismatch`. A response with a status that is not
   2xx and no API error code gives `http_<status>`.
@@ -158,8 +163,17 @@ Test vector: `"support/reply:production:session-123"` → 777154315 → bucket 1
 
 `compile()` replaces each `{{name}}` with the value of the variable: a string as it is, a missing
 value or null as empty text, and other values as `JSON.stringify` JSON. A chat message
-`{role: "placeholder", name}` becomes the list of messages in its variable, or nothing when the
-variable is missing; any other value is a `TypeError`.
+`{role: "placeholder", name}` becomes the messages in its variable: a list, or in Python also a
+tuple. A missing, null, or None variable gives no messages; any other value is a `TypeError`.
+
+Concurrent tasks inside one `withPrompt` / `with_prompt` scope: in Python, a model-call span takes
+the variables of the last `compile()` that ran in its own asyncio task, or before the task started
+in the code that started it (a `ContextVar`), and the last `compile()` of the scope when there is
+none. A `compile()` in a worker thread or a copied context, as with `asyncio.to_thread`, counts
+only for code that has not compiled in its own task. JavaScript
+cannot tell a concurrent task from an awaited helper, so in TypeScript all spans of the scope take
+its last `compile()`; concurrent tasks that compile their own variables call `withPrompt` in each
+task.
 
 ## The shared scenario
 
@@ -199,6 +213,10 @@ eventName: "e2e.inside")` inside it
    - generation `streamed-chat` (gpt-4o/openai, input "Stream please", bounded partial output
      "chunk...", `telemetry.dev.capture.truncated = true`, four output chunk calls at
      1000/1010/1050/1210 ms, timeToFirstChunkMs 250)
+   - prompt `support/reply` (version 12, label production) fetched from a local stub server,
+     compiled with `customer: "Ada"`, then in `withPrompt` / `with_prompt`: generation
+     `prompted-call` (gpt-4o/openai, input the compiled messages) and generation
+     `prompted-private` (the same with captureInput false)
 2. plain span `background-job` started after the agent ended, with
    `parent = <agent traceparent captured via getTraceparent()>`
 3. agent span `follow-up-turn` (`agentName: "support"`) started after the agent ended with no
@@ -211,7 +229,7 @@ eventName: "e2e.inside")` inside it
 7. fail-open phase: re-`init()` WITHOUT an api key, run an observed function + `log()`,
    `flush()` + `shutdown()` — must emit nothing and never throw
 
-## Assertions (C1–C25)
+## Assertions (C1–C26)
 
 Exception content follows the effective per-span capture policy in both SDKs. If either input
 or output capture is off, C14 retains error status/type and the exception event but omits its
@@ -221,33 +239,34 @@ the exception line normally is: TypeScript keeps the start of the stack, and Pyt
 of the traceback, with the marker first. Mask failures omit the affected field. The policy is per span, so an enclosing span with capture on records an error that propagates
 to it. These rules do not sanitize raw OpenTelemetry events or arbitrary attributes.
 
-| #   | Assertion                                                                                                                                                                                                                        |
-| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| C1  | One trace per session: framework `otel`, userId/sessionId/metadata, token rollup 33/12 with the chat span's nine modality totals, server-computed cost >= 0.5, trace name `support-agent`                                        |
-| C2  | Agent root span: operation `invoke_agent`, `agent_name`, parented to the session parent (not stored); trace id = the session trace id                                                                                            |
-| C3  | Generation span: model/provider/aggregate, cache-read/cache-write, and nine modality token fields/finish reason, extracted inputJson/outputJson, per-span cost                                                                   |
-| C4  | Tool span: `tool_name`, extracted arguments/result JSON                                                                                                                                                                          |
-| C5  | Observed function: operation `function`, inputJson `{text}` / outputJson `{formatted}` (via the ingest's `function` extraction branch)                                                                                           |
-| C6  | Every span carries `conversation_id` = sessionId and 16-hex span ids                                                                                                                                                             |
-| C7  | Error span: status `error`, `error_type` = TypeError (TS) / ValueError (Python)                                                                                                                                                  |
-| C8  | In-span `log()`: source `otlp-log`, severity 9, eventName, span-correlated, propagated attrs on the record                                                                                                                       |
-| C9  | Exception event → error log row (source `span-event`, level `error`, message contains the error)                                                                                                                                 |
-| C10 | Standalone `log()`: stored without trace correlation, severity 13, source `otlp-log`                                                                                                                                             |
-| C11 | Metrics: duration histograms for chat/invoke_agent/execute_tool/embeddings; token totals chat 30/12, embeddings 3; first-chunk 1 × 0.25 s; output-chunk intervals count 3, sum 0.21 s, min 0.01 s, max 0.16 s; correct SDK scope |
-| C12 | Embedding span: operation `embeddings`, model extracted                                                                                                                                                                          |
-| C13 | Traceparent join: `background-job` lands in the same trace, parented to the agent, with the conversation id                                                                                                                      |
-| C14 | captureInput:false strips content from inputJson and attributesJson                                                                                                                                                              |
-| C15 | `costUsd` client override stored verbatim (0.5)                                                                                                                                                                                  |
-| C16 | Oversized content truncated to 65536 chars ending with `...[truncated]`, extracted into inputJson and stored once (source attribute stripped from the attribute columns); mask hook output replaces SECRET-bearing input         |
-| C17 | Exact span census (17) — the fail-open no-key phase contributes nothing                                                                                                                                                          |
-| C18 | Streaming generation: `timeToFirstChunkMs` stored as 250 ms; wire attribute `gen_ai.response.time_to_first_chunk` = 0.25 s                                                                                                       |
-| C19 | OpenRouter generation: provider stored as `openrouter`                                                                                                                                                                           |
-| C20 | Session trace: `follow-up-turn` (a second root call of the same session) lands in the same trace, parented to the session parent, started at or after the agent ended                                                            |
-| C21 | Process mode: two otherwise independent roots and a standalone log share one generated UUID session; a nested explicit-session span/log subtree consistently uses the explicit ID instead                                        |
-| C22 | Streaming truncation: `telemetry.dev.capture.truncated = true` survives OTLP transport and ingest on the streamed generation                                                                                                     |
-| C23 | Captured JSON matches an independently specified JSON.stringify byte sequence, including number spelling, key ordering, non-finite values and Unicode                                                                            |
-| C24 | Advisor model and native counters survive transport and storage without changing executor usage or rollup totals; provider extraction is covered in the integration packages' tests                                              |
-| C25 | Offered tool names in `gen_ai.tool.definitions` are stored byte-for-byte with input capture off, and the tool description is not; the Anthropic integration tests cover building them from request tools                         |
+| #   | Assertion                                                                                                                                                                                                                                 |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| C1  | One trace per session: framework `otel`, userId/sessionId/metadata, token rollup 33/12 with the chat span's nine modality totals, server-computed cost >= 0.5, trace name `support-agent`                                                 |
+| C2  | Agent root span: operation `invoke_agent`, `agent_name`, parented to the session parent (not stored); trace id = the session trace id                                                                                                     |
+| C3  | Generation span: model/provider/aggregate, cache-read/cache-write, and nine modality token fields/finish reason, extracted inputJson/outputJson, per-span cost                                                                            |
+| C4  | Tool span: `tool_name`, extracted arguments/result JSON                                                                                                                                                                                   |
+| C5  | Observed function: operation `function`, inputJson `{text}` / outputJson `{formatted}` (via the ingest's `function` extraction branch)                                                                                                    |
+| C6  | Every span carries `conversation_id` = sessionId and 16-hex span ids                                                                                                                                                                      |
+| C7  | Error span: status `error`, `error_type` = TypeError (TS) / ValueError (Python)                                                                                                                                                           |
+| C8  | In-span `log()`: source `otlp-log`, severity 9, eventName, span-correlated, propagated attrs on the record                                                                                                                                |
+| C9  | Exception event → error log row (source `span-event`, level `error`, message contains the error)                                                                                                                                          |
+| C10 | Standalone `log()`: stored without trace correlation, severity 13, source `otlp-log`                                                                                                                                                      |
+| C11 | Metrics: duration histograms for chat/invoke_agent/execute_tool/embeddings; token totals chat 30/12, embeddings 3; first-chunk 1 × 0.25 s; output-chunk intervals count 3, sum 0.21 s, min 0.01 s, max 0.16 s; correct SDK scope          |
+| C12 | Embedding span: operation `embeddings`, model extracted                                                                                                                                                                                   |
+| C13 | Traceparent join: `background-job` lands in the same trace, parented to the agent, with the conversation id                                                                                                                               |
+| C14 | captureInput:false strips content from inputJson and attributesJson                                                                                                                                                                       |
+| C15 | `costUsd` client override stored verbatim (0.5)                                                                                                                                                                                           |
+| C16 | Oversized content truncated to 65536 chars ending with `...[truncated]`, extracted into inputJson and stored once (source attribute stripped from the attribute columns); mask hook output replaces SECRET-bearing input                  |
+| C17 | Exact span census (19) — the fail-open no-key phase contributes nothing                                                                                                                                                                   |
+| C18 | Streaming generation: `timeToFirstChunkMs` stored as 250 ms; wire attribute `gen_ai.response.time_to_first_chunk` = 0.25 s                                                                                                                |
+| C19 | OpenRouter generation: provider stored as `openrouter`                                                                                                                                                                                    |
+| C20 | Session trace: `follow-up-turn` (a second root call of the same session) lands in the same trace, parented to the session parent, started at or after the agent ended                                                                     |
+| C21 | Process mode: two otherwise independent roots and a standalone log share one generated UUID session; a nested explicit-session span/log subtree consistently uses the explicit ID instead                                                 |
+| C22 | Streaming truncation: `telemetry.dev.capture.truncated = true` survives OTLP transport and ingest on the streamed generation                                                                                                              |
+| C23 | Captured JSON matches an independently specified JSON.stringify byte sequence, including number spelling, key ordering, non-finite values and Unicode                                                                                     |
+| C24 | Advisor model and native counters survive transport and storage without changing executor usage or rollup totals; provider extraction is covered in the integration packages' tests                                                       |
+| C25 | Offered tool names in `gen_ai.tool.definitions` are stored byte-for-byte with input capture off, and the tool description is not; the Anthropic integration tests cover building them from request tools                                  |
+| C26 | Prompt spans: `prompted-call` and `prompted-private` carry `td.prompt.name` `support/reply`, `td.prompt.version` 12 (integer) and `td.prompt.label` `production`; only `prompted-call` carries `td.prompt.variables` `{"customer":"Ada"}` |
 
 ## Modality publication gate
 

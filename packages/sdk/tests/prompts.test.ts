@@ -353,6 +353,91 @@ test("with no copy and no fallback, getPrompt rejects with a PromptError", async
   await expect(
     getPrompt("support/reply", { ...options, baseUrl: newBaseUrl(), fetch: invalid }),
   ).rejects.toMatchObject({ code: "invalid_response" });
+
+  const { label: _label, ...unlabeled } = reply();
+  const { fetch: noLabel } = fakeFetch(unlabeled);
+  await expect(
+    getPrompt("support/reply", { ...options, baseUrl: newBaseUrl(), fetch: noLabel }),
+  ).rejects.toMatchObject({ code: "invalid_response" });
+});
+
+test.each([
+  { status: 429, retryAfter: "120", wait: 120 },
+  { status: 503, retryAfter: "120", wait: 120 },
+  // An HTTP date 120 seconds after the fake clock starts.
+  { status: 429, retryAfter: "date", wait: 120 },
+  { status: 429, retryAfter: "86400", wait: 3600 },
+  // Not a Retry-After that getPrompt reads: the 10 second error wait applies.
+  { status: 429, retryAfter: "soon", wait: 10 },
+  { status: 429, retryAfter: "Thu, 01 Jan 2099 00:00:00", wait: 10 },
+  { status: 429, retryAfter: "01 Jan 2099 00:00:00 GMT", wait: 10 },
+  { status: 500, retryAfter: "120", wait: 10 },
+])(
+  "with no copy, getPrompt does not fetch before the Retry-After ($status, $retryAfter)",
+  async ({ status, retryAfter, wait }) => {
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.parse("2026-10-29T12:00:00Z") });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const header =
+      retryAfter === "date" ? new Date(Date.now() + 120_000).toUTCString() : retryAfter;
+
+    const { fetch, calls } = fakeFetch(
+      Response.json(
+        { error: { code: "rate_limited", message: "Too many prompt requests" } },
+        { status, headers: { "retry-after": header } },
+      ),
+    );
+
+    const options = {
+      apiKey: "td_live_a",
+      baseUrl: newBaseUrl(),
+      fetch,
+      fallback: [{ role: "user" as const, content: "Hi" }],
+    };
+
+    expect((await getPrompt("support/reply", options)).isFallback).toBe(true);
+    vi.advanceTimersByTime(wait * 1000 - 1);
+    expect((await getPrompt("support/reply", options)).isFallback).toBe(true);
+    expect(calls).toHaveLength(1);
+
+    vi.advanceTimersByTime(1);
+    await getPrompt("support/reply", options);
+    expect(calls).toHaveLength(2);
+  },
+);
+
+test("a refresh that gets a Retry-After keeps the copy until then", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.spyOn(console, "error").mockImplementation(() => {});
+
+  const { fetch, calls } = fakeFetch(
+    reply(),
+    Response.json(
+      { error: { code: "rate_limited", message: "Too many prompt requests" } },
+      { status: 429, headers: { "retry-after": "300" } },
+    ),
+    reply({ version: 13 }),
+  );
+
+  const options = { apiKey: "td_live_a", baseUrl: newBaseUrl(), fetch };
+
+  expect((await getPrompt("support/reply", options)).version).toBe(12);
+  vi.advanceTimersByTime(60_000);
+  expect((await getPrompt("support/reply", options)).version).toBe(12);
+  await vi.waitFor(() => expect(calls).toHaveLength(2));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  // The TTL ends after 60 seconds, but the server asked for 300.
+  vi.advanceTimersByTime(299_999);
+  expect((await getPrompt("support/reply", options)).version).toBe(12);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(calls).toHaveLength(2);
+
+  vi.advanceTimersByTime(1);
+  await getPrompt("support/reply", options);
+  await vi.waitFor(async () => {
+    expect((await getPrompt("support/reply", options)).version).toBe(13);
+  });
+  expect(calls).toHaveLength(3);
 });
 
 test("a redirect fails with http_302 and does not send the key to the target", async () => {
