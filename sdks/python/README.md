@@ -56,13 +56,17 @@ routed to the `on_error` hook / `telemetry_dev` logger — never raised into you
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `TELEMETRY_DEV_API_KEY` | — | Ingest key (`td_live_...`). Absent = SDK is a no-op. |
-| `TELEMETRY_DEV_BASE_URL` | `https://ingest.telemetry.dev` | Base URL for telemetry export and `get_prompt` (trailing slashes stripped). |
+| `TELEMETRY_DEV_BASE_URL` | `https://api.telemetry.dev` | Base URL for telemetry export and `get_prompt` (trailing slashes stripped). |
 | `TELEMETRY_DEV_ENVIRONMENT` | `production` | Deployment environment label. |
 | `OTEL_SERVICE_NAME` | `unknown_service` | Service name on every trace. |
 | `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | OTel trace sampling policy, which includes session roots. |
 | `OTEL_TRACES_SAMPLER_ARG` | `1.0` | Probability for `traceidratio` / `parentbased_traceidratio`. |
 
 Explicit `init()` arguments take precedence over environment variables.
+
+Earlier versions sent data to `https://ingest.telemetry.dev` by default. That hostname reaches the
+same service and stays supported: if a firewall allows only it, set `TELEMETRY_DEV_BASE_URL` or
+`base_url` to it.
 
 Root spans remain independent by default. `telemetry_dev.init(session_mode="process")` groups
 otherwise uncorrelated spans and logs using a fresh opaque UUID for each enabled SDK
@@ -228,7 +232,7 @@ pinned = telemetry_dev.get_prompt("support/reply", version=13)
   without its prompt.
 - `get_prompt` uses the API key and base URL of an enabled `init()`, or `TELEMETRY_DEV_API_KEY`
   and `TELEMETRY_DEV_BASE_URL`, or its own `api_key` and `base_url`. It reads the same host that
-  telemetry goes to, `https://ingest.telemetry.dev` by default. The key needs the read scope for
+  telemetry goes to, `https://api.telemetry.dev` by default. The key needs the read scope for
   prompts.
 - When a label sends part of the traffic to a second version, each session keeps one version: the
   choice uses the session id of `propagate_attributes` (or of `session_mode="process"`). Without a
@@ -306,7 +310,7 @@ from telemetry_dev import TelemetrySpanProcessor
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `api_key` | `TELEMETRY_DEV_API_KEY` | Ingest key. Absent with no `span_exporter` = inert no-op. |
-| `base_url` | `TELEMETRY_DEV_BASE_URL` or `https://ingest.telemetry.dev` | Ingest base URL; trailing slashes are stripped. |
+| `base_url` | `TELEMETRY_DEV_BASE_URL` or `https://api.telemetry.dev` | Base URL; trailing slashes are stripped. |
 | `export_mode` | `"batched"` | `"batched"` or `"immediate"` span export. |
 | `max_export_batch_size` | `64` | BatchSpanProcessor export batch size. |
 | `schedule_delay_millis` | `1000` | BatchSpanProcessor schedule delay. |
@@ -374,7 +378,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 exporter = OTLPSpanExporter(
-    endpoint="https://ingest.telemetry.dev/v1/traces",
+    endpoint="https://api.telemetry.dev/v1/traces",
     headers={"Authorization": f"Bearer {os.environ['TELEMETRY_DEV_API_KEY']}"},
 )
 provider = TracerProvider()
@@ -382,7 +386,7 @@ provider.add_span_processor(BatchSpanProcessor(exporter))
 trace.set_tracer_provider(provider)
 ```
 
-The Claude API can also send server-side spans to telemetry.dev through a Console destination. Set the endpoint to `https://ingest.telemetry.dev`. Set the `Authorization` header to `Bearer <telemetry.dev API key>`. For more information, refer to [Claude Platform](https://telemetry.dev/docs/integrations/claude-platform).
+The Claude API can also send server-side spans to telemetry.dev through a Console destination. Set the endpoint to `https://api.telemetry.dev`. Set the `Authorization` header to `Bearer <telemetry.dev API key>`. For more information, refer to [Claude Platform](https://telemetry.dev/docs/integrations/claude-platform).
 
 When the SDK and the Claude API send the spans of a request to the same telemetry.dev project, telemetry.dev counts the tokens of the request one time, from the API span. The SDK span stays in the trace with no tokens. telemetry.dev matches the two spans by the request ID or the response ID, so the API span does not have to be a child of the SDK span. If the Console destination uses an API key that is scoped to one environment, its API spans take over only the SDK spans of that environment.
 

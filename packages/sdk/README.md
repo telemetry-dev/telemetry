@@ -2,7 +2,7 @@
 
 Pure TypeScript SDK for [telemetry.dev](https://telemetry.dev): add LLM traces, logs, and GenAI
 metrics to any app. Built on OpenTelemetry — spans use the `gen_ai.*` semantic conventions and
-ship as OTLP protobuf to `https://ingest.telemetry.dev`. Works on Node >= 20.19 and edge runtimes
+ship as OTLP protobuf to `https://api.telemetry.dev`. Works on Node >= 20.19 and edge runtimes
 (Vercel Edge, and Cloudflare Workers with Node.js compatibility, which is on by default for
 compatibility dates of 2026-08-04 or later; earlier dates need the `nodejs_compat` flag). ESM-only;
 CJS consumers can `require()` it on Node >= 20.19.
@@ -59,12 +59,16 @@ Without an API key every call is a silent no-op — the SDK never throws into yo
 
 ## Configuration
 
-| Option        | Env var                     | Default                        |
-| ------------- | --------------------------- | ------------------------------ |
-| `apiKey`      | `TELEMETRY_DEV_API_KEY`     | — (absent ⇒ no-op)             |
-| `baseUrl`     | `TELEMETRY_DEV_BASE_URL`    | `https://ingest.telemetry.dev` |
-| `environment` | `TELEMETRY_DEV_ENVIRONMENT` | `production`                   |
-| `serviceName` | `OTEL_SERVICE_NAME`         | `unknown_service`              |
+| Option        | Env var                     | Default                     |
+| ------------- | --------------------------- | --------------------------- |
+| `apiKey`      | `TELEMETRY_DEV_API_KEY`     | — (absent ⇒ no-op)          |
+| `baseUrl`     | `TELEMETRY_DEV_BASE_URL`    | `https://api.telemetry.dev` |
+| `environment` | `TELEMETRY_DEV_ENVIRONMENT` | `production`                |
+| `serviceName` | `OTEL_SERVICE_NAME`         | `unknown_service`           |
+
+Earlier versions sent data to `https://ingest.telemetry.dev` by default. That hostname reaches the
+same service and stays supported: if a firewall allows only it, set `TELEMETRY_DEV_BASE_URL` or
+`baseUrl` to it.
 
 Other `init()` options: `enabled` (kill switch), `registerGlobal`, `exportMode: "batched" |
 "immediate"`, `captureInput` / `captureOutput`, `mask(value, { key })` redaction hook,
@@ -157,7 +161,7 @@ const pinned = await getPrompt("support/reply", { version: 13 });
   its prompt.
 - getPrompt uses the API key and base URL of an enabled `init()`, or `TELEMETRY_DEV_API_KEY` and
   `TELEMETRY_DEV_BASE_URL`, or its own `apiKey`, `baseUrl`, and `fetch` options. It reads the same
-  host that telemetry goes to, `https://ingest.telemetry.dev` by default. The key needs the read
+  host that telemetry goes to, `https://api.telemetry.dev` by default. The key needs the read
   scope for prompts.
 - When a label sends part of the traffic to a second version, each session keeps one version: the
   choice uses the session id of `propagateAttributes` (or of `sessionMode: "process"`). Without a
@@ -268,7 +272,7 @@ Alternatively `init({ registerGlobal: true })` makes the SDK's provider the app'
 that mode only this SDK's spans are exported by default.
 
 Any vanilla OTel app can also skip the SDK entirely: point a stock OTLP/HTTP protobuf exporter at
-`https://ingest.telemetry.dev/v1/traces` with an `Authorization: Bearer td_live_...` header.
+`https://api.telemetry.dev/v1/traces` with an `Authorization: Bearer td_live_...` header.
 
 ### Native Claude SDK spans
 

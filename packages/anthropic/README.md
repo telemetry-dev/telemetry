@@ -14,6 +14,10 @@ Requires `@anthropic-ai/sdk` 0.110.0 or a later 0.x release, and `@telemetry-dev
 
 Set `TELEMETRY_DEV_API_KEY` for telemetry export and `ANTHROPIC_API_KEY` for Anthropic.
 
+Versions of `@telemetry-dev/sdk` before 0.2.0 sent data to `https://ingest.telemetry.dev` by
+default. That hostname reaches the same service and stays supported: if a firewall allows only it,
+set `TELEMETRY_DEV_BASE_URL` to it.
+
 ## Per-client wrapping
 
 ```ts

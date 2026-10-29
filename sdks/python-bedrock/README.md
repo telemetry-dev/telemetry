@@ -61,6 +61,10 @@ bedrock.converse(
 telemetry_dev.shutdown()
 ```
 
+Versions of `telemetry-dev` before 0.3.0 sent data to `https://ingest.telemetry.dev` by default.
+That hostname reaches the same service and stays supported: if a firewall allows only it, set
+`TELEMETRY_DEV_BASE_URL` to it.
+
 `wrap_bedrock` accepts either a `bedrock-runtime` or `bedrock-agent-runtime` boto3 client. It patches the operation methods on that instance and is idempotent.
 
 ## Global instrumentation

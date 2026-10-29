@@ -95,7 +95,7 @@ import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import { BatchSpanProcessor, NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 
 const exporter = new OTLPTraceExporter({
-  url: "https://ingest.telemetry.dev/v1/traces",
+  url: "https://api.telemetry.dev/v1/traces",
   headers: { Authorization: `Bearer ${process.env.TELEMETRY_DEV_API_KEY}` },
 });
 const provider = new NodeTracerProvider({
@@ -104,25 +104,29 @@ const provider = new NodeTracerProvider({
 provider.register();
 ```
 
-The Claude API can also send server-side spans to telemetry.dev through a Console destination. Set the endpoint to `https://ingest.telemetry.dev`. Set the `Authorization` header to `Bearer <telemetry.dev API key>`. For more information, refer to [Claude Platform](https://telemetry.dev/docs/integrations/claude-platform).
+The Claude API can also send server-side spans to telemetry.dev through a Console destination. Set the endpoint to `https://api.telemetry.dev`. Set the `Authorization` header to `Bearer <telemetry.dev API key>`. For more information, refer to [Claude Platform](https://telemetry.dev/docs/integrations/claude-platform).
 
 When the SDK and the Claude API send the spans of a request to the same telemetry.dev project, telemetry.dev counts the tokens of the request one time, from the API span. The SDK span stays in the trace with no tokens. telemetry.dev matches the two spans by the request ID or the response ID, so the API span does not have to be a child of the SDK span. If the Console destination uses an API key that is scoped to one environment, its API spans take over only the SDK spans of that environment.
 
 ## Options
 
-| Option         | Fallback                                                      | Default / behavior                                                                                                    |
-| -------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `apiKey`       | `TELEMETRY_DEV_API_KEY`                                       | When absent and no `spanExporter` override is provided, the processor is a no-op.                                     |
-| `baseUrl`      | `TELEMETRY_DEV_BASE_URL`, then `https://ingest.telemetry.dev` | Trailing slashes are removed before building OTLP URLs.                                                               |
-| `exportMode`   | —                                                             | `"batched"`; use `"immediate"` for serverless paths that flush explicitly.                                            |
-| `batch`        | —                                                             | Merged over `{ maxExportBatchSize: 64, scheduledDelayMillis: 1000, maxQueueSize: 2048, exportTimeoutMillis: 30000 }`. |
-| `spanFilter`   | —                                                             | Exports every span by default because attaching the processor is an explicit BYO choice.                              |
-| `metrics`      | —                                                             | `true`; records GenAI duration/token histograms when an API key is present.                                           |
-| `serviceName`  | `OTEL_SERVICE_NAME`                                           | `unknown_service`; used on the metrics resource.                                                                      |
-| `environment`  | `TELEMETRY_DEV_ENVIRONMENT`                                   | `production`; used as `deployment.environment.name` on the metrics resource.                                          |
-| `fetch`        | —                                                             | `globalThis.fetch`; override for tests or custom runtimes.                                                            |
-| `onError`      | —                                                             | Receives export and processor errors, which diagnostics also get. A series of failed exports is one report.           |
-| `spanExporter` | —                                                             | Advanced/test seam replacing the built-in OTLP trace exporter.                                                        |
+| Option         | Fallback                                                   | Default / behavior                                                                                                    |
+| -------------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `apiKey`       | `TELEMETRY_DEV_API_KEY`                                    | When absent and no `spanExporter` override is provided, the processor is a no-op.                                     |
+| `baseUrl`      | `TELEMETRY_DEV_BASE_URL`, then `https://api.telemetry.dev` | Trailing slashes are removed before building OTLP URLs.                                                               |
+| `exportMode`   | —                                                          | `"batched"`; use `"immediate"` for serverless paths that flush explicitly.                                            |
+| `batch`        | —                                                          | Merged over `{ maxExportBatchSize: 64, scheduledDelayMillis: 1000, maxQueueSize: 2048, exportTimeoutMillis: 30000 }`. |
+| `spanFilter`   | —                                                          | Exports every span by default because attaching the processor is an explicit BYO choice.                              |
+| `metrics`      | —                                                          | `true`; records GenAI duration/token histograms when an API key is present.                                           |
+| `serviceName`  | `OTEL_SERVICE_NAME`                                        | `unknown_service`; used on the metrics resource.                                                                      |
+| `environment`  | `TELEMETRY_DEV_ENVIRONMENT`                                | `production`; used as `deployment.environment.name` on the metrics resource.                                          |
+| `fetch`        | —                                                          | `globalThis.fetch`; override for tests or custom runtimes.                                                            |
+| `onError`      | —                                                          | Receives export and processor errors, which diagnostics also get. A series of failed exports is one report.           |
+| `spanExporter` | —                                                          | Advanced/test seam replacing the built-in OTLP trace exporter.                                                        |
+
+Earlier versions sent data to `https://ingest.telemetry.dev` by default. That hostname reaches the
+same service and stays supported: if a firewall allows only it, set `baseUrl` or
+`TELEMETRY_DEV_BASE_URL` to it.
 
 ## Missing API key behavior
 

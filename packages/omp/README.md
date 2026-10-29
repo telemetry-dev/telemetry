@@ -36,14 +36,17 @@ extensions.
 
 ## Environment
 
-| Variable                    | Required | Default                        | Notes                                                                   |
-| --------------------------- | -------- | ------------------------------ | ----------------------------------------------------------------------- |
-| `TELEMETRY_DEV_API_KEY`     | yes      | —                              | Ingest key (`td_live_…`). No key ⇒ the integration is a complete no-op. |
-| `TELEMETRY_DEV_BASE_URL`    | no       | `https://ingest.telemetry.dev` | Trailing slashes are stripped.                                          |
-| `TELEMETRY_DEV_ENVIRONMENT` | no       | `production`                   | Environment label on every trace/log.                                   |
-| `OTEL_SERVICE_NAME`         | no       | `omp`                          | OpenTelemetry service name.                                             |
+| Variable                    | Required | Default                     | Notes                                                                   |
+| --------------------------- | -------- | --------------------------- | ----------------------------------------------------------------------- |
+| `TELEMETRY_DEV_API_KEY`     | yes      | —                           | Ingest key (`td_live_…`). No key ⇒ the integration is a complete no-op. |
+| `TELEMETRY_DEV_BASE_URL`    | no       | `https://api.telemetry.dev` | Trailing slashes are stripped.                                          |
+| `TELEMETRY_DEV_ENVIRONMENT` | no       | `production`                | Environment label on every trace/log.                                   |
+| `OTEL_SERVICE_NAME`         | no       | `omp`                       | OpenTelemetry service name.                                             |
 
 All four are also settable through SDK options when loading the extension directly:
+
+Earlier versions sent data to `https://ingest.telemetry.dev` by default. That hostname reaches the
+same service and stays supported: if a firewall allows only it, set `TELEMETRY_DEV_BASE_URL` to it.
 
 ```ts
 import { telemetryDevExtension } from "@telemetry-dev/omp";

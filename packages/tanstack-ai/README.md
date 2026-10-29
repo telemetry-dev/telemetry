@@ -24,15 +24,19 @@ Requires `@tanstack/ai >= 0.28.0 < 1` for `chat()`. The `decide()` activity requ
 
 ## Environment
 
-| Variable                    | Required | Default                        | Notes                                                                  |
-| --------------------------- | -------- | ------------------------------ | ---------------------------------------------------------------------- |
-| `TELEMETRY_DEV_API_KEY`     | yes      | —                              | Ingest key (`td_live_…`). No key ⇒ the middleware is a complete no-op. |
-| `TELEMETRY_DEV_BASE_URL`    | no       | `https://ingest.telemetry.dev` | Trailing slashes are stripped.                                         |
-| `TELEMETRY_DEV_ENVIRONMENT` | no       | `production`                   | Environment label on every trace.                                      |
-| `OTEL_SERVICE_NAME`         | no       | `unknown_service`              | Service name on every trace.                                           |
+| Variable                    | Required | Default                     | Notes                                                                  |
+| --------------------------- | -------- | --------------------------- | ---------------------------------------------------------------------- |
+| `TELEMETRY_DEV_API_KEY`     | yes      | —                           | Ingest key (`td_live_…`). No key ⇒ the middleware is a complete no-op. |
+| `TELEMETRY_DEV_BASE_URL`    | no       | `https://api.telemetry.dev` | Trailing slashes are stripped.                                         |
+| `TELEMETRY_DEV_ENVIRONMENT` | no       | `production`                | Environment label on every trace.                                      |
+| `OTEL_SERVICE_NAME`         | no       | `unknown_service`           | Service name on every trace.                                           |
 
 All four are also settable via `telemetryDev({ apiKey, baseUrl, environment, serviceName })`, which
 takes precedence over the environment.
+
+Earlier versions sent data to `https://ingest.telemetry.dev` by default. That hostname reaches the
+same service and stays supported: if a firewall allows only it, set `TELEMETRY_DEV_BASE_URL` or
+`baseUrl` to it.
 
 Trace sampling uses `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG`, which also control session roots.
 The default is parent-based always-on.
