@@ -97,9 +97,11 @@ export interface ChatPrompt extends PromptBase {
   /**
    * Fills in the variables and replaces each placeholder message with the messages in its
    * variable. `withPrompt` records the variables of the last call before it starts or inside it.
-   * It tags each message object that it makes with this prompt and a copy of these variables, so
-   * that a model call outside `withPrompt` that sends the message records them; see
-   * `promptAttributesFor`. The message keeps the variables alive while it lives.
+   * It tags each message object that it makes with this prompt and a copy of these variables and
+   * of each list in them, so that a model call outside `withPrompt` that sends the message records
+   * them; see `promptAttributesFor`. The objects in a list are not copied. The tag keeps no
+   * variables when input capture is off in the client. It drops them when a compile 100 or more
+   * compiles newer takes one of its messages in a variable, as a chat history does.
    */
   compile<M = ChatMessage>(variables?: PromptVariables<M>): (ChatMessage | M)[];
 }
@@ -205,7 +207,8 @@ interface PromptScope {
 /** The `compile()` call that made a chat message. */
 interface CompileTag {
   readonly prompt: Prompt;
-  readonly variables: PromptVariables<unknown>;
+  /** Undefined when input capture was off, or when the messages became a history; see HISTORY_AGE. */
+  variables: PromptVariables<unknown> | undefined;
   /** Counts the compiles of the process, so a higher one is newer. */
   readonly serial: number;
 }
@@ -225,6 +228,13 @@ const PROMPT_KEY = createContextKey("telemetry.dev prompt");
 const COMPILED_BY = Symbol("telemetry.dev compiled by");
 /** How many messages promptAttributesFor looks at, at each end of the list. */
 const TAG_LOOKUP = 1_000;
+/**
+ * A compile drops its variables when a compile at least this many compiles newer takes one of its
+ * messages in a variable: its messages are then the history of a chat, and the newest compile names
+ * the request. Without this, a history that keeps a compiled message of each turn would keep the
+ * history list of every turn.
+ */
+const HISTORY_AGE = 100;
 
 const cache = new Map<string, CacheEntry>();
 const compiledVariables = new WeakMap<Prompt, object>();
@@ -375,8 +385,9 @@ export function promptAttributes(
  * of messages, or one message): those of the newest `compile()` of a chat prompt that made one of
  * the messages. It looks at the first 1000 and the last 1000 messages. The tag is on the message
  * object, so a copy of it gives nothing. Gives undefined inside `withPrompt`, whose prompt the span
- * gets. `td.prompt.variables` needs input capture on in the client, and the span drops it when its
- * own input capture is off. It never throws.
+ * gets. `td.prompt.variables` needs input capture on in the client, at the compile and now, and
+ * the span drops it when its own input capture is off. A compile whose messages became the history
+ * of a newer compile gives no variables; see `compile()`. It never throws.
  */
 export function promptAttributesFor(messages: unknown): Record<string, AttributeValue> | undefined {
   const config = currentClient().core?.config;
@@ -622,8 +633,7 @@ function createPrompt(input: {
     responseFormat: content.responseFormat,
     isFallback: input.isFallback,
     compile(variables: PromptVariables<unknown> = {}) {
-      // A copy, so that a later change of the app's object does not change what a span records.
-      const values = { ...variables };
+      const values = copyVariables(variables);
       compiledVariables.set(prompt, values);
       const scope = activeContext().getValue(PROMPT_KEY) as PromptScope | undefined;
 
@@ -631,20 +641,48 @@ function createPrompt(input: {
 
       if (type === "text") return fill(content.text ?? "", values);
       compiles += 1;
+      dropHistory(values, compiles);
+      // promptAttributesFor cannot record the variables when input capture is off in the client.
+      const captureInput = currentClient().core?.config.captureInput ?? true;
 
-      return compileMessages(
-        content.messages,
-        Object.freeze({ prompt, variables: values, serial: compiles }),
-      );
+      return compileMessages(content.messages, values, {
+        prompt,
+        variables: captureInput ? values : undefined,
+        serial: compiles,
+      });
     },
   }) as Prompt;
 
   return prompt;
 }
 
-function compileMessages(messages: readonly PromptMessage[], tag: CompileTag): unknown[] {
-  const { variables } = tag;
+// A copy of each list too, so that a change of the app's history after compile() does not change
+// what a span records.
+function copyVariables(variables: PromptVariables<unknown>): PromptVariables<unknown> {
+  return Object.fromEntries(
+    Object.entries(variables).map(([name, value]) => [
+      name,
+      Array.isArray(value) ? [...value] : value,
+    ]),
+  );
+}
 
+/** Drops the variables of each older compile whose message is in `variables`; see HISTORY_AGE. */
+function dropHistory(variables: PromptVariables<unknown>, serial: number): void {
+  for (const value of Object.values(variables)) {
+    for (const item of Array.isArray(value) ? value : [value]) {
+      const tag = tagOf(item);
+
+      if (tag && serial - tag.serial >= HISTORY_AGE) tag.variables = undefined;
+    }
+  }
+}
+
+function compileMessages(
+  messages: readonly PromptMessage[],
+  variables: PromptVariables<unknown>,
+  tag: CompileTag,
+): unknown[] {
   return messages.flatMap((message) => {
     if (message.role !== "placeholder") {
       const compiled = { role: message.role, content: fill(message.content, variables) };

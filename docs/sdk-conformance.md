@@ -183,14 +183,15 @@ Outside a scope, the SDKs find the prompt from the message objects of the reques
 their text:
 
 - `compile()` of a chat prompt tags each message object that it makes with the prompt, a copy of
-  the top level of the variables of that call, and a serial number that grows with each chat
-  compile in the process. It does not tag the messages of a placeholder variable: the app passes
-  those, and they keep the tag of their own compile. TypeScript: a non-enumerable symbol
-  property; the keys and the JSON of a message do not change. Python: the messages are instances
-  of a private `dict` subclass that holds the tag in a slot. `isinstance(message, dict)` is true
-  and the keys and the JSON do not change, but a check of the exact type
-  (`type(message) is dict`), `yaml.safe_dump`, and `marshal` reject it. Its constructor is the
-  one of `dict`.
+  the variables of that call and of each list in them (not of the objects in a list), and a serial
+  number that grows with each chat compile in the process. With input capture off in the client
+  at that time, the tag holds no variables. It does not tag the messages of a placeholder
+  variable: the app passes those, and they keep the tag of their own compile. TypeScript: a
+  non-enumerable symbol property; the keys and the JSON of a message do not change. Python: the
+  messages are instances of a private `dict` subclass that holds the tag in a slot.
+  `isinstance(message, dict)` is true and the keys and the JSON do not change, but a check of the
+  exact type (`type(message) is dict`), `yaml.safe_dump`, and `marshal` reject it. Its
+  constructor is the one of `dict`.
 - A copy has no tag: a spread, `structuredClone`, or a JSON round trip (TypeScript); `dict()`,
   `.copy()`, `copy.copy`, `copy.deepcopy`, pickle, a JSON round trip, `type(message)(message)`, or
   `dataclasses.asdict` (Python). A new message with the same text has no tag either, thus a
@@ -203,17 +204,21 @@ their text:
   They do not look inside a message.
 - In a `withPrompt` / `with_prompt` scope they give nothing. A model-call span whose parent context
   is in a scope gets the attributes of the scope and drops each `td.prompt.*` attribute that the
-  app passes, also when the app calls these functions outside the scope and passes an explicit
-  parent. They never throw: an error goes to `onError` / `on_error`.
-- They give `td.prompt.variables` only when input capture is on in the client. Then they
-  serialize the variables, which calls the `mask` of the client. A span whose effective
-  captureInput is off drops `td.prompt.variables` from its attributes, also when the app passes
-  the result of these functions to its own span.
-- A tagged message keeps the variables of its compile alive while the message lives, with the
-  lists of its placeholder variables. Thus a chat history that keeps a compiled message of each
-  turn keeps the history list of each turn. The SDKs keep no other reference to the variables,
-  except those of the last compile of each prompt object and of each running scope, for
-  `withPrompt` / `with_prompt`.
+  app passes, at start and in each update (`update`, `end`, `updateActiveSpan` /
+  `update_current_span`), also when the app calls these functions outside the scope and passes an
+  explicit parent. They never throw: an error goes to `onError` / `on_error`.
+- They give `td.prompt.variables` only when input capture is on in the client, at the compile and
+  at the call. Then they serialize the variables, which calls the `mask` of the client. A span
+  whose effective captureInput is off drops `td.prompt.variables` from its attributes, also when
+  the app passes the result of these functions to its own span.
+- A tag keeps the variables of its compile alive while a message of the compile lives. When a
+  chat compile gets a tagged message as a variable, or as an item of a list (Python: a list or
+  tuple) in a variable, and the tag is at least 100 serial numbers older, the older tag drops its
+  variables. Thus a chat history that keeps a compiled message of each turn keeps the variables of
+  about the last 100 compiles, not of each turn, and a request with only such messages records no
+  `td.prompt.variables`. The SDKs do not look deeper in a variable. They keep no other reference to
+  the variables, except those of the last compile of each prompt object and of each running scope,
+  for `withPrompt` / `with_prompt`.
 - `compile()` of a text prompt returns a string, which cannot carry a tag. Outside a scope, the
   SDKs do not record a text prompt: use `withPrompt` / `with_prompt`.
 - The provider integrations call them with the request messages before the span starts, also

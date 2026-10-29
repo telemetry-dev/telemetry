@@ -985,7 +985,8 @@ def test_a_message_that_a_placeholder_brings_from_an_older_compile_does_not_win(
         name="summary",
     )
 
-    routed = answer.compile(team="billing", history=router.compile(question="Where is #4?"))
+    question = router.compile(question="Where is #4?")
+    routed = answer.compile(team="billing", history=question)
     # The last 1000 messages are all from chat; the summary message is the first.
     conversation = [chat.compile(question=f"question {index}")[0] for index in range(1500)]
     summarized = summary.compile(history=conversation)
@@ -999,6 +1000,13 @@ def test_a_message_that_a_placeholder_brings_from_an_older_compile_does_not_win(
         ),
     }
     assert prompt_attributes_for(summarized)["td.prompt.name"] == "summary"
+    # A newer compile that takes a message of a recent compile does not drop its variables.
+    assert prompt_attributes_for(question) == {
+        "td.prompt.name": "router",
+        "td.prompt.version": 12,
+        "td.prompt.label": "production",
+        "td.prompt.variables": '{"question":"Where is #4?"}',
+    }
 
 
 def test_prompt_attributes_for_looks_at_the_first_and_the_last_1000_messages(
@@ -1016,24 +1024,37 @@ def test_prompt_attributes_for_looks_at_the_first_and_the_last_1000_messages(
     assert prompt_attributes_for(around(1000, 1000)) == {}
 
 
-def test_compile_records_its_variables_not_later_changes_of_the_mapping(
+def test_compile_records_its_variables_not_later_changes_of_the_mapping_or_of_its_lists(
     make: MakeClient,
 ) -> None:
     memory = make()
-    prompt = chat_prompt({"role": "user", "content": "Order {{order}}"})
-    variables = {"order": "#A"}
+    prompt = chat_prompt(
+        {"role": "placeholder", "name": "history"},
+        {"role": "user", "content": "Order {{order}}"},
+    )
+    history = [{"role": "user", "content": "Hi"}]
+    variables: dict[str, Any] = {"order": "#A", "history": history}
 
     first = prompt.compile(variables)
     variables["order"] = "#B"
+    history.append({"role": "assistant", "content": "Hello"})
     second = prompt.compile(variables)
     variables["order"] = "#C"
+    history.append({"role": "user", "content": "Added after compile"})
     with with_prompt(prompt):
         start_span("scope", type="generation").end()
 
-    assert prompt_attributes_for(first)["td.prompt.variables"] == '{"order":"#A"}'
-    assert prompt_attributes_for(second)["td.prompt.variables"] == '{"order":"#B"}'
+    second_variables = (
+        '{"order":"#B","history":[{"role":"user","content":"Hi"},'
+        '{"role":"assistant","content":"Hello"}]}'
+    )
+    assert (
+        prompt_attributes_for(first)["td.prompt.variables"]
+        == '{"order":"#A","history":[{"role":"user","content":"Hi"}]}'
+    )
+    assert prompt_attributes_for(second)["td.prompt.variables"] == second_variables
     [span] = memory.span_exporter.get_finished_spans()
-    assert (span.attributes or {})["td.prompt.variables"] == '{"order":"#B"}'
+    assert (span.attributes or {})["td.prompt.variables"] == second_variables
 
 
 def test_a_compiled_message_rebuilds_like_a_dict_and_the_rebuilt_one_has_no_tag(
@@ -1059,7 +1080,7 @@ def test_a_compiled_message_rebuilds_like_a_dict_and_the_rebuilt_one_has_no_tag(
     assert prompt_attributes_for(same_type) == {}
 
 
-def test_with_prompt_wins_over_a_compiled_message_of_another_prompt_also_through_a_parent(
+def test_with_prompt_wins_over_a_compiled_message_of_another_prompt_through_a_parent_and_in_updates(
     make: MakeClient,
 ) -> None:
     memory = make()
@@ -1077,9 +1098,22 @@ def test_with_prompt_wins_over_a_compiled_message_of_another_prompt_also_through
         parent = otel_context.get_current()
     attributes = prompt_attributes_for(compiled)
     start_span("with parent", type="generation", parent=parent, attributes=attributes).end()
+    with with_prompt(scoped):
+        start_span("updated", type="generation").update(attributes=attributes).end()
+        start_span("ended", type="generation").end(attributes=attributes)
+        with start_span("current", type="generation"):
+            telemetry_dev.update_current_span(attributes=attributes)
 
     assert attributes["td.prompt.name"] == "other/prompt"
-    for span in memory.span_exporter.get_finished_spans():
+    spans = memory.span_exporter.get_finished_spans()
+    assert sorted(span.name for span in spans) == [
+        "current",
+        "ended",
+        "in scope",
+        "updated",
+        "with parent",
+    ]
+    for span in spans:
         assert {
             key: value
             for key, value in dict(span.attributes or {}).items()
@@ -1147,28 +1181,92 @@ def test_prompt_attributes_for_runs_no_code_of_the_app(make: MakeClient) -> None
     assert reads == []
 
 
+RAG_MESSAGES = [
+    {"role": "system", "content": "Answer from {{documents}}."},
+    {"role": "user", "content": "{{question}}"},
+]
+
+
+class Document(dict[str, str]):
+    """A dict that a weak reference can point to."""
+
+
 def test_the_variables_of_a_compile_are_freed_with_its_messages(make: MakeClient) -> None:
+    make()
+    prompt = chat_prompt(*RAG_MESSAGES)
+
+    document = Document(content="The refund policy")
+    freed = weakref.ref(document)
+    messages = prompt.compile(documents=[document], question="q")
+    del document
+    # with_prompt keeps the variables of the last compile of a prompt object.
+    prompt.compile(documents=[], question="other")
+    gc.collect()
+    assert freed() is not None
+
+    assert len(messages) == 2
+    del messages
+    gc.collect()
+    assert freed() is None
+
+
+def test_with_input_capture_off_compiled_messages_keep_no_variables(make: MakeClient) -> None:
+    make(capture_input=False)
+    prompt = chat_prompt(*RAG_MESSAGES)
+    documents: list[weakref.ref[Document]] = []
+    questions: list[dict[str, Any]] = []
+
+    for turn in range(200):
+        document = Document(content=f"document {turn}")
+        documents.append(weakref.ref(document))
+        questions.append(prompt.compile(documents=[document], question=f"question {turn}")[-1])
+    gc.collect()
+
+    # with_prompt keeps the variables of the last compile of a prompt object.
+    assert sum(1 for document in documents if document() is not None) == 1
+
+    telemetry_dev.shutdown()
+    make()
+    assert prompt_attributes_for(questions) == {
+        "td.prompt.name": "support/reply",
+        "td.prompt.version": 12,
+        "td.prompt.label": "production",
+    }
+
+
+def test_a_chat_history_of_compiled_messages_keeps_the_variables_of_a_bounded_number_of_turns(
+    make: MakeClient,
+) -> None:
     make()
     prompt = chat_prompt(
         {"role": "system", "content": "Answer as the {{team}} desk."},
         {"role": "placeholder", "name": "history"},
+        {"role": "user", "content": "{{question}}"},
     )
+    turns: list[weakref.ref[Document]] = []
+    history: list[dict[str, Any]] = []
+    last: list[dict[str, Any]] = []
 
-    class History(list[dict[str, str]]):
-        """A list that a weak reference can point to."""
+    # Each turn keeps its compiled question in the history. An unused variable marks the variables
+    # of the turn.
+    def chat(count: int) -> int:
+        nonlocal history, last
+        for _ in range(count):
+            marker = Document(content=f"turn {len(turns)}")
+            turns.append(weakref.ref(marker))
+            last = prompt.compile(
+                team="billing", question=f"question {len(turns)}", history=history, marker=marker
+            )
+            history = [*history, last[-1], {"role": "assistant", "content": f"answer {len(turns)}"}]
+        gc.collect()
+        return sum(1 for turn in turns if turn() is not None)
 
-    history = History([{"role": "user", "content": "Hi"}])
-    freed = weakref.ref(history)
-    messages = prompt.compile(team="billing", history=history)
-    del history
-    # with_prompt keeps the variables of the last compile of a prompt object.
-    prompt.compile(team="returns")
-    gc.collect()
-    assert freed() is not None
+    kept = chat(150)
+    assert kept < 150
+    assert chat(150) == kept
 
-    del messages
-    gc.collect()
-    assert freed() is None
+    variables = json.loads(str(prompt_attributes_for(last)["td.prompt.variables"]))
+    assert len(variables["history"]) == 598
 
 
 def test_a_fallback_prompt_records_its_name_and_label_but_no_version(

@@ -182,29 +182,36 @@ and TanStack AI integrations, and from other OpenTelemetry tracers, do not get t
 
 Outside `withPrompt`, those provider integrations record the prompt of the message objects that
 `compile()` returned. `compile()` of a chat prompt tags each message that it makes with its prompt
-and a copy of its variables, in a non-enumerable symbol property: the keys and the JSON of the
-message do not change. A chat call that sends tagged messages gets `td.prompt.name`,
-`td.prompt.version`, and `td.prompt.label` of the newest `compile()` among them, also when input
-capture is off, and `td.prompt.variables` when it is on. The SDK looks at the first 1000 and the
-last 1000 messages of the call. A message from a placeholder variable keeps the tag of its own,
-older `compile()`, so it does not win over the `compile()` that put it in the list. A copy of a
-message (a spread, `structuredClone`, or JSON) and a new message with the same text have no tag,
-so the SDK does not record them. Bedrock Converse and Google GenAI take another message shape:
-change the compiled messages in place, or use `withPrompt`. A text prompt compiles to a string,
-which cannot carry a tag: use `withPrompt`. `withPrompt` wins over the tag. The integrations do it
-for OpenAI chat completions and responses, Anthropic messages, Bedrock Converse, Google GenAI
-`generateContent`, and OpenRouter chat and responses, but not for Bedrock InvokeModel (its body is
-bytes), embeddings, images, audio, video, or OpenAI Realtime.
+and a copy of its variables and of each list in them, in a non-enumerable symbol property: the keys
+and the JSON of the message do not change. The objects in a list are not copied, so a change to one
+of them after `compile()` changes the variables that a call records. A chat call that sends tagged
+messages gets `td.prompt.name`, `td.prompt.version`, and `td.prompt.label` of the newest `compile()`
+among them, also when input capture is off, and `td.prompt.variables` when it is on. The SDK looks
+at the first 1000 and the last 1000 messages of the call. A message from a placeholder variable
+keeps the tag of its own, older `compile()`, so it does not win over the `compile()` that put it in
+the list. A copy of a message (a spread, `structuredClone`, or JSON) and a new message with the same
+text have no tag, so the SDK does not record them. Bedrock Converse and Google GenAI take another
+message shape: change the compiled messages in place, or use `withPrompt`. A text prompt compiles to
+a string, which cannot carry a tag: use `withPrompt`. `withPrompt` wins over the tag. The
+integrations do it for OpenAI chat completions and responses, Anthropic messages, Bedrock Converse,
+Google GenAI `generateContent`, and OpenRouter chat and responses, but not for Bedrock InvokeModel
+(its body is bytes), embeddings, images, audio, video, or OpenAI Realtime.
 
-A tagged message keeps the variables of its `compile()` alive while the message lives, with the
-lists of its placeholder variables. If you keep compiled messages in a long chat history, put
-copies (`{ ...message }`) in the history: else each turn keeps the history list of its own turn.
+With input capture on in the client when `compile()` runs, a tagged message keeps the variables of
+its `compile()` alive while the message lives. With input capture off, the tag keeps no variables.
+When `compile()` gets a message in a variable, or in a list in a variable (for example a chat
+history in a placeholder), and the message is from a `compile()` at least 100 compiles older, that
+older `compile()` drops its variables. Thus a chat history of compiled messages keeps the variables
+of about the last 100 compiles, not of each turn. A call that sends only messages of such an older
+`compile()` records its prompt without `td.prompt.variables`. The SDK does not look deeper in a
+variable for messages.
 
 For your own spans, `promptAttributesFor(messages)` gives the attributes to pass as `attributes`.
 It gives nothing inside `withPrompt`, and a span with `captureInput: false` drops
 `td.prompt.variables`. A model call whose parent is in `withPrompt` gets the prompt of the
-`withPrompt` and none of the `td.prompt.*` attributes that you pass, also when its `parent` option
-leads into a `withPrompt` that the call is not in.
+`withPrompt` and none of the `td.prompt.*` attributes that you pass, at start or in `update`,
+`end`, or `updateActiveSpan`, also when its `parent` option leads into a `withPrompt` that the call
+is not in.
 
 ## API
 

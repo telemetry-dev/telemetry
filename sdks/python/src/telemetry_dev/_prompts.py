@@ -14,7 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import OrderedDict
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -53,6 +53,11 @@ _MODEL_CALL_OPERATIONS = frozenset({"chat", "text_completion", "generate_content
 _PROMPT_KEY = otel_context.create_key("telemetry_dev.prompt")
 # How many messages prompt_attributes_for looks at, at each end of the list.
 _TAG_LOOKUP = 1000
+# A compile drops its variables when a compile at least this many compiles newer takes one of its
+# messages in a variable: its messages are then the history of a chat, and the newest compile names
+# the request. Without this, a history that keeps a compiled message of each turn would keep the
+# history list of every turn.
+_HISTORY_AGE = 100
 
 
 class PromptModel(TypedDict):
@@ -102,12 +107,20 @@ class ChatPrompt:
         """Fill in the variables and replace each placeholder message with the list of messages
         in its variable. ``with_prompt`` records the variables of the last call before it starts
         or inside it. Each message that it makes is a ``dict`` subclass that also holds this
-        prompt and a copy of these variables, so that a model call outside ``with_prompt`` that
-        sends the message records them; see ``prompt_attributes_for``. The message keeps the
-        variables alive while it lives. A check of the exact type (``type(message) is dict``),
-        ``yaml.safe_dump``, and ``marshal`` reject it: give them ``dict(message)``."""
+        prompt and a copy of these variables and of each list in them, so that a model call
+        outside ``with_prompt`` that sends the message records them; see
+        ``prompt_attributes_for``. The objects in a list are not copied. The message holds no
+        variables when input capture is off in the client. It drops them when a compile 100 or
+        more compiles newer takes one of its messages in a variable, as a chat history does. A
+        check of the exact type (``type(message) is dict``), ``yaml.safe_dump``, and ``marshal``
+        reject it: give them ``dict(message)``."""
         values = _record(self, variables, kwargs)
-        tag = _CompileTag(self, values, next(_compiles))
+        serial = next(_compiles)
+        _drop_history(values, serial)
+        client = get_client()
+        # prompt_attributes_for cannot record the variables when input capture is off in the client.
+        kept = values if client is None or client.capture_input else None
+        tag = _CompileTag(self, kept, serial)
         compiled: list[dict[str, Any]] = []
         for message in self.messages:
             if message.get("role") != "placeholder":
@@ -304,7 +317,9 @@ def prompt_attributes_for(messages: object) -> dict[str, AttributeValue]:
     prompt that made one of the messages. It looks at the first 1000 and the last 1000 messages.
     The tag is on the dict that ``compile()`` made, so a copy of it gives ``{}``. Gives ``{}``
     inside ``with_prompt``, whose prompt the span gets. ``td.prompt.variables`` needs input
-    capture on in the client, and the span drops it when its own input capture is off.
+    capture on in the client, at the compile and now, and the span drops it when its own input
+    capture is off. A compile whose messages became the history of a newer compile gives no
+    variables; see ``ChatPrompt.compile``.
 
     It reads only a ``list`` or ``tuple``, not a subclass, so the read runs no code of the app.
     With input capture on, it serializes the variables, which calls the ``mask`` of the client and
@@ -439,7 +454,12 @@ _task_variables: ContextVar[tuple[_PromptScope, dict[str, Any]] | None] = Contex
 def _record(
     prompt: Prompt, variables: Mapping[str, Any] | None, kwargs: Mapping[str, Any]
 ) -> dict[str, Any]:
-    values = {**(variables or {}), **kwargs}
+    # A copy of each list too, so that a change of the app's history after compile() does not
+    # change what a span records.
+    values: dict[str, Any] = {
+        name: list(cast("list[Any]", value)) if isinstance(value, list) else value
+        for name, value in {**(variables or {}), **kwargs}.items()
+    }
     _compiled_variables[prompt] = values
     scope = otel_context.get_value(_PROMPT_KEY)
     if isinstance(scope, _PromptScope) and scope.prompt is prompt:
@@ -448,12 +468,13 @@ def _record(
     return values
 
 
-@dataclass(frozen=True)
+@dataclass(eq=False)
 class _CompileTag:
     """The ``compile()`` call that made a chat message."""
 
     prompt: ChatPrompt
-    variables: dict[str, Any]
+    variables: dict[str, Any] | None
+    """None when input capture was off, or when the messages became a history; see _HISTORY_AGE."""
     serial: int
     """Counts the compiles of the process, so a higher one is newer."""
 
@@ -471,6 +492,22 @@ class _CompiledMessage(dict[str, Any]):
 
     def __reduce__(self) -> tuple[type[dict[str, Any]], tuple[dict[str, Any]]]:
         return dict, (dict(self),)
+
+
+def _drop_history(values: Mapping[str, Any], serial: int) -> None:
+    """Drops the variables of each older compile whose message is in ``values``; see
+    _HISTORY_AGE."""
+    for value in values.values():
+        items: Sequence[object] = (
+            cast("Sequence[object]", value)
+            if type(value) is list or type(value) is tuple
+            else (value,)
+        )
+        for item in items:
+            if type(item) is _CompiledMessage:
+                tag = getattr(item, "compiled_by", None)
+                if tag is not None and serial - tag.serial >= _HISTORY_AGE:
+                    tag.variables = None
 
 
 def _newest_tag(messages: object) -> _CompileTag | None:
