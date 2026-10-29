@@ -19,11 +19,15 @@ export type { BatchOptions, ExportMode, LogLevel, SdkLogLevel } from "@telemetry
  */
 export type MaskFn<T = unknown> = (value: T, ctx: { key: string }) => T;
 
+export const DEFAULT_API_URL = "https://api.telemetry.dev";
+
 export interface TelemetryOptions {
   /** telemetry.dev ingest key (`td_live_…`). Falls back to `TELEMETRY_DEV_API_KEY`. When absent the SDK is a no-op. */
   apiKey?: string;
   /** Ingest base URL. Falls back to `TELEMETRY_DEV_BASE_URL`, then `https://ingest.telemetry.dev`. */
   baseUrl?: string;
+  /** API base URL for getPrompt. Falls back to `TELEMETRY_DEV_API_URL`, then `https://api.telemetry.dev`. */
+  apiUrl?: string;
   /** Deployment environment label. Falls back to `TELEMETRY_DEV_ENVIRONMENT`, then `production`. */
   environment?: string;
   /** Service name attached to every trace. Falls back to `OTEL_SERVICE_NAME`, then `unknown_service`. */
@@ -72,6 +76,7 @@ export interface TelemetryOptions {
 export interface ResolvedConfig {
   apiKey: string | undefined;
   baseUrl: string;
+  apiUrl: string;
   environment: string;
   serviceName: string;
   enabled: boolean;
@@ -123,9 +128,16 @@ export function resolveConfig(options: TelemetryOptions = {}): ResolvedConfig {
     "",
   );
 
+  // An empty value counts as unset, as in the Python SDK.
+  const apiUrl = (options.apiUrl || env.TELEMETRY_DEV_API_URL || DEFAULT_API_URL).replace(
+    /\/+$/,
+    "",
+  );
+
   return {
     apiKey: options.apiKey ?? env.TELEMETRY_DEV_API_KEY,
     baseUrl,
+    apiUrl,
     environment: options.environment ?? env.TELEMETRY_DEV_ENVIRONMENT ?? "production",
     serviceName: options.serviceName ?? env.OTEL_SERVICE_NAME ?? "unknown_service",
     enabled: options.enabled ?? true,
