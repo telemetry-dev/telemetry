@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.0](https://github.com/telemetry-dev/telemetry/compare/python-v0.2.13...python-v0.3.0) (2026-10-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* **sdk:** the default base URL for telemetry export and getPrompt/get_prompt is now https://api.telemetry.dev. https://ingest.telemetry.dev reaches the same service and stays supported; networks that allow only it should set TELEMETRY_DEV_BASE_URL to it.
+
+### Features
+
+* **sdk:** send to api.telemetry.dev by default ([#109](https://github.com/telemetry-dev/telemetry/issues/109)) ([ad8ccf3](https://github.com/telemetry-dev/telemetry/commit/ad8ccf3c41355683deb3b38dab4b604ecaa25a7a))
+
+
+### Bug Fixes
+
+* **sdk-python:** send a user agent with prompt fetches ([#108](https://github.com/telemetry-dev/telemetry/issues/108)) ([cbd7173](https://github.com/telemetry-dev/telemetry/commit/cbd7173db89f315ac48c8013df1d5f0a8059569c))
+
 ## [0.2.13](https://github.com/telemetry-dev/telemetry/compare/python-v0.2.12...python-v0.2.13) (2026-10-29)
 
 
