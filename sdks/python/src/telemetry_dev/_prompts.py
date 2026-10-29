@@ -4,11 +4,14 @@ import asyncio
 import contextlib
 import copy
 import hashlib
+import itertools
 import json
+import os
 import random
 import re
 import socket
 import threading
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -50,6 +53,10 @@ _HTTP_DATE = re.compile(r"[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\
 _VARIABLE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _MODEL_CALL_OPERATIONS = frozenset({"chat", "text_completion", "generate_content"})
 _PROMPT_KEY = otel_context.create_key("telemetry_dev.prompt")
+_MAX_COMPILED_TEXTS = 1000
+_MAX_COMPILED_CHARACTERS = 2_000_000
+_MAX_SEARCH_DEPTH = 6
+_MAX_SEARCH_NODES = 500
 
 
 class PromptModel(TypedDict):
@@ -98,14 +105,15 @@ class ChatPrompt:
     ) -> list[dict[str, Any]]:
         """Fill in the variables and replace each placeholder message with the list of messages
         in its variable. ``with_prompt`` records the variables of the last call before it starts
-        or inside it."""
+        or inside it. Each text is also kept with its variables (the last 1000 texts), so that a
+        model call outside ``with_prompt`` that sends it can name the prompt; see
+        ``prompt_attributes_for``."""
         values = _record(self, variables, kwargs)
         compiled: list[dict[str, Any]] = []
         for message in self.messages:
             if message.get("role") != "placeholder":
-                compiled.append(
-                    {"role": message["role"], "content": _fill(str(message["content"]), values)}
-                )
+                content = _compile_text(self, str(message["content"]), values)
+                compiled.append({"role": message["role"], "content": content})
                 continue
             name = str(message["name"])
             value = values.get(name)
@@ -141,8 +149,10 @@ class TextPrompt:
 
     def compile(self, variables: Mapping[str, Any] | None = None, /, **kwargs: Any) -> str:
         """Fill in the variables. ``with_prompt`` records the variables of the last call before it
-        starts or inside it."""
-        return _fill(self.text, _record(self, variables, kwargs))
+        starts or inside it. The text is also kept with its variables (the last 1000 texts), so
+        that a model call outside ``with_prompt`` that sends it can name the prompt; see
+        ``prompt_attributes_for``."""
+        return _compile_text(self, self.text, _record(self, variables, kwargs))
 
 
 Prompt: TypeAlias = ChatPrompt | TextPrompt
@@ -282,16 +292,45 @@ def prompt_attributes(
     scope = otel_context.get_value(_PROMPT_KEY, context) or otel_context.get_value(_PROMPT_KEY)
     if not isinstance(scope, _PromptScope):
         return {}
-    prompt = scope.prompt
+    task = _task_variables.get()
+    variables = task[1] if task is not None and task[0] is scope else scope.variables
+    return _attributes_of(scope.prompt, variables, client if capture_input else None)
+
+
+def prompt_attributes_for(request: object) -> dict[str, AttributeValue]:
+    """The td.prompt.* attributes for a model call outside ``with_prompt``, from the texts that
+    ``compile()`` made: the first text in ``request`` from a template with a variable, else the
+    first text from a template with none. Only the first gives ``td.prompt.variables``, because
+    only its text holds the values. Gives ``{}`` inside ``with_prompt``, whose prompt the span
+    gets, and when no text matches. It reads lists, tuples, dicts, and the fields that objects
+    store (pydantic models), 6 levels and 500 values deep, and runs no property. It never
+    raises."""
+    client = get_client()
+    try:
+        if isinstance(otel_context.get_value(_PROMPT_KEY), _PromptScope):
+            return {}
+        found = _compiled_texts.find(request)
+        if found is None:
+            return {}
+        capture = client if client is not None and client.capture_input else None
+        return _attributes_of(found.prompt, found.variables, capture)
+    except Exception as exc:
+        if client is not None:
+            client.report("prompt_attributes_for failed", exc)
+        return {}
+
+
+def _attributes_of(
+    prompt: Prompt, variables: dict[str, Any] | None, capture: Client | None
+) -> dict[str, AttributeValue]:
+    """The attributes of ``prompt``; ``capture`` is the client when input capture is on."""
     attrs: dict[str, AttributeValue] = {ATTR_PROMPT_NAME: prompt.name}
     if prompt.version is not None:
         attrs[ATTR_PROMPT_VERSION] = prompt.version
     if prompt.label is not None:
         attrs[ATTR_PROMPT_LABEL] = prompt.label
-    task = _task_variables.get()
-    variables = task[1] if task is not None and task[0] is scope else scope.variables
-    if variables is not None and capture_input:
-        serialized = client.serialize(variables, ATTR_PROMPT_VARIABLES)
+    if variables is not None and capture is not None:
+        serialized = capture.serialize(variables, ATTR_PROMPT_VARIABLES)
         if serialized is not None:
             attrs[ATTR_PROMPT_VARIABLES] = serialized
     return attrs
@@ -402,6 +441,137 @@ def _record(
         scope.variables = values
         _task_variables.set((scope, values))
     return values
+
+
+@dataclass(frozen=True)
+class _CompiledText:
+    """The prompt that ``compile()`` made a text from."""
+
+    prompt: Prompt
+    variables: dict[str, Any] | None
+    """Only for a template with a variable: the text holds the values, so they belong to it."""
+
+
+class _CompiledTexts:
+    """The texts of the last ``compile()`` calls, oldest first, for model calls outside
+    ``with_prompt``."""
+
+    def __init__(self) -> None:
+        self.texts: OrderedDict[str, _CompiledText] = OrderedDict()
+        self.characters = 0
+        self.longest = 0
+        self.lock = threading.Lock()
+
+    def remember(self, text: str, template: str, prompt: Prompt, values: dict[str, Any]) -> None:
+        """Keep ``text`` as the newest entry. A template of only variable tags is skipped: its
+        text is input of the app, which an unrelated request can hold too."""
+        fixed_text = _VARIABLE.sub("", template)
+        if not fixed_text.strip() or len(text) > _MAX_COMPILED_CHARACTERS:
+            return
+        compiled = _CompiledText(prompt, None if fixed_text == template else values)
+        with self.lock:
+            if self.texts.pop(text, None) is not None:
+                self.characters -= len(text)
+            self.texts[text] = compiled
+            self.characters += len(text)
+            self.longest = max(self.longest, len(text))
+            dropped_longest = False
+            while (
+                len(self.texts) > _MAX_COMPILED_TEXTS or self.characters > _MAX_COMPILED_CHARACTERS
+            ):
+                oldest, _ = self.texts.popitem(last=False)
+                self.characters -= len(oldest)
+                dropped_longest = dropped_longest or len(oldest) == self.longest
+            if dropped_longest:
+                self.longest = max(map(len, self.texts), default=0)
+
+    def find(self, request: object) -> _CompiledText | None:
+        first_static: _CompiledText | None = None
+        budget = _MAX_SEARCH_NODES
+        stack: list[tuple[object, int]] = [(request, 0)]
+        with self.lock:
+            while stack and budget > 0:
+                budget -= 1
+                value, depth = stack.pop()
+                if type(value) is str:
+                    found = self.texts.get(value) if len(value) <= self.longest else None
+                    if found is not None and found.variables is not None:
+                        return found
+                    first_static = first_static or found
+                elif depth < _MAX_SEARCH_DEPTH:
+                    children = _stored_values(value, budget)
+                    stack.extend((child, depth + 1) for child in reversed(children))
+        return first_static
+
+
+_compiled_texts = _CompiledTexts()
+
+
+def _lock_compiled_texts_before_fork() -> None:
+    _compiled_texts.lock.acquire()
+
+
+def _unlock_compiled_texts_after_fork() -> None:
+    _compiled_texts.lock.release()
+
+
+# fork() waits for the lock: the child has only the thread that forked, so a lock that another
+# thread held at the fork would stay held there for all time.
+if hasattr(os, "register_at_fork"):  # absent on Windows
+    os.register_at_fork(
+        before=_lock_compiled_texts_before_fork,
+        after_in_parent=_unlock_compiled_texts_after_fork,
+        after_in_child=_unlock_compiled_texts_after_fork,
+    )
+
+
+def _compile_text(prompt: Prompt, template: str, values: dict[str, Any]) -> str:
+    text = _fill(template, values)
+    _compiled_texts.remember(text, template, prompt, values)
+    return text
+
+
+_TYPE_MRO = type.__dict__["__mro__"]
+_TYPE_NAMESPACE = type.__dict__["__dict__"]
+
+
+def _stored_values(value: object, limit: int) -> list[object]:
+    """At most ``limit`` values that ``value`` stores, in order: the items of a list or tuple, the
+    values of a dict, or the fields of another object in ``__dict__`` and ``__pydantic_extra__``.
+    Subclasses of list, tuple, and dict are skipped and fields are read from C-level storage, so
+    no override or property of the app runs."""
+    cls = type(value)
+    if cls is list or cls is tuple:
+        return list(cast("list[object] | tuple[object, ...]", value)[:limit])
+    if cls is dict:
+        return list(itertools.islice(cast("dict[object, object]", value).values(), limit))
+    values: list[object] = []
+    for name in ("__dict__", "__pydantic_extra__"):
+        stored = _stored(value, name)
+        if type(stored) is dict:
+            fields = cast("dict[str, object]", stored)
+            values.extend(itertools.islice(fields.values(), limit - len(values)))
+    return values
+
+
+def _stored(value: object, name: str) -> object:
+    cls = type(value)
+    for klass in _TYPE_MRO.__get__(cls):
+        namespace = _TYPE_NAMESPACE.__get__(klass)
+        if name not in namespace:
+            continue
+        descriptor: object = namespace[name]
+        kind = type(descriptor)
+        storage = kind is types.MemberDescriptorType or (
+            name == "__dict__" and kind is types.GetSetDescriptorType
+        )
+        if not storage or cast(Any, descriptor).__name__ != name:
+            return None
+        try:
+            return cast(Any, descriptor).__get__(value, cls)
+        except (AttributeError, TypeError):
+            return None
+    return None
 
 
 def _fill(text: str, values: Mapping[str, Any]) -> str:

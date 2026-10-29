@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import itertools
+import json
+import os
+import signal
 import socket
 import threading
 import time
@@ -24,8 +27,10 @@ import telemetry_dev._prompts as prompts_module
 from telemetry_dev import (
     ChatPrompt,
     PromptError,
+    TextPrompt,
     get_prompt,
     get_prompt_async,
+    prompt_attributes_for,
     propagate_attributes,
     start_span,
     with_prompt,
@@ -76,9 +81,42 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
 
 @pytest.fixture(autouse=True)
-def empty_cache() -> None:
+def empty_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     # A fetch that runs on after its test must not answer a later test on a reused port.
     prompts_module._cache.clear()  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(
+        prompts_module,
+        "_compiled_texts",
+        prompts_module._CompiledTexts(),  # pyright: ignore[reportPrivateUsage]
+    )
+
+
+def chat_prompt(*messages: dict[str, Any], name: str = "support/reply") -> ChatPrompt:
+    return ChatPrompt(
+        name=name,
+        version=12,
+        label="production",
+        messages=list(messages),
+        model=None,
+        parameters={},
+        tools=[],
+        response_format={"type": "text"},
+        is_fallback=False,
+    )
+
+
+def text_prompt(text: str) -> TextPrompt:
+    return TextPrompt(
+        name="support/reply",
+        version=12,
+        label="production",
+        text=text,
+        model=None,
+        parameters={},
+        tools=[],
+        response_format={"type": "text"},
+        is_fallback=False,
+    )
 
 
 def query_of(path: str) -> dict[str, str]:
@@ -791,6 +829,249 @@ def test_variables_are_omitted_when_input_capture_is_off(
     [span] = off.span_exporter.get_finished_spans()
     assert (span.attributes or {})["td.prompt.version"] == 7
     assert "td.prompt.variables" not in (span.attributes or {})
+
+
+class Part:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+def test_prompt_attributes_for_finds_a_compiled_text_in_the_request_shapes_of_the_providers(
+    make: MakeClient,
+) -> None:
+    make()
+    prompt = chat_prompt(
+        {"role": "system", "content": "Answer as the {{team}} desk."},
+        {"role": "user", "content": "Order {{order}}: where is it?"},
+    )
+    compiled = prompt.compile(team="billing", order="#4")
+    system, user = (message["content"] for message in compiled)
+
+    requests = {
+        "same": compiled,
+        "copy": [dict(message) for message in compiled],
+        "json": json.loads(json.dumps(compiled)),
+        "anthropic": [system, compiled[1:]],
+        "bedrock": [[{"text": system}], [{"role": "user", "content": [{"text": user}]}]],
+        "objects": (Part(system), [SimpleNamespace(role="user", parts=[Part(user)])]),
+    }
+    for request in requests.values():
+        assert prompt_attributes_for(request) == {
+            "td.prompt.name": "support/reply",
+            "td.prompt.version": 12,
+            "td.prompt.label": "production",
+            "td.prompt.variables": '{"team":"billing","order":"#4"}',
+        }
+
+    assert prompt_attributes_for([{"role": "user", "content": "Order #5: where is it?"}]) == {}
+
+
+def test_a_static_text_gives_no_variables_and_a_template_of_only_a_variable_tag_is_not_kept(
+    make: MakeClient,
+) -> None:
+    make()
+    chat = chat_prompt(
+        {"role": "system", "content": "You are the refunds agent."},
+        {"role": "user", "content": "{{ question }}"},
+    )
+    compiled = chat.compile(question="Where is my refund?")
+
+    assert prompt_attributes_for(compiled) == {
+        "td.prompt.name": "support/reply",
+        "td.prompt.version": 12,
+        "td.prompt.label": "production",
+    }
+    assert prompt_attributes_for([{"role": "user", "content": "Where is my refund?"}]) == {}
+
+    summary = text_prompt("Summarize {{doc}} in a line.").compile(doc="the refund policy")
+    assert prompt_attributes_for(summary)["td.prompt.variables"] == '{"doc":"the refund policy"}'
+
+
+def test_a_text_with_variables_wins_over_a_static_text_and_the_first_one_wins_over_a_later_one(
+    make: MakeClient,
+) -> None:
+    make()
+    system = chat_prompt(
+        {"role": "system", "content": "You are the refunds agent, v2."}, name="refunds/system"
+    ).compile()
+    question = chat_prompt(
+        {"role": "user", "content": "Where is order {{order}}?"}, name="orders/question"
+    ).compile(order="#4")
+    style = chat_prompt(
+        {"role": "system", "content": "Reply in {{language}}."}, name="style/language"
+    ).compile(language="French")
+
+    first = prompt_attributes_for([*system, *question])
+    assert (first["td.prompt.name"], first["td.prompt.variables"]) == (
+        "orders/question",
+        '{"order":"#4"}',
+    )
+    second = prompt_attributes_for([*system, *style, *question])
+    assert (second["td.prompt.name"], second["td.prompt.variables"]) == (
+        "style/language",
+        '{"language":"French"}',
+    )
+
+
+def test_each_compile_keeps_its_own_values_so_two_threads_with_one_prompt_get_their_own(
+    make: MakeClient,
+) -> None:
+    make()
+    prompt = chat_prompt({"role": "user", "content": "Track parcel {{parcel}}."})
+
+    first = prompt.compile(parcel="A-1")
+    second = prompt.compile(parcel="B-2")
+
+    assert prompt_attributes_for(first)["td.prompt.variables"] == '{"parcel":"A-1"}'
+    assert prompt_attributes_for(second)["td.prompt.variables"] == '{"parcel":"B-2"}'
+
+
+def test_with_prompt_wins_over_a_compiled_text_of_another_prompt(make: MakeClient) -> None:
+    memory = make()
+    scoped = chat_prompt({"role": "user", "content": "Hi"}, name="scoped/prompt")
+    compiled = chat_prompt(
+        {"role": "user", "content": "Cancel order {{order}}."}, name="other/prompt"
+    ).compile(order="#9")
+
+    with with_prompt(scoped):
+        start_span("chat", type="generation", attributes=prompt_attributes_for(compiled)).end()
+
+    [span] = memory.span_exporter.get_finished_spans()
+    assert (span.attributes or {})["td.prompt.name"] == "scoped/prompt"
+
+
+def test_prompt_attributes_for_omits_variables_when_input_capture_is_off_and_masks_them(
+    make: MakeClient,
+) -> None:
+    compiled = chat_prompt({"role": "user", "content": "My card is {{card}}."}).compile(
+        card="4111 1111"
+    )
+
+    make(capture_input=False)
+    assert prompt_attributes_for(compiled) == {
+        "td.prompt.name": "support/reply",
+        "td.prompt.version": 12,
+        "td.prompt.label": "production",
+    }
+
+    telemetry_dev.shutdown()
+
+    def mask(value: Any, context: telemetry_dev.MaskContext) -> Any:
+        return {"card": "[masked]"} if context.key == "td.prompt.variables" else value
+
+    make(mask=mask)
+    assert prompt_attributes_for(compiled)["td.prompt.variables"] == '{"card":"[masked]"}'
+
+
+def test_the_kept_texts_stop_at_1000_and_at_2000000_characters_oldest_out_first(
+    make: MakeClient,
+) -> None:
+    make()
+    ticket = text_prompt("Ticket {{n}} is open.")
+    for n in range(1001):
+        ticket.compile(n=n)
+
+    assert prompt_attributes_for("Ticket 0 is open.") == {}
+    assert prompt_attributes_for("Ticket 1 is open.")["td.prompt.variables"] == '{"n":1}'
+
+    note = text_prompt("Note: {{body}}")
+    notes = [note.compile(body=letter * (500_000 - len("Note: "))) for letter in "abcde"]
+
+    assert prompt_attributes_for(notes[0]) == {}
+    assert prompt_attributes_for(notes[1])["td.prompt.name"] == "support/reply"
+
+    # A text over the character limit is not kept, and it does not push the others out.
+    note.compile(body="f" * 2_000_001)
+    assert prompt_attributes_for(notes[1])["td.prompt.name"] == "support/reply"
+
+    # A text compiled again counts once.
+    for _ in range(5):
+        note.compile(body="e" * (500_000 - len("Note: ")))
+    assert prompt_attributes_for(notes[4])["td.prompt.name"] == "support/reply"
+
+
+def test_prompt_attributes_for_looks_6_levels_and_500_values_deep(make: MakeClient) -> None:
+    make()
+    [message] = chat_prompt({"role": "user", "content": "Find invoice {{invoice}}."}).compile(
+        invoice="INV-7"
+    )
+    content = message["content"]
+
+    def nest(value: object, levels: int) -> object:
+        return value if levels == 0 else nest([value], levels - 1)
+
+    assert prompt_attributes_for(nest(content, 6)) != {}
+    assert prompt_attributes_for(nest(content, 7)) == {}
+
+    # The request list, 498 strings, and the text are 500 values.
+    assert prompt_attributes_for([*["filler"] * 498, content]) != {}
+    assert prompt_attributes_for([*["filler"] * 499, content]) == {}
+
+
+def test_prompt_attributes_for_runs_no_property_or_override_of_the_app(make: MakeClient) -> None:
+    make()
+    [message] = chat_prompt({"role": "user", "content": "Refund order {{order}}."}).compile(
+        order="#3"
+    )
+    content = message["content"]
+    reads: list[str] = []
+
+    class Message:
+        @property
+        def content(self) -> str:
+            reads.append("property")
+            return content
+
+    class Messages(list[object]):
+        def __getitem__(self, index: Any) -> Any:
+            reads.append("__getitem__")
+            return super().__getitem__(index)
+
+        def __iter__(self) -> Any:
+            reads.append("__iter__")
+            return super().__iter__()
+
+    assert prompt_attributes_for([Message(), Messages([content])]) == {}
+    assert reads == []
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+# Python 3.12+ warns on fork() in a process with threads.
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_fork_while_a_thread_keeps_a_compiled_text_leaves_compile_usable_in_the_child() -> None:
+    prompt = text_prompt("Ship order {{order}}.")
+    texts = prompts_module._compiled_texts  # pyright: ignore[reportPrivateUsage]
+    holding, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with texts.lock:
+            holding.set()
+            release.wait(0.2)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    holding.wait()
+    read_end, write_end = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(read_end)
+            os.write(write_end, prompt.compile(order="#1").encode())
+        finally:
+            os._exit(0)
+    os.close(write_end)
+    release.set()
+    holder.join()
+
+    deadline = time.monotonic() + 5
+    while os.waitpid(pid, os.WNOHANG) == (0, 0):
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pytest.fail("compile() in the child waited for a lock held at the fork")
+        time.sleep(0.01)
+    with os.fdopen(read_end, "rb") as child:
+        assert child.read() == b"Ship order #1."
 
 
 def test_a_fallback_prompt_records_its_name_and_label_but_no_version(

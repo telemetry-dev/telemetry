@@ -114,6 +114,93 @@ def _json_attr(span: Any, key: str) -> Any:
     return json.loads(value)
 
 
+SUPPORT_PROMPT = telemetry_dev.ChatPrompt(
+    name="support/reply",
+    version=12,
+    label="production",
+    messages=[
+        {"role": "system", "content": "You answer for the {{team}} desk."},
+        {"role": "user", "content": "Where is order {{order}}?"},
+    ],
+    model=None,
+    parameters={},
+    tools=[],
+    response_format={"type": "text"},
+    is_fallback=False,
+)
+
+
+@pytest.mark.parametrize("older_core", [False, True])
+def test_converse_and_invoke_model_outside_with_prompt_record_the_prompt_of_a_compiled_text(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, older_core: bool
+) -> None:
+    if older_core:
+        monkeypatch.delattr(telemetry_dev, "prompt_attributes_for")
+    system, user = SUPPORT_PROMPT.compile(team="billing", order="#4")
+    converse_reply = {
+        "output": {"message": {"role": "assistant", "content": [{"text": "Soon."}]}},
+        "stopReason": "end_turn",
+    }
+    answer = _body({"content": [{"type": "text", "text": "Soon."}], "stop_reason": "end_turn"})
+    embedding = _body({"embedding": [0.1, 0.2], "inputTextTokenCount": 6})
+    client = _client("bedrock-runtime")
+    _stub_api_call(
+        client,
+        [
+            converse_reply,
+            converse_reply,
+            {
+                "body": StreamingBody(io.BytesIO(answer), len(answer)),
+                "contentType": "application/json",
+            },
+            {
+                "body": StreamingBody(io.BytesIO(embedding), len(embedding)),
+                "contentType": "application/json",
+            },
+        ],
+        monkeypatch,
+    )
+    wrapped = cast(Any, wrap_bedrock(client))
+
+    wrapped.converse(
+        modelId="anthropic.claude-3-haiku",
+        system=[{"text": system["content"]}],
+        messages=[{"role": "user", "content": [{"text": "Hi"}]}],
+    )
+    wrapped.converse(
+        modelId="anthropic.claude-3-haiku",
+        messages=[{"role": "user", "content": [{"text": user["content"]}]}],
+    )
+    wrapped.invoke_model(
+        modelId="anthropic.claude-3-haiku",
+        contentType="application/json",
+        body=_body({"max_tokens": 64, "messages": [{"role": "user", "content": user["content"]}]}),
+    )["body"].read()
+    wrapped.invoke_model(
+        modelId="amazon.titan-embed-text-v2:0",
+        contentType="application/json",
+        body=_body({"inputText": user["content"]}),
+    )["body"].read()
+
+    system_span, messages_span, invoke_span, embed_span = (
+        dict(span.attributes or {}) for span in memory.span_exporter.get_finished_spans()
+    )
+    for span in (system_span, messages_span, invoke_span):
+        assert span["gen_ai.request.model"] == "anthropic.claude-3-haiku"
+        assert {key: value for key, value in span.items() if key.startswith("td.prompt.")} == (
+            {}
+            if older_core
+            else {
+                "td.prompt.name": "support/reply",
+                "td.prompt.version": 12,
+                "td.prompt.label": "production",
+                "td.prompt.variables": '{"team":"billing","order":"#4"}',
+            }
+        )
+    assert embed_span["gen_ai.operation.name"] == "embeddings"
+    assert "td.prompt.name" not in embed_span
+
+
 def test_converse_happy_path(memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
     client = _client("bedrock-runtime")
     request = {

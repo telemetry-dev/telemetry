@@ -5,6 +5,7 @@ import {
   type SpanHandle,
   type StartSpanOptions,
 } from "@telemetry-dev/sdk";
+import * as telemetrySdk from "@telemetry-dev/sdk";
 import { Stream } from "@anthropic-ai/sdk/core/streaming";
 import { Messages as BetaMessages } from "@anthropic-ai/sdk/resources/beta/messages";
 import { Messages } from "@anthropic-ai/sdk/resources/messages";
@@ -147,6 +148,16 @@ function toolDefinitions<T>(tools: T): Record<string, string> | undefined {
     : undefined;
 }
 
+// Cores older than promptAttributesFor record a prompt only inside withPrompt. A namespace read
+// keeps them loadable without the export.
+function promptAttributes(request: unknown): SpanFields["attributes"] {
+  const read = (
+    telemetrySdk as { promptAttributesFor?: (request: unknown) => SpanFields["attributes"] }
+  ).promptAttributesFor;
+
+  return typeof read === "function" ? read(request) : undefined;
+}
+
 function messagesRequest(body: ValueRecord): RequestMapping {
   const model = readString(body.model);
 
@@ -161,7 +172,10 @@ function messagesRequest(body: ValueRecord): RequestMapping {
       type: "generation",
       model,
       input,
-      attributes: toolDefinitions(body.tools),
+      attributes: {
+        ...toolDefinitions(body.tools),
+        ...promptAttributes([body.system, body.messages]),
+      },
       systemInstructions: body.system,
       temperature: readNumber(body.temperature),
       topP: readNumber(body.top_p),

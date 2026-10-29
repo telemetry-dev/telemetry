@@ -27,6 +27,7 @@ from ._prompts import (
     TextPrompt,
     get_prompt,
     get_prompt_async,
+    prompt_attributes_for,
     with_prompt,
 )
 from ._semconv import LogLevel, SpanType
@@ -67,6 +68,7 @@ __all__ = [
     "init",
     "log",
     "observe",
+    "prompt_attributes_for",
     "propagate_attributes",
     "shutdown",
     "start_span",

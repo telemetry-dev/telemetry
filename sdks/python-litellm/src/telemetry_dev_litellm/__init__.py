@@ -455,6 +455,12 @@ def _output_type(response_format: Any) -> str | None:
     return kind
 
 
+def _prompt_attributes(request: object) -> dict[str, Any]:
+    # Older cores have no prompt_attributes_for and record a prompt only inside with_prompt.
+    read = getattr(telemetry_dev, "prompt_attributes_for", None)
+    return cast("dict[str, Any]", read(request)) if callable(read) else {}
+
+
 def _completion_request(
     args: tuple[Any, ...], kwargs: Mapping[str, Any]
 ) -> tuple[str, dict[str, Any]]:
@@ -478,6 +484,7 @@ def _completion_request(
             "presence_penalty": _number(kwargs.get("presence_penalty")),
             "output_type": _output_type(kwargs.get("response_format")),
             "metadata": _request_metadata(kwargs),
+            "attributes": _prompt_attributes(_arg(args, kwargs, "messages", 1)) or None,
         },
     )
 
@@ -545,7 +552,10 @@ def _responses_request(
     input_budget: telemetry_dev.CaptureBudget | None = None
     if capture_input:
         input_value, input_budget = _bounded_responses_native(_arg(args, kwargs, "input", 0))
-    attributes: dict[str, Any] = {"gen_ai.operation.name": "chat"}
+    attributes: dict[str, Any] = {
+        "gen_ai.operation.name": "chat",
+        **_prompt_attributes([kwargs.get("instructions"), _arg(args, kwargs, "input", 0)]),
+    }
     if input_budget is not None and input_budget.truncated:
         attributes["telemetry.dev.capture.truncated"] = True
     return (

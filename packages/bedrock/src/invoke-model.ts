@@ -9,6 +9,7 @@ import {
   numberValue,
   omitUndefined,
   parseJson,
+  promptAttributes,
   PROVIDER,
   STREAM_CAPTURE_MAX_ITEMS,
   stringValue,
@@ -35,12 +36,14 @@ export function invokeModelSpanName(input: JsonRecord): string {
 export function invokeModelRequestFields(input: JsonRecord): SpanFields {
   const model = stringValue(input.modelId);
   const body = parseBody(input.body, input.contentType);
+  const embedding = isEmbeddingModel(model);
 
   return omitUndefined({
     provider: PROVIDER,
     model,
     input: body,
-    outputType: isEmbeddingModel(model) ? "embedding" : undefined,
+    outputType: embedding ? "embedding" : undefined,
+    attributes: embedding ? undefined : promptAttributes(body),
     ...nativeSamplingFields(model, body),
   });
 }

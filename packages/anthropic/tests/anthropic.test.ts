@@ -4,7 +4,14 @@ import {
   type PushMetricExporter,
 } from "@opentelemetry/sdk-metrics";
 import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
-import { flush, init, shutdown, type TelemetryOptions } from "@telemetry-dev/sdk";
+import {
+  type ChatMessage,
+  flush,
+  getPrompt,
+  init,
+  shutdown,
+  type TelemetryOptions,
+} from "@telemetry-dev/sdk";
 import * as telemetrySdk from "@telemetry-dev/sdk";
 import Anthropic from "@anthropic-ai/sdk";
 import { createRequire } from "node:module";
@@ -273,6 +280,71 @@ afterEach(async () => {
   await shutdown();
   vi.restoreAllMocks();
 });
+
+test.each([
+  { field: "system", olderCore: false },
+  { field: "messages", olderCore: false },
+  { field: "messages", olderCore: true },
+])(
+  "messages.create outside withPrompt records the prompt of a compiled text in $field, older core $olderCore",
+  async ({ field, olderCore }) => {
+    if (olderCore) {
+      vi.spyOn(
+        telemetrySdk as { promptAttributesFor: unknown },
+        "promptAttributesFor",
+        "get",
+      ).mockReturnValue(undefined);
+    }
+
+    const prompt = await getPrompt("support/reply", {
+      apiKey: "td_live_a",
+      apiUrl: "https://prompts.anthropic.test",
+      fetch: async () =>
+        Response.json({
+          name: "support/reply",
+          type: "chat",
+          label: "production",
+          version: 12,
+          messages: [
+            { role: "system", content: "You answer for the {{team}} desk." },
+            { role: "user", content: "Where is order {{order}}?" },
+          ],
+          text: null,
+          model: { provider: "anthropic", name: "claude-sonnet-4-6" },
+          parameters: {},
+          tools: [],
+          responseFormat: { type: "text" },
+          rollout: null,
+        }),
+    });
+    const [system, user] = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+    const spans = setupSpans();
+    const client = clientWith(createFakeFetch(jsonResponse(messagePayload())).fetch);
+
+    await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 64,
+      system: field === "system" ? system!.content : "Be terse.",
+      messages: [{ role: "user", content: field === "messages" ? user!.content : "Hi" }],
+    });
+
+    const { attributes } = await exportedSpan(spans);
+    expect(attributes["gen_ai.input.messages"]).toBeDefined();
+
+    if (olderCore) {
+      expect(attributes["td.prompt.name"]).toBeUndefined();
+
+      return;
+    }
+
+    expect(attributes).toMatchObject({
+      "td.prompt.name": "support/reply",
+      "td.prompt.version": 12,
+      "td.prompt.label": "production",
+      "td.prompt.variables": '{"team":"billing","order":"#4"}',
+    });
+  },
+);
 
 test("messages.create maps request, response, usage, finish reason, provider, and sampling attributes", async () => {
   const spans = setupSpans();

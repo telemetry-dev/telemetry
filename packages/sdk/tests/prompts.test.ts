@@ -4,8 +4,11 @@ import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import {
+  type ChatMessage,
   flush,
   getPrompt,
+  type Prompt,
+  promptAttributesFor,
   propagateAttributes,
   PromptError,
   shutdown,
@@ -727,6 +730,231 @@ test("variables are omitted when input capture is off; a version fetch has no la
   await flush();
   expect(off.spans.getFinishedSpans()[0]!.attributes).toMatchObject({ "td.prompt.version": 7 });
   expect(off.spans.getFinishedSpans()[0]!.attributes["td.prompt.variables"]).toBeUndefined();
+});
+
+async function promptOf(overrides: Record<string, unknown>): Promise<Prompt> {
+  const { fetch } = fakeFetch(reply(overrides));
+
+  return getPrompt("support/reply", {
+    apiKey: "td_live_a",
+    apiUrl: newApiUrl(),
+    fetch,
+    type: overrides.type as "chat",
+  });
+}
+
+test("promptAttributesFor finds a compiled text in the request shapes of the providers", async () => {
+  setup();
+  const prompt = await promptOf({
+    messages: [
+      { role: "system", content: "Answer as the {{team}} desk." },
+      { role: "user", content: "Order {{order}}: where is it?" },
+    ],
+  });
+  const compiled = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+  const [system, user] = compiled.map((message) => message.content);
+
+  const requests = {
+    same: compiled,
+    spread: compiled.map((message) => ({ ...message })),
+    json: JSON.parse(JSON.stringify(compiled)) as unknown,
+    anthropic: [system, compiled.slice(1)],
+    bedrock: [[{ text: system }], [{ role: "user", content: [{ text: user }] }]],
+    google: [{ parts: [{ text: system }] }, [{ role: "user", parts: [{ text: user }] }]],
+  };
+
+  for (const request of Object.values(requests)) {
+    expect(promptAttributesFor(request)).toEqual({
+      "td.prompt.name": "support/reply",
+      "td.prompt.version": 12,
+      "td.prompt.label": "production",
+      "td.prompt.variables": '{"team":"billing","order":"#4"}',
+    });
+  }
+
+  expect(
+    promptAttributesFor([{ role: "user", content: "Order #5: where is it?" }]),
+  ).toBeUndefined();
+});
+
+test("a static text gives no variables, and a template of only a variable tag is not kept", async () => {
+  setup();
+  const chat = await promptOf({
+    messages: [
+      { role: "system", content: "You are the refunds agent." },
+      { role: "user", content: "{{ question }}" },
+    ],
+  });
+  const compiled = chat.compile({ question: "Where is my refund?" });
+
+  expect(promptAttributesFor(compiled)).toEqual({
+    "td.prompt.name": "support/reply",
+    "td.prompt.version": 12,
+    "td.prompt.label": "production",
+  });
+  expect(promptAttributesFor([{ role: "user", content: "Where is my refund?" }])).toBeUndefined();
+
+  const text = await promptOf({ type: "text", messages: [], text: "Summarize {{doc}} in a line." });
+  const summary = text.compile({ doc: "the refund policy" }) as string;
+
+  expect(promptAttributesFor(summary)).toMatchObject({
+    "td.prompt.variables": '{"doc":"the refund policy"}',
+  });
+});
+
+test("a text with variables wins over a static text, and the first one wins over a later one", async () => {
+  setup();
+  const refunds = await promptOf({
+    name: "refunds/system",
+    messages: [{ role: "system", content: "You are the refunds agent, v2." }],
+  });
+  const order = await promptOf({
+    name: "orders/question",
+    messages: [{ role: "user", content: "Where is order {{order}}?" }],
+  });
+  const language = await promptOf({
+    name: "style/language",
+    messages: [{ role: "system", content: "Reply in {{language}}." }],
+  });
+
+  const system = refunds.compile() as ChatMessage[];
+  const question = order.compile({ order: "#4" }) as ChatMessage[];
+  const style = language.compile({ language: "French" }) as ChatMessage[];
+
+  expect(promptAttributesFor([...system, ...question])).toMatchObject({
+    "td.prompt.name": "orders/question",
+    "td.prompt.variables": '{"order":"#4"}',
+  });
+  expect(promptAttributesFor([...system, ...style, ...question])).toMatchObject({
+    "td.prompt.name": "style/language",
+    "td.prompt.variables": '{"language":"French"}',
+  });
+});
+
+test("each compile keeps its own values, so two tasks with one prompt get their own variables", async () => {
+  setup();
+  const prompt = await promptOf({
+    messages: [{ role: "user", content: "Track parcel {{parcel}}." }],
+  });
+
+  const first = prompt.compile({ parcel: "A-1" });
+  const second = prompt.compile({ parcel: "B-2" });
+
+  expect(promptAttributesFor(first)?.["td.prompt.variables"]).toBe('{"parcel":"A-1"}');
+  expect(promptAttributesFor(second)?.["td.prompt.variables"]).toBe('{"parcel":"B-2"}');
+});
+
+test("withPrompt wins over a compiled text of another prompt", async () => {
+  const { spans } = setup();
+  const scoped = await promptOf({ name: "scoped/prompt" });
+  const other = await promptOf({
+    name: "other/prompt",
+    messages: [{ role: "user", content: "Cancel order {{order}}." }],
+  });
+  const compiled = other.compile({ order: "#9" });
+
+  withPrompt(scoped, () => {
+    startSpan("chat", { type: "generation", attributes: promptAttributesFor(compiled) }).end();
+  });
+  await flush();
+
+  expect(spans.getFinishedSpans()[0]!.attributes["td.prompt.name"]).toBe("scoped/prompt");
+});
+
+test("promptAttributesFor omits variables when input capture is off and masks them when on", async () => {
+  const prompt = await promptOf({
+    messages: [{ role: "user", content: "My card is {{card}}." }],
+  });
+  const compiled = prompt.compile({ card: "4111 1111" });
+
+  setup({ captureInput: false });
+  expect(promptAttributesFor(compiled)).toEqual({
+    "td.prompt.name": "support/reply",
+    "td.prompt.version": 12,
+    "td.prompt.label": "production",
+  });
+
+  await shutdown();
+  setup({
+    mask: (value, { key }) => (key === "td.prompt.variables" ? { card: "[masked]" } : value),
+  });
+  expect(promptAttributesFor(compiled)?.["td.prompt.variables"]).toBe('{"card":"[masked]"}');
+});
+
+test("the kept texts stop at 1000 and at 2,000,000 characters, oldest out first", async () => {
+  setup();
+  const ticket = await promptOf({ type: "text", messages: [], text: "Ticket {{n}} is open." });
+
+  for (let n = 0; n <= 1000; n += 1) ticket.compile({ n });
+
+  expect(promptAttributesFor("Ticket 0 is open.")).toBeUndefined();
+  expect(promptAttributesFor("Ticket 1 is open.")).toMatchObject({
+    "td.prompt.variables": '{"n":1}',
+  });
+
+  const note = await promptOf({ type: "text", messages: [], text: "Note: {{body}}" });
+  const notes = ["a", "b", "c", "d", "e"].map(
+    (letter) => note.compile({ body: letter.repeat(500_000 - "Note: ".length) }) as string,
+  );
+
+  expect(promptAttributesFor(notes[0])).toBeUndefined();
+  expect(promptAttributesFor(notes[1])?.["td.prompt.name"]).toBe("support/reply");
+
+  // A text over the character limit is not kept, and it does not push the others out.
+  note.compile({ body: "f".repeat(2_000_001) });
+  expect(promptAttributesFor(notes[1])?.["td.prompt.name"]).toBe("support/reply");
+
+  // A text compiled again counts once.
+  for (let n = 0; n < 5; n += 1) note.compile({ body: "e".repeat(500_000 - "Note: ".length) });
+  expect(promptAttributesFor(notes[4])?.["td.prompt.name"]).toBe("support/reply");
+});
+
+test("promptAttributesFor looks 6 levels and 500 values deep", async () => {
+  setup();
+  const prompt = await promptOf({
+    messages: [{ role: "user", content: "Find invoice {{invoice}}." }],
+  });
+  const [{ content }] = prompt.compile({ invoice: "INV-7" }) as ChatMessage[];
+  const nest = (value: unknown, levels: number): unknown =>
+    levels === 0 ? value : nest([value], levels - 1);
+
+  expect(promptAttributesFor(nest(content, 6))).toBeDefined();
+  expect(promptAttributesFor(nest(content, 7))).toBeUndefined();
+
+  // The request array, 498 strings, and the text are 500 values.
+  expect(promptAttributesFor([...Array<string>(498).fill("filler"), content])).toBeDefined();
+  expect(promptAttributesFor([...Array<string>(499).fill("filler"), content])).toBeUndefined();
+});
+
+test("promptAttributesFor runs no getter and reports a trap that throws", async () => {
+  const errors: Error[] = [];
+  setup({ onError: (error) => errors.push(error) });
+  const prompt = await promptOf({
+    messages: [{ role: "user", content: "Refund order {{order}}." }],
+  });
+  const [{ content }] = prompt.compile({ order: "#3" }) as ChatMessage[];
+  let reads = 0;
+
+  const getter = {
+    role: "user",
+    get content() {
+      reads += 1;
+
+      return content;
+    },
+  };
+
+  expect(promptAttributesFor([getter])).toBeUndefined();
+  expect(reads).toBe(0);
+
+  const trap = new Proxy([], {
+    get() {
+      throw new Error("trap");
+    },
+  });
+
+  expect(promptAttributesFor([trap, content])).toBeUndefined();
+  expect(errors.map((error) => error.message)).toEqual(["trap"]);
 });
 
 test("a fallback prompt records its name and label but no version", async () => {

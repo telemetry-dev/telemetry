@@ -221,6 +221,73 @@ def embeddings_payload() -> dict[str, Any]:
     }
 
 
+SUPPORT_PROMPT = telemetry_dev.ChatPrompt(
+    name="support/reply",
+    version=12,
+    label="production",
+    messages=[
+        {"role": "system", "content": "You answer for the {{team}} desk."},
+        {"role": "user", "content": "Where is order {{order}}?"},
+    ],
+    model=None,
+    parameters={},
+    tools=[],
+    response_format={"type": "text"},
+    is_fallback=False,
+)
+
+
+@pytest.mark.parametrize(
+    ("api", "capture_input", "older_core"),
+    [
+        ("chat", False, False),
+        ("responses instructions", True, False),
+        ("responses input", True, False),
+        ("chat", True, True),
+    ],
+)
+def test_calls_outside_with_prompt_record_the_prompt_of_compiled_messages(
+    make: Any, monkeypatch: pytest.MonkeyPatch, api: str, capture_input: bool, older_core: bool
+) -> None:
+    memory = make(capture_input=capture_input)
+    if older_core:
+        monkeypatch.delattr(telemetry_dev, "prompt_attributes_for")
+    system, user = SUPPORT_PROMPT.compile(team="billing", order="#4")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return json_response(chat_payload() if api == "chat" else responses_payload())
+
+    client = wrap_open_router(sync_client(handler))
+    if api == "chat":
+        client.chat.send(
+            model="openai/gpt-4o-mini",
+            messages=[
+                ChatSystemMessage(role="system", content=system["content"]),
+                ChatUserMessage(role="user", content=user["content"]),
+            ],
+        )
+    else:
+        in_input = api == "responses input"
+        client.responses.send(
+            model="openai/gpt-4o-mini",
+            input=[EasyInputMessage(role="user", content=user["content"] if in_input else "Hi")],
+            instructions="Be terse." if in_input else system["content"],
+        )
+
+    a = attrs(only_span(memory))
+    assert a["gen_ai.request.model"] == "openai/gpt-4o-mini"
+    assert {key: value for key, value in a.items() if key.startswith("td.prompt.")} == (
+        {}
+        if older_core
+        else {
+            "td.prompt.name": "support/reply",
+            "td.prompt.version": 12,
+            "td.prompt.label": "production",
+            **({"td.prompt.variables": '{"team":"billing","order":"#4"}'} if capture_input else {}),
+        }
+    )
+
+
 def test_chat_send_maps_messages_usage_cost_and_sampling(memory: SimpleNamespace) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return json_response(chat_payload())

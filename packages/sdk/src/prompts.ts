@@ -1,4 +1,9 @@
-import { type Attributes, type Context, createContextKey } from "@opentelemetry/api";
+import {
+  type Attributes,
+  type AttributeValue,
+  type Context,
+  createContextKey,
+} from "@opentelemetry/api";
 import {
   activeContext,
   DEFAULT_BASE_URL,
@@ -92,6 +97,8 @@ export interface ChatPrompt extends PromptBase {
   /**
    * Fills in the variables and replaces each placeholder message with the messages in its
    * variable. `withPrompt` records the variables of the last call before it starts or inside it.
+   * Each text is also kept with its variables (the last 1000 texts), so that a model call outside
+   * `withPrompt` that sends it can name the prompt; see `promptAttributesFor`.
    */
   compile<M = ChatMessage>(variables?: PromptVariables<M>): (ChatMessage | M)[];
 }
@@ -102,7 +109,8 @@ export interface TextPrompt extends PromptBase {
   readonly text: string;
   /**
    * Fills in the variables. `withPrompt` records the variables of the last call before it starts
-   * or inside it.
+   * or inside it. The text is also kept with its variables (the last 1000 texts), so that a model
+   * call outside `withPrompt` that sends it can name the prompt; see `promptAttributesFor`.
    */
   compile(variables?: PromptVariables): string;
 }
@@ -193,6 +201,13 @@ interface PromptScope {
   variables: object | undefined;
 }
 
+/** The prompt that `compile()` made a text from. */
+interface CompiledText {
+  readonly prompt: Prompt;
+  /** Only for a template with a variable: the text holds the values, so they belong to it. */
+  readonly variables: object | undefined;
+}
+
 const FETCH_TIMEOUT_MS = 10_000;
 /** The longest Retry-After that getPrompt honors, so that a bad header cannot stop fetches. */
 const MAX_RETRY_AFTER_MS = 3_600_000;
@@ -204,11 +219,19 @@ const HTTP_DATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} G
 const VARIABLE = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
 const MODEL_CALL_OPERATIONS = new Set<unknown>(["chat", "text_completion", "generate_content"]);
 const PROMPT_KEY = createContextKey("telemetry.dev prompt");
+const MAX_COMPILED_TEXTS = 1_000;
+const MAX_COMPILED_CHARACTERS = 2_000_000;
+const MAX_SEARCH_DEPTH = 6;
+const MAX_SEARCH_NODES = 500;
 
 const cache = new Map<string, CacheEntry>();
 const compiledVariables = new WeakMap<Prompt, object>();
 /** The Retry-After of the response that failed with this error, in milliseconds. */
 const retryAfter = new WeakMap<PromptError, number>();
+// The texts of the last compile() calls, oldest first, for model calls outside withPrompt.
+const compiledTexts = new Map<string, CompiledText>();
+let compiledCharacters = 0;
+let longestCompiledText = 0;
 
 /**
  * Fetches a prompt version from telemetry.dev and keeps it. When the copy is older than
@@ -344,17 +367,95 @@ export function promptAttributes(
     | undefined;
 
   if (!scope) return undefined;
-  const { prompt, variables } = scope;
 
+  return attributesOf(scope.prompt, scope.variables, capture);
+}
+
+/**
+ * The td.prompt.* attributes for a model call outside `withPrompt`, from the texts that
+ * `compile()` made: the first text in `request` from a template with a variable, else the first
+ * text from a template with none. Only the first gives `td.prompt.variables`, because only its text
+ * holds the values. Gives undefined inside `withPrompt`, whose prompt the span gets, and when no
+ * text matches. It reads own data properties of arrays and plain objects, 6 levels and 500 values
+ * deep, and runs no getter. It never throws.
+ */
+export function promptAttributesFor(request: unknown): Record<string, AttributeValue> | undefined {
+  const config = currentClient().core?.config;
+
+  try {
+    if (compiledTexts.size === 0 || activeContext().getValue(PROMPT_KEY) !== undefined) {
+      return undefined;
+    }
+
+    const found = findCompiledText(request);
+
+    if (!found) return undefined;
+
+    return attributesOf(found.prompt, found.variables, config) as Record<string, AttributeValue>;
+  } catch (error) {
+    reportError(config?.onError, error);
+
+    return undefined;
+  }
+}
+
+function attributesOf(
+  prompt: Prompt,
+  variables: object | undefined,
+  capture: FieldCaptureConfig | undefined,
+): Attributes {
   return omitUndefined({
     "td.prompt.name": prompt.name,
     "td.prompt.version": prompt.version ?? undefined,
     "td.prompt.label": prompt.label ?? undefined,
     "td.prompt.variables":
-      variables !== undefined && capture.captureInput
+      variables !== undefined && capture?.captureInput
         ? prepareCaptureValue("td.prompt.variables", variables, capture)
         : undefined,
   });
+}
+
+function findCompiledText(request: unknown): CompiledText | undefined {
+  let firstStatic: CompiledText | undefined;
+  let budget = MAX_SEARCH_NODES;
+  const stack: [value: unknown, depth: number][] = [[request, 0]];
+
+  while (stack.length > 0 && budget > 0) {
+    budget -= 1;
+    const [value, depth] = stack.pop()!;
+
+    if (typeof value === "string") {
+      const found = value.length <= longestCompiledText ? compiledTexts.get(value) : undefined;
+
+      if (found?.variables !== undefined) return found;
+      firstStatic ??= found;
+    } else if (depth < MAX_SEARCH_DEPTH) {
+      const children = ownValues(value, budget);
+
+      for (let index = children.length - 1; index >= 0; index -= 1) {
+        stack.push([children[index], depth + 1]);
+      }
+    }
+  }
+
+  return firstStatic;
+}
+
+/** At most `limit` own data values of an array or a plain object, in order. */
+function ownValues(value: unknown, limit: number): unknown[] {
+  if (typeof value !== "object" || value === null) return [];
+  let keys: string[];
+
+  if (Array.isArray(value)) {
+    keys = Array.from({ length: Math.min(value.length, limit) }, (_, index) => String(index));
+  } else {
+    const prototype: unknown = Object.getPrototypeOf(value);
+
+    if (prototype !== Object.prototype && prototype !== null) return [];
+    keys = Object.keys(value).slice(0, limit);
+  }
+
+  return keys.map((key) => Object.getOwnPropertyDescriptor(value, key)?.value);
 }
 
 function checkOptions(name: string, options: GetPromptOptions, type: string): void {
@@ -548,9 +649,12 @@ function createPrompt(input: {
 
       if (scope?.prompt === prompt) scope.variables = variables;
 
+      const compileText = (template: string) =>
+        remember(fill(template, variables), template, prompt, variables);
+
       return type === "chat"
-        ? compileMessages(content.messages, variables)
-        : fill(content.text ?? "", variables);
+        ? compileMessages(content.messages, variables, compileText)
+        : compileText(content.text ?? "");
     },
   }) as Prompt;
 
@@ -560,10 +664,11 @@ function createPrompt(input: {
 function compileMessages(
   messages: readonly PromptMessage[],
   variables: PromptVariables<unknown>,
+  compileText: (template: string) => string,
 ): unknown[] {
   return messages.flatMap((message) => {
     if (message.role !== "placeholder") {
-      return [{ role: message.role, content: fill(message.content, variables) }];
+      return [{ role: message.role, content: compileText(message.content) }];
     }
 
     const value = Object.hasOwn(variables, message.name) ? variables[message.name] : undefined;
@@ -576,6 +681,39 @@ function compileMessages(
 
     return value;
   });
+}
+
+/**
+ * Keeps `text` for promptAttributesFor, as the newest entry. A template of only variable tags is
+ * skipped: its text is input of the app, which an unrelated request can hold too.
+ */
+function remember(text: string, template: string, prompt: Prompt, variables: object): string {
+  const fixedText = template.replace(VARIABLE, "");
+
+  if (fixedText.trim() === "" || text.length > MAX_COMPILED_CHARACTERS) return text;
+
+  if (compiledTexts.delete(text)) compiledCharacters -= text.length;
+  compiledTexts.set(text, { prompt, variables: fixedText === template ? undefined : variables });
+  compiledCharacters += text.length;
+  longestCompiledText = Math.max(longestCompiledText, text.length);
+  let droppedLongest = false;
+
+  while (compiledTexts.size > MAX_COMPILED_TEXTS || compiledCharacters > MAX_COMPILED_CHARACTERS) {
+    const oldest = compiledTexts.keys().next().value!;
+    compiledTexts.delete(oldest);
+    compiledCharacters -= oldest.length;
+    droppedLongest ||= oldest.length === longestCompiledText;
+  }
+
+  if (droppedLongest) {
+    longestCompiledText = 0;
+
+    for (const kept of compiledTexts.keys()) {
+      longestCompiledText = Math.max(longestCompiledText, kept.length);
+    }
+  }
+
+  return text;
 }
 
 function fill(text: string, variables: PromptVariables<unknown>): string {

@@ -251,9 +251,21 @@ ran in it, or before it started in the code that started it; with none, it recor
 for code that has not compiled in its own task. Model calls are the spans of type `generation`
 (operations `chat`, `text_completion`, and `generate_content`), including the spans of the provider
 integrations: OpenAI, Anthropic, Amazon Bedrock, Google GenAI, LiteLLM, and OpenRouter. Spans from
-other OpenTelemetry tracers do not get the attributes. A model call outside `with_prompt` does not
-get the attributes, even when it sends messages from `compile()`; with input capture on, the call
-still records those messages as its input.
+other OpenTelemetry tracers do not get the attributes.
+
+Outside `with_prompt`, those provider integrations find the prompt in the request: `compile()`
+keeps the texts that it makes (the last 1000, at most 2,000,000 characters), and a chat call
+whose request holds one of them gets `td.prompt.name`, `td.prompt.version`, and
+`td.prompt.label`, also when input capture is off. A text from a template with a variable also
+gives `td.prompt.variables`, and it wins over a text from a template with none. A message of only
+a variable tag, for example `{{ question }}`, is not kept, because its text is your user's input.
+The text in the request must be equal to the compiled text. `with_prompt` wins over this. The
+integrations do it for OpenAI chat completions and responses, Anthropic messages, Bedrock
+Converse and InvokeModel, Google GenAI `generate_content`, LiteLLM completion and responses, and
+OpenRouter chat and responses, but not for images, audio, video, or OpenAI Realtime. With an
+older `telemetry-dev` that has no `prompt_attributes_for`, a provider integration records the
+prompt only in `with_prompt`. For your own spans, `prompt_attributes_for(request)` gives the
+attributes to pass as `attributes`; it gives `{}` inside `with_prompt`.
 
 ## Auto-metrics
 

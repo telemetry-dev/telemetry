@@ -9,7 +9,8 @@ import {
 } from "@aws-sdk/client-bedrock-runtime";
 import { afterEach, expect, test, vi } from "vitest";
 
-import type { MaskFn } from "@telemetry-dev/sdk";
+import { type ChatMessage, getPrompt, type MaskFn } from "@telemetry-dev/sdk";
+import * as telemetrySdk from "@telemetry-dev/sdk";
 
 import { instrumentBedrock, uninstrumentBedrock, wrapBedrock } from "../src/index.ts";
 import {
@@ -422,6 +423,114 @@ test("ConverseStream records stream errors with partial output", async () => {
   expect(jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content).toBe("partial");
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
+
+test.each([false, true])(
+  "Converse and InvokeModel outside withPrompt record the prompt of a compiled text; embeddings do not; older core %s",
+  async (olderCore) => {
+    const spans = setup();
+    if (olderCore) {
+      vi.spyOn(
+        telemetrySdk as { promptAttributesFor: unknown },
+        "promptAttributesFor",
+        "get",
+      ).mockReturnValue(undefined);
+    }
+    const prompt = await getPrompt("support/reply", {
+      apiKey: "td_live_a",
+      apiUrl: "https://prompts.bedrock.test",
+      fetch: async () =>
+        Response.json({
+          name: "support/reply",
+          type: "chat",
+          label: "production",
+          version: 12,
+          messages: [
+            { role: "system", content: "You answer for the {{team}} desk." },
+            { role: "user", content: "Where is order {{order}}?" },
+          ],
+          text: null,
+          model: { provider: "amazon-bedrock", name: "anthropic.claude-3-haiku" },
+          parameters: {},
+          tools: [],
+          responseFormat: { type: "text" },
+          rollout: null,
+        }),
+    });
+    const [system, user] = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+    const converseReply = {
+      output: { message: { role: "assistant", content: [{ text: "Soon." }] } },
+      stopReason: "end_turn",
+    };
+
+    const client = wrapBedrock(
+      new FakeClient([
+        converseReply,
+        converseReply,
+        {
+          body: bytes({ content: [{ type: "text", text: "Soon." }], stop_reason: "end_turn" }),
+          contentType: "application/json",
+        },
+        {
+          body: bytes({ embedding: [0.1, 0.2], inputTextTokenCount: 6 }),
+          contentType: "application/json",
+        },
+      ]),
+    );
+
+    await client.send(
+      new ConverseCommand({
+        modelId: "anthropic.claude-3-haiku",
+        system: [{ text: system!.content }],
+        messages: [{ role: "user", content: [{ text: "Hi" }] }],
+      }),
+    );
+    await client.send(
+      new ConverseCommand({
+        modelId: "anthropic.claude-3-haiku",
+        messages: [{ role: "user", content: [{ text: user!.content }] }],
+      }),
+    );
+    await client.send(
+      new InvokeModelCommand({
+        modelId: "anthropic.claude-3-haiku",
+        contentType: "application/json",
+        body: bytes({
+          anthropic_version: "bedrock-2023-05-31",
+          max_tokens: 64,
+          messages: [{ role: "user", content: user!.content }],
+        }),
+      }),
+    );
+    await client.send(
+      new InvokeModelCommand({
+        modelId: "amazon.titan-embed-text-v2:0",
+        contentType: "application/json",
+        body: bytes({ inputText: user!.content }),
+      }),
+    );
+
+    const [systemSpan, messagesSpan, invokeSpan, embedSpan] = spans.getFinishedSpans();
+
+    for (const span of [systemSpan, messagesSpan, invokeSpan]) {
+      expect(span!.attributes["gen_ai.request.model"]).toBe("anthropic.claude-3-haiku");
+      expect(
+        Object.entries(span!.attributes).filter(([key]) => key.startsWith("td.prompt.")),
+      ).toEqual(
+        olderCore
+          ? []
+          : [
+              ["td.prompt.name", "support/reply"],
+              ["td.prompt.version", 12],
+              ["td.prompt.label", "production"],
+              ["td.prompt.variables", '{"team":"billing","order":"#4"}'],
+            ],
+      );
+    }
+
+    expect(embedSpan!.attributes["gen_ai.operation.name"]).toBe("embeddings");
+    expect(embedSpan!.attributes["td.prompt.name"]).toBeUndefined();
+  },
+);
 
 test("InvokeModel captures provider-native bodies and embedding spans", async () => {
   const spans = setup();

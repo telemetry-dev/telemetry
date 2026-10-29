@@ -244,6 +244,12 @@ def _offered_tools(tools: Any) -> dict[str, str] | None:
     return {"gen_ai.tool.definitions": json_dumps(definitions)} if definitions else None
 
 
+def _prompt_attributes(request: object) -> dict[str, Any]:
+    # Older cores have no prompt_attributes_for and record a prompt only inside with_prompt.
+    read = getattr(telemetry_dev, "prompt_attributes_for", None)
+    return cast("dict[str, Any]", read(request)) if callable(read) else {}
+
+
 def _messages_request(params: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     params = _sent_params(params)
     model = _string(params.get("model"))
@@ -264,7 +270,11 @@ def _messages_request(params: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
             "type": "generation",
             "model": model,
             "input": input_value,
-            "attributes": _offered_tools(tools),
+            "attributes": {
+                **(_offered_tools(tools) or {}),
+                **_prompt_attributes([params.get("system"), params.get("messages")]),
+            }
+            or None,
             "system_instructions": _native(params.get("system")),
             "temperature": _number(params.get("temperature")),
             "top_p": _number(params.get("top_p")),

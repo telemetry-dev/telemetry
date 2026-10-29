@@ -656,6 +656,62 @@ def test_generate_videos_terminal_operation_error_ends_span(
     assert attrs(span)["google_genai.response.operation_done"] is True
 
 
+SUPPORT_PROMPT = telemetry_dev.ChatPrompt(
+    name="support/reply",
+    version=12,
+    label="production",
+    messages=[
+        {"role": "system", "content": "You answer for the {{team}} desk."},
+        {"role": "user", "content": "Where is order {{order}}?"},
+    ],
+    model=None,
+    parameters={},
+    tools=[],
+    response_format={"type": "text"},
+    is_fallback=False,
+)
+
+
+@pytest.mark.parametrize(
+    ("field", "capture_input", "older_core"),
+    [("system_instruction", True, False), ("contents", False, False), ("contents", True, True)],
+)
+def test_generate_content_outside_with_prompt_records_the_prompt_of_a_compiled_text(
+    make: Any, monkeypatch: pytest.MonkeyPatch, field: str, capture_input: bool, older_core: bool
+) -> None:
+    memory = make(capture_input=capture_input)
+    if older_core:
+        monkeypatch.delattr(telemetry_dev, "prompt_attributes_for")
+    system, user = SUPPORT_PROMPT.compile(team="billing", order="#4")
+    client, _transport = client_with_transport([happy_payload()])
+
+    wrap_google_genai(client).models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[
+            types.Content(
+                role="user",
+                parts=[types.Part(text=user["content"] if field == "contents" else "Hi")],
+            )
+        ],
+        config=types.GenerateContentConfig(
+            system_instruction=system["content"] if field == "system_instruction" else "Be terse."
+        ),
+    )
+
+    a = attrs(only_span(memory))
+    assert a["gen_ai.request.model"] == "gemini-2.5-flash"
+    assert {key: value for key, value in a.items() if key.startswith("td.prompt.")} == (
+        {}
+        if older_core
+        else {
+            "td.prompt.name": "support/reply",
+            "td.prompt.version": 12,
+            "td.prompt.label": "production",
+            **({"td.prompt.variables": '{"team":"billing","order":"#4"}'} if capture_input else {}),
+        }
+    )
+
+
 @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
 def test_generate_content_maps_request_response_usage_and_sampling(
     memory: SimpleNamespace, async_mode: bool

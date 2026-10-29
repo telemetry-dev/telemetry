@@ -179,8 +179,18 @@ compiles its own. Model calls are the spans of type `generation` (operations `ch
 `text_completion`, and `generate_content`), including the spans of the provider integrations that
 use this SDK: OpenAI, Anthropic, Amazon Bedrock, Google GenAI, and OpenRouter. Spans from the AI SDK
 and TanStack AI integrations, and from other OpenTelemetry tracers, do not get the attributes.
-A model call outside `withPrompt` does not get the attributes, even when it sends messages from
-`compile()`; with input capture on, the call still records those messages as its input.
+
+Outside `withPrompt`, those provider integrations find the prompt in the request:
+`compile()` keeps the texts that it makes (the last 1000, at most 2,000,000 characters), and a
+chat call whose request holds one of them gets `td.prompt.name`, `td.prompt.version`, and
+`td.prompt.label`, also when input capture is off. A text from a template with a variable also
+gives `td.prompt.variables`, and it wins over a text from a template with none. A message of only
+a variable tag, for example `{{ question }}`, is not kept, because its text is your user's input.
+The text in the request must be equal to the compiled text. `withPrompt` wins over this. The
+integrations do it for OpenAI chat completions and responses, Anthropic messages, Bedrock Converse
+and InvokeModel, Google GenAI `generateContent`, and OpenRouter chat and responses, but not for
+images, audio, video, or OpenAI Realtime. For your own spans, `promptAttributesFor(request)`
+gives the attributes to pass as `attributes`; it gives nothing inside `withPrompt`.
 
 ## API
 

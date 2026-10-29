@@ -6,7 +6,14 @@ from typing import Any, Literal, cast
 
 import telemetry_dev
 
-from ._fields import PROVIDER, clean, merge_fields, metadata_fields, usage_from_converse
+from ._fields import (
+    PROVIDER,
+    clean,
+    merge_fields,
+    metadata_fields,
+    prompt_attributes,
+    usage_from_converse,
+)
 from ._invoke_model import is_embedding_model
 from ._invoke_model import request_fields as invoke_request_fields
 from ._invoke_model import response_fields as invoke_response_fields
@@ -50,6 +57,7 @@ def _converse_request(params: dict[str, Any]) -> dict[str, Any]:
             "model": _model(params),
             "input": normalize_messages(params.get("messages")),
             "system_instructions": normalize_content_list(params.get("system")) or None,
+            "attributes": prompt_attributes([params.get("system"), params.get("messages")]) or None,
             "temperature": inference.get("temperature"),
             "top_p": inference.get("topP"),
             "max_tokens": inference.get("maxTokens"),

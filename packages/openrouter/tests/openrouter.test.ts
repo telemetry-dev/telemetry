@@ -5,13 +5,16 @@ import { Embeddings } from "@openrouter/sdk/sdk/embeddings.js";
 import { EventStream } from "@openrouter/sdk/lib/event-streams.js";
 import { Responses } from "@openrouter/sdk/sdk/responses.js";
 import {
+  type ChatMessage,
   flush,
+  getPrompt,
   init,
   type MaskFn,
   shutdown,
   startActiveSpan,
   type TelemetryOptions,
 } from "@telemetry-dev/sdk";
+import * as telemetrySdk from "@telemetry-dev/sdk";
 import { afterEach, expect, test, vi } from "vitest";
 
 import { instrumentOpenRouter, uninstrumentOpenRouter, wrapOpenRouter } from "../src/index.ts";
@@ -307,6 +310,96 @@ afterEach(async () => {
   await shutdown();
   vi.restoreAllMocks();
 });
+
+test.each([
+  { api: "chat", olderCore: false },
+  { api: "streamed responses instructions", olderCore: false },
+  { api: "responses input", olderCore: false },
+  { api: "chat", olderCore: true },
+])(
+  "$api outside withPrompt record the prompt of compiled messages, older core $olderCore",
+  async ({ api, olderCore }) => {
+    if (olderCore) {
+      vi.spyOn(
+        telemetrySdk as { promptAttributesFor: unknown },
+        "promptAttributesFor",
+        "get",
+      ).mockReturnValue(undefined);
+    }
+
+    const prompt = await getPrompt("support/reply", {
+      apiKey: "td_live_a",
+      apiUrl: "https://prompts.openrouter.test",
+      fetch: async () =>
+        Response.json({
+          name: "support/reply",
+          type: "chat",
+          label: "production",
+          version: 12,
+          messages: [
+            { role: "system", content: "You answer for the {{team}} desk." },
+            { role: "user", content: "Where is order {{order}}?" },
+          ],
+          text: null,
+          model: { provider: "openrouter", name: "openai/gpt-4o" },
+          parameters: {},
+          tools: [],
+          responseFormat: { type: "text" },
+          rollout: null,
+        }),
+    });
+    const [system, user] = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+    const spans = setupSpans();
+
+    if (api === "chat") {
+      const client = clientWith(createFakeFetcher(jsonResponse(chatBody("chat_1"))).fetcher);
+      await client.chat.send({
+        chatRequest: { model: "openai/gpt-4o", messages: [system!, user!] },
+      });
+    } else if (api === "responses input") {
+      const client = clientWith(createFakeFetcher(jsonResponse(responsesBody("resp_1"))).fetcher);
+      await client.responses.send({
+        responsesRequest: {
+          model: "openai/gpt-4o",
+          input: [{ type: "message", role: "user", content: user!.content }],
+        },
+      });
+    } else {
+      const client = clientWith(
+        createFakeFetcher(
+          sseResponse([{ type: "response.completed", response: responsesBody("resp_1") }]),
+        ).fetcher,
+      );
+      const stream = await client.responses.send({
+        responsesRequest: {
+          model: "openai/gpt-4o",
+          instructions: system!.content,
+          input: "Hi",
+          stream: true,
+        },
+      });
+
+      if (!(stream instanceof ReadableStream)) throw new Error("expected a readable stream");
+      await collectStream(stream);
+    }
+
+    const { attributes } = await exportedSpan(spans);
+    expect(attributes["gen_ai.request.model"]).toBe("openai/gpt-4o");
+
+    if (olderCore) {
+      expect(attributes["td.prompt.name"]).toBeUndefined();
+
+      return;
+    }
+
+    expect(attributes).toMatchObject({
+      "td.prompt.name": "support/reply",
+      "td.prompt.version": 12,
+      "td.prompt.label": "production",
+      "td.prompt.variables": '{"team":"billing","order":"#4"}',
+    });
+  },
+);
 
 test("chat maps request, response, usage, primary cost, provider, and sampling fields", async () => {
   const spans = setupSpans();

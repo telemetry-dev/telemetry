@@ -1206,6 +1206,72 @@ def test_disabled_transcription_stream_capture_does_not_read_text(make: Any) -> 
     assert a["gen_ai.usage.text.output_tokens"] == 2
 
 
+SUPPORT_PROMPT = telemetry_dev.ChatPrompt(
+    name="support/reply",
+    version=12,
+    label="production",
+    messages=[
+        {"role": "system", "content": "You answer for the {{team}} desk."},
+        {"role": "user", "content": "Where is order {{order}}?"},
+    ],
+    model=None,
+    parameters={},
+    tools=[],
+    response_format={"type": "text"},
+    is_fallback=False,
+)
+
+
+def prompt_attrs(span: ReadableSpan) -> dict[str, object]:
+    return {key: value for key, value in attrs(span).items() if key.startswith("td.prompt.")}
+
+
+@pytest.mark.parametrize(
+    ("api", "capture_input", "older_core"),
+    [
+        ("chat", False, False),
+        ("responses instructions", True, False),
+        ("responses input", True, False),
+        ("chat", True, True),
+    ],
+)
+def test_calls_outside_with_prompt_record_the_prompt_of_compiled_messages(
+    make: Any, monkeypatch: pytest.MonkeyPatch, api: str, capture_input: bool, older_core: bool
+) -> None:
+    memory = make(capture_input=capture_input)
+    if older_core:
+        monkeypatch.delattr(telemetry_dev, "prompt_attributes_for")
+    system, user = SUPPORT_PROMPT.compile(team="billing", order="#4")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return json_response(chat_completion() if api == "chat" else response_payload())
+
+    client = wrap_openai(sync_client(handler))
+    if api == "chat":
+        cast(Any, client.chat.completions.create)(model="gpt-4o", messages=[system, user])
+    else:
+        in_input = api == "responses input"
+        cast(Any, client.responses.create)(
+            model="gpt-4.1",
+            instructions="Be terse." if in_input else system["content"],
+            input=[{"role": "user", "content": user["content"] if in_input else "Hi"}],
+        )
+
+    span = only_span(memory)
+    assert attrs(span)["gen_ai.request.model"] == ("gpt-4o" if api == "chat" else "gpt-4.1")
+    assert prompt_attrs(span) == (
+        {}
+        if older_core
+        else {
+            "td.prompt.name": "support/reply",
+            "td.prompt.version": 12,
+            "td.prompt.label": "production",
+            **({"td.prompt.variables": '{"team":"billing","order":"#4"}'} if capture_input else {}),
+        }
+    )
+    assert ("gen_ai.input.messages" in attrs(span)) is capture_input
+
+
 def test_chat_completion_maps_native_messages_usage_finish_provider_and_sampling(
     memory: SimpleNamespace,
 ) -> None:

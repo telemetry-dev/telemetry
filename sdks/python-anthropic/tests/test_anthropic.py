@@ -421,6 +421,56 @@ def test_streamed_input_tokens_include_cache_reads_and_writes(
     assert a["gen_ai.usage.cache_read.input_tokens"] == 1000
 
 
+SUPPORT_PROMPT = telemetry_dev.ChatPrompt(
+    name="support/reply",
+    version=12,
+    label="production",
+    messages=[
+        {"role": "system", "content": "You answer for the {{team}} desk."},
+        {"role": "user", "content": "Where is order {{order}}?"},
+    ],
+    model=None,
+    parameters={},
+    tools=[],
+    response_format={"type": "text"},
+    is_fallback=False,
+)
+
+
+@pytest.mark.parametrize(
+    ("field", "capture_input", "older_core"),
+    [("system", False, False), ("messages", True, False), ("messages", True, True)],
+)
+def test_create_outside_with_prompt_records_the_prompt_of_a_compiled_text(
+    make: Any, monkeypatch: pytest.MonkeyPatch, field: str, capture_input: bool, older_core: bool
+) -> None:
+    memory = make(capture_input=capture_input)
+    if older_core:
+        monkeypatch.delattr(telemetry_dev, "prompt_attributes_for")
+    system, user = SUPPORT_PROMPT.compile(team="billing", order="#4")
+    client = wrapped_sync_client(lambda _request: json_response(message_payload()))
+
+    client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=64,
+        system=system["content"] if field == "system" else "Be terse.",
+        messages=[{"role": "user", "content": user["content"] if field == "messages" else "Hi"}],
+    )
+
+    a = attrs(only_span(memory))
+    assert a["gen_ai.request.model"] == "claude-sonnet-4-6"
+    assert {key: value for key, value in a.items() if key.startswith("td.prompt.")} == (
+        {}
+        if older_core
+        else {
+            "td.prompt.name": "support/reply",
+            "td.prompt.version": 12,
+            "td.prompt.label": "production",
+            **({"td.prompt.variables": '{"team":"billing","order":"#4"}'} if capture_input else {}),
+        }
+    )
+
+
 def test_create_maps_native_messages_system_params_usage_finish_and_provider(
     memory: SimpleNamespace,
 ) -> None:

@@ -10,7 +10,8 @@ import {
   type PushMetricExporter,
   type ResourceMetrics,
 } from "@opentelemetry/sdk-metrics";
-import { flush, init, shutdown } from "@telemetry-dev/sdk";
+import { type ChatMessage, flush, getPrompt, init, shutdown } from "@telemetry-dev/sdk";
+import * as telemetrySdk from "@telemetry-dev/sdk";
 import {
   FunctionCallingConfigMode,
   GoogleGenAI,
@@ -233,6 +234,84 @@ afterEach(async () => {
   await shutdown();
   vi.restoreAllMocks();
 });
+
+test.each([
+  { field: "systemInstruction", captureInput: true, olderCore: false },
+  { field: "contents", captureInput: false, olderCore: false },
+  { field: "contents", captureInput: true, olderCore: true },
+])(
+  "generateContent outside withPrompt records the prompt of a compiled text in $field, input capture $captureInput, older core $olderCore",
+  async ({ field, captureInput, olderCore }) => {
+    if (olderCore) {
+      vi.spyOn(
+        telemetrySdk as { promptAttributesFor: unknown },
+        "promptAttributesFor",
+        "get",
+      ).mockReturnValue(undefined);
+    }
+
+    const prompt = await getPrompt("support/reply", {
+      apiKey: "td_live_a",
+      apiUrl: "https://prompts.google-genai.test",
+      fetch: async () =>
+        Response.json({
+          name: "support/reply",
+          type: "chat",
+          label: "production",
+          version: 12,
+          messages: [
+            { role: "system", content: "You answer for the {{team}} desk." },
+            { role: "user", content: "Where is order {{order}}?" },
+          ],
+          text: null,
+          model: { provider: "gcp.gemini", name: "gemini-2.5-flash" },
+          parameters: {},
+          tools: [],
+          responseFormat: { type: "text" },
+          rollout: null,
+        }),
+    });
+    const [system, user] = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+    const spans = setupSpans({ captureInput });
+    vi.stubGlobal(
+      "fetch",
+      createFakeFetch(
+        jsonResponse({
+          candidates: [
+            { content: { role: "model", parts: [{ text: "Soon." }] }, finishReason: "STOP" },
+          ],
+        }),
+      ).fetch,
+    );
+
+    await clientWith().models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: [{ role: "user", parts: [{ text: field === "contents" ? user!.content : "Hi" }] }],
+      config: {
+        temperature: 0.2,
+        systemInstruction: field === "systemInstruction" ? system!.content : "Be terse.",
+      },
+    });
+
+    const { attributes } = await exportedSpan(spans);
+    expect(attributes["gen_ai.request.temperature"]).toBe(0.2);
+
+    if (olderCore) {
+      expect(attributes["td.prompt.name"]).toBeUndefined();
+
+      return;
+    }
+
+    expect(attributes).toMatchObject({
+      "td.prompt.name": "support/reply",
+      "td.prompt.version": 12,
+      "td.prompt.label": "production",
+    });
+    expect(attributes["td.prompt.variables"]).toBe(
+      captureInput ? '{"team":"billing","order":"#4"}' : undefined,
+    );
+  },
+);
 
 test("generateContent maps request, response, usage, finish reason, provider, and sampling attributes", async () => {
   const spans = setupSpans();
