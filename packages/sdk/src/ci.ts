@@ -78,7 +78,8 @@ export function githubRun(env: Env): CiRun | undefined {
  * its `min-scores` input: `name=value` pairs, separated by commas or new lines.
  */
 export function minScoresFromEnv(env: Env): Record<string, number> {
-  const scores: Record<string, number> = {};
+  // Pairs, so that the name __proto__ becomes a key and not the prototype of the object.
+  const scores: [string, number][] = [];
 
   for (const pair of (env.TELEMETRY_DEV_EXPERIMENT_MIN_SCORES ?? "").split(/[,\n]/)) {
     if (pair.trim() === "") continue;
@@ -90,10 +91,10 @@ export function minScoresFromEnv(env: Env): Record<string, number> {
       );
     }
 
-    scores[name] = Number(value);
+    scores.push([name, Number(value)]);
   }
 
-  return scores;
+  return Object.fromEntries(scores);
 }
 
 /**

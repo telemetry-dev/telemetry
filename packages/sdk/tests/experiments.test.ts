@@ -7,6 +7,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   type ExperimentItem,
   ExperimentError,
+  log,
   propagateAttributes,
   runExperiment,
   type RunExperimentOptions,
@@ -216,22 +217,23 @@ test("runs each item of each page, posts batches of 100 on one version, then com
 
   const outcome = await experiment(api, { runsPerItem: 2, evaluators: ["Correctness"] });
 
-  expect(routes(api.requests)).toEqual([
-    "GET /v1/datasets/support-golden",
-    "POST /v1/experiments",
+  const sent = routes(api.requests);
+  expect(sent.slice(0, 2)).toEqual(["GET /v1/datasets/support-golden", "POST /v1/experiments"]);
+  // The second page and the first post of items run at the same time, in either order.
+  expect(sent.slice(2, -2).sort()).toEqual([
     "GET /v1/datasets/support-golden",
     `POST /v1/experiments/${EXPERIMENT_ID}/items`,
     `POST /v1/experiments/${EXPERIMENT_ID}/items`,
+  ]);
+  expect(sent.slice(-2)).toEqual([
     `POST /v1/experiments/${EXPERIMENT_ID}/complete`,
     `GET /v1/experiments/${EXPERIMENT_ID}`,
   ]);
 
   // The first page names no version; the next one asks for the version of the first.
-  expect(Object.fromEntries(api.requests[0]!.url.searchParams)).toEqual({});
-  expect(Object.fromEntries(api.requests[2]!.url.searchParams)).toEqual({
-    version: "3",
-    cursor: "50",
-  });
+  const pages = api.requests.filter((request) => request.url.pathname.startsWith("/v1/datasets/"));
+  expect(Object.fromEntries(pages[0]!.url.searchParams)).toEqual({});
+  expect(Object.fromEntries(pages[1]!.url.searchParams)).toEqual({ version: "3", cursor: "50" });
 
   expect(api.requests[1]!.body).toEqual({
     dataset: "support-golden",
@@ -271,7 +273,7 @@ test("runs each item of each page, posts batches of 100 on one version, then com
 });
 
 test("each item run is its own trace, and each span of the task carries the experiment and the item", async () => {
-  const { spans } = setup({ environment: "experiment", sessionMode: "process" });
+  const { spans, logs } = setup({ environment: "experiment", sessionMode: "process" });
   const api = fakeApi();
 
   // An active span, an ambient session, and the process session would each put the runs in one
@@ -282,6 +284,7 @@ test("each item run is its own trace, and each span of the task carries the expe
         runsPerItem: 2,
         task: (item) => {
           startSpan("chat gpt-4o", { type: "generation" }).end();
+          log("replied", { attributes: { number: item.number } });
 
           return { reply: `r${item.number}` };
         },
@@ -314,6 +317,20 @@ test("each item run is its own trace, and each span of the task carries the expe
         "user.id": "u-1",
       });
     }
+  }
+
+  const records = logs.getFinishedLogRecords();
+  expect(records).toHaveLength(4);
+
+  for (const record of records) {
+    const run = posted.find(
+      (candidate: { traceId: string }) => candidate.traceId === record.spanContext?.traceId,
+    );
+
+    expect(record.attributes).toMatchObject({
+      "td.experiment.id": EXPERIMENT_ID,
+      "td.dataset.item_id": run.itemId,
+    });
   }
 
   expect(posted.map((run: { output: string }) => run.output).sort()).toEqual([
@@ -627,7 +644,7 @@ test("in GitHub Actions the experiment records the pull request, its head commit
   vi.stubEnv("GITHUB_EVENT_PATH", event);
   vi.stubEnv("GITHUB_RUN_ID", "991");
   vi.stubEnv("TELEMETRY_DEV_EXPERIMENT_DATASET", "support-golden");
-  vi.stubEnv("TELEMETRY_DEV_EXPERIMENT_MIN_SCORES", "correctness=0.9\nlength = 12.5");
+  vi.stubEnv("TELEMETRY_DEV_EXPERIMENT_MIN_SCORES", "correctness=0.9\nlength = 12.5,__proto__=1");
   vi.stubEnv("TELEMETRY_DEV_EXPERIMENT_RESULTS", results);
   const api = fakeApi();
 
@@ -635,7 +652,7 @@ test("in GitHub Actions the experiment records the pull request, its head commit
 
   expect(api.requests[1]!.body).toMatchObject({
     dataset: "support-golden",
-    minScores: { correctness: 0.9, length: 12.5, tone: 2 },
+    minScores: JSON.parse('{"correctness":0.9,"tone":2,"length":12.5,"__proto__":1}'),
     ci: {
       provider: "github_actions",
       repository: "acme/support",

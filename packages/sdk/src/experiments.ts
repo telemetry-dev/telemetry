@@ -826,7 +826,7 @@ function formatScore(kind: string | null, value: number | null): string {
 
   return kind !== null && RATE_KINDS.has(kind)
     ? `${Math.round(value * 100)}%`
-    : String(Number(value.toFixed(2)));
+    : String(Math.round(value * 100) / 100);
 }
 
 function parseCreated(body: unknown): Created {
