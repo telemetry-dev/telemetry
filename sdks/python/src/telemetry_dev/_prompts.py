@@ -498,10 +498,10 @@ def _reset_in_child() -> None:
         entry.pending = None
 
 
-# A fork waits for each thread that holds the lock, so that the child gets no entry that a thread
-# changed only in part. os.register_at_fork cannot remove a hook, and importlib.reload runs this
-# module again with the same globals. Thus the hooks of the first run stay, and they find the lock
-# and the cache when they run. Windows has no fork.
+# A fork that runs these hooks waits for a thread that holds the lock, so that the child gets no
+# entry that a thread changed only in part. os.register_at_fork cannot remove a hook, and
+# importlib.reload runs this module again with the same globals. Thus the hooks of the first run
+# stay, and they find the lock and the cache when they run. Windows has no fork.
 if hasattr(os, "register_at_fork") and "_fork_hooks" not in globals():
     _fork_hooks = True
     os.register_at_fork(
@@ -528,7 +528,9 @@ def _load(
         now = monotonic()
         ttl = ttl_seconds if entry.response is not None else min(ttl_seconds, _ERROR_TTL_S)
         if entry.pending is not None and entry.pending_pid != os.getpid():
-            # A fork in C code that runs no hooks copied the fetch but not its thread.
+            # A fork in C code that runs no hooks copied the fetch but not its thread. This check
+            # does not replace the lock. If a thread of the parent held the lock at that fork, a
+            # call in the child waits for the lock with no limit.
             entry.pending = None
         # A local, because a fork in this thread, as in a signal handler, can clear entry.pending.
         pending = entry.pending

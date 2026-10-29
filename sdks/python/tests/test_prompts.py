@@ -760,10 +760,11 @@ def test_a_fork_after_a_reload_of_the_prompt_module_returns(
         prompts_module.__dict__.update(saved)
 
 
+@needs_fork
 @pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="needs signal.setitimer")
 @pytest.mark.parametrize("before_hook", ["stopped by a signal", "not run"])
 def test_the_fork_hooks_handle_a_lock_that_the_before_hook_did_not_get(
-    monkeypatch: pytest.MonkeyPatch, before_hook: str
+    server: CaptureServer, monkeypatch: pytest.MonkeyPatch, before_hook: str
 ) -> None:
     class Interrupted(Exception):
         pass
@@ -778,34 +779,48 @@ def test_the_fork_hooks_handle_a_lock_that_the_before_hook_did_not_get(
         try:
             with lock:
                 held.set()
-                done.wait(5)
+                # The fork must end while this thread holds the lock. If no signal stops the
+                # before hook, the hook waits for this thread, and this assert fails after 5 s.
+                assert done.wait(5)
         except BaseException as exc:
             errors.append(exc)
 
     def interrupt(signum: int, frame: FrameType | None) -> NoReturn:
         raise Interrupted
 
+    def fork_in_a_signal() -> int:
+        # SIGALRM raises while the before hook waits for the lock. os.fork() gives the error to
+        # sys.unraisablehook, forks, and then runs the after hooks.
+        in_fork_hook = sys.unraisablehook
+
+        def record(unraisable: sys.UnraisableHookArgs) -> None:
+            if not isinstance(unraisable.exc_value, Interrupted):
+                in_fork_hook(unraisable)
+
+        previous = signal.signal(signal.SIGALRM, interrupt)
+        sys.unraisablehook = record
+        signal.setitimer(signal.ITIMER_REAL, 0.1)
+        try:
+            return os.fork()
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            sys.unraisablehook = in_fork_hook
+            signal.signal(signal.SIGALRM, previous)
+
     holder = threading.Thread(target=hold)
     holder.start()
     held.wait()
-    previous = signal.signal(signal.SIGALRM, interrupt)
     try:
         if before_hook == "stopped by a signal":
-            # A signal handler raises while the before hook waits for the lock. os.fork()
-            # reports the error, forks, and then runs the after hooks.
-            signal.setitimer(signal.ITIMER_REAL, 0.1)
-            with pytest.raises(Interrupted):
-                prompts_module._lock_for_fork()  # pyright: ignore[reportPrivateUsage]
-            prompts_module._unlock_after_fork()  # pyright: ignore[reportPrivateUsage]
-        # The child hook. uWSGI with py-call-osafterfork forks in C and runs only this hook. In a
-        # child, the holder is a thread of the parent that does not exist there.
-        prompts_module._reset_in_child()  # pyright: ignore[reportPrivateUsage]
-        child_lock = prompts_module._cache_lock  # pyright: ignore[reportPrivateUsage]
-        assert child_lock.acquire(blocking=False)
-        child_lock.release()
+            # In the child, the holder is a thread of the parent that does not exist there.
+            assert in_fork(lambda: str(version_of(server)), fork_in_a_signal) == "12"
+        else:
+            # uWSGI with py-call-osafterfork forks in C and runs only the child hook.
+            prompts_module._reset_in_child()  # pyright: ignore[reportPrivateUsage]
+            child_lock = prompts_module._cache_lock  # pyright: ignore[reportPrivateUsage]
+            assert child_lock.acquire(blocking=False)
+            child_lock.release()
     finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
         done.set()
         holder.join()
     assert errors == []
