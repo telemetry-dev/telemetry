@@ -141,7 +141,9 @@ Concurrent calls share one fetch.
   its connection down at that time, because the urllib timeout applies to each socket operation
   and not to the full response. Only an address lookup can continue after the call stops waiting,
   until the system resolver gives up. Both SDKs measure the TTL and Retry-After in elapsed time, so
-  a change of the system clock does not move them.
+  a change of the system clock does not move them. A process that `os.fork()` makes gets the
+  copies of the parent, but not the fetch threads of the parent. In the child, a fetch that did not
+  end before the fork counts as not started. Thus a call that must fetch starts a new fetch.
 - Failure: when a fetch fails, the SDKs keep the last copy for another TTL and send the error to
   `onError` / `on_error`. With no copy, the call gets the fallback. With no fallback, the call gets
   a `PromptError`. With no copy, the calls of the next 10 seconds (or the TTL, if it is shorter)

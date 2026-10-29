@@ -3,9 +3,13 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import itertools
+import os
+import signal
 import socket
+import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Generator
@@ -91,6 +95,55 @@ def wait_for(check: Callable[[], bool]) -> None:
     while not check():
         assert time.monotonic() < deadline
         time.sleep(0.01)
+
+
+def in_fork(child: Callable[[], str]) -> str:
+    """Run ``child`` in a forked process and return its result, or the repr of its exception or
+    of an exception in a fork hook of the prompt module. The parent kills a child that does not
+    end in 10 s, and the test fails."""
+    # Python ignores an exception in a fork hook and only gives it to sys.unraisablehook. The
+    # hooks of OpenTelemetry raise after an earlier test discards its batch processor.
+    hook_errors: list[BaseException | None] = []
+
+    def record(unraisable: sys.UnraisableHookArgs) -> None:
+        frames = traceback.extract_tb(unraisable.exc_traceback)
+        if any(frame.filename == prompts_module.__file__ for frame in frames):
+            hook_errors.append(unraisable.exc_value)
+
+    previous_hook = sys.unraisablehook
+    read_end, write_end = os.pipe()
+    sys.unraisablehook = record
+    try:
+        pid = os.fork()
+    finally:
+        sys.unraisablehook = previous_hook
+    if pid == 0:
+        try:
+            os.close(read_end)
+            try:
+                result = repr(hook_errors[0]) if hook_errors else child()
+            except BaseException as exc:
+                result = repr(exc)
+            os.write(write_end, result.encode())
+        finally:
+            # The child must not return into pytest.
+            os._exit(0)
+    os.close(write_end)
+    with os.fdopen(read_end, "rb") as reader:
+        deadline = time.monotonic() + 10
+        while os.waitpid(pid, os.WNOHANG) == (0, 0):
+            if time.monotonic() > deadline:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                pytest.fail("The forked process did not end in 10 s")
+            time.sleep(0.01)
+        result = reader.read().decode()
+    assert hook_errors == []
+    return result
+
+
+def version_of(server: CaptureServer) -> int | None:
+    return get_prompt("support/reply", api_key="td_live_a", api_url=server.url).version
 
 
 @pytest.mark.parametrize(
@@ -523,6 +576,69 @@ def test_a_fetch_starts_no_connection_after_its_deadline(monkeypatch: pytest.Mon
     time.sleep(0.3)
     assert len(timeouts) == 1
     assert timeouts[0] is not None and timeouts[0] <= 0.2
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+# Python 3.12+ gives a warning for fork() in a process with threads, and the capture server has one.
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_forked_process_fetches_the_prompt_that_the_parent_was_fetching(
+    server: CaptureServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # This puts a limit on the wait of a child that waits for the fetch of the parent.
+    monkeypatch.setattr(prompts_module, "_FETCH_TIMEOUT_S", 3)
+    server.delay = 1
+    versions: list[int | None] = []
+    parent = threading.Thread(target=lambda: versions.append(version_of(server)))
+    parent.start()
+    wait_for(lambda: len(server.requests) == 1)
+    server.delay = 0
+
+    assert in_fork(lambda: str(version_of(server))) == "12"
+    parent.join()
+    assert versions == [12]
+    # The fetch of the parent, and the fetch of the child.
+    assert len(server.requests) == 2
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_forked_process_refreshes_the_copy_that_the_parent_was_refreshing(
+    server: CaptureServer, clock: list[float]
+) -> None:
+    assert version_of(server) == 12
+    clock[0] += 60
+    server.replies = [(200, reply(version=13))]
+    server.delay = 1
+    assert version_of(server) == 12
+    wait_for(lambda: len(server.requests) == 2)
+    server.delay = 0
+
+    def child() -> str:
+        kept = version_of(server)
+        wait_for(lambda: version_of(server) == 13)
+        return str(kept)
+
+    # The child returns the copy of the parent. Then its refresh gets version 13.
+    assert in_fork(child) == "12"
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_fork_while_a_thread_holds_the_cache_lock_does_not_deadlock_the_child(
+    server: CaptureServer,
+) -> None:
+    held = threading.Event()
+
+    def hold() -> None:
+        with prompts_module._cache_lock:  # pyright: ignore[reportPrivateUsage]
+            held.set()
+            time.sleep(0.2)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    held.wait()
+    assert in_fork(lambda: str(version_of(server))) == "12"
+    holder.join()
 
 
 def test_get_prompt_rejects_a_prompt_of_the_other_type_and_bad_options(

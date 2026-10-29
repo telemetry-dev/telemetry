@@ -5,6 +5,7 @@ import contextlib
 import copy
 import hashlib
 import json
+import os
 import random
 import re
 import socket
@@ -461,6 +462,30 @@ class _Entry:
 
 _cache: OrderedDict[tuple[str, str, str, str], _Entry] = OrderedDict()
 _cache_lock = threading.Lock()
+
+
+def _lock_cache() -> None:
+    _cache_lock.acquire()
+
+
+def _unlock_cache() -> None:
+    _cache_lock.release()
+
+
+def _reset_fetches() -> None:
+    # The child has no fetch threads of the parent, thus no thread can set their events. A call
+    # that must fetch starts a new fetch. The child keeps the copies.
+    for entry in _cache.values():
+        entry.pending = None
+    _unlock_cache()
+
+
+# fork() waits for each thread that holds the lock. Thus the child gets an unlocked lock, and no
+# entry that a thread changed only in part. Windows has no fork.
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_lock_cache, after_in_parent=_unlock_cache, after_in_child=_reset_fetches
+    )
 
 
 def _load(
