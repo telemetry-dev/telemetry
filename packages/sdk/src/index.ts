@@ -47,6 +47,20 @@ export { log, type LogOptions } from "./logs.ts";
 export { observe, type ObserveOptions } from "./observe.ts";
 
 export {
+  type DatasetItem,
+  ExperimentError,
+  type ExperimentItem,
+  type ExperimentResult,
+  type ExperimentScore,
+  runExperiment,
+  type RunExperimentOptions,
+  type Scorer,
+  type ScorerResult,
+} from "./experiments.ts";
+
+export { score, ScoreError, type ScoreOptions } from "./scores.ts";
+
+export {
   type ChatMessage,
   type ChatPrompt,
   type GetChatPromptOptions,
