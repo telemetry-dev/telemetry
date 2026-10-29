@@ -152,7 +152,7 @@ def in_fork(child: Callable[[], str], fork: Callable[[], int] | None = None) -> 
 
 
 def version_of(server: CaptureServer) -> int | None:
-    return get_prompt("support/reply", api_key="td_live_a", api_url=server.url).version
+    return get_prompt("support/reply", api_key="td_live_a", base_url=server.url).version
 
 
 @pytest.mark.parametrize(
