@@ -88,6 +88,8 @@ ATTR_PROMPT_NAME = "td.prompt.name"
 ATTR_PROMPT_VERSION = "td.prompt.version"
 ATTR_PROMPT_LABEL = "td.prompt.label"
 ATTR_PROMPT_VARIABLES = "td.prompt.variables"
+ATTR_EXPERIMENT_ID = "td.experiment.id"
+ATTR_DATASET_ITEM_ID = "td.dataset.item_id"
 
 USAGE_ATTRS: dict[str, str] = {
     "input_tokens": "gen_ai.usage.input_tokens",
