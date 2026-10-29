@@ -53,11 +53,6 @@ _MODEL_CALL_OPERATIONS = frozenset({"chat", "text_completion", "generate_content
 _PROMPT_KEY = otel_context.create_key("telemetry_dev.prompt")
 # How many messages prompt_attributes_for looks at, at each end of the list.
 _TAG_LOOKUP = 1000
-# A compile drops its variables when a compile at least this many compiles newer takes one of its
-# messages in a variable: its messages are then the history of a chat, and the newest compile names
-# the request. Without this, a history that keeps a compiled message of each turn would keep the
-# history list of every turn.
-_HISTORY_AGE = 100
 
 
 class PromptModel(TypedDict):
@@ -110,13 +105,15 @@ class ChatPrompt:
         prompt and a copy of these variables and of each list in them, so that a model call
         outside ``with_prompt`` that sends the message records them; see
         ``prompt_attributes_for``. The objects in a list are not copied. The message holds no
-        variables when input capture is off in the client. It drops them when a compile 100 or
-        more compiles newer takes one of its messages in a variable, as a chat history does. A
-        check of the exact type (``type(message) is dict``), ``yaml.safe_dump``, and ``marshal``
-        reject it: give them ``dict(message)``."""
+        variables when input capture is off in the client. When a newer compile gets one of these
+        messages in a variable, the compiles whose messages this compile got remove their
+        variables, and this compile keeps its own. Thus a chat history keeps the variables of its
+        last two turns, and a guard prompt that gets the messages before their call does not
+        remove them. A check of the exact type (``type(message) is dict``), ``yaml.safe_dump``, and
+        ``marshal`` reject it: give them ``dict(message)``."""
         values = _record(self, variables, kwargs)
         serial = next(_compiles)
-        _drop_history(values, serial)
+        _drop_history(values)
         client = get_client()
         # prompt_attributes_for cannot record the variables when input capture is off in the client.
         kept = values if client is None or client.capture_input else None
@@ -318,8 +315,8 @@ def prompt_attributes_for(messages: object) -> dict[str, AttributeValue]:
     The tag is on the dict that ``compile()`` made, so a copy of it gives ``{}``. Gives ``{}``
     inside ``with_prompt``, whose prompt the span gets. ``td.prompt.variables`` needs input
     capture on in the client, at the compile and now, and the span drops it when its own input
-    capture is off. A compile whose messages became the history of a newer compile gives no
-    variables; see ``ChatPrompt.compile``.
+    capture is off. The compile of a previous turn of a chat history gives no variables; see
+    ``ChatPrompt.compile``.
 
     It reads only a ``list`` or ``tuple``, not a subclass, so the read runs no code of the app.
     With input capture on, it serializes the variables, which calls the ``mask`` of the client and
@@ -474,7 +471,8 @@ class _CompileTag:
 
     prompt: ChatPrompt
     variables: dict[str, Any] | None
-    """None when input capture was off, or when the messages became a history; see _HISTORY_AGE."""
+    """None when input capture was off, or when the messages became a history; see
+    _drop_history."""
     serial: int
     """Counts the compiles of the process, so a higher one is newer."""
 
@@ -494,9 +492,23 @@ class _CompiledMessage(dict[str, Any]):
         return dict, (dict(self),)
 
 
-def _drop_history(values: Mapping[str, Any], serial: int) -> None:
-    """Drops the variables of each older compile whose message is in ``values``; see
-    _HISTORY_AGE."""
+def _drop_history(values: Mapping[str, Any]) -> None:
+    """When a compile gets a message of a previous compile in ``values``, the compiles whose
+    messages that previous compile got are the history of a chat and remove their variables. The
+    previous compile keeps its own, because its model call can come after this compile, as with a
+    guard prompt. Thus a chain of tags with variables is at most two tags long, for a history of
+    any length."""
+    for tag in _tags_in(values):
+        # One read: a compile in another thread can remove the variables of the tag.
+        variables = tag.variables
+        if variables is not None:
+            for older in _tags_in(variables):
+                older.variables = None
+
+
+def _tags_in(values: Mapping[str, Any]) -> Generator[_CompileTag]:
+    """The tags of the messages in ``values``: a value, or an item of a list or tuple in a value.
+    Exact types, so the read runs no code of the app."""
     for value in values.values():
         items: Sequence[object] = (
             cast("Sequence[object]", value)
@@ -506,8 +518,8 @@ def _drop_history(values: Mapping[str, Any], serial: int) -> None:
         for item in items:
             if type(item) is _CompiledMessage:
                 tag = getattr(item, "compiled_by", None)
-                if tag is not None and serial - tag.serial >= _HISTORY_AGE:
-                    tag.variables = None
+                if tag is not None:
+                    yield tag
 
 
 def _newest_tag(messages: object) -> _CompileTag | None:

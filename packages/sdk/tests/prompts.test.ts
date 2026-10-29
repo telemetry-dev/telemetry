@@ -11,6 +11,7 @@ import {
   getPrompt,
   type Prompt,
   promptAttributesFor,
+  type PromptVariables,
   propagateAttributes,
   PromptError,
   shutdown,
@@ -927,13 +928,6 @@ test("a message that a placeholder brings from an older compile does not win", a
       '{"team":"billing","history":[{"role":"user","content":"Where is #4?"}]}',
   });
   expect(promptAttributesFor(summarized)?.["td.prompt.name"]).toBe("summary");
-  // A newer compile that takes a message of a recent compile does not drop its variables.
-  expect(promptAttributesFor(question)).toEqual({
-    "td.prompt.name": "router",
-    "td.prompt.version": 1,
-    "td.prompt.label": "production",
-    "td.prompt.variables": '{"question":"Where is #4?"}',
-  });
 });
 
 test("promptAttributesFor looks at the first and the last 1000 messages", async () => {
@@ -1039,50 +1033,101 @@ test("with input capture off, compiled messages keep no variables", async () => 
   });
 });
 
-test("a chat history of compiled messages keeps the variables of a bounded number of turns", async () => {
-  setup();
-  const prompt = await promptOf({
-    messages: [
-      { role: "system", content: "Answer as the {{team}} desk." },
-      { role: "placeholder", name: "history" },
-      { role: "user", content: "{{question}}" },
-    ],
-  });
-  const turns: WeakRef<ChatMessage>[] = [];
-  let history: ChatMessage[] = [];
-  let last: ChatMessage[] = [];
+// Each row keeps the compiled question and the answer of a turn for the next turn: the variable
+// that gets them, and the value of that variable after the turn.
+test.each<[string, string, (kept: unknown, question: object, answer: object) => unknown]>([
+  ["a new list each turn", "history", (kept, ...turn) => [...(kept as object[]), ...turn]],
+  [
+    "one list trimmed in place to 20 messages",
+    "history",
+    (kept, ...turn) => {
+      const history = kept as object[];
+      history.push(...turn);
+      history.splice(0, history.length - 20);
 
-  // Each turn keeps its compiled question in the history. An unused variable marks the variables
-  // of the turn.
-  const chat = async (count: number) => {
-    for (let turn = 0; turn < count; turn += 1) {
-      const marker: ChatMessage = { role: "user", content: `turn ${turns.length}` };
+      return history;
+    },
+  ],
+  [
+    "a new list of the last 20 messages",
+    "history",
+    (kept, ...turn) => [...(kept as object[]), ...turn].slice(-20),
+  ],
+  ["the last question, not in a list", "previous", (_kept, question) => question],
+])(
+  "a chat history in %s keeps the variables of its last two turns",
+  async (_shape, variable, next) => {
+    setup();
+    const prompt = await promptOf({
+      messages: [
+        { role: "system", content: "Answer as the {{team}} desk." },
+        { role: "placeholder", name: "history" },
+        { role: "user", content: "{{question}}" },
+      ],
+    });
+    const turns: WeakRef<ChatMessage>[] = [];
+    let kept: unknown = variable === "history" ? [] : undefined;
+    let last: ChatMessage[] = [];
+    let older: ChatMessage | undefined;
+
+    // An unused variable marks the variables of each turn.
+    for (let turn = 0; turn < 300; turn += 1) {
+      const marker: ChatMessage = { role: "user", content: `turn ${turn}` };
       turns.push(new WeakRef(marker));
       last = prompt.compile({
         team: "billing",
-        question: `question ${turns.length}`,
-        history,
+        question: `question ${turn}`,
         marker: [marker],
-      }) as ChatMessage[];
-      history = [
-        ...history,
-        last.at(-1)!,
-        { role: "assistant", content: `answer ${turns.length}` },
-      ];
+        [variable]: kept,
+      } as PromptVariables) as ChatMessage[];
+      const question = last.at(-1)!;
+
+      if (turn === 297) older = question;
+      kept = next(kept, question, { role: "assistant", content: `answer ${turn}` });
     }
     await collect();
 
-    return turns.filter((turn) => turn.deref()).length;
-  };
+    expect(turns.filter((turn) => turn.deref()).length).toBe(2);
+    expect(promptAttributesFor(last)?.["td.prompt.variables"]).toContain(
+      '"question":"question 299"',
+    );
+    expect(promptAttributesFor(older)).toEqual({
+      "td.prompt.name": "support/reply",
+      "td.prompt.version": 12,
+      "td.prompt.label": "production",
+    });
+  },
+);
 
-  const kept = await chat(150);
-  expect(kept).toBeLessThan(150);
-  expect(await chat(150)).toBe(kept);
+test("a guard prompt keeps the variables of its request, also after other compiles", async () => {
+  setup();
+  const answer = await promptOf(RAG_PROMPT);
+  const guard = await promptOf({
+    name: "guard",
+    messages: [
+      { role: "system", content: "Is this safe?" },
+      { role: "placeholder", name: "conversation" },
+    ],
+  });
+  const other = await promptOf({ name: "other", messages: [{ role: "user", content: "{{q}}" }] });
+  const variables = '{"documents":"The refund policy","question":"Where is #4?"}';
 
-  const variables = JSON.parse(promptAttributesFor(last)!["td.prompt.variables"] as string) as {
-    history: ChatMessage[];
-  };
-  expect(variables.history).toHaveLength(598);
+  const messages = answer.compile({
+    documents: "The refund policy",
+    question: "Where is #4?",
+  }) as ChatMessage[];
+  // Other requests of the server compile before this request runs its guard.
+  for (let index = 0; index < 150; index += 1) other.compile({ q: `${index}` });
+  guard.compile({ conversation: messages });
+  expect(promptAttributesFor(messages)?.["td.prompt.variables"]).toBe(variables);
+
+  // An agent loop runs the guard before each step.
+  const conversation = [...messages];
+  for (let step = 0; step < 150; step += 1) {
+    guard.compile({ conversation });
+    conversation.push({ role: "assistant", content: `step ${step}` });
+  }
+  expect(promptAttributesFor(conversation)?.["td.prompt.variables"]).toBe(variables);
 });
 
 test("withPrompt wins over a compiled message of another prompt, through a parent and in updates", async () => {

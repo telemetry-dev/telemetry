@@ -1000,13 +1000,6 @@ def test_a_message_that_a_placeholder_brings_from_an_older_compile_does_not_win(
         ),
     }
     assert prompt_attributes_for(summarized)["td.prompt.name"] == "summary"
-    # A newer compile that takes a message of a recent compile does not drop its variables.
-    assert prompt_attributes_for(question) == {
-        "td.prompt.name": "router",
-        "td.prompt.version": 12,
-        "td.prompt.label": "production",
-        "td.prompt.variables": '{"question":"Where is #4?"}',
-    }
 
 
 def test_prompt_attributes_for_looks_at_the_first_and_the_last_1000_messages(
@@ -1234,8 +1227,45 @@ def test_with_input_capture_off_compiled_messages_keep_no_variables(make: MakeCl
     }
 
 
-def test_a_chat_history_of_compiled_messages_keeps_the_variables_of_a_bounded_number_of_turns(
+# How a chat keeps the compiled question and the answer of a turn for the next turn.
+def _new_list(kept: Any, question: dict[str, Any], answer: dict[str, Any]) -> Any:
+    return [*kept, question, answer]
+
+
+def _list_trimmed_in_place(kept: Any, question: dict[str, Any], answer: dict[str, Any]) -> Any:
+    kept.extend((question, answer))
+    del kept[:-20]
+    return kept
+
+
+def _new_list_of_20(kept: Any, question: dict[str, Any], answer: dict[str, Any]) -> Any:
+    return [*kept, question, answer][-20:]
+
+
+def _tuple_of_20(kept: Any, question: dict[str, Any], answer: dict[str, Any]) -> Any:
+    return (*kept, question, answer)[-20:]
+
+
+def _last_question(kept: Any, question: dict[str, Any], answer: dict[str, Any]) -> Any:
+    return question
+
+
+@pytest.mark.parametrize(
+    ("variable", "first", "keep"),
+    [
+        ("history", [], _new_list),
+        ("history", [], _list_trimmed_in_place),
+        ("history", [], _new_list_of_20),
+        ("history", (), _tuple_of_20),
+        ("previous", None, _last_question),
+    ],
+    ids=["new-list", "list-trimmed-in-place", "new-list-of-20", "tuple-of-20", "not-in-a-list"],
+)
+def test_a_chat_history_keeps_the_variables_of_its_last_two_turns(
     make: MakeClient,
+    variable: str,
+    first: Any,
+    keep: Callable[[Any, dict[str, Any], dict[str, Any]], Any],
 ) -> None:
     make()
     prompt = chat_prompt(
@@ -1244,29 +1274,57 @@ def test_a_chat_history_of_compiled_messages_keeps_the_variables_of_a_bounded_nu
         {"role": "user", "content": "{{question}}"},
     )
     turns: list[weakref.ref[Document]] = []
-    history: list[dict[str, Any]] = []
+    kept = copy.copy(first)
     last: list[dict[str, Any]] = []
+    older: dict[str, Any] = {}
 
-    # Each turn keeps its compiled question in the history. An unused variable marks the variables
-    # of the turn.
-    def chat(count: int) -> int:
-        nonlocal history, last
-        for _ in range(count):
-            marker = Document(content=f"turn {len(turns)}")
-            turns.append(weakref.ref(marker))
-            last = prompt.compile(
-                team="billing", question=f"question {len(turns)}", history=history, marker=marker
-            )
-            history = [*history, last[-1], {"role": "assistant", "content": f"answer {len(turns)}"}]
-        gc.collect()
-        return sum(1 for turn in turns if turn() is not None)
+    # An unused variable marks the variables of each turn.
+    for turn in range(300):
+        marker = Document(content=f"turn {turn}")
+        turns.append(weakref.ref(marker))
+        last = prompt.compile(
+            {"team": "billing", "question": f"question {turn}", "marker": marker, variable: kept}
+        )
+        if turn == 297:
+            older = last[-1]
+        kept = keep(kept, last[-1], {"role": "assistant", "content": f"answer {turn}"})
+    gc.collect()
 
-    kept = chat(150)
-    assert kept < 150
-    assert chat(150) == kept
+    assert sum(1 for turn in turns if turn() is not None) == 2
+    assert '"question":"question 299"' in str(prompt_attributes_for(last)["td.prompt.variables"])
+    assert prompt_attributes_for(older) == {
+        "td.prompt.name": "support/reply",
+        "td.prompt.version": 12,
+        "td.prompt.label": "production",
+    }
 
-    variables = json.loads(str(prompt_attributes_for(last)["td.prompt.variables"]))
-    assert len(variables["history"]) == 598
+
+def test_a_guard_prompt_keeps_the_variables_of_its_request_also_after_other_compiles(
+    make: MakeClient,
+) -> None:
+    make()
+    answer = chat_prompt(*RAG_MESSAGES)
+    guard = chat_prompt(
+        {"role": "system", "content": "Is this safe?"},
+        {"role": "placeholder", "name": "conversation"},
+        name="guard",
+    )
+    other = chat_prompt({"role": "user", "content": "{{q}}"}, name="other")
+    variables = '{"documents":"The refund policy","question":"Where is #4?"}'
+
+    messages = answer.compile(documents="The refund policy", question="Where is #4?")
+    # Other requests of the server compile before this request runs its guard.
+    for index in range(150):
+        other.compile(q=str(index))
+    guard.compile(conversation=messages)
+    assert prompt_attributes_for(messages)["td.prompt.variables"] == variables
+
+    # An agent loop runs the guard before each step.
+    conversation = list(messages)
+    for step in range(150):
+        guard.compile(conversation=conversation)
+        conversation.append({"role": "assistant", "content": f"step {step}"})
+    assert prompt_attributes_for(conversation)["td.prompt.variables"] == variables
 
 
 def test_a_fallback_prompt_records_its_name_and_label_but_no_version(

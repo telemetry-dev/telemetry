@@ -211,14 +211,16 @@ their text:
   at the call. Then they serialize the variables, which calls the `mask` of the client. A span
   whose effective captureInput is off drops `td.prompt.variables` from its attributes, also when
   the app passes the result of these functions to its own span.
-- A tag keeps the variables of its compile alive while a message of the compile lives. When a
-  chat compile gets a tagged message as a variable, or as an item of a list (Python: a list or
-  tuple) in a variable, and the tag is at least 100 serial numbers older, the older tag drops its
-  variables. Thus a chat history that keeps a compiled message of each turn keeps the variables of
-  about the last 100 compiles, not of each turn, and a request with only such messages records no
-  `td.prompt.variables`. The SDKs do not look deeper in a variable. They keep no other reference to
-  the variables, except those of the last compile of each prompt object and of each running scope,
-  for `withPrompt` / `with_prompt`.
+- A tag keeps the variables of its compile alive while a message of the compile lives. A chat
+  compile C can get a tagged message of a compile B as a variable, or as an item of a list
+  (Python: a list or tuple) in a variable. Then each compile A whose message B got in the same way
+  removes its variables, and B keeps its own. Thus a chat history that keeps a compiled message of
+  each turn keeps the variables of the last two turns, for a history of any length or window, and
+  a request with only messages of previous turns records no `td.prompt.variables`. A guard prompt
+  that gets the messages of a request before its call does not remove their variables, also after
+  other compiles in the process. The SDKs do not look deeper in a variable. They keep no other
+  reference to the variables, except those of the last compile of each prompt object and of each
+  running scope, for `withPrompt` / `with_prompt`.
 - `compile()` of a text prompt returns a string, which cannot carry a tag. Outside a scope, the
   SDKs do not record a text prompt: use `withPrompt` / `with_prompt`.
 - The provider integrations call them with the request messages before the span starts, also

@@ -199,12 +199,15 @@ Google GenAI `generateContent`, and OpenRouter chat and responses, but not for B
 
 With input capture on in the client when `compile()` runs, a tagged message keeps the variables of
 its `compile()` alive while the message lives. With input capture off, the tag keeps no variables.
-When `compile()` gets a message in a variable, or in a list in a variable (for example a chat
-history in a placeholder), and the message is from a `compile()` at least 100 compiles older, that
-older `compile()` drops its variables. Thus a chat history of compiled messages keeps the variables
-of about the last 100 compiles, not of each turn. A call that sends only messages of such an older
-`compile()` records its prompt without `td.prompt.variables`. The SDK does not look deeper in a
-variable for messages.
+When `compile()` gets a tagged message in a variable, or in a list in a variable, the `compile()`
+that made the message keeps its variables. But each `compile()` whose message that `compile()` got
+removes its variables. For a chat history in a placeholder, turn 3 thus removes the variables of
+turn 1 and keeps those of turn 2. A chat history of compiled messages keeps the variables of its
+last two turns, also when you cut it, and a call that sends only messages of previous turns records
+its prompt without `td.prompt.variables`. A guard prompt that gets the messages before their call
+does not remove their variables. The SDK does not look deeper in a variable for messages. If you
+keep compiled messages and do not give them to `compile()`, each one keeps the variables of its
+`compile()`: keep copies (`{ ...message }`) to free them.
 
 For your own spans, `promptAttributesFor(messages)` gives the attributes to pass as `attributes`.
 It gives nothing inside `withPrompt`, and a span with `captureInput: false` drops

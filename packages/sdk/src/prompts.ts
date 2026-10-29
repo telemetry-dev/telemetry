@@ -100,8 +100,10 @@ export interface ChatPrompt extends PromptBase {
    * It tags each message object that it makes with this prompt and a copy of these variables and
    * of each list in them, so that a model call outside `withPrompt` that sends the message records
    * them; see `promptAttributesFor`. The objects in a list are not copied. The tag keeps no
-   * variables when input capture is off in the client. It drops them when a compile 100 or more
-   * compiles newer takes one of its messages in a variable, as a chat history does.
+   * variables when input capture is off in the client. When a newer compile gets one of these
+   * messages in a variable, the compiles whose messages this compile got remove their variables,
+   * and this compile keeps its own. Thus a chat history keeps the variables of its last two turns,
+   * and a guard prompt that gets the messages before their call does not remove them.
    */
   compile<M = ChatMessage>(variables?: PromptVariables<M>): (ChatMessage | M)[];
 }
@@ -207,7 +209,9 @@ interface PromptScope {
 /** The `compile()` call that made a chat message. */
 interface CompileTag {
   readonly prompt: Prompt;
-  /** Undefined when input capture was off, or when the messages became a history; see HISTORY_AGE. */
+  /**
+   * Undefined when input capture was off, or when the messages became a history; see dropHistory.
+   */
   variables: PromptVariables<unknown> | undefined;
   /** Counts the compiles of the process, so a higher one is newer. */
   readonly serial: number;
@@ -228,13 +232,6 @@ const PROMPT_KEY = createContextKey("telemetry.dev prompt");
 const COMPILED_BY = Symbol("telemetry.dev compiled by");
 /** How many messages promptAttributesFor looks at, at each end of the list. */
 const TAG_LOOKUP = 1_000;
-/**
- * A compile drops its variables when a compile at least this many compiles newer takes one of its
- * messages in a variable: its messages are then the history of a chat, and the newest compile names
- * the request. Without this, a history that keeps a compiled message of each turn would keep the
- * history list of every turn.
- */
-const HISTORY_AGE = 100;
 
 const cache = new Map<string, CacheEntry>();
 const compiledVariables = new WeakMap<Prompt, object>();
@@ -386,8 +383,8 @@ export function promptAttributes(
  * the messages. It looks at the first 1000 and the last 1000 messages. The tag is on the message
  * object, so a copy of it gives nothing. Gives undefined inside `withPrompt`, whose prompt the span
  * gets. `td.prompt.variables` needs input capture on in the client, at the compile and now, and
- * the span drops it when its own input capture is off. A compile whose messages became the history
- * of a newer compile gives no variables; see `compile()`. It never throws.
+ * the span drops it when its own input capture is off. The compile of a previous turn of a chat
+ * history gives no variables; see `compile()`. It never throws.
  */
 export function promptAttributesFor(messages: unknown): Record<string, AttributeValue> | undefined {
   const config = currentClient().core?.config;
@@ -641,7 +638,7 @@ function createPrompt(input: {
 
       if (type === "text") return fill(content.text ?? "", values);
       compiles += 1;
-      dropHistory(values, compiles);
+      dropHistory(values);
       // promptAttributesFor cannot record the variables when input capture is off in the client.
       const captureInput = currentClient().core?.config.captureInput ?? true;
 
@@ -667,13 +664,26 @@ function copyVariables(variables: PromptVariables<unknown>): PromptVariables<unk
   );
 }
 
-/** Drops the variables of each older compile whose message is in `variables`; see HISTORY_AGE. */
-function dropHistory(variables: PromptVariables<unknown>, serial: number): void {
+/**
+ * When a compile gets a message of a previous compile in `variables`, the compiles whose messages
+ * that previous compile got are the history of a chat and remove their variables. The previous
+ * compile keeps its own, because its model call can come after this compile, as with a guard
+ * prompt. Thus a chain of tags with variables is at most two tags long, for a history of any
+ * length.
+ */
+function dropHistory(variables: PromptVariables<unknown>): void {
+  for (const tag of tagsIn(variables)) {
+    if (tag.variables) for (const older of tagsIn(tag.variables)) older.variables = undefined;
+  }
+}
+
+/** The tags of the messages in `variables`: a value, or an item of a list in a value. */
+function* tagsIn(variables: PromptVariables<unknown>): Generator<CompileTag> {
   for (const value of Object.values(variables)) {
     for (const item of Array.isArray(value) ? value : [value]) {
       const tag = tagOf(item);
 
-      if (tag && serial - tag.serial >= HISTORY_AGE) tag.variables = undefined;
+      if (tag) yield tag;
     }
   }
 }
