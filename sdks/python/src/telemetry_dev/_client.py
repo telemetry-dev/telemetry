@@ -269,7 +269,6 @@ def init(
     *,
     api_key: str | None = None,
     base_url: str | None = None,
-    api_url: str | None = None,
     environment: str | None = None,
     service_name: str | None = None,
     enabled: bool = True,
@@ -297,7 +296,6 @@ def init(
     config = resolve_config(
         api_key=api_key,
         base_url=base_url,
-        api_url=api_url,
         environment=environment,
         service_name=service_name,
     )

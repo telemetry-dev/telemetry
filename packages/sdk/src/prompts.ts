@@ -1,6 +1,7 @@
 import { type Attributes, type Context, createContextKey } from "@opentelemetry/api";
 import {
   activeContext,
+  DEFAULT_BASE_URL,
   jsonAttr,
   omitUndefined,
   reportError,
@@ -13,7 +14,6 @@ import {
 import type { FieldCaptureConfig } from "./attrs.ts";
 import { prepareCaptureValue } from "./capture.ts";
 import { currentClient } from "./client.ts";
-import { DEFAULT_API_URL } from "./config.ts";
 
 /** A message of a chat prompt. A placeholder stands for a list of messages that the app passes. */
 export type PromptMessage =
@@ -118,8 +118,8 @@ interface GetPromptOptionsBase {
   cacheTtlSeconds?: number;
   /** API key with the prompts:read scope. Falls back to the initialized client, then `TELEMETRY_DEV_API_KEY`. */
   apiKey?: string;
-  /** Falls back to the initialized client, then `TELEMETRY_DEV_API_URL`, then `https://api.telemetry.dev`. */
-  apiUrl?: string;
+  /** Falls back to the initialized client, then `TELEMETRY_DEV_BASE_URL`, then `https://ingest.telemetry.dev`. */
+  baseUrl?: string;
   /** Falls back to the initialized client's `fetch`, then `globalThis.fetch`. */
   fetch?: typeof fetch;
 }
@@ -224,11 +224,12 @@ export async function getPrompt(name: string, options: GetPromptOptions = {}): P
   const env = resolveEnv();
   const apiKey = options.apiKey ?? core?.config.apiKey ?? env.TELEMETRY_DEV_API_KEY;
 
-  const apiUrl = (
-    options.apiUrl ||
-    core?.config.apiUrl ||
-    env.TELEMETRY_DEV_API_URL ||
-    DEFAULT_API_URL
+  // An empty value counts as unset, as in the Python SDK.
+  const baseUrl = (
+    options.baseUrl ||
+    core?.config.baseUrl ||
+    env.TELEMETRY_DEV_BASE_URL ||
+    DEFAULT_BASE_URL
   ).replace(/\/+$/, "");
 
   const label = options.version === undefined ? (options.label ?? "production") : null;
@@ -243,7 +244,7 @@ export async function getPrompt(name: string, options: GetPromptOptions = {}): P
       );
     }
 
-    const url = new URL(`${apiUrl}/v1/prompts`);
+    const url = new URL(`${baseUrl}/v1/prompts`);
     url.searchParams.set("name", name);
 
     if (label === null) url.searchParams.set("version", String(options.version));
@@ -251,7 +252,7 @@ export async function getPrompt(name: string, options: GetPromptOptions = {}): P
 
     response = await load(
       [
-        apiUrl,
+        baseUrl,
         keyFingerprint(apiKey),
         name,
         label === null ? `version:${options.version}` : `label:${label}`,

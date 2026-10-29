@@ -22,13 +22,13 @@ interface Call {
 
 type Reply = Record<string, unknown> | Response | Promise<Response> | Error;
 
-let apiCount = 0;
+let baseCount = 0;
 
-// The prompt cache lives for the process; a new API URL gives each test its own entries.
-function newApiUrl(): string {
-  apiCount += 1;
+// The prompt cache lives for the process; a new base URL gives each test its own entries.
+function newBaseUrl(): string {
+  baseCount += 1;
 
-  return `https://api-${apiCount}.test`;
+  return `https://ingest-${baseCount}.test`;
 }
 
 function fakeFetch(...replies: Reply[]) {
@@ -100,7 +100,6 @@ async function serve(handler: RequestListener): Promise<{ url: string; close: ()
 
 beforeEach(() => {
   vi.stubEnv("TELEMETRY_DEV_API_KEY", undefined);
-  vi.stubEnv("TELEMETRY_DEV_API_URL", undefined);
   vi.stubEnv("TELEMETRY_DEV_BASE_URL", undefined);
 });
 
@@ -117,13 +116,13 @@ test.each([
   [{ version: 13 }, { version: "13" }],
 ])("getPrompt(%j) sends query %j with the key and the SDK header", async (options, query) => {
   const { fetch, calls } = fakeFetch(reply());
-  const apiUrl = newApiUrl();
+  const baseUrl = newBaseUrl();
 
-  await getPrompt("support/reply", { ...options, apiKey: "td_live_a", apiUrl, fetch });
+  await getPrompt("support/reply", { ...options, apiKey: "td_live_a", baseUrl, fetch });
 
   expect(calls).toHaveLength(1);
   const { url, init } = calls[0]!;
-  expect(`${url.origin}${url.pathname}`).toBe(`${apiUrl}/v1/prompts`);
+  expect(`${url.origin}${url.pathname}`).toBe(`${baseUrl}/v1/prompts`);
   expect(Object.fromEntries(url.searchParams)).toEqual({ name: "support/reply", ...query });
   expect(init?.method).toBe("GET");
   expect(init?.headers).toMatchObject({
@@ -132,56 +131,79 @@ test.each([
   });
 });
 
-test("getPrompt reads the key, API URL, and fetch of the initialized client", async () => {
+test("getPrompt reads the key, base URL, and fetch of the initialized client", async () => {
   const { fetch, calls } = fakeFetch(reply());
-  const apiUrl = newApiUrl();
-  setup({ apiKey: "td_live_client", apiUrl, fetch });
+  const baseUrl = newBaseUrl();
+  setup({ apiKey: "td_live_client", baseUrl, fetch });
 
   const prompt = await getPrompt("support/reply");
 
   expect(prompt.version).toBe(12);
-  expect(calls[0]!.url.origin).toBe(apiUrl);
+  expect(calls[0]!.url.origin).toBe(baseUrl);
   expect(calls[0]!.init?.headers).toMatchObject({ authorization: "Bearer td_live_client" });
 });
 
 test.each([false, true])(
-  "getPrompt reads the key and API URL from the environment (initialized: %s)",
+  "getPrompt reads the key and base URL from the environment (initialized: %s)",
   async (initialized) => {
     const { fetch, calls } = fakeFetch(reply());
-    const apiUrl = newApiUrl();
+    const baseUrl = newBaseUrl();
     vi.stubEnv("TELEMETRY_DEV_API_KEY", "td_live_env");
-    vi.stubEnv("TELEMETRY_DEV_API_URL", `${apiUrl}/`);
+    vi.stubEnv("TELEMETRY_DEV_BASE_URL", `${baseUrl}/`);
     if (initialized) setup({ apiKey: undefined });
 
     await getPrompt("support/reply", { fetch });
 
     const { url, init } = calls[0]!;
-    expect(`${url.origin}${url.pathname}`).toBe(`${apiUrl}/v1/prompts`);
+    expect(`${url.origin}${url.pathname}`).toBe(`${baseUrl}/v1/prompts`);
     expect(init?.headers).toMatchObject({ authorization: "Bearer td_live_env" });
   },
 );
 
-test.each([
-  { initialized: false, envApiUrl: undefined },
-  { initialized: true, envApiUrl: undefined },
-  { initialized: false, envApiUrl: "" },
-  { initialized: true, envApiUrl: "" },
-])(
-  "without an API URL, getPrompt reads https://api.telemetry.dev, not the base URL (initialized: $initialized, TELEMETRY_DEV_API_URL: $envApiUrl)",
-  async ({ initialized, envApiUrl }) => {
-    const { fetch, calls } = fakeFetch(reply());
-    vi.stubEnv("TELEMETRY_DEV_BASE_URL", "https://ingest-env.test");
-    vi.stubEnv("TELEMETRY_DEV_API_URL", envApiUrl);
-    if (initialized) setup({ baseUrl: "https://ingest-init.test" });
+test("getPrompt sends the request to the base URL that telemetry exports use", async () => {
+  const exported: string[] = [];
+  const { fetch: prompts, calls } = fakeFetch(reply());
 
-    // The cases use one API URL, thus each uses its own key to get its own cache entry.
+  const fetch = (async (input: string | URL, init?: RequestInit) => {
+    const url = new URL(input);
+
+    if (url.pathname === "/v1/prompts") return prompts(input, init);
+    exported.push(url.href);
+
+    return new Response(null, { status: 200 });
+  }) as typeof globalThis.fetch;
+
+  const baseUrl = newBaseUrl();
+  setup({ baseUrl: `${baseUrl}/`, fetch }, { spanExporter: undefined });
+
+  startSpan("work").end();
+  await flush();
+  await getPrompt("support/reply");
+
+  expect(exported).toEqual([`${baseUrl}/v1/traces`]);
+  expect(calls[0]!.url.href).toBe(`${baseUrl}/v1/prompts?name=support%2Freply&label=production`);
+});
+
+test.each([
+  { initialized: false, envBaseUrl: undefined },
+  { initialized: true, envBaseUrl: undefined },
+  { initialized: false, envBaseUrl: "" },
+  { initialized: true, envBaseUrl: "" },
+])(
+  "without a base URL, getPrompt reads https://ingest.telemetry.dev (initialized: $initialized, TELEMETRY_DEV_BASE_URL: $envBaseUrl)",
+  async ({ initialized, envBaseUrl }) => {
+    const { fetch, calls } = fakeFetch(reply());
+    vi.stubEnv("TELEMETRY_DEV_BASE_URL", envBaseUrl);
+    if (initialized) setup();
+
+    // The cases use one base URL, thus each uses its own key to get its own cache entry.
     await getPrompt("support/reply", {
-      apiKey: `td_live_${initialized}_${envApiUrl === undefined ? "unset" : "empty"}`,
+      apiKey: `td_live_${initialized}_${envBaseUrl === undefined ? "unset" : "empty"}`,
       fetch,
     });
 
     expect(calls[0]!.url.href).toBe(
-      "https://api.telemetry.dev/v1/prompts?name=support%2Freply&label=production",
+      "https://ingest.telemetry.dev/v1/prompts?name=support%2Freply&label=production",
     );
   },
 );
@@ -190,7 +212,7 @@ test("getPrompt keeps a prompt for the TTL, then refreshes it in the background"
   vi.useFakeTimers({ toFake: ["Date"] });
   const refresh = deferred();
   const { fetch, calls } = fakeFetch(reply(), refresh.promise);
-  const options = { apiKey: "td_live_a", apiUrl: newApiUrl(), fetch };
+  const options = { apiKey: "td_live_a", baseUrl: newBaseUrl(), fetch };
 
   expect((await getPrompt("support/reply", options)).version).toBe(12);
   vi.advanceTimersByTime(59_000);
@@ -218,7 +240,7 @@ test("getPrompt keeps a prompt for the TTL, then refreshes it in the background"
 
 test("concurrent calls share one fetch", async () => {
   const { fetch, calls } = fakeFetch(reply());
-  const options = { apiKey: "td_live_a", apiUrl: newApiUrl(), fetch };
+  const options = { apiKey: "td_live_a", baseUrl: newBaseUrl(), fetch };
 
   const prompts = await Promise.all([
     getPrompt("support/reply", options),
@@ -241,8 +263,8 @@ test("a failed refresh returns the last copy and reports the error", async () =>
     new TypeError("fetch failed"),
   );
 
-  const apiUrl = newApiUrl();
-  setup({ apiUrl, fetch, onError: (error) => errors.push(error) });
+  const baseUrl = newBaseUrl();
+  setup({ baseUrl, fetch, onError: (error) => errors.push(error) });
 
   expect((await getPrompt("support/reply")).version).toBe(12);
   vi.advanceTimersByTime(60_000);
@@ -269,7 +291,7 @@ test("with no copy, a failed fetch returns the fallback, and so do calls for 10 
 
   const options = {
     apiKey: "td_live_a",
-    apiUrl: newApiUrl(),
+    baseUrl: newBaseUrl(),
     fetch,
     fallback: [{ role: "user" as const, content: "Answer {{customer_message}}" }],
   };
@@ -305,7 +327,7 @@ test("with no copy and no fallback, getPrompt rejects with a PromptError", async
   const { fetch } = fakeFetch(
     apiError(404, "label_not_found", "support/reply has no production label"),
   );
-  const options = { apiKey: "td_live_a", apiUrl: newApiUrl(), fetch };
+  const options = { apiKey: "td_live_a", baseUrl: newBaseUrl(), fetch };
 
   const error = await getPrompt("support/reply", options).catch((cause: unknown) => cause);
 
@@ -324,12 +346,12 @@ test("with no copy and no fallback, getPrompt rejects with a PromptError", async
 
   const { fetch: offline } = fakeFetch(new TypeError("fetch failed"));
   await expect(
-    getPrompt("support/reply", { ...options, apiUrl: newApiUrl(), fetch: offline }),
+    getPrompt("support/reply", { ...options, baseUrl: newBaseUrl(), fetch: offline }),
   ).rejects.toMatchObject({ code: "network_error" });
 
   const { fetch: invalid } = fakeFetch({ name: "support/reply", type: "chat" });
   await expect(
-    getPrompt("support/reply", { ...options, apiUrl: newApiUrl(), fetch: invalid }),
+    getPrompt("support/reply", { ...options, baseUrl: newBaseUrl(), fetch: invalid }),
   ).rejects.toMatchObject({ code: "invalid_response" });
 });
 
@@ -347,7 +369,7 @@ test("a redirect fails with http_302 and does not send the key to the target", a
 
   try {
     await expect(
-      getPrompt("support/reply", { apiKey: "td_live_a", apiUrl: origin.url }),
+      getPrompt("support/reply", { apiKey: "td_live_a", baseUrl: origin.url }),
     ).rejects.toMatchObject({ code: "http_302", status: 302 });
     expect(targetRequests).toEqual([]);
   } finally {
@@ -364,7 +386,7 @@ test("a fetch that takes more than 10 seconds fails with timeout", async () => {
       init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
     })) as typeof globalThis.fetch;
 
-  const pending = getPrompt("support/reply", { apiKey: "td_live_a", apiUrl: newApiUrl(), fetch });
+  const pending = getPrompt("support/reply", { apiKey: "td_live_a", baseUrl: newBaseUrl(), fetch });
   const result = pending.catch((cause: unknown) => cause);
   await vi.advanceTimersByTimeAsync(10_000);
 
@@ -373,7 +395,7 @@ test("a fetch that takes more than 10 seconds fails with timeout", async () => {
 
 test("getPrompt rejects a prompt of the other type and bad options", async () => {
   const { fetch } = fakeFetch(reply({ type: "text", messages: [], text: "Hi" }));
-  const options = { apiKey: "td_live_a", apiUrl: newApiUrl(), fetch };
+  const options = { apiKey: "td_live_a", baseUrl: newBaseUrl(), fetch };
 
   await expect(getPrompt("support/reply", options)).rejects.toMatchObject({
     code: "type_mismatch",
@@ -406,7 +428,7 @@ test("one session keeps one version of a gradual rollout", async () => {
   const fetchWith = async (percent: number, sessionId?: string) => {
     const options = {
       apiKey: "td_live_a",
-      apiUrl: newApiUrl(),
+      baseUrl: newBaseUrl(),
       fetch: fakeFetch(rollout(percent)).fetch,
     };
 
@@ -433,7 +455,7 @@ test("compile fills variables and expands placeholders", async () => {
   const { fetch } = fakeFetch(reply());
   const prompt = await getPrompt("support/reply", {
     apiKey: "td_live_a",
-    apiUrl: newApiUrl(),
+    baseUrl: newBaseUrl(),
     fetch,
   });
 
@@ -463,7 +485,7 @@ test("compile fills variables and expands placeholders", async () => {
   );
   const tricky = await getPrompt("support/reply", {
     apiKey: "td_live_a",
-    apiUrl: newApiUrl(),
+    baseUrl: newBaseUrl(),
     fetch: prototypeFetch,
   });
   expect(tricky.compile()).toEqual([{ role: "user", content: "" }]);
@@ -481,7 +503,7 @@ test("withPrompt stamps model-call spans in scope and no others", async () => {
   const { fetch } = fakeFetch(reply());
   const prompt = await getPrompt("support/reply", {
     apiKey: "td_live_a",
-    apiUrl: newApiUrl(),
+    baseUrl: newBaseUrl(),
     fetch,
   });
 
@@ -530,7 +552,7 @@ test.each(["before", "inside"])(
     const { fetch } = fakeFetch(reply());
     const prompt = await getPrompt("support/reply", {
       apiKey: "td_live_a",
-      apiUrl: newApiUrl(),
+      baseUrl: newBaseUrl(),
       fetch,
     });
 
@@ -576,7 +598,7 @@ test("variables are omitted when input capture is off; a version fetch has no la
   const prompt = await getPrompt("support/reply", {
     version: 7,
     apiKey: "td_live_a",
-    apiUrl: newApiUrl(),
+    baseUrl: newBaseUrl(),
     fetch,
   });
 
@@ -616,7 +638,7 @@ test("a fallback prompt records its name and label but no version", async () => 
 
   const prompt = await getPrompt("support/reply", {
     apiKey: "td_live_a",
-    apiUrl: newApiUrl(),
+    baseUrl: newBaseUrl(),
     fetch,
     fallback: [{ role: "user", content: "Hi" }],
   });

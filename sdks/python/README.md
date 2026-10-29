@@ -56,8 +56,7 @@ routed to the `on_error` hook / `telemetry_dev` logger — never raised into you
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `TELEMETRY_DEV_API_KEY` | — | Ingest key (`td_live_...`). Absent = SDK is a no-op. |
-| `TELEMETRY_DEV_BASE_URL` | `https://ingest.telemetry.dev` | Ingest base URL (trailing slashes stripped). |
-| `TELEMETRY_DEV_API_URL` | `https://api.telemetry.dev` | API base URL for `get_prompt` (trailing slashes stripped). |
+| `TELEMETRY_DEV_BASE_URL` | `https://ingest.telemetry.dev` | Base URL for telemetry export and `get_prompt` (trailing slashes stripped). |
 | `TELEMETRY_DEV_ENVIRONMENT` | `production` | Deployment environment label. |
 | `OTEL_SERVICE_NAME` | `unknown_service` | Service name on every trace. |
 | `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | OTel trace sampling policy, which includes session roots. |
@@ -84,7 +83,7 @@ later `init()` generates a new ID. It is not persisted across processes.
 | `propagate_attributes(*, user_id=, session_id=, metadata=)` | Context manager stamping `user.id` / `gen_ai.conversation.id` / `td.metadata.*` on every span and log record started inside (threads/asyncio included via contextvars). |
 | `log(message, *, level="info", event_name=None, attributes=None)` | Emit an OTLP log record to `/v1/logs`, correlated with the current trace. Levels: `debug`/`info`/`warn`/`error` (`"warning"` is accepted as an alias of `warn`). |
 | `get_traceparent() -> str \| None` | W3C traceparent of the current context. |
-| `get_prompt(name, *, label=, version=, type="chat", cache_ttl_seconds=60, fallback=, api_key=, api_url=)` / `get_prompt_async(...)` | Fetch a prompt by label or version; see [Prompts](#prompts). |
+| `get_prompt(name, *, label=, version=, type="chat", cache_ttl_seconds=60, fallback=, api_key=, base_url=)` / `get_prompt_async(...)` | Fetch a prompt by label or version; see [Prompts](#prompts). |
 | `with_prompt(prompt)` | Context manager recording the prompt on each model call started inside. |
 | `flush(timeout_s=10.0)` / `shutdown(timeout_s=10.0)` | Force-flush / tear down traces + logs + metrics. Shutdown also runs atexit unless `disable_atexit=True`. |
 | `TelemetrySpanProcessor` / `telemetry_dev.otel.create_telemetry_span_exporter` | Bring-your-own-OTel helpers (below). |
@@ -145,7 +144,7 @@ metadata, identifiers, resource attributes, or events written directly through r
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `api_key`, `base_url`, `api_url`, `environment`, `service_name` | env vars | Connection + resource settings. |
+| `api_key`, `base_url`, `environment`, `service_name` | env vars | Connection + resource settings. |
 | `enabled` | `True` | `False` = hard kill switch (tests). |
 | `session_mode` | `"explicit"` | `"process"` groups otherwise uncorrelated spans and logs under one generated session ID per `init()` (see [Environment variables](#environment-variables)). Other values call `on_error` and install a disabled client. |
 | `register_global` | `False` | Also register the tracer provider globally. Applies a default export filter (only `telemetry_dev`-scoped spans are exported); pass `span_filter=lambda s: True` to export everything. |
@@ -225,10 +224,10 @@ pinned = telemetry_dev.get_prompt("support/reply", version=13)
   redirect, thus your key does not go to a different host. With no copy, the calls of the next 10
   seconds (or the TTL, if it is shorter) get the same result without a fetch. This is the one SDK
   function that can raise: your app cannot run without its prompt.
-- `get_prompt` uses the API key and API URL of an enabled `init()`, or `TELEMETRY_DEV_API_KEY`
-  and `TELEMETRY_DEV_API_URL`, or its own `api_key` and `api_url`. The default API URL is
-  `https://api.telemetry.dev`. `get_prompt` does not use `base_url` or `TELEMETRY_DEV_BASE_URL`.
-  The key needs the read scope for prompts.
+- `get_prompt` uses the API key and base URL of an enabled `init()`, or `TELEMETRY_DEV_API_KEY`
+  and `TELEMETRY_DEV_BASE_URL`, or its own `api_key` and `base_url`. It reads the same host that
+  telemetry goes to, `https://ingest.telemetry.dev` by default. The key needs the read scope for
+  prompts.
 - When a label sends part of the traffic to a second version, each session keeps one version: the
   choice uses the session id of `propagate_attributes` (or of `session_mode="process"`). Without a
   session id, each call chooses at random.

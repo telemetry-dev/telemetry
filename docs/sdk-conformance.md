@@ -84,8 +84,8 @@ server tools. They record it regardless of capture flags and `mask`; description
 schemas stay in the captured input.
 
 Shared constants: env vars `TELEMETRY_DEV_API_KEY` / `TELEMETRY_DEV_BASE_URL` (default
-`https://ingest.telemetry.dev`) / `TELEMETRY_DEV_API_URL` (default `https://api.telemetry.dev`,
-used only by `getPrompt` / `get_prompt`) / `TELEMETRY_DEV_ENVIRONMENT` (default `production`) /
+`https://ingest.telemetry.dev`, for telemetry export and `getPrompt` / `get_prompt`) /
+`TELEMETRY_DEV_ENVIRONMENT` (default `production`) /
 `OTEL_SERVICE_NAME` (default `unknown_service`); truncation cap 65536 chars **including** the
 `...[truncated]` marker (custom caps shorter than the marker retain its prefix); batch defaults
 64/1000ms/2048/30000ms; instrumentation scopes
@@ -124,13 +124,13 @@ The metrics use DELTA temporality and the bucket boundaries in `packages/otel/sr
 
 ## Prompts
 
-`getPrompt(name, options)` / `get_prompt(name, ...)` send `GET {apiUrl}/v1/prompts?name=<name>`
+`getPrompt(name, options)` / `get_prompt(name, ...)` send `GET {baseUrl}/v1/prompts?name=<name>`
 with `label=<label>` (default `production`) or `version=<n>`, the `Authorization: Bearer <key>`
-header, and the SDK header. `{apiUrl}` is the `apiUrl` / `api_url` option, then the API URL of an
-enabled `init()`, then `TELEMETRY_DEV_API_URL`, then `https://api.telemetry.dev`. An empty value
-counts as unset. The SDKs do not send
-this request to the ingest base URL. The two SDKs keep one copy per API URL, API key fingerprint,
-name, and label or version. Concurrent calls share one fetch.
+header, and the SDK header. `{baseUrl}` is the `baseUrl` / `base_url` option, then the base URL of
+an enabled `init()`, then `TELEMETRY_DEV_BASE_URL`, then `https://ingest.telemetry.dev`, so prompts
+come from the host that telemetry goes to. For the prompt request, an empty value counts as unset.
+The two SDKs keep one copy per base URL, API key fingerprint, name, and label or version.
+Concurrent calls share one fetch.
 
 - Cache: when the copy is older than `cacheTtlSeconds` / `cache_ttl_seconds` (default 60), a call
   returns the copy at once and starts one fetch in the background. Only a call with no copy waits
