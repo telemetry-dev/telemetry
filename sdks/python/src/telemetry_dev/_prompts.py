@@ -13,8 +13,11 @@ import urllib.request
 from collections import OrderedDict
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from email.message import Message
+from email.utils import parsedate_to_datetime
 from time import monotonic
 from typing import IO, Any, Literal, TypeAlias, TypedDict, cast, overload
 from weakref import WeakKeyDictionary
@@ -37,7 +40,11 @@ from ._serialize import AttributeValue, json_dumps
 _FETCH_TIMEOUT_S = 10.0
 # How long a failed fetch with no copy answers calls, so that they do not each fetch again.
 _ERROR_TTL_S = 10.0
+# The longest Retry-After that get_prompt honors, so that a bad header cannot stop fetches.
+_MAX_RETRY_AFTER_S = 3600.0
 _MAX_CACHE_ENTRIES = 1000
+# IMF-fixdate, the HTTP date that servers send: Sun, 06 Nov 1994 08:49:37 GMT.
+_HTTP_DATE = re.compile(r"[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT", re.ASCII)
 _VARIABLE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _MODEL_CALL_OPERATIONS = frozenset({"chat", "text_completion", "generate_content"})
 _PROMPT_KEY = otel_context.create_key("telemetry_dev.prompt")
@@ -61,6 +68,8 @@ class PromptError(Exception):
         self.code = code
         self.message = message
         self.status = status
+        # The Retry-After of a 429 or 503 response, in seconds.
+        self._retry_after: float | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -243,12 +252,21 @@ def with_prompt(prompt: Prompt) -> Generator[None]:
     ``td.prompt.name``, ``td.prompt.version``, ``td.prompt.label``, and, when input capture is on,
     ``td.prompt.variables``. The variables are those of the last ``compile()`` of this prompt
     object before the context starts, or of the last ``compile()`` inside it, so a compile in
-    another thread or task does not change them once the context runs."""
+    another thread or task does not change them once the context runs. When concurrent tasks in
+    the context each compile, a span records the last compile of its own task; a compile in a
+    worker thread (``asyncio.to_thread``) counts only for a task that has not compiled."""
     scope = _PromptScope(prompt, _compiled_variables.get(prompt))
     token = otel_context.attach(otel_context.set_value(_PROMPT_KEY, scope))
+    task_token = _task_variables.set(_task_variables.get())
     try:
         yield
     finally:
+        try:
+            _task_variables.reset(task_token)
+        except ValueError:
+            # The block ended in another Context, as a generator closed elsewhere does. Keep
+            # going like otel_context.detach does, so that the detach below still runs.
+            pass
         otel_context.detach(token)
 
 
@@ -267,8 +285,10 @@ def prompt_attributes(
         attrs[ATTR_PROMPT_VERSION] = prompt.version
     if prompt.label is not None:
         attrs[ATTR_PROMPT_LABEL] = prompt.label
-    if scope.variables is not None and capture_input:
-        serialized = client.serialize(scope.variables, ATTR_PROMPT_VARIABLES)
+    task = _task_variables.get()
+    variables = task[1] if task is not None and task[0] is scope else scope.variables
+    if variables is not None and capture_input:
+        serialized = client.serialize(variables, ATTR_PROMPT_VARIABLES)
         if serialized is not None:
             attrs[ATTR_PROMPT_VARIABLES] = serialized
     return attrs
@@ -347,12 +367,20 @@ _compiled_variables: WeakKeyDictionary[ChatPrompt | TextPrompt, dict[str, Any]] 
 )
 
 
-@dataclass
+@dataclass(eq=False)
 class _PromptScope:
-    """The prompt of a ``with_prompt`` context and the variables that its spans record."""
+    """The prompt of a ``with_prompt`` context and the variables of the last ``compile()`` in it.
+    Concurrent tasks in the context share the scope; see ``_task_variables``."""
 
     prompt: Prompt
     variables: dict[str, Any] | None
+
+
+# The variables of the last compile() of a scope in the current task. A new asyncio task or a
+# copied context gets a copy, so its compile does not change the value of other tasks.
+_task_variables: ContextVar[tuple[_PromptScope, dict[str, Any]] | None] = ContextVar(
+    "telemetry_dev_prompt_variables", default=None
+)
 
 
 def _record(
@@ -363,6 +391,7 @@ def _record(
     scope = otel_context.get_value(_PROMPT_KEY)
     if isinstance(scope, _PromptScope) and scope.prompt is prompt:
         scope.variables = values
+        _task_variables.set((scope, values))
     return values
 
 
@@ -413,6 +442,8 @@ class _Entry:
     error: Exception | None = None
     # When the last fetch ended.
     checked_at: float = 0.0
+    # No fetch before this time: the Retry-After of the last 429 or 503 response.
+    retry_at: float = 0.0
     # Set when the running fetch ends.
     pending: threading.Event | None = None
     # When calls stop waiting for the running fetch.
@@ -442,7 +473,7 @@ def _load(
             entry = _cache[key] = _Entry()
         now = monotonic()
         ttl = ttl_seconds if entry.response is not None else min(ttl_seconds, _ERROR_TTL_S)
-        if now >= entry.checked_at + ttl and entry.pending is None:
+        if now >= max(entry.checked_at + ttl, entry.retry_at) and entry.pending is None:
             entry.pending = threading.Event()
             entry.deadline = now + _FETCH_TIMEOUT_S
             threading.Thread(
@@ -478,6 +509,12 @@ def _refresh(
         error = exc
     with _cache_lock:
         stale = entry.response
+        delay = (
+            error._retry_after  # pyright: ignore[reportPrivateUsage]
+            if isinstance(error, PromptError)
+            else None
+        )
+        entry.retry_at = 0.0 if delay is None else monotonic() + delay
         if response is not None:
             entry.response = response
         elif stale is None:
@@ -515,7 +552,11 @@ def _fetch(url: str, headers: dict[str, str]) -> dict[str, Any]:
             body: bytes = response.read()
     except urllib.error.HTTPError as exc:
         with exc:
-            raise _api_error(exc.code, exc.read()) from None
+            error = _api_error(exc.code, exc.read())
+            if exc.code in (429, 503):
+                retry_after = _retry_after(exc.headers.get("Retry-After"))
+                error._retry_after = retry_after  # pyright: ignore[reportPrivateUsage]
+            raise error from None
     except TimeoutError as exc:
         raise PromptError(
             "timeout", f"Fetching the prompt took more than {_FETCH_TIMEOUT_S:g} s"
@@ -550,6 +591,25 @@ def _api_error(status: int, body: bytes) -> PromptError:
     )
 
 
+def _retry_after(value: str | None) -> float | None:
+    """Seconds to wait from a Retry-After header of seconds or an IMF-fixdate HTTP date
+    (``Sun, 06 Nov 1994 08:49:37 GMT``), capped."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    if value.isascii() and value.isdigit():
+        seconds = float(value)
+    elif _HTTP_DATE.fullmatch(value):
+        try:
+            date = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        seconds = (date - datetime.now(timezone.utc)).total_seconds()
+    else:
+        return None
+    return min(seconds, _MAX_RETRY_AFTER_S) if seconds > 0 else None
+
+
 def _parse_response(data: object) -> dict[str, Any] | None:
     if not isinstance(data, dict):
         return None
@@ -559,6 +619,7 @@ def _parse_response(data: object) -> dict[str, Any] | None:
     if (
         not isinstance(body.get("name"), str)
         or prompt_type not in ("chat", "text")
+        or "label" not in body
         or not (label is None or isinstance(label, str))
         or not _is_version(body.get("version"))
         or not _valid_content(body, prompt_type)

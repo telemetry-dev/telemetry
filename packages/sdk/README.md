@@ -151,8 +151,10 @@ const pinned = await getPrompt("support/reply", { version: 13 });
   `timeout`. A response with a different status and no API error gives `http_<status>`, for
   example `http_302` for a redirect. getPrompt does not send the request to the location of a
   redirect, thus your key does not go to a different host. With no copy, the calls of the next 10
-  seconds (or the TTL, if it is shorter) get the same result without a fetch. This is the one SDK
-  function that can reject: your app cannot run without its prompt.
+  seconds (or the TTL, if it is shorter) get the same result without a fetch. After a 429 or 503
+  response with a `Retry-After` header, getPrompt does not fetch that prompt again before that time
+  (one hour at most). This is the one SDK function that can reject: your app cannot run without
+  its prompt.
 - getPrompt uses the API key and base URL of an enabled `init()`, or `TELEMETRY_DEV_API_KEY` and
   `TELEMETRY_DEV_BASE_URL`, or its own `apiKey`, `baseUrl`, and `fetch` options. It reads the same
   host that telemetry goes to, `https://ingest.telemetry.dev` by default. The key needs the read
@@ -167,12 +169,13 @@ When input capture is on, `td.prompt.variables` holds the JSON of the variables 
 `compile()` of that prompt object before `withPrompt` starts, or of the last `compile()` inside
 `fn`, after `mask` and truncation. If tasks that run at the same time share one prompt object, call
 `compile()` in `withPrompt`, or call getPrompt in each task. getPrompt returns a new object from
-the cache. If you do not, a task can record the variables of a different task. Model calls are the
-spans of type `generation` (operations `chat`, `text_completion`, and `generate_content`),
-including the spans of the provider integrations that use this SDK: OpenAI, Anthropic, Amazon
-Bedrock, Google GenAI, and OpenRouter. Spans from the AI SDK and TanStack AI integrations, and from
-other OpenTelemetry tracers, do not get the attributes. Messages from `compile()` that you pass to
-a model call outside `withPrompt` are not recorded.
+the cache. If you do not, a task can record the variables of a different task. Tasks that run at the
+same time inside one `withPrompt` share its variables, so call `withPrompt` in each task that
+compiles its own. Model calls are the spans of type `generation` (operations `chat`,
+`text_completion`, and `generate_content`), including the spans of the provider integrations that
+use this SDK: OpenAI, Anthropic, Amazon Bedrock, Google GenAI, and OpenRouter. Spans from the AI SDK
+and TanStack AI integrations, and from other OpenTelemetry tracers, do not get the attributes.
+Messages from `compile()` that you pass to a model call outside `withPrompt` are not recorded.
 
 ## API
 

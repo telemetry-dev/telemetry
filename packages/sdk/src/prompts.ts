@@ -182,6 +182,8 @@ interface CacheEntry {
   error?: unknown;
   /** When the last fetch ended. */
   checkedAt: number;
+  /** No fetch before this time: the Retry-After of the last 429 or 503 response. */
+  retryAt: number;
   pending?: Promise<PromptResponse>;
 }
 
@@ -192,15 +194,21 @@ interface PromptScope {
 }
 
 const FETCH_TIMEOUT_MS = 10_000;
+/** The longest Retry-After that getPrompt honors, so that a bad header cannot stop fetches. */
+const MAX_RETRY_AFTER_MS = 3_600_000;
 /** How long a failed fetch with no copy answers calls, so that they do not each fetch again. */
 const ERROR_TTL_MS = 10_000;
 const MAX_CACHE_ENTRIES = 1_000;
+/** IMF-fixdate, the HTTP date that servers send: `Sun, 06 Nov 1994 08:49:37 GMT`. */
+const HTTP_DATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
 const VARIABLE = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
 const MODEL_CALL_OPERATIONS = new Set<unknown>(["chat", "text_completion", "generate_content"]);
 const PROMPT_KEY = createContextKey("telemetry.dev prompt");
 
 const cache = new Map<string, CacheEntry>();
 const compiledVariables = new WeakMap<Prompt, object>();
+/** The Retry-After of the response that failed with this error, in milliseconds. */
+const retryAfter = new WeakMap<PromptError, number>();
 
 /**
  * Fetches a prompt version from telemetry.dev and keeps it. When the copy is older than
@@ -314,7 +322,8 @@ export async function getPrompt(name: string, options: GetPromptOptions = {}): P
  * it: the spans get `td.prompt.name`, `td.prompt.version`, `td.prompt.label`, and, when input
  * capture is on, `td.prompt.variables`. The variables are those of the last `compile()` of this
  * prompt object before withPrompt starts, or of the last `compile()` inside `fn`, so a compile in
- * another task does not change them once withPrompt runs.
+ * another task does not change them once withPrompt runs. Concurrent tasks in `fn` share the
+ * variables, so call withPrompt in each task that compiles its own.
  */
 export function withPrompt<T>(prompt: Prompt, fn: () => T): T {
   const scope: PromptScope = { prompt, variables: compiledVariables.get(prompt) };
@@ -397,12 +406,16 @@ async function load(
 
   if (!entry) {
     if (cache.size >= MAX_CACHE_ENTRIES) cache.delete(cache.keys().next().value!);
-    entry = { checkedAt: 0 };
+    entry = { checkedAt: 0, retryAt: 0 };
     cache.set(key, entry);
   }
 
   const fresh =
-    Date.now() < entry.checkedAt + (entry.response ? ttlMs : Math.min(ttlMs, ERROR_TTL_MS));
+    Date.now() <
+    Math.max(
+      entry.checkedAt + (entry.response ? ttlMs : Math.min(ttlMs, ERROR_TTL_MS)),
+      entry.retryAt,
+    );
 
   if (entry.response) {
     if (!fresh) entry.pending ??= refresh(entry, fetchResponse, onError);
@@ -424,10 +437,14 @@ function refresh(
     .then(
       (response) => {
         entry.response = response;
+        entry.retryAt = 0;
 
         return response;
       },
       (error: unknown) => {
+        const delay = error instanceof PromptError ? retryAfter.get(error) : undefined;
+        entry.retryAt = delay === undefined ? 0 : Date.now() + delay;
+
         if (!entry.response) {
           entry.error = error;
           throw error;
@@ -468,11 +485,16 @@ async function fetchPrompt(
     if (!res.ok) {
       const error = isRecord(body) && isRecord(body.error) ? body.error : {};
 
-      throw new PromptError(
+      const failure = new PromptError(
         typeof error.code === "string" ? error.code : `http_${res.status}`,
         typeof error.message === "string" ? error.message : `telemetry.dev returned ${res.status}`,
         res.status,
       );
+
+      const delay = retryAfterMs(res);
+      if (delay !== undefined) retryAfter.set(failure, delay);
+
+      throw failure;
     }
 
     const response = parseResponse(body);
@@ -592,6 +614,23 @@ function keyFingerprint(apiKey: string): string {
   const digest = sha256(new TextEncoder().encode(apiKey)).subarray(0, 16);
 
   return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** The Retry-After of a 429 or 503 response, as seconds or an IMF-fixdate HTTP date, capped. */
+function retryAfterMs(res: Response): number | undefined {
+  if (res.status !== 429 && res.status !== 503) return undefined;
+
+  const value = res.headers.get("retry-after")?.trim();
+
+  if (!value) return undefined;
+
+  let ms: number;
+
+  if (/^\d+$/.test(value)) ms = Number(value) * 1000;
+  else if (HTTP_DATE.test(value)) ms = Date.parse(value) - Date.now();
+  else return undefined;
+
+  return ms > 0 ? Math.min(ms, MAX_RETRY_AFTER_MS) : undefined;
 }
 
 function parseResponse(body: unknown): PromptResponse | undefined {
