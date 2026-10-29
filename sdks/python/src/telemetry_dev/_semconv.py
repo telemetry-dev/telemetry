@@ -84,6 +84,11 @@ ATTR_TIME_TO_FIRST_CHUNK = "gen_ai.response.time_to_first_chunk"
 
 METADATA_PREFIX = "td.metadata."
 
+ATTR_PROMPT_NAME = "td.prompt.name"
+ATTR_PROMPT_VERSION = "td.prompt.version"
+ATTR_PROMPT_LABEL = "td.prompt.label"
+ATTR_PROMPT_VARIABLES = "td.prompt.variables"
+
 USAGE_ATTRS: dict[str, str] = {
     "input_tokens": "gen_ai.usage.input_tokens",
     "output_tokens": "gen_ai.usage.output_tokens",

@@ -47,6 +47,25 @@ export { log, type LogOptions } from "./logs.ts";
 export { observe, type ObserveOptions } from "./observe.ts";
 
 export {
+  type ChatMessage,
+  type ChatPrompt,
+  type GetChatPromptOptions,
+  getPrompt,
+  type GetPromptOptions,
+  type GetTextPromptOptions,
+  type Prompt,
+  PromptError,
+  type PromptMessage,
+  type PromptModel,
+  type PromptParameters,
+  type PromptResponseFormat,
+  type PromptTool,
+  type PromptVariables,
+  type TextPrompt,
+  withPrompt,
+} from "./prompts.ts";
+
+export {
   activeContext,
   extractW3cContext,
   getTraceparent,

@@ -63,6 +63,7 @@ Without an API key every call is a silent no-op — the SDK never throws into yo
 | ------------- | --------------------------- | ------------------------------ |
 | `apiKey`      | `TELEMETRY_DEV_API_KEY`     | — (absent ⇒ no-op)             |
 | `baseUrl`     | `TELEMETRY_DEV_BASE_URL`    | `https://ingest.telemetry.dev` |
+| `apiUrl`      | `TELEMETRY_DEV_API_URL`     | `https://api.telemetry.dev`    |
 | `environment` | `TELEMETRY_DEV_ENVIRONMENT` | `production`                   |
 | `serviceName` | `OTEL_SERVICE_NAME`         | `unknown_service`              |
 
@@ -111,6 +112,69 @@ The default is parent-based always-on. Session roots keep the configured root po
 Nested spans and explicitly parented spans keep the real parent's policy.
 The SDK installs the [session sampling wrapper](https://github.com/telemetry-dev/telemetry/blob/main/packages/otel/README.md#correlation-attributes) on its provider. This includes the global provider that Eve uses.
 
+## Prompts
+
+`getPrompt` fetches a prompt that you manage in telemetry.dev. Fetch it by its label, so that you
+deploy a version when you move the label, without a change to the code:
+
+```ts
+import OpenAI from "openai";
+import { getPrompt, init, withPrompt } from "@telemetry-dev/sdk";
+import { wrapOpenAI } from "@telemetry-dev/openai";
+
+init();
+const openai = wrapOpenAI(new OpenAI());
+
+const prompt = await getPrompt("support/reply", { label: "production" });
+const messages = prompt.compile({ customer_message, tone });
+
+const response = await withPrompt(prompt, () =>
+  openai.chat.completions.create({ model: prompt.model?.name ?? "gpt-4o", messages }),
+);
+
+// Pin one version, as in a test:
+const pinned = await getPrompt("support/reply", { version: 13 });
+```
+
+- Without `label` and `version`, getPrompt fetches the `production` label. A text prompt needs
+  `type: "text"`; getPrompt rejects a prompt of the other type.
+- `compile(variables)` puts the values in place of `{{name}}`. A missing value becomes an empty
+  text, and a value that is not a string becomes JSON. In a chat prompt, a placeholder message
+  becomes the list of messages in its variable. A text prompt compiles to a string.
+- The prompt also has `model`, `parameters`, `tools`, and `responseFormat` of its version.
+- getPrompt keeps each prompt. When the copy is older than `cacheTtlSeconds` (default 60), a call
+  returns it at once and fetches a new copy in the background. Only a call with no copy waits for a
+  fetch, for 10 seconds at most. Calls for the same prompt share one fetch.
+- If a fetch fails, getPrompt returns the last copy that it fetched and reports the error through
+  `onError`. With no copy, it returns the `fallback` option (`version` is `null` and `isFallback`
+  is `true`). With no fallback, it rejects with a `PromptError` whose `code` tells why, for
+  example `prompt_not_found`, `label_not_found`, `insufficient_scope`, `missing_api_key`, or
+  `timeout`. A response with a different status and no API error gives `http_<status>`, for
+  example `http_302` for a redirect. getPrompt does not send the request to the location of a
+  redirect, thus your key does not go to a different host. With no copy, the calls of the next 10
+  seconds (or the TTL, if it is shorter) get the same result without a fetch. This is the one SDK
+  function that can reject: your app cannot run without its prompt.
+- getPrompt uses the API key and API URL of an enabled `init()`, or `TELEMETRY_DEV_API_KEY` and
+  `TELEMETRY_DEV_API_URL`, or its own `apiKey`, `apiUrl`, and `fetch` options. The default API URL
+  is `https://api.telemetry.dev`. getPrompt does not use `baseUrl` or `TELEMETRY_DEV_BASE_URL`. The
+  key needs the read scope for prompts.
+- When a label sends part of the traffic to a second version, each session keeps one version: the
+  choice uses the session id of `propagateAttributes` (or of `sessionMode: "process"`). Without a
+  session id, each call chooses at random.
+
+`withPrompt(prompt, fn)` records the prompt on each model call that starts inside `fn`:
+`td.prompt.name`, `td.prompt.version`, and `td.prompt.label` (only for a prompt fetched by label).
+When input capture is on, `td.prompt.variables` holds the JSON of the variables of the last
+`compile()` of that prompt object before `withPrompt` starts, or of the last `compile()` inside
+`fn`, after `mask` and truncation. If tasks that run at the same time share one prompt object, call
+`compile()` in `withPrompt`, or call getPrompt in each task. getPrompt returns a new object from
+the cache. If you do not, a task can record the variables of a different task. Model calls are the
+spans of type `generation` (operations `chat`, `text_completion`, and `generate_content`),
+including the spans of the provider integrations that use this SDK: OpenAI, Anthropic, Amazon
+Bedrock, Google GenAI, and OpenRouter. Spans from the AI SDK and TanStack AI integrations, and from
+other OpenTelemetry tracers, do not get the attributes. Messages from `compile()` that you pass to
+a model call outside `withPrompt` are not recorded.
+
 ## API
 
 - `init(options?)` — create the client (isolated OTel TracerProvider by default).
@@ -130,6 +194,8 @@ The SDK installs the [session sampling wrapper](https://github.com/telemetry-dev
 - `updateActiveSpan(fields)` — update the innermost active span.
 - `propagateAttributes({ userId, sessionId, metadata }, fn)` — stamps `user.id`,
   `gen_ai.conversation.id`, and `td.metadata.*` on every span and log record in scope.
+- `getPrompt(name, options?)` — fetch a prompt by label or version; see [Prompts](#prompts).
+- `withPrompt(prompt, fn)` — record the prompt on each model call in `fn`.
 - `log(message, { level, eventName, attributes }?)` — log record correlated to the active trace.
 - `getTraceparent()` — W3C traceparent of the active span (pass to other services; accept it via
   `startSpan(name, { parent })`).

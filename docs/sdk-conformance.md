@@ -40,6 +40,10 @@ repository, not this SDK workspace. Paths below refer to that product repository
 | `init({sessionMode: "process"})` / `init(session_mode="process")`                                                                                                                                                                                                                                                                                                                                                     | fresh UUID as `gen_ai.conversation.id` on spans/logs without an explicit or propagated session                                       | opt-in per enabled initialization; explicit/propagated sessions win; valid parent trace context is never replaced       |
 | error                                                                                                                                                                                                                                                                                                                                                                                                                 | span status ERROR + `error.type` + `exception` event (`exception.type/message/stacktrace`, `log.severity_number: 17`)                |                                                                                                                         |
 | `log()`                                                                                                                                                                                                                                                                                                                                                                                                               | OTLP log record to `/v1/logs` (always; never span events)                                                                            | severity debug=5/info=9/warn=13/error=17; trace-correlated via active context                                           |
+| `withPrompt(prompt, fn)` / `with with_prompt(prompt):` → `prompt.name`                                                                                                                                                                                                                                                                                                                                                | `td.prompt.name`                                                                                                                     | on model-call spans that start in scope: operation `chat`, `text_completion`, or `generate_content`                     |
+| `prompt.version`                                                                                                                                                                                                                                                                                                                                                                                                      | `td.prompt.version` (int)                                                                                                            | omitted for a fallback prompt (`version` null / None)                                                                   |
+| `prompt.label`                                                                                                                                                                                                                                                                                                                                                                                                        | `td.prompt.label`                                                                                                                    | only for a fetch by label; a fetch without label or version is the `production` label                                   |
+| variables of the last `prompt.compile()` before `withPrompt` / `with_prompt` starts, or in its scope                                                                                                                                                                                                                                                                                                                  | `td.prompt.variables` (JSON object)                                                                                                  | mask → JSON stringify → truncate; gated by the effective captureInput of the span                                       |
 
 `SpanHandle.serializeContent(value, key)` / `SpanHandle.serialize_content(value, key)` returns
 what `input` / `output` would emit for `value` under `key`: mask → JSON stringify → truncate. It
@@ -80,7 +84,8 @@ server tools. They record it regardless of capture flags and `mask`; description
 schemas stay in the captured input.
 
 Shared constants: env vars `TELEMETRY_DEV_API_KEY` / `TELEMETRY_DEV_BASE_URL` (default
-`https://ingest.telemetry.dev`) / `TELEMETRY_DEV_ENVIRONMENT` (default `production`) /
+`https://ingest.telemetry.dev`) / `TELEMETRY_DEV_API_URL` (default `https://api.telemetry.dev`,
+used only by `getPrompt` / `get_prompt`) / `TELEMETRY_DEV_ENVIRONMENT` (default `production`) /
 `OTEL_SERVICE_NAME` (default `unknown_service`); truncation cap 65536 chars **including** the
 `...[truncated]` marker (custom caps shorter than the marker retain its prefix); batch defaults
 64/1000ms/2048/30000ms; instrumentation scopes
@@ -116,6 +121,45 @@ but disables time-per-output-chunk because OpenTelemetry Python 1.x has no publi
 or `MetricProducer` API. The first accepted span with intervals reports the limitation once through
 `on_error` and the SDK logger; no undrainable aggregate is retained.
 The metrics use DELTA temporality and the bucket boundaries in `packages/otel/src/metrics.ts`.
+
+## Prompts
+
+`getPrompt(name, options)` / `get_prompt(name, ...)` send `GET {apiUrl}/v1/prompts?name=<name>`
+with `label=<label>` (default `production`) or `version=<n>`, the `Authorization: Bearer <key>`
+header, and the SDK header. `{apiUrl}` is the `apiUrl` / `api_url` option, then the API URL of an
+enabled `init()`, then `TELEMETRY_DEV_API_URL`, then `https://api.telemetry.dev`. An empty value
+counts as unset. The SDKs do not send
+this request to the ingest base URL. The two SDKs keep one copy per API URL, API key fingerprint,
+name, and label or version. Concurrent calls share one fetch.
+
+- Cache: when the copy is older than `cacheTtlSeconds` / `cache_ttl_seconds` (default 60), a call
+  returns the copy at once and starts one fetch in the background. Only a call with no copy waits
+  for a fetch.
+- Timeout: a call waits for a fetch for 10 seconds at most, and then gets `timeout`. The
+  TypeScript SDK aborts the fetch at that time. The Python SDK fetches in a daemon thread, because
+  the urllib timeout applies to each socket operation and not to the address lookup or to the full
+  response. Thus the Python fetch can continue after the call stops waiting.
+- Failure: when a fetch fails, the SDKs keep the last copy for another TTL and send the error to
+  `onError` / `on_error`. With no copy, the call gets the fallback. With no fallback, the call gets
+  a `PromptError`. With no copy, the calls of the next 10 seconds (or the TTL, if it is shorter)
+  get the same result without a fetch.
+- Error codes: the `PromptError` code is the API error code, or `missing_api_key`, `timeout`,
+  `network_error`, `invalid_response`, or `type_mismatch`. A response with a status that is not
+  2xx and no API error code gives `http_<status>`.
+- Redirects: the SDKs do not send the request to the location of a redirect, thus the key does not
+  go to a different host. A 3xx response gives `http_<status>`, for example `http_302`. The
+  TypeScript SDK uses `redirect: "manual"`, because Cloudflare Workers reject `redirect: "error"`.
+
+A label with a rollout gives the rollout version when the bucket is less than the rollout
+percent. The bucket is FNV-1a 32-bit (offset 2166136261, prime 16777619) over the UTF-8 bytes of
+`"<name>:<label>:<session id>"`, mod 100. The session id is the propagated
+`gen_ai.conversation.id`, then the process session id; without one, the bucket is random per call.
+Test vector: `"support/reply:production:session-123"` → 777154315 → bucket 15.
+
+`compile()` replaces each `{{name}}` with the value of the variable: a string as it is, a missing
+value or null as empty text, and other values as `JSON.stringify` JSON. A chat message
+`{role: "placeholder", name}` becomes the list of messages in its variable, or nothing when the
+variable is missing; any other value is a `TypeError`.
 
 ## The shared scenario
 

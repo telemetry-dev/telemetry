@@ -19,6 +19,16 @@ from ._config import LogLevelOption
 from ._context import get_traceparent, propagate_attributes
 from ._logs import log
 from ._observe import observe
+from ._prompts import (
+    ChatPrompt,
+    Prompt,
+    PromptError,
+    PromptModel,
+    TextPrompt,
+    get_prompt,
+    get_prompt_async,
+    with_prompt,
+)
 from ._semconv import LogLevel, SpanType
 from ._serialize import AttributeValue, Mask, MaskContext
 from ._spans import (
@@ -34,18 +44,25 @@ __all__ = [
     "NOT_GIVEN",
     "AttributeValue",
     "CaptureBudget",
+    "ChatPrompt",
     "Client",
     "LogLevel",
     "LogLevelOption",
     "Mask",
     "MaskContext",
+    "Prompt",
+    "PromptError",
+    "PromptModel",
     "SpanHandle",
     "SpanType",
     "TelemetrySpanProcessor",
+    "TextPrompt",
     "Usage",
     "__version__",
     "flush",
     "get_client",
+    "get_prompt",
+    "get_prompt_async",
     "get_traceparent",
     "init",
     "log",
@@ -54,4 +71,5 @@ __all__ = [
     "shutdown",
     "start_span",
     "update_current_span",
+    "with_prompt",
 ]

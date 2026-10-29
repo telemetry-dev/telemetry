@@ -29,6 +29,7 @@ from ._context import (
     traceparent_of,
     with_session_parent,
 )
+from ._prompts import prompt_attributes
 from ._semconv import (
     ATTR_AGENT_ID,
     ATTR_AGENT_NAME,
@@ -743,6 +744,11 @@ def start_span(
             ctx, session_id if isinstance(session_id, str) else None, client.config.api_key
         )
         initial.update(propagated)
+        initial.update(
+            prompt_attributes(
+                client, ctx, attrs.get(ATTR_OPERATION, operation), state.capture_input
+            )
+        )
         initial.update(attrs)
         span = client.tracer.start_span(
             name,
