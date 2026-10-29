@@ -4,6 +4,7 @@
   "packages/ai": "0.1.10",
   "packages/anthropic": "0.1.15",
   "packages/bedrock": "0.1.14",
+  "packages/cli": "0.1.0",
   "packages/cursor": "0.1.12",
   "packages/eve": "0.1.13",
   "packages/google-genai": "0.1.13",

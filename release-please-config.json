@@ -33,6 +33,10 @@
       "component": "bedrock",
       "release-type": "node"
     },
+    "packages/cli": {
+      "component": "cli",
+      "release-type": "node"
+    },
     "packages/cursor": {
       "component": "cursor",
       "release-type": "node"

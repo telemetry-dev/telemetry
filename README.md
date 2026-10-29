@@ -169,6 +169,14 @@ To send these spans to telemetry.dev, refer to Native Claude SDK spans for [Type
 Do not use these spans together with the Anthropic integration, because each request then has two spans.
 The Claude API can also send server-side spans through a Console destination. Refer to [Claude Platform](https://telemetry.dev/docs/integrations/claude-platform).
 
+## Command line
+
+[`@telemetry-dev/cli`](packages/cli) reads traces, sessions, logs, and usage from a terminal, a script, or an agent's shell. It uses the same read-only access as the telemetry.dev MCP server, so it works where an MCP client isn't available.
+
+```sh
+npx @telemetry-dev/cli login
+```
+
 ## Development
 
 Local development uses Node.js 24, pnpm 11.25.0, Vite+, uv, and Python 3.10 or newer.
