@@ -63,7 +63,6 @@ Without an API key every call is a silent no-op — the SDK never throws into yo
 | ------------- | --------------------------- | ------------------------------ |
 | `apiKey`      | `TELEMETRY_DEV_API_KEY`     | — (absent ⇒ no-op)             |
 | `baseUrl`     | `TELEMETRY_DEV_BASE_URL`    | `https://ingest.telemetry.dev` |
-| `apiUrl`      | `TELEMETRY_DEV_API_URL`     | `https://api.telemetry.dev`    |
 | `environment` | `TELEMETRY_DEV_ENVIRONMENT` | `production`                   |
 | `serviceName` | `OTEL_SERVICE_NAME`         | `unknown_service`              |
 
@@ -154,10 +153,10 @@ const pinned = await getPrompt("support/reply", { version: 13 });
   redirect, thus your key does not go to a different host. With no copy, the calls of the next 10
   seconds (or the TTL, if it is shorter) get the same result without a fetch. This is the one SDK
   function that can reject: your app cannot run without its prompt.
-- getPrompt uses the API key and API URL of an enabled `init()`, or `TELEMETRY_DEV_API_KEY` and
-  `TELEMETRY_DEV_API_URL`, or its own `apiKey`, `apiUrl`, and `fetch` options. The default API URL
-  is `https://api.telemetry.dev`. getPrompt does not use `baseUrl` or `TELEMETRY_DEV_BASE_URL`. The
-  key needs the read scope for prompts.
+- getPrompt uses the API key and base URL of an enabled `init()`, or `TELEMETRY_DEV_API_KEY` and
+  `TELEMETRY_DEV_BASE_URL`, or its own `apiKey`, `baseUrl`, and `fetch` options. It reads the same
+  host that telemetry goes to, `https://ingest.telemetry.dev` by default. The key needs the read
+  scope for prompts.
 - When a label sends part of the traffic to a second version, each session keeps one version: the
   choice uses the session id of `propagateAttributes` (or of `sessionMode: "process"`). Without a
   session id, each call chooses at random.
