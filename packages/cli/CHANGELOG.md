@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.0...cli-v0.1.1) (2026-10-30)
+
+
+### Features
+
+* **cli:** report errors as one JSON line with a stable code under --json ([#127](https://github.com/telemetry-dev/telemetry/issues/127)) ([dcad14b](https://github.com/telemetry-dev/telemetry/commit/dcad14b08926862409cfaf94c529ecfab8df26e5))
+* **cli:** summarize a trace's failures and repeated calls, and suggest next commands ([#128](https://github.com/telemetry-dev/telemetry/issues/128)) ([02f63f5](https://github.com/telemetry-dev/telemetry/commit/02f63f5bb3ac5fc3c3c28d8198c0605961768077))
+
 ## 0.1.0 (2026-10-30)
 
 
