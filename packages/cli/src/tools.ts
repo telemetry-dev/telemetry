@@ -75,6 +75,8 @@ export type TraceLog = {
 export type TraceDetailPage = {
   trace: Omit<TraceSummary, "models" | "span_count" | "error_span_count"> & {
     framework: string | null;
+    /** The trace's dashboard page. Servers before this field omit it. */
+    url?: string;
   };
   span_count: number;
   log_count: number;

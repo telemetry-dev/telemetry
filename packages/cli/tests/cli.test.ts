@@ -18,6 +18,7 @@ import {
   PAYLOADS,
   PROJECTS,
   QUIET_TRACE_ID,
+  QUIET_TRACE_URL,
   REFRESH_TOKEN,
   serverState,
   startFixture,
@@ -65,6 +66,7 @@ beforeEach(async () => {
     failProjects: false,
     removedFromWorkspace: false,
     errorCodes: true,
+    traceUrl: QUIET_TRACE_URL,
   });
 
   return () => rm(home, { recursive: true, force: true });
@@ -219,6 +221,36 @@ test("a trace with no failures and no repeated calls goes straight to the span t
   expect(result.stdout).toMatch(/^SPAN /m);
   expect(result.stdout).not.toMatch(/^(Errors|Repeated) /m);
   expect(result.stderr).toBe("");
+});
+
+test("trace links its dashboard page only when the server sends a web address", async () => {
+  await signIn(PROJECTS[0]);
+
+  const lines = (await run("trace", QUIET_TRACE_ID)).stdout.split("\n");
+  const ids = lines.findIndex((line) => line.startsWith("  trace "));
+  expect(lines[ids + 1]).toBe(`  View: ${QUIET_TRACE_URL}`);
+
+  // A server from before trace links sends no url; the rest aren't web addresses. Each still
+  // shows the trace, just without the line.
+  for (const url of [undefined, "javascript:alert(1)", "file:///etc/passwd", "not a url"]) {
+    serverState.traceUrl = url;
+    const result = await run("trace", QUIET_TRACE_ID);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toMatch(/^SPAN /m);
+    expect(result.stdout).not.toContain("View:");
+  }
+
+  // An escape sequence in the link can't reach the terminal; the URL parser encodes it.
+  serverState.traceUrl = "https://telemetry.dev/traces/\u001b]8;;https://evil.example\u0007x";
+  const hostile = await run("trace", QUIET_TRACE_ID);
+  expect(hostile.stdout).not.toContain("\u001b");
+  expect(hostile.stdout.split("\n")).toContain(
+    "  View: https://telemetry.dev/traces/%1B]8;;https://evil.example%07x",
+  );
+
+  // --json passes the server's text through as sent; only the terminal line is normalized.
+  const json = await run("trace", QUIET_TRACE_ID, "--json");
+  expect(JSON.parse(json.stdout).trace.url).toBe(serverState.traceUrl);
 });
 
 /** The words a POSIX shell makes of a pasted command line. */
