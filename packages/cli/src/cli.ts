@@ -5,6 +5,7 @@ import { VERSION } from "./api.ts";
 import {
   type Context,
   home,
+  jsonText,
   loginCommand,
   logoutCommand,
   logsCommand,
@@ -18,7 +19,7 @@ import {
   usageCommand,
   useCommand,
 } from "./commands.ts";
-import { CliError, EXIT, usageError } from "./errors.ts";
+import { CliError, type ErrorCode, EXIT, usageError } from "./errors.ts";
 import { clean, disableColor, SHOW_CURSOR, style } from "./terminal.ts";
 
 type Option = {
@@ -309,8 +310,18 @@ const closest = (input: string, names: readonly string[]) => {
 const commandNamed = (name: string | undefined) =>
   name !== undefined && Object.hasOwn(COMMANDS, name) ? COMMANDS[name] : undefined;
 
+// Arguments after `--` are values, never options.
+const optionArgs = (argv: readonly string[]) => {
+  const end = argv.indexOf("--");
+
+  return end === -1 ? argv : argv.slice(0, end);
+};
+
+const jsonOutput = optionArgs(process.argv.slice(2)).includes("--json");
+
 const main = async (argv: readonly string[]) => {
-  if (argv.includes("--no-color")) disableColor();
+  // With --json, stderr carries no spinner or color, so an error line is plain JSON.
+  if (argv.includes("--no-color") || jsonOutput) disableColor();
 
   // The command comes first; only --no-color may precede it.
   const first = argv.findIndex((arg) => arg !== "--no-color");
@@ -338,7 +349,12 @@ const main = async (argv: readonly string[]) => {
 
     const command = commandNamed(topic);
 
-    if (!command) throw usageError(`Unknown command "${topic}". Run telemetry --help.`);
+    if (!command) {
+      throw usageError(`Unknown command "${topic}". Run telemetry --help.`, {
+        code: "unknown_command",
+        hint: "telemetry --help",
+      });
+    }
 
     return void process.stdout.write(`${commandHelp(topic, command)}\n`);
   }
@@ -350,6 +366,7 @@ const main = async (argv: readonly string[]) => {
 
     throw usageError(
       `Unknown command "${name}".${suggestion ? ` Did you mean \`telemetry ${suggestion}\`?` : ""} Run telemetry --help.`,
+      { code: "unknown_command", hint: "telemetry --help" },
     );
   }
 
@@ -373,13 +390,17 @@ const main = async (argv: readonly string[]) => {
   } catch (error) {
     const message = error instanceof Error ? error.message.split("\n")[0] : String(error);
 
-    throw usageError(`${message} Run \`telemetry ${name} --help\`.`);
+    throw usageError(`${message} Run \`telemetry ${name} --help\`.`, {
+      hint: `telemetry ${name} --help`,
+    });
   }
 
   const extra = parsed.positionals[command.arguments ?? 0];
 
   if (extra !== undefined) {
-    throw usageError(`Unexpected argument "${extra}". Run \`telemetry ${name} --help\`.`);
+    throw usageError(`Unexpected argument "${extra}". Run \`telemetry ${name} --help\`.`, {
+      hint: `telemetry ${name} --help`,
+    });
   }
 
   await command.run({
@@ -390,21 +411,40 @@ const main = async (argv: readonly string[]) => {
 };
 
 const fail = (error: unknown) => {
-  process.stderr.write(SHOW_CURSOR.repeat(process.stderr.isTTY ? 1 : 0));
+  if (!jsonOutput) process.stderr.write(SHOW_CURSOR.repeat(process.stderr.isTTY ? 1 : 0));
 
-  // Tool errors are written by the server and can quote what the request named.
-  if (error instanceof CliError) {
-    process.stderr.write(`${style.red("error", process.stderr)} ${clean(error.message)}\n`);
-    process.exitCode = error.exitCode;
+  const known = error instanceof CliError ? error : undefined;
+  const exitCode = known?.exitCode ?? EXIT.failure;
+  process.exitCode = exitCode;
+
+  // With --json, a script or agent reads the error as one JSON line on stderr; stdout
+  // stays empty, so it never mistakes an error for data.
+  if (jsonOutput) {
+    process.stderr.write(
+      `${jsonText({
+        error: {
+          code: known?.code ?? ("internal" satisfies ErrorCode),
+          message: known ? known.message : error instanceof Error ? error.message : String(error),
+          ...(known?.hint ? { hint: known.hint } : {}),
+          retryable: known?.retryable ?? false,
+          exit_code: exitCode,
+          cli_version: VERSION,
+        },
+      })}\n`,
+    );
 
     return;
   }
 
-  // Unexpected, so the stack is kept for a bug report; it can still quote a server.
-  process.stderr.write(
-    `${style.red("error", process.stderr)} ${clean(error instanceof Error ? (error.stack ?? error.message) : String(error))}\n`,
-  );
-  process.exitCode = EXIT.failure;
+  // Tool errors are written by the server and can quote what the request named. An
+  // unexpected error keeps its stack for a bug report; it can still quote a server.
+  const message = known
+    ? known.message
+    : error instanceof Error
+      ? (error.stack ?? error.message)
+      : String(error);
+
+  process.stderr.write(`${style.red("error", process.stderr)} ${clean(message)}\n`);
 };
 
 // The MCP SDK warns app developers on the console, for instance when it retries a refresh.

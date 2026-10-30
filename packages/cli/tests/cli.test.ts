@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { type AddressInfo, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { afterAll, beforeAll, beforeEach, expect, test } from "vitest";
+import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
 
 import { sessionFile } from "../src/session.ts";
 import {
@@ -190,6 +191,106 @@ test("input that isn't valid exits 2 before calling telemetry.dev, even from a s
 
   expect(invalid.map((result) => result.code)).toEqual(invalid.map(() => 2));
   expect(calls).toEqual([]);
+});
+
+test("with --json, an error is one JSON line on stderr with a code to branch on, and stdout stays empty", async () => {
+  const errorOf = async (result: { code: number; stdout: string; stderr: string }) => {
+    expect(result.stdout).toBe("");
+    expect(result.stderr.trim().split("\n")).toHaveLength(1);
+
+    return { exit: result.code, ...JSON.parse(result.stderr).error };
+  };
+
+  expect(await errorOf(await run("traces", "--json"))).toMatchObject({
+    exit: 4,
+    code: "not_signed_in",
+    hint: "telemetry login",
+    retryable: false,
+    exit_code: 4,
+  });
+
+  await signIn(PROJECTS[0]);
+
+  expect(await errorOf(await run("traces", "--limit", "99", "--json"))).toMatchObject({
+    exit: 2,
+    code: "invalid_arguments",
+    exit_code: 2,
+  });
+  expect(await errorOf(await run("traces", "--project", "nope", "--json"))).toMatchObject({
+    exit: 2,
+    code: "project_not_found",
+    hint: "telemetry projects",
+  });
+  expect(await errorOf(await run("trace", "0000", "--json"))).toMatchObject({
+    exit: 1,
+    code: "tool_error",
+    message: "Trace not found.",
+  });
+
+  // A port that was just closed refuses the connection.
+  const closed = await new Promise<string>((resolve) => {
+    const server = createServer().listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as AddressInfo;
+      server.close(() => resolve(`http://127.0.0.1:${port}`));
+    });
+  });
+  await writeFile(
+    join(home, sessionFile(closed)),
+    JSON.stringify({ server: closed, tokens: { access_token: TOKEN, token_type: "Bearer" } }),
+  );
+  expect(
+    await errorOf(
+      await runWith(
+        { TELEMETRY_DEV_URL: closed },
+        "traces",
+        "--project",
+        PROJECTS[0]!.id,
+        "--json",
+      ),
+    ),
+  ).toMatchObject({ exit: 1, code: "unreachable", retryable: true });
+
+  // After `--`, --json is a value, so the error stays the line a person reads.
+  const value = await run("use", "--", "--json");
+  expect(value.code).toBe(2);
+  expect(value.stderr).toMatch(/^error No project "--json"/);
+
+  // The same failures without --json keep the line a person reads.
+  const human = await run("trace", "0000");
+  expect(human.code).toBe(1);
+  expect(human.stderr).toBe("error Trace not found.\n");
+});
+
+test("a request that times out inside fetch is a retryable timeout, not a failed request", async () => {
+  const { Api } = await import("../src/api.ts");
+
+  for (const code of [
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT",
+  ]) {
+    vi.stubGlobal("fetch", () =>
+      Promise.reject(
+        new TypeError("fetch failed", { cause: Object.assign(new Error(""), { code }) }),
+      ),
+    );
+
+    const api = new Api({
+      server: fixture.url,
+      tokens: { access_token: TOKEN, token_type: "Bearer" },
+    });
+
+    try {
+      await expect(api.call("list_projects")).rejects.toMatchObject({
+        code: "timeout",
+        retryable: true,
+        exitCode: 1,
+      });
+    } finally {
+      vi.unstubAllGlobals();
+      await api.close();
+    }
+  }
 });
 
 const savedSession = async () => JSON.parse(await readFile(sessionPath(), "utf8"));

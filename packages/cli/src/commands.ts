@@ -58,15 +58,16 @@ const note = (text = "") => process.stderr.write(`${text}\n`);
 
 /**
  * JSON for scripts and agents. JSON.stringify escapes C0 controls but not C1 controls
- * or bidirectional overrides, which some terminals act on, so those are escaped too.
+ * or bidirectional overrides, which some terminals act on, or the line and paragraph
+ * separators some line readers split on, so those are escaped too.
  */
-const printJson = (value: unknown) =>
-  out(
-    JSON.stringify(value, null, 2).replace(
-      /[\u0080-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g,
-      (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
-    ),
+export const jsonText = (value: unknown, indent?: number) =>
+  JSON.stringify(value, null, indent).replace(
+    /[\u0080-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g,
+    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
   );
+
+const printJson = (value: unknown) => out(jsonText(value, 2));
 
 const json = (context: Context) => context.values.json === true;
 
@@ -123,10 +124,14 @@ const matchProject = (projects: ProjectList["projects"], wanted: string): Projec
   if (byName.length > 1) {
     throw usageError(
       `Several projects are named "${wanted}". Pass its id instead: telemetry projects`,
+      { code: "project_ambiguous", hint: "telemetry projects" },
     );
   }
 
-  throw usageError(`No project "${wanted}" in this workspace. Projects: ${names || "none"}.`);
+  throw usageError(`No project "${wanted}" in this workspace. Projects: ${names || "none"}.`, {
+    code: "project_not_found",
+    hint: "telemetry projects",
+  });
 };
 
 /**
@@ -148,10 +153,13 @@ const resolveProject = async (api: Api, context: Context): Promise<Project> => {
   if (projects.length === 1) return toProject(projects[0]!);
 
   if (projects.length === 0)
-    throw new CliError("This workspace has no projects yet. Create one at telemetry.dev.");
+    throw new CliError("This workspace has no projects yet. Create one at telemetry.dev.", {
+      code: "no_projects",
+    });
 
   throw usageError(
     `Choose a project with --project <name>, or set a default with \`telemetry use <name>\`. Projects: ${projectNames(projects)}.`,
+    { code: "project_required", hint: "telemetry projects" },
   );
 };
 
@@ -1085,7 +1093,7 @@ export async function payloadCommand(context: Context) {
     if (!grantedScopes(session).has(PAYLOADS_SCOPE)) {
       throw new CliError(
         'This sign-in can\'t read captured prompts and outputs. Run `telemetry login`, check "Also read captured prompts, outputs, and tool arguments", and select Allow.',
-        EXIT.auth,
+        { exitCode: EXIT.auth, code: "payloads_not_allowed", hint: "telemetry login" },
       );
     }
 

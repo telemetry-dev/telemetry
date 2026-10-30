@@ -264,10 +264,11 @@ export class SessionAuthProvider implements OAuthClientProvider {
 }
 
 const sessionExpired = () =>
-  new CliError(
-    "Your sign-in has expired or was disconnected. Run `telemetry login` again.",
-    EXIT.auth,
-  );
+  new CliError("Your sign-in has expired or was disconnected. Run `telemetry login` again.", {
+    exitCode: EXIT.auth,
+    code: "sign_in_expired",
+    hint: "telemetry login",
+  });
 
 export const grantedScopes = (session: Session) =>
   new Set((session.tokens?.scope ?? "").split(" ").filter(Boolean));
@@ -441,7 +442,7 @@ const authorizationParams = (address: string, state: string) => {
   if (params?.get("state") !== state) {
     throw new CliError(
       "That isn't the address from this sign-in. Copy the browser's whole address bar after you select Allow.",
-      EXIT.auth,
+      { exitCode: EXIT.auth, code: "sign_in_failed" },
     );
   }
 
@@ -475,14 +476,14 @@ const authorize = async (
         error.code === "invalid_grant"
           ? "That sign-in link was already used or has expired. Run `telemetry login` again."
           : `Sign-in failed: ${oneLine(error.message).slice(0, 300)}`,
-        EXIT.auth,
+        { exitCode: EXIT.auth, code: "sign_in_failed", hint: "telemetry login" },
       );
     }
 
     if (error instanceof IssuerMismatchError || error instanceof AuthorizationServerMismatchError) {
       throw new CliError(
         "The sign-in answer came from a different authorization server than this sign-in started with. Run `telemetry login` again.",
-        EXIT.auth,
+        { exitCode: EXIT.auth, code: "sign_in_failed", hint: "telemetry login" },
       );
     }
 
@@ -499,7 +500,7 @@ const redeem = async (provider: SessionAuthProvider, params: URLSearchParams) =>
       error === "access_denied"
         ? "Sign-in was cancelled in the browser."
         : `Sign-in failed: ${oneLine(params.get("error_description") ?? error)}.`,
-      EXIT.auth,
+      { exitCode: EXIT.auth, code: "sign_in_failed", hint: "telemetry login" },
     );
   }
 
@@ -508,7 +509,7 @@ const redeem = async (provider: SessionAuthProvider, params: URLSearchParams) =>
   if (!code) {
     throw new CliError(
       "The browser returned without an authorization code. Run `telemetry login` again.",
-      EXIT.auth,
+      { exitCode: EXIT.auth, code: "sign_in_failed", hint: "telemetry login" },
     );
   }
 
@@ -587,7 +588,7 @@ export const login = async ({
     if (!pending) {
       throw new CliError(
         "No sign-in is waiting to finish. Run `telemetry login --no-browser` to start one.",
-        EXIT.auth,
+        { exitCode: EXIT.auth, code: "no_pending_sign_in", hint: "telemetry login --no-browser" },
       );
     }
 
@@ -661,7 +662,7 @@ export const login = async ({
             reject(
               new CliError(
                 "Sign-in timed out after 10 minutes. Run `telemetry login` to try again.",
-                EXIT.auth,
+                { exitCode: EXIT.auth, code: "sign_in_failed", hint: "telemetry login" },
               ),
             ),
           LOGIN_TIMEOUT_MS,

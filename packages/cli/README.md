@@ -57,11 +57,11 @@ List commands return 20 results by default. Use `--limit` to return from 1 to 50
 
 ## Scripts and agents
 
-Add `--json` to any command for machine-readable output on stdout. Messages and progress go to stderr, so `telemetry traces --json > traces.json` writes only data. List commands print the MCP tool's result as returned, with the fields that the [MCP server documentation](https://telemetry.dev/docs/platform/mcp-server) describes.
+Add `--json` to any command except `login` and `logout` for machine-readable output on stdout. Messages and progress go to stderr, so `telemetry traces --json > traces.json` writes only data. List commands print the MCP tool's result as returned, with the fields that the [MCP server documentation](https://telemetry.dev/docs/platform/mcp-server) describes.
 
 `telemetry trace` and `telemetry payload` read every page of a trace or a captured text, up to a limit: 2,000 spans for a trace, and 1,000,000 characters for each payload field. Their JSON output has `complete: false` when the limit cut it short, and human output says so on stderr.
 
-Captured text comes from your users, models, and tools. Human-readable output, including `payload --field`, removes terminal escape sequences and control characters from that text. JSON output escapes them, so use `--json` when you need the exact text.
+Captured text comes from your users, models, and tools. telemetry.dev removes ANSI color and cursor sequences, bidirectional overrides, and Unicode tag characters from results before they reach the CLI; it does not clean the text of error messages. Human-readable output, including `payload --field`, removes the remaining escape sequences and control characters. JSON output escapes them instead of removing them, so use `--json` when you need everything the server sent.
 
 | Exit code | Meaning                                                         |
 | --------- | --------------------------------------------------------------- |
@@ -70,6 +70,33 @@ Captured text comes from your users, models, and tools. Human-readable output, i
 | 2         | The command or its options were not valid                       |
 | 4         | You are not signed in, the sign-in expired, or access is denied |
 | 130       | Interrupted with Ctrl-C                                         |
+
+With `--json`, an error is one line of JSON on stderr, and stdout stays empty. Ctrl-C exits with 130 and no JSON, and `status --json` reports a missing sign-in as data on stdout with exit code 4.
+
+```text
+{"error":{"code":"not_signed_in","message":"You're not signed in. Run `telemetry login` first.","hint":"telemetry login","retryable":false,"exit_code":4,"cli_version":"0.1.0"}}
+```
+
+Branch on `code`, not on `message`, whose wording can change. `hint` is a command to run next, when there is one; `telemetry login` needs a person at a browser, so an agent should ask for it rather than run it. `retryable` is true when running the same command again may succeed. New codes may be added, and existing codes keep their meaning.
+
+| Code                   | Exit | Meaning                                                                          |
+| ---------------------- | ---- | -------------------------------------------------------------------------------- |
+| `invalid_arguments`    | 2    | An option or argument is not valid                                               |
+| `unknown_command`      | 2    | There is no command with that name                                               |
+| `project_not_found`    | 2    | No project in the workspace has that name or id                                  |
+| `project_ambiguous`    | 2    | Several projects have that name; pass its id                                     |
+| `project_required`     | 2    | The workspace has several projects and none was chosen                           |
+| `no_projects`          | 1    | The workspace has no projects yet                                                |
+| `not_signed_in`        | 4    | No sign-in is saved for this deployment                                          |
+| `sign_in_expired`      | 4    | The sign-in expired or was disconnected                                          |
+| `payloads_not_allowed` | 4    | The sign-in doesn't include reading captured prompts and outputs                 |
+| `unreachable`          | 1    | telemetry.dev could not be reached                                               |
+| `timeout`              | 1    | telemetry.dev took too long to answer                                            |
+| `tool_error`           | 1    | telemetry.dev returned an error; `message` says what it was                      |
+| `result_too_large`     | 1    | The result was too large to read; narrow it with filters or `--limit`            |
+| `request_failed`       | 1    | The request failed for another reason                                            |
+| `failed`               | 1    | The command failed for another reason                                            |
+| `internal`             | 1    | An unexpected error, such as a configuration file the CLI couldn't read or write |
 
 ## Configuration
 
