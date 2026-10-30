@@ -34,7 +34,7 @@ In a shell with no terminal to paste into, such as an agent's, `telemetry login 
 telemetry login --finish 'http://127.0.0.1:53124/callback?code=…'
 ```
 
-A sign-in covers one workspace. To read another workspace, run `telemetry login` again and choose it.
+A sign-in covers one workspace. To read another workspace, run `telemetry login` again and choose it. The new sign-in replaces the old one, and the CLI asks telemetry.dev to revoke the old one.
 
 ## Use
 

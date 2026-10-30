@@ -466,8 +466,21 @@ const redeem = async (provider: SessionAuthProvider, params: URLSearchParams) =>
 
   const email = await fetchEmail(provider.session);
   const { pending: _finished, ...signedIn } = provider.session;
+  // Read under the same lock as the write: the server treats revoking a refresh token
+  // that another command already rotated as reuse, and revokes every token the client
+  // holds for the person, this new sign-in included.
+  let replaced: Session = { server: signedIn.server };
+  const saved = await updateSession(signedIn.server, (current) => {
+    replaced = current;
 
-  return updateSession(signedIn.server, () => ({ ...signedIn, ...(email ? { email } : {}) }));
+    return { ...signedIn, ...(email ? { email } : {}) };
+  });
+
+  // The sign-in this one replaces would otherwise stay valid at the server until it
+  // expires. Its revocation is best effort: the new sign-in is already saved.
+  if (tokenKey(replaced.tokens) !== tokenKey(saved.tokens)) await revokeRefreshToken(replaced);
+
+  return saved;
 };
 
 /**
@@ -596,46 +609,51 @@ export const login = async ({
 };
 
 /**
+ * Revokes `session`'s refresh token at the server (RFC 7009) with the client it was
+ * issued to. Returns whether the server confirmed it; nothing here throws.
+ */
+const revokeRefreshToken = async (session: Session) => {
+  const refresh = session.tokens?.refresh_token;
+
+  if (!refresh || !session.client) return false;
+
+  try {
+    const { discoverOAuthServerInfo } = await import("@modelcontextprotocol/client");
+    const info = await discoverOAuthServerInfo(mcpUrl(session.server), { fetchFn: oauthFetch });
+
+    // RFC 7009 revocation is in the OAuth metadata, outside the SDK's type.
+    const metadata = info.authorizationServerMetadata as
+      | { revocation_endpoint?: unknown }
+      | undefined;
+    const endpoint =
+      typeof metadata?.revocation_endpoint === "string" ? metadata.revocation_endpoint : undefined;
+
+    if (!endpoint) return false;
+
+    const response = await oauthFetch(endpoint, {
+      method: "POST",
+      redirect: "error",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        token: refresh,
+        token_type_hint: "refresh_token",
+        client_id: session.client.client_id,
+      }),
+    });
+
+    return response.ok;
+  } catch {
+    return false;
+  }
+};
+
+/**
  * Revokes the refresh token at the server, then forgets the tokens. Keeps the client
  * registration so the next sign-in reuses it. A revocation that fails still signs out
  * locally, and reports it so the person can disconnect the CLI in account settings.
  */
 export const logout = async (session: Session) => {
-  const refresh = session.tokens?.refresh_token;
-  let revoked = false;
-
-  if (refresh && session.client) {
-    try {
-      const { discoverOAuthServerInfo } = await import("@modelcontextprotocol/client");
-      const info = await discoverOAuthServerInfo(mcpUrl(session.server), { fetchFn: oauthFetch });
-
-      // RFC 7009 revocation is in the OAuth metadata, outside the SDK's type.
-      const metadata = info.authorizationServerMetadata as
-        | { revocation_endpoint?: unknown }
-        | undefined;
-      const endpoint =
-        typeof metadata?.revocation_endpoint === "string"
-          ? metadata.revocation_endpoint
-          : undefined;
-
-      if (endpoint) {
-        const response = await oauthFetch(endpoint, {
-          method: "POST",
-          redirect: "error",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            token: refresh,
-            token_type_hint: "refresh_token",
-            client_id: session.client.client_id,
-          }),
-        });
-
-        revoked = response.ok;
-      }
-    } catch {
-      revoked = false;
-    }
-  }
+  const revoked = await revokeRefreshToken(session);
 
   await updateSession(session.server, (saved) => ({
     server: saved.server,
