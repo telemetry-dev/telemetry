@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.2...cli-v0.1.3) (2026-10-30)
+
+
+### Bug Fixes
+
+* **cli:** break the sign-in lock only when its holder has exited ([#124](https://github.com/telemetry-dev/telemetry/issues/124)) ([bb3369d](https://github.com/telemetry-dev/telemetry/commit/bb3369d276b287b09aaf2b749c7f991321d9508f))
+
 ## [0.1.2](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.1...cli-v0.1.2) (2026-10-30)
 
 
