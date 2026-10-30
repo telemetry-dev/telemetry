@@ -179,7 +179,8 @@ compiles its own. Model calls are the spans of type `generation` (operations `ch
 `text_completion`, and `generate_content`), including the spans of the provider integrations that
 use this SDK: OpenAI, Anthropic, Amazon Bedrock, Google GenAI, and OpenRouter. Spans from the AI SDK
 and TanStack AI integrations, and from other OpenTelemetry tracers, do not get the attributes.
-Messages from `compile()` that you pass to a model call outside `withPrompt` are not recorded.
+A model call outside `withPrompt` does not get the attributes, even when it sends messages from
+`compile()`; with input capture on, the call still records those messages as its input.
 
 ## API
 

@@ -11,6 +11,7 @@ import urllib.request
 from collections.abc import Callable, Generator
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any, NoReturn
 from urllib.parse import parse_qsl, urlsplit
@@ -446,6 +447,84 @@ def test_a_fetch_that_takes_too_long_fails_with_timeout(
     assert time.monotonic() - started < 0.8
 
 
+def test_a_fetch_stops_reading_a_trickled_reply_at_its_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(prompts_module, "_FETCH_TIMEOUT_S", 0.2)
+    disconnected = threading.Event()
+
+    # Each byte comes within the socket timeout, so only a deadline for the whole fetch ends it.
+    class Trickle(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("content-length", "1000")
+            self.end_headers()
+            try:
+                for _ in range(60):
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                    time.sleep(0.05)
+            except OSError:
+                disconnected.set()
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+    # server_close then waits for the reply thread, so that it does not write after the test.
+    server.daemon_threads = False
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+    thread.start()
+    try:
+        with pytest.raises(PromptError) as raised:
+            get_prompt(
+                "support/reply",
+                api_key="td_" + "live_a",
+                base_url=f"http://127.0.0.1:{server.server_address[1]}",
+            )
+        assert raised.value.code == "timeout"
+        # The fetch closed the connection, rather than reading for the 3 s of the reply.
+        assert disconnected.wait(1)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_a_fetch_starts_no_connection_after_its_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(prompts_module, "_FETCH_TIMEOUT_S", 0.2)
+    timeouts: list[float | None] = []
+
+    # Two addresses whose connect waits for the whole timeout, as an unreachable host does.
+    def lookup(*args: Any, **kwargs: Any) -> list[Any]:
+        address = (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("192.0.2.1", 80))
+        return [address, address]
+
+    class Unreachable:
+        def __init__(self, *args: Any) -> None:
+            self.timeout: float | None = None
+
+        def settimeout(self, timeout: float | None) -> None:
+            self.timeout = timeout
+
+        def connect(self, address: Any) -> NoReturn:
+            timeouts.append(self.timeout)
+            time.sleep(self.timeout or 0)
+            raise TimeoutError
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "getaddrinfo", lookup)
+    monkeypatch.setattr(socket, "socket", Unreachable)
+    with pytest.raises(PromptError) as raised:
+        get_prompt("support/reply", api_key="td_" + "live_a", base_url="http://prompts.test")
+    assert raised.value.code == "timeout"
+    time.sleep(0.3)
+    assert len(timeouts) == 1
+    assert timeouts[0] is not None and timeouts[0] <= 0.2
+
+
 def test_get_prompt_rejects_a_prompt_of_the_other_type_and_bad_options(
     server: CaptureServer,
 ) -> None:
@@ -567,6 +646,7 @@ def test_with_prompt_stamps_model_call_spans_in_scope_and_no_others(
         start_span("plain").end()
         start_span("embed", type="embedding").end()
         start_span("explicit parent", type="generation", parent=outside_context).end()
+        start_span("list operation", attributes={"gen_ai.operation.name": ["chat"]}).end()
 
     outside.end()
     with start_span("after", type="generation"):
@@ -583,7 +663,7 @@ def test_with_prompt_stamps_model_call_spans_in_scope_and_no_others(
             by_name[name]["td.prompt.variables"]
             == '{"customer_message":"Where is #4?","tone":"friendly"}'
         )
-    for name in ("before", "outside", "tool", "plain", "embed", "after"):
+    for name in ("before", "outside", "tool", "plain", "embed", "list operation", "after"):
         assert "td.prompt.name" not in by_name[name]
 
 

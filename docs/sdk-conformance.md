@@ -137,9 +137,11 @@ Concurrent calls share one fetch.
   returns the copy at once and starts one fetch in the background. Only a call with no copy waits
   for a fetch.
 - Timeout: a call waits for a fetch for 10 seconds at most, and then gets `timeout`. The
-  TypeScript SDK aborts the fetch at that time. The Python SDK fetches in a daemon thread, because
-  the urllib timeout applies to each socket operation and not to the address lookup or to the full
-  response. Thus the Python fetch can continue after the call stops waiting.
+  TypeScript SDK aborts the fetch at that time. The Python SDK fetches in a daemon thread and shuts
+  its connection down at that time, because the urllib timeout applies to each socket operation
+  and not to the full response. Only an address lookup can continue after the call stops waiting,
+  until the system resolver gives up. Both SDKs measure the TTL and Retry-After in elapsed time, so
+  a change of the system clock does not move them.
 - Failure: when a fetch fails, the SDKs keep the last copy for another TTL and send the error to
   `onError` / `on_error`. With no copy, the call gets the fallback. With no fallback, the call gets
   a `PromptError`. With no copy, the calls of the next 10 seconds (or the TTL, if it is shorter)

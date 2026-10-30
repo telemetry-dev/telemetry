@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import hashlib
 import json
 import random
 import re
+import socket
 import threading
 import urllib.error
 import urllib.parse
@@ -274,7 +276,8 @@ def prompt_attributes(
     client: Client, context: Context | None, operation: object, capture_input: bool
 ) -> dict[str, AttributeValue]:
     """The td.prompt.* attributes for a span with this operation that starts in ``context``."""
-    if operation not in _MODEL_CALL_OPERATIONS:
+    # An attribute can be a list, which a frozenset cannot hold.
+    if not isinstance(operation, str) or operation not in _MODEL_CALL_OPERATIONS:
         return {}
     scope = otel_context.get_value(_PROMPT_KEY, context) or otel_context.get_value(_PROMPT_KEY)
     if not isinstance(scope, _PromptScope):
@@ -467,10 +470,9 @@ def _load(
     on_error: Callable[[BaseException], None] | None,
 ) -> dict[str, Any]:
     """Return the kept copy of a prompt, and fetch a new copy in a background thread when it is
-    older than the TTL. Only a call with no copy waits for a fetch, until the fetch's deadline: the
-    timeout of urllib applies to each socket operation, not to the whole fetch. A failed fetch with
-    no copy fails the calls of the next ``_ERROR_TTL_S`` (or the TTL, if it is shorter) without a
-    fetch."""
+    older than the TTL. Only a call with no copy waits for a fetch, until the fetch's deadline. A
+    failed fetch with no copy fails the calls of the next ``_ERROR_TTL_S`` (or the TTL, if it is
+    shorter) without a fetch."""
     with _cache_lock:
         entry = _cache.get(key)
         if entry is None:
@@ -489,7 +491,7 @@ def _load(
             return entry.response
         pending, deadline = entry.pending, entry.deadline
     if pending is not None and not pending.wait(deadline - monotonic()):
-        raise PromptError("timeout", f"Fetching the prompt took more than {_FETCH_TIMEOUT_S:g} s")
+        raise _timeout()
     with _cache_lock:
         response, error = entry.response, entry.error
     if response is not None:
@@ -548,31 +550,141 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_opener = urllib.request.build_opener(_NoRedirect)
+class _Deadline:
+    """Ends one prompt fetch after ``_FETCH_TIMEOUT_S``. The timeout of urllib applies to each
+    socket operation, so a server that sends a byte now and then could keep a fetch reading forever,
+    and each address of a host gets the full timeout to connect. A connection attempt gets only the
+    time that is left, and at the deadline this shuts the connection down, which ends a blocked
+    read. It cannot stop an address lookup; the system resolver bounds that."""
+
+    def __init__(self) -> None:
+        self.expired = False
+        self._end = monotonic() + _FETCH_TIMEOUT_S
+        self._lock = threading.Lock()
+        self._sockets: list[socket.socket] = []
+        self._timer = threading.Timer(_FETCH_TIMEOUT_S, self._expire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def connect(
+        self,
+        address: tuple[str, int],
+        timeout: float | None,
+        source_address: tuple[str, int] | None = None,
+    ) -> socket.socket:
+        """``socket.create_connection``, with each attempt bounded by the deadline."""
+        host, port = address
+        error: OSError = OSError(f"no address for {host}")
+        for family, kind, proto, _, target in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+            left = self._end - monotonic()
+            if left <= 0:
+                break
+            sock = socket.socket(family, kind, proto)
+            try:
+                sock.settimeout(left if timeout is None else min(left, timeout))
+                if source_address is not None:
+                    sock.bind(source_address)
+                sock.connect(target)
+                sock.settimeout(timeout)
+            except OSError as exc:
+                sock.close()
+                error = exc
+                continue
+            with self._lock:
+                if not self.expired:
+                    try:
+                        # A TLS wrap takes the file descriptor of sock, so keep a copy to shut down.
+                        self._sockets.append(sock.dup())
+                    except OSError:
+                        sock.close()
+                        raise
+                    return sock
+            sock.close()
+            break
+        if self.expired or self._end <= monotonic():
+            raise TimeoutError("the prompt fetch passed its deadline")
+        raise error
+
+    def _expire(self) -> None:
+        with self._lock:
+            self.expired = True
+            for sock in self._sockets:
+                with contextlib.suppress(OSError):
+                    sock.shutdown(socket.SHUT_RDWR)
+
+    def close(self) -> None:
+        self._timer.cancel()
+        with self._lock:
+            for sock in self._sockets:
+                sock.close()
+            self._sockets.clear()
+
+
+class _Request(urllib.request.Request):
+    def __init__(self, url: str, headers: dict[str, str], deadline: _Deadline) -> None:
+        super().__init__(url, headers=headers, method="GET")
+        self.deadline = deadline
+
+
+def _on_deadline(http_class: Any, request: urllib.request.Request) -> Any:
+    """``http_class``, with the sockets of a ``_Request`` under its deadline."""
+
+    def connection(host: str, **kwargs: Any) -> Any:
+        conn = http_class(host, **kwargs)
+        if isinstance(request, _Request):
+            conn._create_connection = request.deadline.connect
+        return conn
+
+    return connection
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def do_open(self, http_class: Any, req: urllib.request.Request, **http_conn_args: Any) -> Any:
+        return super().do_open(_on_deadline(http_class, req), req, **http_conn_args)
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    def do_open(self, http_class: Any, req: urllib.request.Request, **http_conn_args: Any) -> Any:
+        return super().do_open(_on_deadline(http_class, req), req, **http_conn_args)
+
+
+_opener = urllib.request.build_opener(_NoRedirect, _HTTPHandler, _HTTPSHandler)
 
 
 def _fetch(url: str, headers: dict[str, str]) -> dict[str, Any]:
-    request = urllib.request.Request(url, headers=headers, method="GET")
+    deadline = _Deadline()
+    retry_after: str | None = None
     try:
-        with _opener.open(request, timeout=_FETCH_TIMEOUT_S) as response:
-            body: bytes = response.read()
-    except urllib.error.HTTPError as exc:
-        with exc:
-            error = _api_error(exc.code, exc.read())
-            if exc.code in (429, 503):
-                retry_after = _retry_after(exc.headers.get("Retry-After"))
-                error._retry_after = retry_after  # pyright: ignore[reportPrivateUsage]
-            raise error from None
-    except TimeoutError as exc:
-        raise PromptError(
-            "timeout", f"Fetching the prompt took more than {_FETCH_TIMEOUT_S:g} s"
-        ) from exc
-    except (urllib.error.URLError, OSError) as exc:
-        if isinstance(getattr(exc, "reason", None), TimeoutError):
-            raise PromptError(
-                "timeout", f"Fetching the prompt took more than {_FETCH_TIMEOUT_S:g} s"
-            ) from exc
-        raise PromptError("network_error", "Could not reach telemetry.dev") from exc
+        try:
+            with _opener.open(
+                _Request(url, headers, deadline), timeout=_FETCH_TIMEOUT_S
+            ) as response:
+                status: int = response.status
+                body: bytes = response.read()
+        except urllib.error.HTTPError as exc:
+            with exc:
+                status, body = exc.code, exc.read()
+                retry_after = exc.headers.get("Retry-After")
+    except Exception as exc:
+        if (
+            deadline.expired
+            or isinstance(exc, TimeoutError)
+            or isinstance(getattr(exc, "reason", None), TimeoutError)
+        ):
+            raise _timeout() from exc
+        if isinstance(exc, (urllib.error.URLError, OSError)):
+            raise PromptError("network_error", "Could not reach telemetry.dev") from exc
+        raise
+    finally:
+        deadline.close()
+    # A read that the deadline cut short can end without an error, with part of the body.
+    if deadline.expired:
+        raise _timeout()
+    if not 200 <= status < 300:
+        error = _api_error(status, body)
+        if status in (429, 503):
+            error._retry_after = _retry_after(retry_after)  # pyright: ignore[reportPrivateUsage]
+        raise error
     try:
         parsed = _parse_response(json.loads(body))
     except ValueError:
@@ -580,6 +692,10 @@ def _fetch(url: str, headers: dict[str, str]) -> dict[str, Any]:
     if parsed is None:
         raise PromptError("invalid_response", "telemetry.dev returned a prompt it cannot read")
     return parsed
+
+
+def _timeout() -> PromptError:
+    return PromptError("timeout", f"Fetching the prompt took more than {_FETCH_TIMEOUT_S:g} s")
 
 
 def _api_error(status: int, body: bytes) -> PromptError:

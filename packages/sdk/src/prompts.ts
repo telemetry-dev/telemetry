@@ -180,9 +180,9 @@ interface CacheEntry {
   response?: PromptResponse;
   /** Why the last fetch failed, when there was no response to keep. */
   error?: unknown;
-  /** When the last fetch ended. */
+  /** When the last fetch ended, in `performance.now()` time, so that a clock change does not move it. */
   checkedAt: number;
-  /** No fetch before this time: the Retry-After of the last 429 or 503 response. */
+  /** No fetch before this `performance.now()` time: the Retry-After of the last 429 or 503 response. */
   retryAt: number;
   pending?: Promise<PromptResponse>;
 }
@@ -406,12 +406,12 @@ async function load(
 
   if (!entry) {
     if (cache.size >= MAX_CACHE_ENTRIES) cache.delete(cache.keys().next().value!);
-    entry = { checkedAt: 0, retryAt: 0 };
+    entry = { checkedAt: Number.NEGATIVE_INFINITY, retryAt: 0 };
     cache.set(key, entry);
   }
 
   const fresh =
-    Date.now() <
+    performance.now() <
     Math.max(
       entry.checkedAt + (entry.response ? ttlMs : Math.min(ttlMs, ERROR_TTL_MS)),
       entry.retryAt,
@@ -443,7 +443,7 @@ function refresh(
       },
       (error: unknown) => {
         const delay = error instanceof PromptError ? retryAfter.get(error) : undefined;
-        entry.retryAt = delay === undefined ? 0 : Date.now() + delay;
+        entry.retryAt = delay === undefined ? 0 : performance.now() + delay;
 
         if (!entry.response) {
           entry.error = error;
@@ -457,7 +457,7 @@ function refresh(
     )
     .finally(() => {
       // A failed fetch counts too, so that calls do not each start a fetch while it fails.
-      entry.checkedAt = Date.now();
+      entry.checkedAt = performance.now();
       entry.pending = undefined;
     });
 }
