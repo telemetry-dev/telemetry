@@ -69,10 +69,11 @@ List commands return 20 results by default. Use `--limit` to return from 1 to 50
 
 ### Time windows
 
-`traces` and `sessions` take `--since` and `--until` to choose the time they search:
+`traces`, `sessions`, and `logs` take `--since` and `--until` to choose the time they search:
 
 ```sh
 telemetry traces --errors --since 2h
+telemetry logs --level warn --since 30m
 telemetry sessions --since 2026-10-29 --until 2026-10-30
 ```
 
@@ -88,7 +89,7 @@ Each option takes one of these forms:
 
 A duration has up to five digits. The CLI sends a date or a time without a zone with your zone's offset on that day, so a day that changes to or from daylight saving time still starts at the start of your local day. Without `--since`, a command uses its usual window, and without `--until`, the window ends now. telemetry.dev doesn't search past the project's retention: when a window reaches further back, it starts at the retention limit, and the CLI says so on stderr.
 
-`--range` on `sessions` still picks one of the usual windows, and it can't be combined with `--since` or `--until`.
+`--range` on `sessions` and `logs` still picks one of the usual windows, and it can't be combined with `--since` or `--until`.
 
 `traces` also takes `--framework` and `--service`, which match the trace, and `--model`, `--provider`, and `--operation`, which match traces with a span that started in the window.
 
@@ -96,13 +97,15 @@ A duration has up to five digits. The CLI sends a date or a time without a zone 
 
 Add `--json` to any command for machine-readable output on stdout. Messages and progress go to stderr, so `telemetry traces --json > traces.json` writes only data. List commands print the MCP tool's result as returned, with the fields that the [MCP server documentation](https://telemetry.dev/docs/platform/mcp-server) describes.
 
-The results of `traces` and `sessions` include the window that telemetry.dev searched, with both ends resolved to ISO times. `capped_by_retention` is true when the window starts at the start of the project's retention, so older data wasn't searched. That is also the case for `traces` without `--since`, which searches the whole retention:
+The results of `traces`, `sessions`, and `logs` include the window that telemetry.dev searched, with both ends resolved to ISO times. `capped_by_retention` is true when the window starts at the start of the project's retention, so older data wasn't searched. That is also the case for `traces` without `--since`, which searches the whole retention:
 
 ```json
 "window": { "since": "2026-10-30T12:00:00.000Z", "until": "2026-10-30T14:00:00.000Z", "capped_by_retention": false }
 ```
 
-An older telemetry.dev deployment may ignore `--since`, `--until`, and the `traces` filters and return unfiltered results. So when the CLI sends one of them and the result has no `window`, the command fails with `server_unsupported` and prints no results. A deployment that refuses arguments it doesn't know fails with `tool_error` instead.
+`logs` results also have `next_cursor`, which is `null` on the last page, and `range_days` is `null` when the command used `--since` or `--until`.
+
+An older telemetry.dev deployment may ignore `--since`, `--until`, the `traces` filters, and `logs --cursor` and return unfiltered results, or the first page of logs again. So when the CLI sends one of them and the result has no `window`, or no `next_cursor` for `logs --cursor`, the command fails with `server_unsupported` and prints no results. A deployment that refuses arguments it doesn't know fails with `tool_error` instead.
 
 `telemetry trace` and `telemetry payload` read every page of a trace or a captured text, up to a limit: 2,000 spans for a trace, and 1,000,000 characters for each payload field. Their JSON output has `complete: false` when the limit cut it short, and human output says so on stderr.
 

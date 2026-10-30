@@ -1378,9 +1378,11 @@ export async function logsCommand(context: Context) {
     warn: "warn",
     error: "error",
   } as const;
+  const window = timeWindow(context);
 
   await withApi(async (api) => {
     const project = await resolveProject(api, context);
+    const cursor = string(context, "cursor");
 
     const result = await api.call<LogList>(
       "list_logs",
@@ -1388,22 +1390,36 @@ export async function logsCommand(context: Context) {
         project_id: project.id,
         level: choice(context, "level", LEVELS),
         range_days: choice(context, "range", DAYS),
+        ...window.args,
         limit: limit(context),
+        cursor,
       },
       "Loading logs",
     );
 
+    requireSupport(result, "window", window.flags, "use --range");
+    // A server from before log pages would answer a cursor with the first page again.
+    requireSupport(result, "next_cursor", cursor === undefined ? [] : ["cursor"]);
+
     if (json(context)) return printJson(result);
 
     const { counts } = result;
+    const covered =
+      result.range_days === null && result.window
+        ? windowText(result.window)
+        : `in the last ${result.range_days} days`;
 
     out(
       style.dim(
-        `${formatInteger(counts.totalCount)} logs in the last ${result.range_days} days · ${formatInteger(counts.errorCount)} error · ${formatInteger(counts.warnCount)} warn · ${formatInteger(counts.infoCount)} info · ${formatInteger(counts.debugCount)} debug`,
+        `${formatInteger(counts.totalCount)} logs ${covered} · ${formatInteger(counts.errorCount)} error · ${formatInteger(counts.warnCount)} warn · ${formatInteger(counts.infoCount)} info · ${formatInteger(counts.debugCount)} debug`,
       ),
     );
 
-    if (result.logs.length === 0) return nothing("No logs match.");
+    if (result.logs.length === 0) {
+      nothing("No logs match.");
+
+      return noteCapped(context, result.window);
+    }
 
     out();
     out(
@@ -1425,13 +1441,18 @@ export async function logsCommand(context: Context) {
       ),
     );
 
-    if (result.has_more)
+    noteCapped(context, result.window);
+
+    // A server from before log pages has more logs than it can return.
+    if (result.has_more && !result.next_cursor)
       note(
         style.dim(
           "\nShowing the newest logs. Raise --limit (up to 50) or narrow with --level.",
           process.stderr,
         ),
       );
+
+    suggest(context, nextPage(context, result.next_cursor ?? null));
   });
 }
 

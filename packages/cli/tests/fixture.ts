@@ -584,7 +584,55 @@ const server = () => {
       ? TRACE_DETAILS[String(args.trace_id)]!()
       : new ToolFailure("Trace not found or outside retention", "trace_not_found"),
   );
-  tool("list_logs", () => logs());
+  tool("list_logs", (args) => {
+    if (!serverState.windows) return logs();
+
+    const window = resolveWindow(args, Number(args.range_days ?? 7) * UNIT_MS.d);
+
+    if (window instanceof ToolFailure) return window;
+
+    // A cursor holds its offset and the arguments it was made for, all but limit.
+    const { limit = 20, cursor, ...query } = args;
+    const key = JSON.stringify(query);
+    let offset = 0;
+
+    if (cursor !== undefined) {
+      const decoded = (() => {
+        try {
+          return JSON.parse(Buffer.from(cursor as string, "base64url").toString()) as unknown;
+        } catch {
+          return undefined;
+        }
+      })() as { offset?: unknown; key?: unknown } | undefined;
+
+      if (decoded?.key !== key || typeof decoded.offset !== "number") {
+        return new ToolFailure(
+          "cursor is not a next_cursor value from list_logs with these arguments. Omit it to start over.",
+          "invalid_cursor",
+        );
+      }
+
+      offset = decoded.offset;
+    }
+
+    const all = logs();
+    const level = typeof args.level === "string" ? args.level : "all";
+    const matching = all.logs.filter((log) => level === "all" || log.level === level);
+    const end = offset + Number(limit);
+    const more = end < matching.length;
+
+    return {
+      ...all,
+      range_days:
+        args.since === undefined && args.until === undefined ? Number(args.range_days ?? 7) : null,
+      window,
+      has_more: more,
+      next_cursor: more
+        ? Buffer.from(JSON.stringify({ offset: end, key })).toString("base64url")
+        : null,
+      logs: matching.slice(offset, end),
+    };
+  });
   tool("get_usage_summary", () => usage());
   tool("get_span_payload", (args) => {
     const text = PAYLOADS[String(args.field)] ?? "";
@@ -618,9 +666,9 @@ export const serverState = {
   /** The quiet trace's `url`; undefined acts as a server from before trace links. */
   traceUrl: QUIET_TRACE_URL as string | undefined,
   /**
-   * search_traces and search_sessions take since and until and answer with a window,
-   * and search_traces takes the filters that came with them. False acts as a server from
-   * before them, which drops those arguments and answers without them.
+   * Lists take since and until and answer with a window, and search_traces takes the
+   * filters that came with them. False acts as a server from before them, which drops
+   * those arguments and answers without them.
    */
   windows: true,
 };

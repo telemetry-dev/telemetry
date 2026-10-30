@@ -106,7 +106,11 @@ export type PayloadPage = {
 };
 
 export type LogList = {
-  range_days: number;
+  /** Null when the request named `since` or `until`; `window` has the times instead. */
+  range_days: number | null;
+  window?: Window;
+  /** Missing from servers from before log pages. */
+  next_cursor?: string | null;
   counts: {
     debugCount: number;
     infoCount: number;
