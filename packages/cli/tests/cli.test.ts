@@ -1,12 +1,14 @@
-import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { execFile, spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 import { afterAll, beforeAll, beforeEach, expect, test } from "vitest";
 
-import { sessionFile } from "../src/session.ts";
+import { type Session, sessionFile, updateSession } from "../src/session.ts";
 import {
   beforeRefresh,
   calls,
@@ -366,4 +368,114 @@ test("logout revokes the refresh token and keeps the client registration and oth
   expect(session.client).toEqual({ client_id: "fixture-client" });
   expect(session.tokens).toBeUndefined();
   expect(await readFile(join(home, "session.json"), "utf8")).toBe(production);
+});
+
+const lockPath = () => `${sessionPath()}.lock`;
+const markerFor = (path: string, token: string) =>
+  `${path}.${createHash("sha256").update(token).digest("hex").slice(0, 16)}`;
+const holdLock = async (path: string, token: string, pid: number, host = hostname()) =>
+  writeFile(path, JSON.stringify({ token, pid, host }));
+const backdate = async (path: string) => {
+  const minuteAgo = new Date(Date.now() - 60_000);
+  await utimes(path, minuteAgo, minuteAgo);
+};
+const exitedPid = () => spawnSync(process.execPath, ["-e", ""]).pid;
+
+const record = (write: number) =>
+  updateSession(
+    fixture.url,
+    (saved) =>
+      ({
+        ...saved,
+        writes: [...((saved as { writes?: number[] }).writes ?? []), write],
+      }) as Session,
+  );
+const recorded = async () =>
+  ((await savedSession().catch(() => ({}))) as { writes?: number[] }).writes?.toSorted(
+    (a, b) => a - b,
+  ) ?? [];
+
+// updateSession reads the config directory from the environment on each call.
+const inConfigDir = async (run: () => Promise<void>) => {
+  const configured = process.env.TELEMETRY_DEV_CONFIG_DIR;
+  process.env.TELEMETRY_DEV_CONFIG_DIR = home;
+
+  try {
+    await run();
+  } finally {
+    if (configured === undefined) delete process.env.TELEMETRY_DEV_CONFIG_DIR;
+    else process.env.TELEMETRY_DEV_CONFIG_DIR = configured;
+  }
+};
+
+test("the sign-in lock waits for a running holder however long it holds, and for a command already removing an abandoned lock", async () => {
+  const running = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+
+  try {
+    await inConfigDir(async () => {
+      await holdLock(lockPath(), "running", running.pid!);
+      await backdate(lockPath());
+
+      const waiting = Promise.all([0, 1, 2, 3].map(record));
+      await sleep(500);
+      expect(await recorded()).toEqual([]);
+
+      await rm(lockPath());
+      await waiting;
+      expect(await recorded()).toEqual([0, 1, 2, 3]);
+
+      // Another machine's lock is judged by its age, and this one is fresh.
+      await holdLock(lockPath(), "other-machine", process.ppid, "another-machine");
+      const behindOtherMachine = record(5);
+      await sleep(500);
+      expect(await recorded()).toEqual([0, 1, 2, 3]);
+
+      await rm(lockPath());
+      await behindOtherMachine;
+      expect(await recorded()).toEqual([0, 1, 2, 3, 5]);
+
+      await holdLock(lockPath(), "abandoned", exitedPid());
+      const marker = markerFor(lockPath(), "abandoned");
+      await holdLock(marker, "breaking", running.pid!);
+
+      const behindBreaker = record(4);
+      await sleep(500);
+      expect(await recorded()).toEqual([0, 1, 2, 3, 5]);
+
+      await rm(marker);
+      await behindBreaker;
+      expect(await recorded()).toEqual([0, 1, 2, 3, 4, 5]);
+    });
+  } finally {
+    running.kill();
+  }
+});
+
+test("the sign-in lock is taken over at once, without lost writes, when its holder or a command breaking it has exited", async () => {
+  await inConfigDir(async () => {
+    const takeOver = async (writes: number[]) => {
+      const started = Date.now();
+      await Promise.all(writes.map(record));
+      expect(Date.now() - started).toBeLessThan(2000);
+    };
+
+    await holdLock(lockPath(), "exited", exitedPid());
+    await takeOver([0, 1, 2, 3, 4, 5, 6, 7]);
+
+    await holdLock(lockPath(), "exited-again", exitedPid());
+    await holdLock(markerFor(lockPath(), "exited-again"), "exited-breaker", exitedPid());
+    await takeOver([8]);
+
+    // Left by an earlier process that had this one's pid.
+    await holdLock(lockPath(), "same-pid", process.pid);
+    await takeOver([9]);
+
+    // Another machine's lock can only be judged by its age.
+    await holdLock(lockPath(), "other-machine", process.ppid, "another-machine");
+    await backdate(lockPath());
+    await takeOver([10]);
+
+    expect(await recorded()).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(await readdir(home)).toEqual([sessionFile(fixture.url)]);
+  });
 });
