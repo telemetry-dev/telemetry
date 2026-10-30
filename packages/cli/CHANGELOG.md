@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.4](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.3...cli-v0.1.4) (2026-10-30)
+
+
+### Features
+
+* **cli:** add --since, --until and trace filters to traces and sessions ([#137](https://github.com/telemetry-dev/telemetry/issues/137)) ([4aa30a4](https://github.com/telemetry-dev/telemetry/commit/4aa30a4cf26a795f53c368248560f60b02f91b01))
+* **cli:** link a trace to its dashboard page ([#136](https://github.com/telemetry-dev/telemetry/issues/136)) ([7848f15](https://github.com/telemetry-dev/telemetry/commit/7848f157c1ddc53192a8ceabf3e8eb179c14820c))
+* **cli:** page logs and give it --since and --until ([#138](https://github.com/telemetry-dev/telemetry/issues/138)) ([82c8d1b](https://github.com/telemetry-dev/telemetry/commit/82c8d1b49ee69223a818a55b624219fe3e5524d5))
+
 ## [0.1.3](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.2...cli-v0.1.3) (2026-10-30)
 
 
