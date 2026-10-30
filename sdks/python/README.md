@@ -260,9 +260,51 @@ ran in it, or before it started in the code that started it; with none, it recor
 for code that has not compiled in its own task. Model calls are the spans of type `generation`
 (operations `chat`, `text_completion`, and `generate_content`), including the spans of the provider
 integrations: OpenAI, Anthropic, Amazon Bedrock, Google GenAI, LiteLLM, and OpenRouter. Spans from
-other OpenTelemetry tracers do not get the attributes. A model call outside `with_prompt` does not
-get the attributes, even when it sends messages from `compile()`; with input capture on, the call
-still records those messages as its input.
+other OpenTelemetry tracers do not get the attributes.
+
+Outside `with_prompt`, those provider integrations record the prompt of the message dicts that
+`compile()` returned. `compile()` of a chat prompt returns instances of a private `dict` subclass
+that also hold its prompt and a copy of its variables and of each list in them. The objects in a
+list are not copied, so a change to one of them after `compile()` changes the variables that a call
+records. A chat call that sends such messages gets `td.prompt.name`, `td.prompt.version`, and
+`td.prompt.label` of the newest `compile()` among them, also when input capture is off, and
+`td.prompt.variables` when it is on. The SDK looks at the first 1000 and the last 1000 messages of
+the call. A message from a placeholder variable keeps the prompt of its own, older `compile()`, so
+it does not win over the `compile()` that put it in the list. A copy of a message (`dict()`,
+`.copy()`, `copy.copy`, `copy.deepcopy`, pickle, JSON, `type(message)(message)`, or
+`dataclasses.asdict`) and a new message with the same text do not hold the prompt, so a call that
+sends only such messages gets no `td.prompt.*` attributes; with input capture on, the call still
+records them as its input. Bedrock Converse and Google GenAI take another message shape: change the
+compiled dicts in place, or use `with_prompt`. A text prompt compiles to a string, which cannot hold
+its prompt: use `with_prompt`. `with_prompt` wins over the message. The integrations do it for OpenAI
+chat completions and responses, Anthropic messages (for `messages.stream()`, at `__enter__`),
+Bedrock Converse, Google GenAI `generate_content`, LiteLLM completion and responses, and OpenRouter
+chat and responses, but not for Bedrock InvokeModel (its body is bytes), embeddings, images, audio,
+video, or OpenAI Realtime. With an older `telemetry-dev` that has no `prompt_attributes_for`, a
+provider integration records the prompt only in `with_prompt`.
+
+A compiled message is a `dict` for `isinstance`, and its keys and its JSON (`json`, `orjson`,
+pydantic) do not change. A check of the exact type (`type(message) is dict`), `yaml.safe_dump`,
+and `marshal` reject it: give them `dict(message)`.
+
+With input capture on in the client when `compile()` runs, a compiled message keeps the variables
+of its `compile()` for 5 minutes. A call keeps them for 5 more minutes when the newest `compile()`
+of the call is that one. After that time, a call records the prompt without
+`td.prompt.variables`, and the SDK removes the variables from the message, also when you keep the
+message. Other compiles do not change this time. Thus a chat history keeps the variables of the
+compiles of its last 5 minutes, and a guard prompt, a queue, or a compile in another thread before
+the call does not remove them. A message that you compile one time and send in many calls keeps its
+variables while a call names its `compile()` at least one time in 5 minutes. A call that sends only
+messages of earlier turns records the prompt of the newest `compile()` among them, and its
+variables when they are less than 5 minutes old. With input capture off, the message keeps no
+variables.
+
+For your own spans, `prompt_attributes_for(messages)` gives the attributes to pass as
+`attributes`. It gives `{}` inside `with_prompt`, and a span with `capture_input=False` drops
+`td.prompt.variables`. A model call whose parent is in `with_prompt` gets the prompt of the
+`with_prompt` and none of the `td.prompt.*` attributes that you pass, at start or in `update`,
+`end`, or `update_current_span`, also when its `parent` context comes from a `with_prompt` that the
+call is not in.
 
 ## Experiments
 

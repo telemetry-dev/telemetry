@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import copy
+import dataclasses
+import gc
 import importlib
 import itertools
+import json
 import os
+import pickle
 import signal
 import socket
 import sys
@@ -13,15 +18,17 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+import weakref
 from collections.abc import Callable, Generator
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import FrameType, SimpleNamespace
-from typing import Any, NoReturn
+from typing import Any, NoReturn, TypeAlias
 from urllib.parse import parse_qsl, urlsplit
 
 import pytest
+from opentelemetry import context as otel_context
 from opentelemetry import trace
 
 import telemetry_dev
@@ -29,8 +36,10 @@ import telemetry_dev._prompts as prompts_module
 from telemetry_dev import (
     ChatPrompt,
     PromptError,
+    TextPrompt,
     get_prompt,
     get_prompt_async,
+    prompt_attributes_for,
     propagate_attributes,
     start_span,
     with_prompt,
@@ -90,6 +99,34 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 def empty_cache() -> None:
     # A fetch that runs on after its test must not answer a later test on a reused port.
     prompts_module._cache.clear()  # pyright: ignore[reportPrivateUsage]
+
+
+def chat_prompt(*messages: dict[str, Any], name: str = "support/reply") -> ChatPrompt:
+    return ChatPrompt(
+        name=name,
+        version=12,
+        label="production",
+        messages=list(messages),
+        model=None,
+        parameters={},
+        tools=[],
+        response_format={"type": "text"},
+        is_fallback=False,
+    )
+
+
+def text_prompt(text: str) -> TextPrompt:
+    return TextPrompt(
+        name="support/reply",
+        version=12,
+        label="production",
+        text=text,
+        model=None,
+        parameters={},
+        tools=[],
+        response_format={"type": "text"},
+        is_fallback=False,
+    )
 
 
 def query_of(path: str) -> dict[str, str]:
@@ -1092,6 +1129,716 @@ def test_variables_are_omitted_when_input_capture_is_off(
     [span] = off.span_exporter.get_finished_spans()
     assert (span.attributes or {})["td.prompt.version"] == 7
     assert "td.prompt.variables" not in (span.attributes or {})
+
+
+DESK_MESSAGES = [
+    {"role": "system", "content": "Answer as the {{team}} desk."},
+    {"role": "user", "content": "Order {{order}}: where is it?"},
+]
+
+
+def test_prompt_attributes_for_names_the_compile_of_a_message_dict_and_a_copy_names_nothing(
+    make: MakeClient,
+) -> None:
+    make()
+    compiled = chat_prompt(*DESK_MESSAGES).compile(team="billing", order="#4")
+    attributes = {
+        "td.prompt.name": "support/reply",
+        "td.prompt.version": 12,
+        "td.prompt.label": "production",
+        "td.prompt.variables": '{"team":"billing","order":"#4"}',
+    }
+
+    assert prompt_attributes_for(compiled) == attributes
+    assert prompt_attributes_for(tuple(compiled)) == attributes
+    assert prompt_attributes_for(compiled[0]) == attributes
+    assert json.dumps(compiled[0]) == '{"role": "system", "content": "Answer as the billing desk."}'
+
+    copies: list[object] = [
+        [dict(message) for message in compiled],
+        [message.copy() for message in compiled],
+        [copy.copy(message) for message in compiled],
+        copy.deepcopy(compiled),
+        pickle.loads(pickle.dumps(compiled)),
+        json.loads(json.dumps(compiled)),
+        [message["content"] for message in compiled],
+    ]
+    for messages in copies:
+        assert prompt_attributes_for(messages) == {}
+
+    summary = text_prompt("Summarize {{doc}}.").compile(doc="the policy")
+    assert prompt_attributes_for([summary]) == {}
+
+
+def test_an_unrelated_message_with_the_text_of_a_compiled_message_is_not_tagged(
+    make: MakeClient,
+) -> None:
+    make()
+    chat_prompt({"role": "system", "content": "You are a helpful assistant."}).compile()
+
+    unrelated = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is 2 + 2?"},
+    ]
+    assert prompt_attributes_for(unrelated) == {}
+
+
+def test_two_tasks_with_one_text_and_different_other_variables_each_record_their_own(
+    make: MakeClient,
+) -> None:
+    memory = make()
+    prompt = chat_prompt(*DESK_MESSAGES)
+
+    # Both compiles make the system text "Answer as the billing desk.", and each task sends only it.
+    system_a = prompt.compile(team="billing", order="#A")[0]
+    system_b = prompt.compile(team="billing", order="#B")[0]
+    start_span("a", type="generation", attributes=prompt_attributes_for([system_a])).end()
+    start_span("b", type="generation", attributes=prompt_attributes_for([system_b])).end()
+
+    assert {
+        span.name: (span.attributes or {})["td.prompt.variables"]
+        for span in memory.span_exporter.get_finished_spans()
+    } == {
+        "a": '{"team":"billing","order":"#A"}',
+        "b": '{"team":"billing","order":"#B"}',
+    }
+
+
+def test_a_rollout_with_two_versions_of_the_same_messages_records_the_version_of_each_call(
+    server: CaptureServer, make: MakeClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make()
+    server.replies = [
+        (
+            200,
+            reply(
+                messages=DESK_MESSAGES,
+                rollout={
+                    "percent": 16,
+                    "version": 13,
+                    "messages": DESK_MESSAGES,
+                    "text": None,
+                    "model": {"provider": "openai", "name": "gpt-4o-mini"},
+                    "parameters": {},
+                    "tools": [],
+                    "responseFormat": {"type": "text"},
+                },
+            ),
+        )
+    ]
+    draws = iter([15, 16])
+
+    def draw(_stop: int) -> int:
+        return next(draws)
+
+    monkeypatch.setattr(prompts_module.random, "randrange", draw)
+    rollout = get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+    production = get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+    from_rollout = rollout.compile(team="billing", order="#4")
+    from_production = production.compile(team="billing", order="#4")
+
+    assert prompt_attributes_for(from_rollout)["td.prompt.version"] == 13
+    assert prompt_attributes_for(from_production)["td.prompt.version"] == 12
+
+
+def test_the_newest_compiled_message_wins_also_after_170_messages_of_history(
+    make: MakeClient,
+) -> None:
+    make()
+    prompt = chat_prompt(
+        {"role": "system", "content": "Answer as the {{team}} desk."},
+        {"role": "placeholder", "name": "history"},
+        {"role": "user", "content": "{{question}}"},
+    )
+    history = [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"message {index}"}
+        for index in range(170)
+    ]
+
+    first_turn = prompt.compile(team="billing", question="Where is #4?", history=history)
+    second_turn = prompt.compile(team="returns", question="Can I return it?")
+    chat = [*first_turn, {"role": "assistant", "content": "On its way."}, *second_turn[1:]]
+
+    assert '"team":"billing"' in str(prompt_attributes_for(first_turn)["td.prompt.variables"])
+    assert '"team":"billing"' in str(
+        prompt_attributes_for([first_turn[0], *history])["td.prompt.variables"]
+    )
+    assert (
+        prompt_attributes_for(chat)["td.prompt.variables"]
+        == '{"team":"returns","question":"Can I return it?"}'
+    )
+
+
+def test_a_message_that_a_placeholder_brings_from_an_older_compile_does_not_win(
+    make: MakeClient,
+) -> None:
+    make()
+    router = chat_prompt({"role": "user", "content": "{{question}}"}, name="router")
+    answer = chat_prompt(
+        {"role": "system", "content": "Answer for {{team}}."},
+        {"role": "placeholder", "name": "history"},
+        name="answer",
+    )
+    chat = chat_prompt({"role": "user", "content": "{{question}}"}, name="chat")
+    summary = chat_prompt(
+        {"role": "system", "content": "Summarize the chat."},
+        {"role": "placeholder", "name": "history"},
+        name="summary",
+    )
+
+    question = router.compile(question="Where is #4?")
+    routed = answer.compile(team="billing", history=question)
+    # The last 1000 messages are all from chat; the summary message is the first.
+    conversation = [chat.compile(question=f"question {index}")[0] for index in range(1500)]
+    summarized = summary.compile(history=conversation)
+
+    assert prompt_attributes_for(routed) == {
+        "td.prompt.name": "answer",
+        "td.prompt.version": 12,
+        "td.prompt.label": "production",
+        "td.prompt.variables": (
+            '{"team":"billing","history":[{"role":"user","content":"Where is #4?"}]}'
+        ),
+    }
+    assert prompt_attributes_for(summarized)["td.prompt.name"] == "summary"
+
+
+def test_prompt_attributes_for_looks_at_the_first_and_the_last_1000_messages(
+    make: MakeClient,
+) -> None:
+    make()
+    system = chat_prompt(*DESK_MESSAGES).compile(team="billing", order="#4")[0]
+
+    def around(before: int, after: int) -> list[dict[str, Any]]:
+        return [*[{"role": "user"}] * before, system, *[{"role": "user"}] * after]
+
+    assert prompt_attributes_for(around(1000, 999)) != {}
+    assert prompt_attributes_for(around(999, 1001)) != {}
+    assert prompt_attributes_for(tuple(around(1001, 999))) != {}
+    assert prompt_attributes_for(around(1000, 1000)) == {}
+
+
+def test_compile_records_its_variables_not_later_changes_of_the_mapping_or_of_its_lists(
+    make: MakeClient,
+) -> None:
+    memory = make()
+    prompt = chat_prompt(
+        {"role": "placeholder", "name": "history"},
+        {"role": "user", "content": "Order {{order}}"},
+    )
+    history = [{"role": "user", "content": "Hi"}]
+    variables: dict[str, Any] = {"order": "#A", "history": history}
+
+    first = prompt.compile(variables)
+    variables["order"] = "#B"
+    history.append({"role": "assistant", "content": "Hello"})
+    second = prompt.compile(variables)
+    variables["order"] = "#C"
+    history.append({"role": "user", "content": "Added after compile"})
+    with with_prompt(prompt):
+        start_span("scope", type="generation").end()
+
+    second_variables = (
+        '{"order":"#B","history":[{"role":"user","content":"Hi"},'
+        '{"role":"assistant","content":"Hello"}]}'
+    )
+    assert (
+        prompt_attributes_for(first)["td.prompt.variables"]
+        == '{"order":"#A","history":[{"role":"user","content":"Hi"}]}'
+    )
+    assert prompt_attributes_for(second)["td.prompt.variables"] == second_variables
+    [span] = memory.span_exporter.get_finished_spans()
+    assert (span.attributes or {})["td.prompt.variables"] == second_variables
+
+
+def test_a_compiled_message_rebuilds_like_a_dict_and_the_rebuilt_one_has_no_tag(
+    make: MakeClient,
+) -> None:
+    make()
+    compiled = chat_prompt(*DESK_MESSAGES).compile(team="billing", order="#4")
+
+    @dataclasses.dataclass
+    class Conversation:
+        messages: list[dict[str, Any]]
+
+    rebuilt = dataclasses.asdict(Conversation(messages=compiled))["messages"]
+    same_type = [type(message)(message) for message in compiled]
+    plain = [
+        {"role": "system", "content": "Answer as the billing desk."},
+        {"role": "user", "content": "Order #4: where is it?"},
+    ]
+
+    assert rebuilt == plain
+    assert same_type == plain
+    assert prompt_attributes_for(rebuilt) == {}
+    assert prompt_attributes_for(same_type) == {}
+
+
+def test_with_prompt_wins_over_a_compiled_message_of_another_prompt_through_a_parent_and_in_updates(
+    make: MakeClient,
+) -> None:
+    memory = make()
+    scoped = chat_prompt({"role": "user", "content": "Hi"}, name="scoped/prompt")
+    # Fetched by version, so it has no label that the label of the scope could hide.
+    other = dataclasses.replace(
+        chat_prompt({"role": "user", "content": "Cancel order {{order}}."}, name="other/prompt"),
+        version=3,
+        label=None,
+    )
+    compiled = other.compile(order="#9")
+
+    with with_prompt(scoped):
+        start_span("in scope", type="generation", attributes=prompt_attributes_for(compiled)).end()
+        parent = otel_context.get_current()
+    attributes = prompt_attributes_for(compiled)
+    start_span("with parent", type="generation", parent=parent, attributes=attributes).end()
+    with with_prompt(scoped):
+        start_span("updated", type="generation").update(attributes=attributes).end()
+        start_span("ended", type="generation").end(attributes=attributes)
+        with start_span("current", type="generation"):
+            telemetry_dev.update_current_span(attributes=attributes)
+
+    assert attributes["td.prompt.name"] == "other/prompt"
+    spans = memory.span_exporter.get_finished_spans()
+    assert sorted(span.name for span in spans) == [
+        "current",
+        "ended",
+        "in scope",
+        "updated",
+        "with parent",
+    ]
+    for span in spans:
+        assert {
+            key: value
+            for key, value in dict(span.attributes or {}).items()
+            if key.startswith("td.prompt.")
+        } == {
+            "td.prompt.name": "scoped/prompt",
+            "td.prompt.version": 12,
+            "td.prompt.label": "production",
+        }
+
+
+def test_prompt_variables_follow_the_input_capture_of_the_client_and_of_the_span(
+    make: MakeClient,
+) -> None:
+    compiled = chat_prompt({"role": "user", "content": "My card is {{card}}."}).compile(
+        card="4111 1111"
+    )
+
+    make(capture_input=False)
+    assert prompt_attributes_for(compiled) == {
+        "td.prompt.name": "support/reply",
+        "td.prompt.version": 12,
+        "td.prompt.label": "production",
+    }
+
+    telemetry_dev.shutdown()
+
+    def mask(value: Any, context: telemetry_dev.MaskContext) -> Any:
+        return {"card": "[masked]"} if context.key == "td.prompt.variables" else value
+
+    memory = make(mask=mask)
+    attributes = prompt_attributes_for(compiled)
+    assert attributes["td.prompt.variables"] == '{"card":"[masked]"}'
+
+    start_span("private", type="generation", capture_input=False, attributes=attributes).end()
+    with start_span("updated", type="generation", capture_input=False):
+        telemetry_dev.update_current_span(attributes=attributes)
+
+    for span in memory.span_exporter.get_finished_spans():
+        assert (span.attributes or {})["td.prompt.name"] == "support/reply"
+        assert "td.prompt.variables" not in (span.attributes or {})
+
+
+def test_prompt_attributes_for_runs_no_code_of_the_app(make: MakeClient) -> None:
+    make()
+    [message] = chat_prompt({"role": "user", "content": "Refund order {{order}}."}).compile(
+        order="#3"
+    )
+    reads: list[str] = []
+
+    class Messages(list[object]):
+        def __getitem__(self, index: Any) -> Any:
+            reads.append("__getitem__")
+            return super().__getitem__(index)
+
+        def __iter__(self) -> Any:
+            reads.append("__iter__")
+            return super().__iter__()
+
+        def __reversed__(self) -> Any:
+            reads.append("__reversed__")
+            return super().__reversed__()
+
+    assert prompt_attributes_for(Messages([message])) == {}
+    assert reads == []
+
+
+RAG_MESSAGES = [
+    {"role": "system", "content": "Answer from {{documents}}."},
+    {"role": "user", "content": "{{question}}"},
+]
+
+
+class Document(dict[str, str]):
+    """A dict that a weak reference can point to."""
+
+
+def test_the_variables_of_a_compile_are_freed_with_its_messages(make: MakeClient) -> None:
+    make()
+    prompt = chat_prompt(*RAG_MESSAGES)
+
+    document = Document(content="The refund policy")
+    freed = weakref.ref(document)
+    messages = prompt.compile(documents=[document], question="q")
+    del document
+    # with_prompt keeps the variables of the last compile of a prompt object.
+    prompt.compile(documents=[], question="other")
+    gc.collect()
+    assert freed() is not None
+
+    assert len(messages) == 2
+    del messages
+    gc.collect()
+    assert freed() is None
+
+
+def test_with_input_capture_off_compiled_messages_keep_no_variables(make: MakeClient) -> None:
+    make(capture_input=False)
+    prompt = chat_prompt(*RAG_MESSAGES)
+    documents: list[weakref.ref[Document]] = []
+    questions: list[dict[str, Any]] = []
+
+    for turn in range(200):
+        document = Document(content=f"document {turn}")
+        documents.append(weakref.ref(document))
+        questions.append(prompt.compile(documents=[document], question=f"question {turn}")[-1])
+    gc.collect()
+
+    # with_prompt keeps the variables of the last compile of a prompt object.
+    assert sum(1 for document in documents if document() is not None) == 1
+
+    telemetry_dev.shutdown()
+    make()
+    assert prompt_attributes_for(questions) == {
+        "td.prompt.name": "support/reply",
+        "td.prompt.version": 12,
+        "td.prompt.label": "production",
+    }
+
+
+CHAT_MESSAGES = (
+    {"role": "system", "content": "Answer as the {{team}} desk."},
+    {"role": "placeholder", "name": "history"},
+    {"role": "user", "content": "{{question}}"},
+)
+
+
+@dataclasses.dataclass
+class ChatPrompts:
+    chat: ChatPrompt
+    question: ChatPrompt
+    rag: ChatPrompt
+    reply: ChatPrompt
+
+
+def _answer(turn: int) -> dict[str, Any]:
+    return {"role": "assistant", "content": f"answer {turn}"}
+
+
+# What a row gives for one turn of a chat: the request, the history for the next turn, and the kept
+# message. The row puts `marker` in the variables of the compile that made the kept message.
+ChatTurn: TypeAlias = tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]
+
+
+def _new_list(
+    p: ChatPrompts, history: list[dict[str, Any]], turn: int, marker: Document
+) -> ChatTurn:
+    request = p.chat.compile(
+        team="billing", history=history, question=f"question {turn}", marker=marker
+    )
+    return request, [*history, request[-1], _answer(turn)], request[-1]
+
+
+def _new_list_of_20(
+    p: ChatPrompts, history: list[dict[str, Any]], turn: int, marker: Document
+) -> ChatTurn:
+    request = p.chat.compile(
+        team="billing", history=history, question=f"question {turn}", marker=marker
+    )
+    return request, [*history, request[-1], _answer(turn)][-20:], request[-1]
+
+
+def _full_list_as_copies(
+    p: ChatPrompts, history: list[dict[str, Any]], turn: int, marker: Document
+) -> ChatTurn:
+    request = p.chat.compile(
+        team="billing",
+        history=[dict(message) for message in history],
+        question=f"question {turn}",
+        marker=marker,
+    )
+    return request, [*history, request[-1], _answer(turn)], request[-1]
+
+
+def _question_prompt_in_a_placeholder(
+    p: ChatPrompts, history: list[dict[str, Any]], turn: int, marker: Document
+) -> ChatTurn:
+    [kept] = p.question.compile(
+        documents=f"document {turn}", question=f"question {turn}", marker=marker
+    )
+    request = p.rag.compile(team="billing", history=history, current=[kept])
+    return request, [*history, kept, _answer(turn)], kept
+
+
+def _raw_questions_and_a_reply_prompt(
+    p: ChatPrompts, history: list[dict[str, Any]], turn: int, marker: Document
+) -> ChatTurn:
+    request = p.chat.compile(team="billing", history=history, question=f"question {turn}")
+    [kept] = p.reply.compile(answer=f"answer {turn}", marker=marker)
+    return request, [*history, {"role": "user", "content": f"question {turn}"}, kept], kept
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        _new_list,
+        _new_list_of_20,
+        _full_list_as_copies,
+        _question_prompt_in_a_placeholder,
+        _raw_questions_and_a_reply_prompt,
+    ],
+    ids=[
+        "new-list",
+        "new-list-of-20",
+        "full-list-as-copies",
+        "question-prompt-in-a-placeholder",
+        "raw-questions-and-a-reply-prompt",
+    ],
+)
+def test_a_chat_history_keeps_the_variables_of_the_last_5_minutes(
+    make: MakeClient,
+    clock: list[float],
+    run: Callable[[ChatPrompts, list[dict[str, Any]], int, Document], ChatTurn],
+) -> None:
+    make()
+    prompts = ChatPrompts(
+        chat=chat_prompt(*CHAT_MESSAGES),
+        question=chat_prompt({"role": "user", "content": "Context: {{documents}}\n\n{{question}}"}),
+        rag=chat_prompt(
+            {"role": "system", "content": "Answer as the {{team}} desk."},
+            {"role": "placeholder", "name": "history"},
+            {"role": "placeholder", "name": "current"},
+        ),
+        reply=chat_prompt({"role": "assistant", "content": "{{answer}}"}),
+    )
+    markers: list[weakref.ref[Document]] = []
+    history: list[dict[str, Any]] = []
+    request: list[dict[str, Any]] = []
+    older: dict[str, Any] = {}
+
+    # One turn in 2 minutes, for 300 turns. An unused variable marks the variables of each turn.
+    for turn in range(300):
+        if turn > 0:
+            clock[0] += 120
+        marker = Document(content=f"turn {turn}")
+        markers.append(weakref.ref(marker))
+        request, history, kept = run(prompts, history, turn, marker)
+        # The model call of the turn.
+        prompt_attributes_for(request)
+        if turn == 296:
+            older = kept
+    gc.collect()
+
+    # Turns 297, 298, and 299: 4, 2, and 0 minutes old.
+    assert sum(1 for marker in markers if marker() is not None) == 3
+    assert "question 299" in str(prompt_attributes_for(request)["td.prompt.variables"])
+    assert prompt_attributes_for(older) == {
+        "td.prompt.name": "support/reply",
+        "td.prompt.version": 12,
+        "td.prompt.label": "production",
+    }
+
+
+def _variables_of(messages: object) -> object:
+    return prompt_attributes_for(messages).get("td.prompt.variables")
+
+
+REFUND_VARIABLES = '{"documents":"The refund policy","question":"Where is #4?"}'
+
+
+@dataclasses.dataclass
+class LivePrompts:
+    answer: ChatPrompt
+    guard: ChatPrompt
+    judge: ChatPrompt
+    other: ChatPrompt
+    chat: ChatPrompt
+    system: ChatPrompt
+    with_system: ChatPrompt
+
+
+# A row compiles one or more requests and runs other compiles before their calls. It gives the
+# variables that each call records and the variables of the compile of its request.
+LiveCalls: TypeAlias = list[tuple[object, str]]
+
+
+def _other_compiles_then_a_guard(p: LivePrompts) -> LiveCalls:
+    request = p.answer.compile(documents="The refund policy", question="Where is #4?")
+    for index in range(150):
+        p.other.compile(q=str(index))
+    p.guard.compile(conversation=request)
+    return [(_variables_of(request), REFUND_VARIABLES)]
+
+
+def _a_guard_before_each_agent_step(p: LivePrompts) -> LiveCalls:
+    conversation = p.answer.compile(documents="The refund policy", question="Where is #4?")
+    for step in range(150):
+        p.guard.compile(conversation=conversation)
+        conversation.append({"role": "assistant", "content": f"step {step}"})
+    return [(_variables_of(conversation), REFUND_VARIABLES)]
+
+
+def _a_guard_then_a_judge_of_the_guard(p: LivePrompts) -> LiveCalls:
+    request = p.answer.compile(documents="The refund policy", question="Where is #4?")
+    p.judge.compile(conversation=p.guard.compile(conversation=request))
+    return [(_variables_of(request), REFUND_VARIABLES)]
+
+
+def _turns_in_threads_that_share_a_history(p: LivePrompts) -> LiveCalls:
+    history: list[dict[str, Any]] = []
+    turns = [threading.Event() for _ in range(4)]
+    compiled = threading.Barrier(3, timeout=5)
+    recorded: list[object] = [None] * 3
+
+    def turn(index: int) -> None:
+        turns[index].wait(5)
+        request = p.chat.compile(team="billing", history=history, question=f"q{index + 1}")
+        history.append(request[-1])
+        turns[index + 1].set()
+        # A guard call or a queue: the call comes after the other turns compiled.
+        compiled.wait()
+        recorded[index] = _variables_of(request)
+
+    threads = [threading.Thread(target=turn, args=(index,)) for index in range(3)]
+    for thread in threads:
+        thread.start()
+    turns[0].set()
+    for thread in threads:
+        thread.join(5)
+    return list(
+        zip(
+            recorded,
+            [
+                '{"team":"billing","history":[],"question":"q1"}',
+                '{"team":"billing","history":[{"role":"user","content":"q1"}],"question":"q2"}',
+                '{"team":"billing","history":[{"role":"user","content":"q1"},'
+                '{"role":"user","content":"q2"}],"question":"q3"}',
+            ],
+            strict=True,
+        )
+    )
+
+
+def _a_system_message_from_startup_after_a_chat_that_gets_it(p: LivePrompts) -> LiveCalls:
+    startup = p.system.compile(product="Acme")
+    history: list[dict[str, Any]] = []
+    for turn in range(3):
+        request = p.with_system.compile(
+            system=startup, history=history, question=f"question {turn}"
+        )
+        prompt_attributes_for(request)
+        history = [*history, request[-1], _answer(turn)]
+    return [
+        (
+            _variables_of([*startup, {"role": "user", "content": "Where is #4?"}]),
+            '{"product":"Acme"}',
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        _other_compiles_then_a_guard,
+        _a_guard_before_each_agent_step,
+        _a_guard_then_a_judge_of_the_guard,
+        _turns_in_threads_that_share_a_history,
+        _a_system_message_from_startup_after_a_chat_that_gets_it,
+    ],
+    ids=[
+        "150-other-compiles-then-a-guard",
+        "a-guard-before-each-of-150-agent-steps",
+        "a-guard-then-a-judge-of-the-guard",
+        "turns-in-threads-that-share-a-history",
+        "a-system-message-from-startup-after-a-chat-that-gets-it",
+    ],
+)
+def test_a_request_keeps_its_variables_until_its_call(
+    make: MakeClient, run: Callable[[LivePrompts], LiveCalls]
+) -> None:
+    make()
+    calls = run(
+        LivePrompts(
+            answer=chat_prompt(*RAG_MESSAGES),
+            guard=chat_prompt(
+                {"role": "system", "content": "Is this safe?"},
+                {"role": "placeholder", "name": "conversation"},
+                name="guard",
+            ),
+            judge=chat_prompt(
+                {"role": "system", "content": "Check the answer of the guard."},
+                {"role": "placeholder", "name": "conversation"},
+                name="judge",
+            ),
+            other=chat_prompt({"role": "user", "content": "{{q}}"}, name="other"),
+            chat=chat_prompt(*CHAT_MESSAGES),
+            system=chat_prompt(
+                {"role": "system", "content": "You support {{product}}."}, name="system"
+            ),
+            with_system=chat_prompt(
+                {"role": "placeholder", "name": "system"},
+                {"role": "placeholder", "name": "history"},
+                {"role": "user", "content": "{{question}}"},
+            ),
+        )
+    )
+
+    for recorded, compiled in calls:
+        assert recorded == compiled
+
+
+def test_a_compile_keeps_its_variables_for_5_minutes_after_it_or_after_the_last_call_that_names_it(
+    make: MakeClient, clock: list[float]
+) -> None:
+    make()
+    chat = chat_prompt(*CHAT_MESSAGES)
+    history: list[dict[str, Any]] = []
+    for turn in range(5):
+        request = chat.compile(team="billing", history=history, question=f"q{turn}")
+        prompt_attributes_for(request)
+        history = [*history, request[-1], _answer(turn)]
+    # These calls send only messages of the chat, so they name the newest compile among them.
+    summary = [*history, {"role": "user", "content": "Summarize the chat."}]
+    earlier = history[:-2]
+    start = clock[0]
+
+    assert '"question":"q4"' in str(_variables_of(summary))
+    assert '"question":"q3"' in str(_variables_of(earlier))
+
+    clock[0] = start + 299.5
+    assert '"question":"q4"' in str(_variables_of(summary))
+    clock[0] = start + 300
+    assert _variables_of(earlier) is None
+    # The call 0.5 seconds before moved the deadline of q4.
+    assert '"question":"q4"' in str(_variables_of(summary))
+    clock[0] = start + 600
+    assert prompt_attributes_for(summary) == {
+        "td.prompt.name": "support/reply",
+        "td.prompt.version": 12,
+        "td.prompt.label": "production",
+    }
 
 
 def test_a_fallback_prompt_records_its_name_and_label_but_no_version(

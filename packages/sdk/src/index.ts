@@ -68,6 +68,7 @@ export {
   type GetPromptOptions,
   type GetTextPromptOptions,
   type Prompt,
+  promptAttributesFor,
   PromptError,
   type PromptMessage,
   type PromptModel,

@@ -656,6 +656,75 @@ def test_generate_videos_terminal_operation_error_ends_span(
     assert attrs(span)["google_genai.response.operation_done"] is True
 
 
+SUPPORT_PROMPT = telemetry_dev.ChatPrompt(
+    name="support/reply",
+    version=12,
+    label="production",
+    messages=[
+        {"role": "system", "content": "You answer for the {{team}} desk."},
+        {"role": "user", "content": "Where is order {{order}}?"},
+    ],
+    model=None,
+    parameters={},
+    tools=[],
+    response_format={"type": "text"},
+    is_fallback=False,
+)
+
+
+@pytest.mark.parametrize(
+    ("contents", "capture_input", "older_core"),
+    [
+        ("changed in place", True, False),
+        ("changed in place", False, False),
+        ("new", True, False),
+        ("changed in place", True, True),
+    ],
+)
+def test_generate_content_outside_with_prompt_records_the_prompt_of_compiled_messages(
+    make: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    contents: str,
+    capture_input: bool,
+    older_core: bool,
+) -> None:
+    memory = make(capture_input=capture_input)
+    if older_core:
+        monkeypatch.delattr(telemetry_dev, "prompt_attributes_for")
+    system, user = SUPPORT_PROMPT.compile(team="billing", order="#4")
+    parts = [{"text": user["content"]}]
+    # Gemini takes parts: a message changed in place keeps its tag, a new one has none.
+    if contents == "new":
+        content: dict[str, Any] = {"role": "user", "parts": parts}
+    else:
+        del user["content"]
+        user["parts"] = parts
+        content = user
+    client, transport = client_with_transport([happy_payload()])
+
+    wrap_google_genai(client).models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[content],
+        config=types.GenerateContentConfig(system_instruction=system["content"]),
+    )
+
+    assert cast(Any, transport.calls[0])["contents"] == [
+        {"role": "user", "parts": [{"text": "Where is order #4?"}]}
+    ]
+    a = attrs(only_span(memory))
+    assert a["gen_ai.request.model"] == "gemini-2.5-flash"
+    assert {key: value for key, value in a.items() if key.startswith("td.prompt.")} == (
+        {}
+        if older_core or contents == "new"
+        else {
+            "td.prompt.name": "support/reply",
+            "td.prompt.version": 12,
+            "td.prompt.label": "production",
+            **({"td.prompt.variables": '{"team":"billing","order":"#4"}'} if capture_input else {}),
+        }
+    )
+
+
 @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
 def test_generate_content_maps_request_response_usage_and_sampling(
     memory: SimpleNamespace, async_mode: bool

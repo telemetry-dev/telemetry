@@ -14,6 +14,7 @@ import telemetry_dev
 from botocore.client import BaseClient
 from botocore.exceptions import ClientError, EventStreamError
 from botocore.response import StreamingBody
+from botocore.stub import Stubber
 
 import telemetry_dev_bedrock._streams as bedrock_streams
 from telemetry_dev_bedrock import instrument_bedrock, uninstrument_bedrock, wrap_bedrock
@@ -112,6 +113,74 @@ def _json_attr(span: Any, key: str) -> Any:
     value = span.attributes[key]
     assert isinstance(value, str)
     return json.loads(value)
+
+
+SUPPORT_PROMPT = telemetry_dev.ChatPrompt(
+    name="support/reply",
+    version=12,
+    label="production",
+    messages=[
+        {"role": "system", "content": "You answer for the {{team}} desk."},
+        {"role": "user", "content": "Where is order {{order}}?"},
+    ],
+    model=None,
+    parameters={},
+    tools=[],
+    response_format={"type": "text"},
+    is_fallback=False,
+)
+
+
+@pytest.mark.parametrize(
+    ("messages", "older_core"),
+    [("changed in place", False), ("new", False), ("changed in place", True)],
+)
+def test_converse_outside_with_prompt_records_the_prompt_of_compiled_messages(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, messages: str, older_core: bool
+) -> None:
+    if older_core:
+        monkeypatch.delattr(telemetry_dev, "prompt_attributes_for")
+    system, user = SUPPORT_PROMPT.compile(team="billing", order="#4")
+    blocks = [{"text": user["content"]}]
+    # Converse takes content blocks: a message changed in place keeps its tag, a new one has none.
+    if messages == "new":
+        message = {"role": "user", "content": blocks}
+    else:
+        user["content"] = blocks
+        message = user
+    client = _client("bedrock-runtime")
+    # The stubber runs botocore's validation of the request.
+    stubber = Stubber(client)
+    stubber.add_response(
+        "converse",
+        {
+            "output": {"message": {"role": "assistant", "content": [{"text": "Soon."}]}},
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+            "metrics": {"latencyMs": 1},
+        },
+    )
+
+    with stubber:
+        cast(Any, wrap_bedrock(client)).converse(
+            modelId="anthropic.claude-3-haiku",
+            system=[{"text": system["content"]}],
+            messages=[message],
+        )
+
+    [span] = memory.span_exporter.get_finished_spans()
+    a = dict(span.attributes or {})
+    assert a["gen_ai.request.model"] == "anthropic.claude-3-haiku"
+    assert {key: value for key, value in a.items() if key.startswith("td.prompt.")} == (
+        {}
+        if older_core or messages == "new"
+        else {
+            "td.prompt.name": "support/reply",
+            "td.prompt.version": 12,
+            "td.prompt.label": "production",
+            "td.prompt.variables": '{"team":"billing","order":"#4"}',
+        }
+    )
 
 
 def test_converse_happy_path(memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:

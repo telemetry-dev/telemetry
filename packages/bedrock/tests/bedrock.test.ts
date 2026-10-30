@@ -9,7 +9,8 @@ import {
 } from "@aws-sdk/client-bedrock-runtime";
 import { afterEach, expect, test, vi } from "vitest";
 
-import type { MaskFn } from "@telemetry-dev/sdk";
+import { type ChatMessage, getPrompt, type MaskFn } from "@telemetry-dev/sdk";
+import * as telemetrySdk from "@telemetry-dev/sdk";
 
 import { instrumentBedrock, uninstrumentBedrock, wrapBedrock } from "../src/index.ts";
 import {
@@ -422,6 +423,90 @@ test("ConverseStream records stream errors with partial output", async () => {
   expect(jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content).toBe("partial");
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
+
+test.each([
+  { messages: "changed in place", olderCore: false },
+  { messages: "new", olderCore: false },
+  { messages: "changed in place", olderCore: true },
+])(
+  "Converse outside withPrompt records the prompt of $messages messages, older core $olderCore",
+  async ({ messages: kind, olderCore }) => {
+    const spans = setup();
+
+    if (olderCore) {
+      vi.spyOn(
+        telemetrySdk as { promptAttributesFor: unknown },
+        "promptAttributesFor",
+        "get",
+      ).mockReturnValue(undefined);
+    }
+
+    const prompt = await getPrompt("support/reply", {
+      apiKey: "td_live_a",
+      baseUrl: "https://prompts.bedrock.test",
+      fetch: async () =>
+        Response.json({
+          name: "support/reply",
+          type: "chat",
+          label: "production",
+          version: 12,
+          messages: [
+            { role: "system", content: "You answer for the {{team}} desk." },
+            { role: "user", content: "Where is order {{order}}?" },
+          ],
+          text: null,
+          model: { provider: "amazon-bedrock", name: "anthropic.claude-3-haiku" },
+          parameters: {},
+          tools: [],
+          responseFormat: { type: "text" },
+          rollout: null,
+        }),
+    });
+    const [system, user] = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+    const blocks = [{ text: user!.content }];
+    // Converse takes content blocks: a message changed in place keeps its tag, a new one has none.
+    const message =
+      kind === "new"
+        ? { role: "user", content: blocks }
+        : Object.assign(user!, { content: blocks });
+
+    const client = wrapBedrock(
+      new BedrockRuntimeClient({
+        region: "us-east-1",
+        credentials: { accessKeyId: "test", secretAccessKey: "test" },
+        maxAttempts: 1,
+        requestHandler: jsonRequestHandler("prompt-1", {
+          output: { message: { role: "assistant", content: [{ text: "Soon." }] } },
+          stopReason: "end_turn",
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        }),
+      }),
+    );
+
+    await client.send(
+      new ConverseCommand({
+        modelId: "anthropic.claude-3-haiku",
+        system: [{ text: system!.content }],
+        messages: [message] as ConverseCommandInput["messages"],
+      }),
+    );
+
+    const [span] = spans.getFinishedSpans();
+    expect(span!.attributes["gen_ai.response.id"]).toBe("prompt-1");
+    expect(
+      Object.entries(span!.attributes).filter(([key]) => key.startsWith("td.prompt.")),
+    ).toEqual(
+      olderCore || kind === "new"
+        ? []
+        : [
+            ["td.prompt.name", "support/reply"],
+            ["td.prompt.version", 12],
+            ["td.prompt.label", "production"],
+            ["td.prompt.variables", '{"team":"billing","order":"#4"}'],
+          ],
+    );
+  },
+);
 
 test("InvokeModel captures provider-native bodies and embedding spans", async () => {
   const spans = setup();

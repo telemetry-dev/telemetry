@@ -1,4 +1,5 @@
 import {
+  type Attributes,
   type Context,
   defaultTextMapGetter,
   defaultTextMapSetter,
@@ -98,6 +99,8 @@ interface SpanMeta {
   type: SpanType;
   capture: FieldCaptureConfig;
   onError?: (cause: Error) => void;
+  /** The span got its prompt from withPrompt. */
+  scopedPrompt?: boolean;
 }
 
 // Remembers each span's type + capture flags so update()/end()/updateActiveSpan map
@@ -190,9 +193,20 @@ function applyFields(span: Span, meta: SpanMeta, fields: SpanFields): void {
   if (fields.name) span.updateName(fields.name);
   const attrs = fieldsToAttributes(fields, meta.type, meta.capture);
 
+  if (meta.scopedPrompt) dropPromptAttributes(attrs);
+
   if (Object.keys(attrs).length > 0) span.setAttributes(attrs);
 
   if (fields.error !== undefined) applyError(span, fields.error, meta.capture);
+}
+
+// The prompt of withPrompt replaces each td.prompt.* attribute that the app passes, at start and in
+// each update, so that a span does not mix two prompts when the app calls promptAttributesFor
+// outside withPrompt.
+function dropPromptAttributes(attrs: Attributes): void {
+  for (const key of Object.keys(attrs)) {
+    if (key.startsWith("td.prompt.")) delete attrs[key];
+  }
 }
 
 function metaFor(core: ClientCore, options?: StartSpanOptions): SpanMeta {
@@ -231,6 +245,10 @@ export function createSpanHandle(
   const parentCtx = withSessionParent(sessionContext, sessionId, core.config.apiKey);
   const attrs = fieldsToAttributes(options, meta.type, meta.capture);
   const operation = attrs["gen_ai.operation.name"] ?? SPAN_TYPE_OPERATIONS[meta.type];
+  const prompt = promptAttributes(parentCtx, operation, meta.capture);
+  meta.scopedPrompt = prompt !== undefined;
+
+  if (meta.scopedPrompt) dropPromptAttributes(attrs);
 
   const span = core.tracer.startSpan(
     name,
@@ -241,7 +259,7 @@ export function createSpanHandle(
       attributes: {
         "gen_ai.operation.name": SPAN_TYPE_OPERATIONS[meta.type],
         ...propagatedFromContext(parentCtx),
-        ...promptAttributes(parentCtx, operation, meta.capture),
+        ...prompt,
         ...attrs,
       },
     },

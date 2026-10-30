@@ -1,4 +1,9 @@
-import { type Attributes, type Context, createContextKey } from "@opentelemetry/api";
+import {
+  type Attributes,
+  type AttributeValue,
+  type Context,
+  createContextKey,
+} from "@opentelemetry/api";
 import {
   activeContext,
   jsonAttr,
@@ -91,6 +96,12 @@ export interface ChatPrompt extends PromptBase {
   /**
    * Fills in the variables and replaces each placeholder message with the messages in its
    * variable. `withPrompt` records the variables of the last call before it starts or inside it.
+   * It tags each message object that it makes with this prompt and a copy of these variables and
+   * of each list in them, so that a model call outside `withPrompt` that sends the message records
+   * them; see `promptAttributesFor`. The objects in a list are not copied. The tag keeps the
+   * variables for 5 minutes after this compile and after each call that names it. Other compiles
+   * do not change this. The tag keeps no variables when input capture is off in the client, or
+   * when the runtime has no `WeakRef`.
    */
   compile<M = ChatMessage>(variables?: PromptVariables<M>): (ChatMessage | M)[];
 }
@@ -101,7 +112,8 @@ export interface TextPrompt extends PromptBase {
   readonly text: string;
   /**
    * Fills in the variables. `withPrompt` records the variables of the last call before it starts
-   * or inside it.
+   * or inside it. A string cannot carry a tag, so a model call outside `withPrompt` does not
+   * record a text prompt.
    */
   compile(variables?: PromptVariables): string;
 }
@@ -195,6 +207,20 @@ interface PromptScope {
   variables: object | undefined;
 }
 
+/** The `compile()` call that made a chat message. */
+interface CompileTag {
+  readonly prompt: Prompt;
+  /** Undefined when input capture was off, or after `expires`; see expire. */
+  variables: PromptVariables<unknown> | undefined;
+  /** Counts the compiles of the process, so a higher one is newer. */
+  readonly serial: number;
+  /**
+   * When the tag removes its variables, in `performance.now()` time. A call that names the tag
+   * moves it.
+   */
+  expires: number;
+}
+
 const FETCH_TIMEOUT_MS = 10_000;
 /** The longest Retry-After that getPrompt honors, so that a bad header cannot stop fetches. */
 const MAX_RETRY_AFTER_MS = 3_600_000;
@@ -204,11 +230,25 @@ const MAX_CACHE_ENTRIES = 1_000;
 const VARIABLE = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
 const MODEL_CALL_OPERATIONS = new Set<unknown>(["chat", "text_completion", "generate_content"]);
 const PROMPT_KEY = createContextKey("telemetry.dev prompt");
+// Not enumerable, so JSON.stringify, spreads, and structuredClone leave the tag out of a copy.
+const COMPILED_BY = Symbol("telemetry.dev compiled by");
+/** How many messages promptAttributesFor looks at, at each end of the list. */
+const TAG_LOOKUP = 1_000;
+/** How long a tag keeps its variables after its compile, or after a call that names it. */
+const VARIABLES_TTL_MS = 300_000;
+const MINUTE_MS = 60_000;
 
 const cache = new Map<string, CacheEntry>();
 const compiledVariables = new WeakMap<Prompt, object>();
 /** The Retry-After of the response that failed with this error, in milliseconds. */
 const retryAfter = new WeakMap<PromptError, number>();
+let compiles = 0;
+/**
+ * The tags that keep variables, by the minute of their deadline. A weak reference, so that the
+ * variables of a message that the app dropped do not stay until the deadline. The minutes are not
+ * sorted, since a tag that a call named goes back in at its new minute.
+ */
+const deadlines = new Map<number, WeakRef<CompileTag>[]>();
 
 /**
  * Fetches a prompt version from telemetry.dev and keeps it. When the copy is older than
@@ -329,17 +369,80 @@ export function promptAttributes(
     | undefined;
 
   if (!scope) return undefined;
-  const { prompt, variables } = scope;
 
+  return attributesOf(scope.prompt, scope.variables, capture);
+}
+
+/**
+ * The td.prompt.* attributes for a model call outside `withPrompt` that sends `messages` (a list
+ * of messages, or one message): those of the newest `compile()` of a chat prompt that made one of
+ * the messages. It looks at the first 1000 and the last 1000 messages. The tag is on the message
+ * object, so a copy of it gives nothing. Gives undefined inside `withPrompt`, whose prompt the span
+ * gets. `td.prompt.variables` needs input capture on in the client, at the compile and now, and
+ * the span drops it when its own input capture is off. A compile gives no variables 5 minutes
+ * after it or after the last call that named it; see `compile()`. It never throws.
+ */
+export function promptAttributesFor(messages: unknown): Record<string, AttributeValue> | undefined {
+  const config = currentClient().core?.config;
+
+  try {
+    if (activeContext().getValue(PROMPT_KEY) !== undefined) return undefined;
+
+    const now = performance.now();
+    expire(now);
+    const tag = newestTag(messages);
+
+    if (!tag) return undefined;
+
+    if (tag.expires > now) tag.expires = now + VARIABLES_TTL_MS;
+    else tag.variables = undefined;
+
+    return attributesOf(tag.prompt, tag.variables, config) as Record<string, AttributeValue>;
+  } catch (error) {
+    reportError(config?.onError, error);
+
+    return undefined;
+  }
+}
+
+function attributesOf(
+  prompt: Prompt,
+  variables: object | undefined,
+  capture: FieldCaptureConfig | undefined,
+): Attributes {
   return omitUndefined({
     "td.prompt.name": prompt.name,
     "td.prompt.version": prompt.version ?? undefined,
     "td.prompt.label": prompt.label ?? undefined,
     "td.prompt.variables":
-      variables !== undefined && capture.captureInput
+      variables !== undefined && capture?.captureInput
         ? prepareCaptureValue("td.prompt.variables", variables, capture)
         : undefined,
   });
+}
+
+// The messages of a placeholder come from an older compile, so the newest compile, not the last
+// tagged message, names the prompt of the request. Its own messages are at the start or the end of
+// the list, unless placeholders put more than 1000 messages on each side of them.
+function newestTag(messages: unknown): CompileTag | undefined {
+  if (!Array.isArray(messages)) return tagOf(messages);
+  const { length } = messages;
+  let newest: CompileTag | undefined;
+
+  for (let index = 0; index < length; index += 1) {
+    if (index === TAG_LOOKUP && length > 2 * TAG_LOOKUP) index = length - TAG_LOOKUP;
+    const tag = tagOf(messages[index]);
+
+    if (tag && (newest === undefined || tag.serial > newest.serial)) newest = tag;
+  }
+
+  return newest;
+}
+
+function tagOf(message: unknown): CompileTag | undefined {
+  return typeof message === "object" && message !== null
+    ? (message as { [COMPILED_BY]?: CompileTag })[COMPILED_BY]
+    : undefined;
 }
 
 function checkOptions(name: string, options: GetPromptOptions, type: string): void {
@@ -528,27 +631,90 @@ function createPrompt(input: {
     responseFormat: content.responseFormat,
     isFallback: input.isFallback,
     compile(variables: PromptVariables<unknown> = {}) {
-      compiledVariables.set(prompt, variables);
+      const values = copyVariables(variables);
+      compiledVariables.set(prompt, values);
       const scope = activeContext().getValue(PROMPT_KEY) as PromptScope | undefined;
 
-      if (scope?.prompt === prompt) scope.variables = variables;
+      if (scope?.prompt === prompt) scope.variables = values;
 
-      return type === "chat"
-        ? compileMessages(content.messages, variables)
-        : fill(content.text ?? "", variables);
+      if (type === "text") return fill(content.text ?? "", values);
+      compiles += 1;
+      const now = performance.now();
+      expire(now);
+      const tag: CompileTag = {
+        prompt,
+        variables: undefined,
+        serial: compiles,
+        expires: now + VARIABLES_TTL_MS,
+      };
+
+      // promptAttributesFor cannot record the variables when input capture is off in the client.
+      // Without WeakRef (Cloudflare Workers before 2025-05-05), expire could not remove them.
+      if ((currentClient().core?.config.captureInput ?? true) && typeof WeakRef === "function") {
+        tag.variables = values;
+        addDeadline(new WeakRef(tag), tag.expires);
+      }
+
+      return compileMessages(content.messages, values, tag);
     },
   }) as Prompt;
 
   return prompt;
 }
 
+/**
+ * Removes the variables of each expired tag, also when the app keeps its messages. Thus a chat
+ * history keeps the variables of the last 5 minutes only, and other compiles do not change the time
+ * of a request. A tag that a call named gets its new deadline.
+ */
+function expire(now: number): void {
+  const minute = Math.floor(now / MINUTE_MS);
+
+  for (const [due, refs] of deadlines) {
+    if (due >= minute) continue;
+    deadlines.delete(due);
+
+    for (const ref of refs) {
+      const tag = ref.deref();
+
+      if (!tag) continue;
+
+      if (tag.expires > now) addDeadline(ref, tag.expires);
+      else tag.variables = undefined;
+    }
+  }
+}
+
+function addDeadline(ref: WeakRef<CompileTag>, at: number): void {
+  const minute = Math.floor(at / MINUTE_MS);
+  const refs = deadlines.get(minute);
+
+  if (refs) refs.push(ref);
+  else deadlines.set(minute, [ref]);
+}
+
+// A copy of each list too, so that a change of the app's history after compile() does not change
+// what a span records.
+function copyVariables(variables: PromptVariables<unknown>): PromptVariables<unknown> {
+  return Object.fromEntries(
+    Object.entries(variables).map(([name, value]) => [
+      name,
+      Array.isArray(value) ? [...value] : value,
+    ]),
+  );
+}
+
 function compileMessages(
   messages: readonly PromptMessage[],
   variables: PromptVariables<unknown>,
+  tag: CompileTag,
 ): unknown[] {
   return messages.flatMap((message) => {
     if (message.role !== "placeholder") {
-      return [{ role: message.role, content: fill(message.content, variables) }];
+      const compiled = { role: message.role, content: fill(message.content, variables) };
+      Object.defineProperty(compiled, COMPILED_BY, { value: tag });
+
+      return [compiled];
     }
 
     const value = Object.hasOwn(variables, message.name) ? variables[message.name] : undefined;

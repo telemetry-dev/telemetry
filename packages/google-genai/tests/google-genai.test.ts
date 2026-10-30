@@ -10,7 +10,8 @@ import {
   type PushMetricExporter,
   type ResourceMetrics,
 } from "@opentelemetry/sdk-metrics";
-import { flush, init, shutdown } from "@telemetry-dev/sdk";
+import { type ChatMessage, flush, getPrompt, init, shutdown } from "@telemetry-dev/sdk";
+import * as telemetrySdk from "@telemetry-dev/sdk";
 import {
   FunctionCallingConfigMode,
   GoogleGenAI,
@@ -233,6 +234,86 @@ afterEach(async () => {
   await shutdown();
   vi.restoreAllMocks();
 });
+
+test.each([
+  { contents: "changed in place", captureInput: true, olderCore: false },
+  { contents: "changed in place", captureInput: false, olderCore: false },
+  { contents: "new", captureInput: true, olderCore: false },
+  { contents: "changed in place", captureInput: true, olderCore: true },
+])(
+  "generateContent outside withPrompt records the prompt of $contents contents, input capture $captureInput, older core $olderCore",
+  async ({ contents: kind, captureInput, olderCore }) => {
+    if (olderCore) {
+      vi.spyOn(
+        telemetrySdk as { promptAttributesFor: unknown },
+        "promptAttributesFor",
+        "get",
+      ).mockReturnValue(undefined);
+    }
+
+    const prompt = await getPrompt("support/reply", {
+      apiKey: "td_live_a",
+      baseUrl: "https://prompts.google-genai.test",
+      fetch: async () =>
+        Response.json({
+          name: "support/reply",
+          type: "chat",
+          label: "production",
+          version: 12,
+          messages: [
+            { role: "system", content: "You answer for the {{team}} desk." },
+            { role: "user", content: "Where is order {{order}}?" },
+          ],
+          text: null,
+          model: { provider: "gcp.gemini", name: "gemini-2.5-flash" },
+          parameters: {},
+          tools: [],
+          responseFormat: { type: "text" },
+          rollout: null,
+        }),
+    });
+    const [system, user] = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+    const parts = [{ text: user!.content }];
+    // Gemini takes parts: a message changed in place keeps its tag, a new one has none.
+    const content = kind === "new" ? { role: "user", parts } : Object.assign(user!, { parts });
+    const spans = setupSpans({ captureInput });
+    const fake = createFakeFetch(
+      jsonResponse({
+        candidates: [
+          { content: { role: "model", parts: [{ text: "Soon." }] }, finishReason: "STOP" },
+        ],
+      }),
+    );
+    vi.stubGlobal("fetch", fake.fetch);
+
+    await clientWith().models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: [content],
+      config: { temperature: 0.2, systemInstruction: system!.content },
+    });
+
+    const { attributes } = await exportedSpan(spans);
+    expect(attributes["gen_ai.request.temperature"]).toBe(0.2);
+    expect(fake.requests[0]!.body).toMatchObject({
+      contents: [{ role: "user", parts: [{ text: "Where is order #4?" }] }],
+    });
+
+    if (olderCore || kind === "new") {
+      expect(attributes["td.prompt.name"]).toBeUndefined();
+
+      return;
+    }
+
+    expect(attributes).toMatchObject({
+      "td.prompt.name": "support/reply",
+      "td.prompt.version": 12,
+      "td.prompt.label": "production",
+    });
+    expect(attributes["td.prompt.variables"]).toBe(
+      captureInput ? '{"team":"billing","order":"#4"}' : undefined,
+    );
+  },
+);
 
 test("generateContent maps request, response, usage, finish reason, provider, and sampling attributes", async () => {
   const spans = setupSpans();

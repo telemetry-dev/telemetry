@@ -1,16 +1,22 @@
 import { createServer, type RequestListener } from "node:http";
 import type { AddressInfo } from "node:net";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import {
+  type ChatMessage,
   flush,
   getPrompt,
+  type Prompt,
+  promptAttributesFor,
   propagateAttributes,
   PromptError,
   shutdown,
   startActiveSpan,
   startSpan,
+  updateActiveSpan,
   withPrompt,
 } from "../src/index.ts";
 import { setup } from "./helpers.ts";
@@ -107,6 +113,7 @@ afterEach(async () => {
   await shutdown();
   vi.useRealTimers();
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
@@ -727,6 +734,736 @@ test("variables are omitted when input capture is off; a version fetch has no la
   await flush();
   expect(off.spans.getFinishedSpans()[0]!.attributes).toMatchObject({ "td.prompt.version": 7 });
   expect(off.spans.getFinishedSpans()[0]!.attributes["td.prompt.variables"]).toBeUndefined();
+});
+
+async function promptOf(overrides: Record<string, unknown>): Promise<Prompt> {
+  const { fetch } = fakeFetch(reply(overrides));
+
+  return getPrompt("support/reply", {
+    apiKey: "td_live_a",
+    baseUrl: newBaseUrl(),
+    fetch,
+    type: overrides.type as "chat",
+  });
+}
+
+const DESK_PROMPT = {
+  messages: [
+    { role: "system", content: "Answer as the {{team}} desk." },
+    { role: "user", content: "Order {{order}}: where is it?" },
+  ],
+};
+
+test("promptAttributesFor names the compile of a message object; a copy or a string names nothing", async () => {
+  setup();
+  const prompt = await promptOf(DESK_PROMPT);
+  const compiled = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+  const attributes = {
+    "td.prompt.name": "support/reply",
+    "td.prompt.version": 12,
+    "td.prompt.label": "production",
+    "td.prompt.variables": '{"team":"billing","order":"#4"}',
+  };
+
+  expect(promptAttributesFor(compiled)).toEqual(attributes);
+  expect(promptAttributesFor(compiled[0])).toEqual(attributes);
+  expect(JSON.stringify(compiled[0])).toBe(
+    '{"role":"system","content":"Answer as the billing desk."}',
+  );
+
+  for (const copy of [
+    compiled.map((message) => ({ ...message })),
+    JSON.parse(JSON.stringify(compiled)) as unknown,
+    structuredClone(compiled),
+    compiled.map((message) => message.content),
+  ]) {
+    expect(promptAttributesFor(copy)).toBeUndefined();
+  }
+
+  const text = await promptOf({ type: "text", messages: [], text: "Summarize {{doc}}." });
+  expect(promptAttributesFor([text.compile({ doc: "the policy" })])).toBeUndefined();
+});
+
+test("an unrelated message with the text of a compiled message is not tagged", async () => {
+  setup();
+  const prompt = await promptOf({
+    messages: [{ role: "system", content: "You are a helpful assistant." }],
+  });
+  prompt.compile();
+
+  expect(
+    promptAttributesFor([
+      { role: "system", content: "You are a helpful assistant." },
+      { role: "user", content: "What is 2 + 2?" },
+    ]),
+  ).toBeUndefined();
+});
+
+test("two tasks with one text and different other variables each record their own", async () => {
+  const { spans } = setup();
+  const prompt = await promptOf(DESK_PROMPT);
+
+  // Both compiles make the system text "Answer as the billing desk.", and each task sends only it.
+  const [systemA] = prompt.compile({ team: "billing", order: "#A" }) as ChatMessage[];
+  const [systemB] = prompt.compile({ team: "billing", order: "#B" }) as ChatMessage[];
+  startSpan("a", { type: "generation", attributes: promptAttributesFor([systemA]) }).end();
+  startSpan("b", { type: "generation", attributes: promptAttributesFor([systemB]) }).end();
+  await flush();
+
+  expect(
+    Object.fromEntries(
+      spans.getFinishedSpans().map((span) => [span.name, span.attributes["td.prompt.variables"]]),
+    ),
+  ).toEqual({
+    a: '{"team":"billing","order":"#A"}',
+    b: '{"team":"billing","order":"#B"}',
+  });
+});
+
+test("a rollout with two versions of the same messages records the version of each call", async () => {
+  setup();
+  const { fetch } = fakeFetch(
+    reply({
+      ...DESK_PROMPT,
+      rollout: {
+        percent: 16,
+        version: 13,
+        ...DESK_PROMPT,
+        text: null,
+        model: { provider: "openai", name: "gpt-4o-mini" },
+        parameters: {},
+        tools: [],
+        responseFormat: { type: "text" },
+      },
+    }),
+  );
+  const options = { apiKey: "td_live_a", baseUrl: newBaseUrl(), fetch };
+  vi.spyOn(Math, "random").mockReturnValueOnce(0.159).mockReturnValueOnce(0.16);
+
+  const rollout = await getPrompt("support/reply", options);
+  const production = await getPrompt("support/reply", options);
+  const fromRollout = rollout.compile({ team: "billing", order: "#4" });
+  const fromProduction = production.compile({ team: "billing", order: "#4" });
+
+  expect(promptAttributesFor(fromRollout)?.["td.prompt.version"]).toBe(13);
+  expect(promptAttributesFor(fromProduction)?.["td.prompt.version"]).toBe(12);
+});
+
+test("the newest compiled message wins, also after 170 messages of history", async () => {
+  setup();
+  const prompt = await promptOf({
+    messages: [
+      { role: "system", content: "Answer as the {{team}} desk." },
+      { role: "placeholder", name: "history" },
+      { role: "user", content: "{{question}}" },
+    ],
+  });
+  const history = Array.from({ length: 170 }, (_, index) => ({
+    role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+    content: `message ${index}`,
+  }));
+
+  const firstTurn = prompt.compile({
+    team: "billing",
+    question: "Where is #4?",
+    history,
+  }) as ChatMessage[];
+  const answer = { role: "assistant", content: "On its way." };
+  const secondTurn = prompt.compile({
+    team: "returns",
+    question: "Can I return it?",
+  }) as ChatMessage[];
+  const chat = [...firstTurn, answer, ...secondTurn.slice(1)];
+
+  expect(promptAttributesFor(firstTurn)?.["td.prompt.variables"]).toContain('"team":"billing"');
+  expect(promptAttributesFor([firstTurn[0], ...history])?.["td.prompt.variables"]).toContain(
+    '"team":"billing"',
+  );
+  expect(promptAttributesFor(chat)?.["td.prompt.variables"]).toBe(
+    '{"team":"returns","question":"Can I return it?"}',
+  );
+});
+
+test("a message that a placeholder brings from an older compile does not win", async () => {
+  setup();
+  const router = await promptOf({
+    name: "router",
+    version: 1,
+    messages: [{ role: "user", content: "{{question}}" }],
+  });
+  const answer = await promptOf({
+    name: "answer",
+    version: 7,
+    messages: [
+      { role: "system", content: "Answer for {{team}}." },
+      { role: "placeholder", name: "history" },
+    ],
+  });
+  const chat = await promptOf({
+    name: "chat",
+    messages: [{ role: "user", content: "{{question}}" }],
+  });
+  const summary = await promptOf({
+    name: "summary",
+    messages: [
+      { role: "system", content: "Summarize the chat." },
+      { role: "placeholder", name: "history" },
+    ],
+  });
+
+  const question = router.compile({ question: "Where is #4?" }) as ChatMessage[];
+  const routed = answer.compile({ team: "billing", history: question });
+  // The last 1000 messages are all from chat; the summary message is the first.
+  const conversation = Array.from(
+    { length: 1500 },
+    (_, index) => chat.compile({ question: `question ${index}` }) as ChatMessage[],
+  ).flat();
+  const summarized = summary.compile({ history: conversation });
+
+  expect(promptAttributesFor(routed)).toEqual({
+    "td.prompt.name": "answer",
+    "td.prompt.version": 7,
+    "td.prompt.label": "production",
+    "td.prompt.variables":
+      '{"team":"billing","history":[{"role":"user","content":"Where is #4?"}]}',
+  });
+  expect(promptAttributesFor(summarized)?.["td.prompt.name"]).toBe("summary");
+});
+
+test("promptAttributesFor looks at the first and the last 1000 messages", async () => {
+  setup();
+  const prompt = await promptOf(DESK_PROMPT);
+  const [system] = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+  const filler = (count: number) => Array.from({ length: count }, () => ({ role: "user" }));
+
+  expect(promptAttributesFor([...filler(1000), system, ...filler(999)])).toBeDefined();
+  expect(promptAttributesFor([...filler(999), system, ...filler(1001)])).toBeDefined();
+  expect(promptAttributesFor([...filler(1001), system, ...filler(999)])).toBeDefined();
+  expect(promptAttributesFor([...filler(1000), system, ...filler(1000)])).toBeUndefined();
+});
+
+test("compile records its variables, not later changes of the object or of its lists", async () => {
+  const { spans } = setup();
+  const prompt = await promptOf({
+    messages: [
+      { role: "placeholder", name: "history" },
+      { role: "user", content: "Order {{order}}" },
+    ],
+  });
+  const history: ChatMessage[] = [{ role: "user", content: "Hi" }];
+  const variables = { order: "#A", history };
+
+  const first = prompt.compile(variables);
+  variables.order = "#B";
+  history.push({ role: "assistant", content: "Hello" });
+  const second = prompt.compile(variables);
+  variables.order = "#C";
+  history.push({ role: "user", content: "Added after compile" });
+  withPrompt(prompt, () => startSpan("scope", { type: "generation" }).end());
+  await flush();
+
+  const secondVariables =
+    '{"order":"#B","history":[{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello"}]}';
+  expect(promptAttributesFor(first)?.["td.prompt.variables"]).toBe(
+    '{"order":"#A","history":[{"role":"user","content":"Hi"}]}',
+  );
+  expect(promptAttributesFor(second)?.["td.prompt.variables"]).toBe(secondVariables);
+  expect(spans.getFinishedSpans()[0]!.attributes["td.prompt.variables"]).toBe(secondVariables);
+});
+
+// A WeakRef keeps its target until the current job ends, so collect in a new one.
+async function collect(): Promise<void> {
+  setFlagsFromString("--expose-gc");
+  const gc = runInNewContext("gc") as () => void;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  gc();
+}
+
+const RAG_PROMPT = {
+  messages: [
+    { role: "system", content: "Answer from {{documents}}." },
+    { role: "user", content: "{{question}}" },
+  ],
+};
+
+test("the variables of a compile are freed with its messages", async () => {
+  setup();
+  const prompt = await promptOf(RAG_PROMPT);
+
+  let document: ChatMessage | undefined = { role: "user", content: "The refund policy" };
+  const freed = new WeakRef(document);
+  let messages = prompt.compile({ documents: [document], question: "q" }) as
+    | ChatMessage[]
+    | undefined;
+  document = undefined;
+  // withPrompt keeps the variables of the last compile of a prompt object.
+  prompt.compile({ documents: [], question: "other" });
+  await collect();
+  expect(freed.deref()).toBeDefined();
+
+  expect(messages).toHaveLength(2);
+  messages = undefined;
+  await collect();
+  expect(freed.deref()).toBeUndefined();
+});
+
+// A row removes the global WeakRef, so the test keeps its own.
+const TrackedRef = WeakRef;
+
+test.each<[string, () => void]>([
+  ["input capture is off", () => setup({ captureInput: false })],
+  [
+    "the runtime has no WeakRef (Cloudflare Workers before 2025-05-05)",
+    () => {
+      setup();
+      vi.stubGlobal("WeakRef", undefined);
+    },
+  ],
+])("when %s, compiled messages keep no variables", async (_case, start) => {
+  start();
+  const prompt = await promptOf(RAG_PROMPT);
+  const documents: WeakRef<ChatMessage>[] = [];
+  const questions: ChatMessage[] = [];
+
+  for (let turn = 0; turn < 200; turn += 1) {
+    const document: ChatMessage = { role: "user", content: `document ${turn}` };
+    documents.push(new TrackedRef(document));
+    const compiled = prompt.compile({ documents: [document], question: `question ${turn}` });
+    questions.push(compiled.at(-1) as ChatMessage);
+  }
+  await collect();
+
+  // withPrompt keeps the variables of the last compile of a prompt object.
+  expect(documents.filter((document) => document.deref()).length).toBe(1);
+
+  await shutdown();
+  vi.unstubAllGlobals();
+  setup();
+  expect(promptAttributesFor(questions)).toEqual({
+    "td.prompt.name": "support/reply",
+    "td.prompt.version": 12,
+    "td.prompt.label": "production",
+  });
+});
+
+const CHAT_PROMPT = {
+  messages: [
+    { role: "system", content: "Answer as the {{team}} desk." },
+    { role: "placeholder", name: "history" },
+    { role: "user", content: "{{question}}" },
+  ],
+};
+
+interface ChatPrompts {
+  chat: Prompt;
+  question: Prompt;
+  rag: Prompt;
+  reply: Prompt;
+}
+
+async function chatPrompts(): Promise<ChatPrompts> {
+  return {
+    chat: await promptOf(CHAT_PROMPT),
+    question: await promptOf({
+      messages: [{ role: "user", content: "Context: {{documents}}\n\n{{question}}" }],
+    }),
+    rag: await promptOf({
+      messages: [
+        { role: "system", content: "Answer as the {{team}} desk." },
+        { role: "placeholder", name: "history" },
+        { role: "placeholder", name: "current" },
+      ],
+    }),
+    reply: await promptOf({ messages: [{ role: "assistant", content: "{{answer}}" }] }),
+  };
+}
+
+function answer(turn: number): ChatMessage {
+  return { role: "assistant", content: `answer ${turn}` };
+}
+
+// A row runs one turn of a chat. It puts `marker` in the variables of the compile that made the
+// message that the chat keeps. It gives the request, the history for the next turn, and that message.
+type ChatTurn = (
+  prompts: ChatPrompts,
+  history: ChatMessage[],
+  turn: number,
+  marker: ChatMessage,
+) => [request: ChatMessage[], history: ChatMessage[], kept: ChatMessage];
+
+test.each<[string, ChatTurn]>([
+  [
+    "a new list each turn",
+    ({ chat }, history, turn, marker) => {
+      const request = chat.compile({
+        team: "billing",
+        history,
+        question: `question ${turn}`,
+        marker: [marker],
+      }) as ChatMessage[];
+      const kept = request.at(-1)!;
+
+      return [request, [...history, kept, answer(turn)], kept];
+    },
+  ],
+  [
+    "a new list of the last 20 messages",
+    ({ chat }, history, turn, marker) => {
+      const request = chat.compile({
+        team: "billing",
+        history,
+        question: `question ${turn}`,
+        marker: [marker],
+      }) as ChatMessage[];
+      const kept = request.at(-1)!;
+
+      return [request, [...history, kept, answer(turn)].slice(-20), kept];
+    },
+  ],
+  [
+    "a full list that compile gets as copies",
+    ({ chat }, history, turn, marker) => {
+      const request = chat.compile({
+        team: "billing",
+        history: history.map((message) => ({ ...message })),
+        question: `question ${turn}`,
+        marker: [marker],
+      }) as ChatMessage[];
+      const kept = request.at(-1)!;
+
+      return [request, [...history, kept, answer(turn)], kept];
+    },
+  ],
+  [
+    "a question prompt for each turn, in a placeholder of the chat prompt",
+    ({ question, rag }, history, turn, marker) => {
+      const [kept] = question.compile({
+        documents: `document ${turn}`,
+        question: `question ${turn}`,
+        marker: [marker],
+      }) as ChatMessage[];
+      const request = rag.compile({ team: "billing", history, current: [kept!] }) as ChatMessage[];
+
+      return [request, [...history, kept!, answer(turn)], kept!];
+    },
+  ],
+  [
+    "raw questions and a reply prompt for each answer",
+    ({ chat, reply }, history, turn, marker) => {
+      const request = chat.compile({
+        team: "billing",
+        history,
+        question: `question ${turn}`,
+      }) as ChatMessage[];
+      const [kept] = reply.compile({ answer: `answer ${turn}`, marker: [marker] }) as ChatMessage[];
+
+      return [request, [...history, { role: "user", content: `question ${turn}` }, kept!], kept!];
+    },
+  ],
+])("a chat history in %s keeps the variables of the last 5 minutes", async (_shape, run) => {
+  vi.useFakeTimers({ toFake: ["Date", "performance"] });
+  setup();
+  const prompts = await chatPrompts();
+  const markers: WeakRef<ChatMessage>[] = [];
+  let history: ChatMessage[] = [];
+  let request: ChatMessage[] = [];
+  let older: ChatMessage | undefined;
+
+  // One turn in 2 minutes, for 300 turns. An unused variable marks the variables of each turn.
+  for (let turn = 0; turn < 300; turn += 1) {
+    if (turn > 0) vi.advanceTimersByTime(120_000);
+    const marker: ChatMessage = { role: "user", content: `turn ${turn}` };
+    markers.push(new WeakRef(marker));
+    let kept: ChatMessage;
+    [request, history, kept] = run(prompts, history, turn, marker);
+    // The model call of the turn.
+    promptAttributesFor(request);
+
+    if (turn === 296) older = kept;
+  }
+  await collect();
+
+  // Turns 297, 298, and 299: 4, 2, and 0 minutes old.
+  expect(markers.filter((marker) => marker.deref()).length).toBe(3);
+  expect(promptAttributesFor(request)?.["td.prompt.variables"]).toContain("question 299");
+  expect(promptAttributesFor(older)).toEqual({
+    "td.prompt.name": "support/reply",
+    "td.prompt.version": 12,
+    "td.prompt.label": "production",
+  });
+});
+
+function variablesOf(messages: unknown): unknown {
+  return promptAttributesFor(messages)?.["td.prompt.variables"];
+}
+
+const REFUND_VARIABLES = '{"documents":"The refund policy","question":"Where is #4?"}';
+
+interface LivePrompts {
+  answer: Prompt;
+  guard: Prompt;
+  judge: Prompt;
+  other: Prompt;
+  chat: Prompt;
+  system: Prompt;
+  withSystem: Prompt;
+}
+
+// A row compiles one or more requests and runs other compiles before their calls. It gives the
+// variables that each call records and the variables of the compile of its request.
+type LiveRequests = (prompts: LivePrompts) => Promise<[recorded: unknown, compiled: string][]>;
+
+test.each<[string, LiveRequests]>([
+  [
+    "150 compiles of other requests, then a guard",
+    async ({ answer, guard, other }) => {
+      const request = answer.compile({ documents: "The refund policy", question: "Where is #4?" });
+      for (let index = 0; index < 150; index += 1) other.compile({ q: `${index}` });
+      guard.compile({ conversation: request });
+
+      return [[variablesOf(request), REFUND_VARIABLES]];
+    },
+  ],
+  [
+    "a guard before each of 150 agent steps",
+    async ({ answer, guard }) => {
+      const conversation = answer.compile({
+        documents: "The refund policy",
+        question: "Where is #4?",
+      }) as ChatMessage[];
+
+      for (let step = 0; step < 150; step += 1) {
+        guard.compile({ conversation });
+        conversation.push({ role: "assistant", content: `step ${step}` });
+      }
+
+      return [[variablesOf(conversation), REFUND_VARIABLES]];
+    },
+  ],
+  [
+    "a guard, then a judge of the messages of the guard",
+    async ({ answer, guard, judge }) => {
+      const request = answer.compile({ documents: "The refund policy", question: "Where is #4?" });
+      judge.compile({ conversation: guard.compile({ conversation: request }) });
+
+      return [[variablesOf(request), REFUND_VARIABLES]];
+    },
+  ],
+  [
+    "three turns of a session that add their question to the history before their calls",
+    async ({ chat }) => {
+      const history: ChatMessage[] = [];
+      let open!: () => void;
+      const queue = new Promise<void>((resolve) => {
+        open = resolve;
+      });
+      const turn = async (question: string) => {
+        const request = chat.compile({ team: "billing", history, question }) as ChatMessage[];
+        history.push(request.at(-1)!);
+        await queue;
+
+        return variablesOf(request);
+      };
+      const turns = ["q1", "q2", "q3"].map(turn);
+      open();
+      const [first, second, third] = await Promise.all(turns);
+
+      return [
+        [first, '{"team":"billing","history":[],"question":"q1"}'],
+        [second, '{"team":"billing","history":[{"role":"user","content":"q1"}],"question":"q2"}'],
+        [
+          third,
+          '{"team":"billing","history":[{"role":"user","content":"q1"},{"role":"user","content":"q2"}],"question":"q3"}',
+        ],
+      ];
+    },
+  ],
+  [
+    "a system message compiled at startup, after 3 turns of a chat that gets it",
+    async ({ system, withSystem }) => {
+      const startup = system.compile({ product: "Acme" }) as ChatMessage[];
+      let history: ChatMessage[] = [];
+
+      for (let turn = 0; turn < 3; turn += 1) {
+        const request = withSystem.compile({
+          system: startup,
+          history,
+          question: `question ${turn}`,
+        }) as ChatMessage[];
+        promptAttributesFor(request);
+        history = [...history, request.at(-1)!, answer(turn)];
+      }
+
+      return [
+        [
+          variablesOf([...startup, { role: "user", content: "Where is #4?" }]),
+          '{"product":"Acme"}',
+        ],
+      ];
+    },
+  ],
+])("a request keeps its variables until its call: %s", async (_case, run) => {
+  setup();
+  const calls = await run({
+    answer: await promptOf(RAG_PROMPT),
+    guard: await promptOf({
+      name: "guard",
+      messages: [
+        { role: "system", content: "Is this safe?" },
+        { role: "placeholder", name: "conversation" },
+      ],
+    }),
+    judge: await promptOf({
+      name: "judge",
+      messages: [
+        { role: "system", content: "Check the answer of the guard." },
+        { role: "placeholder", name: "conversation" },
+      ],
+    }),
+    other: await promptOf({ name: "other", messages: [{ role: "user", content: "{{q}}" }] }),
+    chat: await promptOf(CHAT_PROMPT),
+    system: await promptOf({
+      name: "system",
+      messages: [{ role: "system", content: "You support {{product}}." }],
+    }),
+    withSystem: await promptOf({
+      messages: [
+        { role: "placeholder", name: "system" },
+        { role: "placeholder", name: "history" },
+        { role: "user", content: "{{question}}" },
+      ],
+    }),
+  });
+
+  for (const [recorded, compiled] of calls) expect(recorded).toBe(compiled);
+});
+
+test("a compile keeps its variables for 5 minutes after it or after the last call that names it", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "performance"] });
+  setup();
+  const chat = await promptOf(CHAT_PROMPT);
+  let history: ChatMessage[] = [];
+
+  for (let turn = 0; turn < 5; turn += 1) {
+    const request = chat.compile({ team: "billing", history, question: `q${turn}` });
+    promptAttributesFor(request);
+    history = [...history, request.at(-1) as ChatMessage, answer(turn)];
+  }
+  // These calls send only messages of the chat, so they name the newest compile among them.
+  const summary = [...history, { role: "user", content: "Summarize the chat." }];
+  const earlier = history.slice(0, -2);
+
+  expect(variablesOf(summary)).toContain('"question":"q4"');
+  expect(variablesOf(earlier)).toContain('"question":"q3"');
+
+  vi.advanceTimersByTime(299_999);
+  expect(variablesOf(summary)).toContain('"question":"q4"');
+  vi.advanceTimersByTime(1);
+  expect(variablesOf(earlier)).toBeUndefined();
+  // The call 1 ms before moved the deadline of q4.
+  expect(variablesOf(summary)).toContain('"question":"q4"');
+  // The system clock moves back an hour; 5 minutes still pass.
+  vi.setSystemTime(Date.now() - 3_600_000);
+  vi.advanceTimersByTime(300_000);
+  expect(promptAttributesFor(summary)).toEqual({
+    "td.prompt.name": "support/reply",
+    "td.prompt.version": 12,
+    "td.prompt.label": "production",
+  });
+});
+
+test("withPrompt wins over a compiled message of another prompt, through a parent and in updates", async () => {
+  const { spans } = setup();
+  const scoped = await promptOf({ name: "scoped/prompt" });
+  // Fetched by version, so it has no label that the label of the scope could hide.
+  const { fetch } = fakeFetch(
+    reply({
+      name: "other/prompt",
+      label: null,
+      version: 3,
+      messages: [{ role: "user", content: "Cancel order {{order}}." }],
+    }),
+  );
+  const other = await getPrompt("other/prompt", {
+    apiKey: "td_live_a",
+    baseUrl: newBaseUrl(),
+    version: 3,
+    fetch,
+  });
+  const compiled = other.compile({ order: "#9" });
+
+  const parent = withPrompt(scoped, () => {
+    startSpan("in scope", { type: "generation", attributes: promptAttributesFor(compiled) }).end();
+
+    return startSpan("parent");
+  });
+  const attributes = promptAttributesFor(compiled);
+  startSpan("with parent", { type: "generation", parent, attributes }).end();
+  parent.end();
+  withPrompt(scoped, () => {
+    startSpan("updated", { type: "generation" }).update({ attributes }).end();
+    startSpan("ended", { type: "generation" }).end({ attributes });
+    startActiveSpan("active", { type: "generation" }, () => updateActiveSpan({ attributes }));
+  });
+  await flush();
+
+  expect(attributes?.["td.prompt.name"]).toBe("other/prompt");
+  for (const name of ["in scope", "with parent", "updated", "ended", "active"]) {
+    const span = spans.getFinishedSpans().find((finished) => finished.name === name)!;
+    expect(
+      Object.fromEntries(
+        Object.entries(span.attributes).filter(([key]) => key.startsWith("td.prompt.")),
+      ),
+    ).toEqual({
+      "td.prompt.name": "scoped/prompt",
+      "td.prompt.version": 12,
+      "td.prompt.label": "production",
+    });
+  }
+});
+
+test("td.prompt.variables follows the input capture of the client and of the span", async () => {
+  const prompt = await promptOf({
+    messages: [{ role: "user", content: "My card is {{card}}." }],
+  });
+  const compiled = prompt.compile({ card: "4111 1111" });
+
+  setup({ captureInput: false });
+  expect(promptAttributesFor(compiled)).toEqual({
+    "td.prompt.name": "support/reply",
+    "td.prompt.version": 12,
+    "td.prompt.label": "production",
+  });
+
+  await shutdown();
+  const { spans } = setup({
+    mask: (value, { key }) => (key === "td.prompt.variables" ? { card: "[masked]" } : value),
+  });
+  const attributes = promptAttributesFor(compiled);
+  expect(attributes?.["td.prompt.variables"]).toBe('{"card":"[masked]"}');
+
+  startSpan("private", { type: "generation", captureInput: false, attributes }).end();
+  startSpan("updated", { type: "generation", captureInput: false }).update({ attributes }).end();
+  await flush();
+
+  for (const span of spans.getFinishedSpans()) {
+    expect(span.attributes["td.prompt.name"]).toBe("support/reply");
+    expect(span.attributes["td.prompt.variables"]).toBeUndefined();
+  }
+});
+
+test("promptAttributesFor reports an error and gives undefined", async () => {
+  const errors: Error[] = [];
+  setup({ onError: (error) => errors.push(error) });
+
+  const trap = new Proxy([], {
+    get() {
+      throw new Error("trap");
+    },
+  });
+
+  expect(promptAttributesFor(trap)).toBeUndefined();
+  expect(errors.map((error) => error.message)).toEqual(["trap"]);
 });
 
 test("a fallback prompt records its name and label but no version", async () => {

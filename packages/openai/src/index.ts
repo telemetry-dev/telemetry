@@ -156,6 +156,7 @@ function stopSequences<T>(value: T): string[] | undefined {
 function chatRequest(body: JsonRecord): RequestMapping {
   const model = readString(body.model);
   const capture = captureEnabled("input") ? sanitizeResponsesCapture(body.messages) : undefined;
+  const prompt = promptAttributes(body.messages);
 
   return {
     name: `chat ${model ?? "unknown"}`,
@@ -170,7 +171,9 @@ function chatRequest(body: JsonRecord): RequestMapping {
       seed: readNumber(body.seed),
       frequencyPenalty: readNumber(body.frequency_penalty),
       presencePenalty: readNumber(body.presence_penalty),
-      attributes: capture?.truncated ? { "telemetry.dev.capture.truncated": true } : undefined,
+      attributes: capture?.truncated
+        ? { ...prompt, "telemetry.dev.capture.truncated": true }
+        : prompt,
     },
   };
 }
@@ -243,6 +246,7 @@ function chatResponse<T>(response: T): SpanFields {
 function responsesRequest(body: JsonRecord): RequestMapping {
   const model = readString(body.model);
   const capture = captureEnabled("input") ? sanitizeResponsesCapture(body.input) : undefined;
+  const prompt = promptAttributes(body.input);
 
   return {
     name: `chat ${model ?? "unknown"}`,
@@ -254,7 +258,9 @@ function responsesRequest(body: JsonRecord): RequestMapping {
       temperature: readNumber(body.temperature),
       topP: readNumber(body.top_p),
       maxTokens: readNumber(body.max_output_tokens),
-      attributes: capture?.truncated ? { "telemetry.dev.capture.truncated": true } : undefined,
+      attributes: capture?.truncated
+        ? { ...prompt, "telemetry.dev.capture.truncated": true }
+        : prompt,
     },
   };
 }
@@ -1624,6 +1630,16 @@ function captureMaskedBeforeStart(): boolean {
   } catch {
     return true;
   }
+}
+
+// Cores older than promptAttributesFor record a prompt only inside withPrompt. A namespace read
+// keeps them loadable without the export.
+function promptAttributes(messages: unknown): SpanFields["attributes"] {
+  const read = (
+    telemetrySdk as { promptAttributesFor?: (messages: unknown) => SpanFields["attributes"] }
+  ).promptAttributesFor;
+
+  return typeof read === "function" ? read(messages) : undefined;
 }
 
 // The decision is made before the span starts so samplers see the same attributes as before.

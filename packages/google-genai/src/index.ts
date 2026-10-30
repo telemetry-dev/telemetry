@@ -567,7 +567,11 @@ function responseAttributes(response: UnknownRecord, metadataContent: boolean) {
 function generateRequestFields(params: UnknownRecord): RequestMapping {
   const model = readString(params.model);
   const config = asRecord(params.config);
-  const attributes = requestAttributesFromConfig(config);
+
+  const attributes = {
+    ...requestAttributesFromConfig(config),
+    ...promptAttributes(params.contents),
+  };
   const input = captureEnabled("input") ? normalizeContentInput(params.contents) : undefined;
 
   const systemInstructions = captureEnabled("input")
@@ -938,6 +942,16 @@ function captureMaskedBeforeStart(): boolean {
   } catch {
     return true;
   }
+}
+
+// Cores older than promptAttributesFor record a prompt only inside withPrompt. A namespace read
+// keeps them loadable without the export.
+function promptAttributes(messages: unknown): SpanFields["attributes"] {
+  const read = (
+    telemetrySdk as { promptAttributesFor?: (messages: unknown) => SpanFields["attributes"] }
+  ).promptAttributesFor;
+
+  return typeof read === "function" ? read(messages) : undefined;
 }
 
 // The decision is made before the span starts so samplers see the same attributes as before.

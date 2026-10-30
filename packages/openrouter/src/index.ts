@@ -4,6 +4,7 @@ import {
   type SpanHandle,
   type StartSpanOptions,
 } from "@telemetry-dev/sdk";
+import * as telemetrySdk from "@telemetry-dev/sdk";
 import { activeContext } from "@telemetry-dev/otel";
 import { Chat } from "@openrouter/sdk/sdk/chat.js";
 import { Embeddings } from "@openrouter/sdk/sdk/embeddings.js";
@@ -384,6 +385,16 @@ function usageCost<T>(usage: T): number | undefined {
   return cost ?? upstreamCost;
 }
 
+// Cores older than promptAttributesFor record a prompt only inside withPrompt. A namespace read
+// keeps them loadable without the export.
+function promptAttributes(messages: unknown): SpanFields["attributes"] {
+  const read = (
+    telemetrySdk as { promptAttributesFor?: (messages: unknown) => SpanFields["attributes"] }
+  ).promptAttributesFor;
+
+  return typeof read === "function" ? read(messages) : undefined;
+}
+
 function chatRequest(request: JsonRecord): RequestMapping {
   const body = asRecord(request.chatRequest) ?? {};
   const model = readString(body.model);
@@ -403,6 +414,7 @@ function chatRequest(request: JsonRecord): RequestMapping {
       seed: readNumber(body.seed),
       frequencyPenalty: readNumber(body.frequencyPenalty),
       presencePenalty: readNumber(body.presencePenalty),
+      attributes: promptAttributes(body.messages),
     },
   };
 }
@@ -472,6 +484,7 @@ function responsesRequest(request: JsonRecord): RequestMapping {
       maxTokens: readNumber(body.maxOutputTokens),
       frequencyPenalty: readNumber(body.frequencyPenalty),
       presencePenalty: readNumber(body.presencePenalty),
+      attributes: promptAttributes(body.input),
     },
   };
 }

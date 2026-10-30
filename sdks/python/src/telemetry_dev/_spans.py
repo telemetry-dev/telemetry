@@ -38,6 +38,7 @@ from ._semconv import (
     ATTR_FINISH_REASONS,
     ATTR_OPERATION,
     ATTR_OUTPUT_TYPE,
+    ATTR_PROMPT_VARIABLES,
     ATTR_PROVIDER,
     ATTR_REQUEST_MODEL,
     ATTR_RESPONSE_ID,
@@ -102,6 +103,7 @@ class _SpanState:
     operation: str
     capture_input: bool
     capture_output: bool
+    prompt_from_scope: bool = False
     output_chunk_last_ms: float | None = None
     output_chunk_count: int = 0
     output_chunk_sum_s: float = 0
@@ -279,6 +281,9 @@ def _fields_to_attributes(
     raw = fields.get("attributes")
     if raw is not None:
         for key, value in raw.items():
+            # The variables are input, also when the app passes them from prompt_attributes_for().
+            if key == ATTR_PROMPT_VARIABLES and not state.capture_input:
+                continue
             attr = coerce_attr_value(
                 value,
                 max_len=sys.maxsize,
@@ -296,12 +301,23 @@ def _apply_fields(client: Client, span: Span, state: _SpanState, fields: dict[st
     if name is not None:
         span.update_name(name)
     attrs = _fields_to_attributes(client, state, fields)
+    if state.prompt_from_scope:
+        attrs = _without_prompt(attrs)
     if attrs:
         span.set_attributes(attrs)
 
     error = fields.get("error")
     if error is not None:
         _record_error_on_span(client, span, state, error)
+
+
+def _without_prompt(
+    attrs: dict[str, otel_types.AttributeValue],
+) -> dict[str, otel_types.AttributeValue]:
+    """The prompt of with_prompt replaces each td.prompt.* attribute that the app passes, at start
+    and in each update, so that a span does not mix two prompts when the app calls
+    prompt_attributes_for outside with_prompt."""
+    return {key: value for key, value in attrs.items() if not key.startswith("td.prompt.")}
 
 
 def _collect_fields(
@@ -744,11 +760,13 @@ def start_span(
             ctx, session_id if isinstance(session_id, str) else None, client.config.api_key
         )
         initial.update(propagated)
-        initial.update(
-            prompt_attributes(
-                client, ctx, attrs.get(ATTR_OPERATION, operation), state.capture_input
-            )
+        prompt = prompt_attributes(
+            client, ctx, attrs.get(ATTR_OPERATION, operation), state.capture_input
         )
+        if prompt:
+            state.prompt_from_scope = True
+            attrs = _without_prompt(attrs)
+        initial.update(prompt)
         initial.update(attrs)
         span = client.tracer.start_span(
             name,

@@ -179,6 +179,9 @@ export function fieldsToAttributes(
 
   if (fields.attributes) {
     Object.assign(attrs, omitUndefined(fields.attributes));
+
+    // The variables are input, also when the app passes them from promptAttributesFor().
+    if (!cfg.captureInput) delete attrs["td.prompt.variables"];
   }
 
   return attrs;

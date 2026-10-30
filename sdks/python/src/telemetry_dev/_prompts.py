@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import copy
 import hashlib
+import itertools
 import json
 import os
 import random
@@ -20,7 +21,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any, Literal, TypeAlias, TypedDict, cast, overload
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, ref
 
 from opentelemetry import context as otel_context
 from opentelemetry.context import Context
@@ -47,6 +48,11 @@ _MAX_CACHE_ENTRIES = 1000
 _VARIABLE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _MODEL_CALL_OPERATIONS = frozenset({"chat", "text_completion", "generate_content"})
 _PROMPT_KEY = otel_context.create_key("telemetry_dev.prompt")
+# How many messages prompt_attributes_for looks at, at each end of the list.
+_TAG_LOOKUP = 1000
+# How long a tag keeps its variables after its compile, or after a call that names it.
+_VARIABLES_TTL_S = 300.0
+_MINUTE_S = 60.0
 
 
 class PromptModel(TypedDict):
@@ -95,14 +101,31 @@ class ChatPrompt:
     ) -> list[dict[str, Any]]:
         """Fill in the variables and replace each placeholder message with the list of messages
         in its variable. ``with_prompt`` records the variables of the last call before it starts
-        or inside it."""
+        or inside it. Each message that it makes is a ``dict`` subclass that also holds this
+        prompt and a copy of these variables and of each list in them, so that a model call
+        outside ``with_prompt`` that sends the message records them; see
+        ``prompt_attributes_for``. The objects in a list are not copied. The message keeps the
+        variables for 5 minutes after this compile and after each call that names it. Other
+        compiles do not change this. The message holds no variables when input capture is off in
+        the client. A check of the exact type (``type(message) is dict``), ``yaml.safe_dump``, and
+        ``marshal`` reject it: give them ``dict(message)``."""
         values = _record(self, variables, kwargs)
+        now = monotonic()
+        _expire(now)
+        tag = _CompileTag(self, None, next(_compiles), now + _VARIABLES_TTL_S)
+        client = get_client()
+        # prompt_attributes_for cannot record the variables when input capture is off in the client.
+        if client is None or client.capture_input:
+            tag.variables = values
+            _add_deadline(ref(tag), tag.expires)
         compiled: list[dict[str, Any]] = []
         for message in self.messages:
             if message.get("role") != "placeholder":
-                compiled.append(
-                    {"role": message["role"], "content": _fill(str(message["content"]), values)}
+                tagged = _CompiledMessage(
+                    role=message["role"], content=_fill(str(message["content"]), values)
                 )
+                tagged.compiled_by = tag
+                compiled.append(tagged)
                 continue
             name = str(message["name"])
             value = values.get(name)
@@ -138,7 +161,8 @@ class TextPrompt:
 
     def compile(self, variables: Mapping[str, Any] | None = None, /, **kwargs: Any) -> str:
         """Fill in the variables. ``with_prompt`` records the variables of the last call before it
-        starts or inside it."""
+        starts or inside it. A string cannot carry a tag, so a model call outside ``with_prompt``
+        does not record a text prompt."""
         return _fill(self.text, _record(self, variables, kwargs))
 
 
@@ -279,16 +303,59 @@ def prompt_attributes(
     scope = otel_context.get_value(_PROMPT_KEY, context) or otel_context.get_value(_PROMPT_KEY)
     if not isinstance(scope, _PromptScope):
         return {}
-    prompt = scope.prompt
+    task = _task_variables.get()
+    variables = task[1] if task is not None and task[0] is scope else scope.variables
+    return _attributes_of(scope.prompt, variables, client if capture_input else None)
+
+
+def prompt_attributes_for(messages: object) -> dict[str, AttributeValue]:
+    """The td.prompt.* attributes for a model call outside ``with_prompt`` that sends ``messages``
+    (a list or tuple of messages, or one message): those of the newest ``compile()`` of a chat
+    prompt that made one of the messages. It looks at the first 1000 and the last 1000 messages.
+    The tag is on the dict that ``compile()`` made, so a copy of it gives ``{}``. Gives ``{}``
+    inside ``with_prompt``, whose prompt the span gets. ``td.prompt.variables`` needs input
+    capture on in the client, at the compile and now, and the span drops it when its own input
+    capture is off. A compile gives no variables 5 minutes after it or after the last call that
+    named it; see ``ChatPrompt.compile``.
+
+    It reads only a ``list`` or ``tuple``, not a subclass, so the read runs no code of the app.
+    With input capture on, it serializes the variables, which calls the ``mask`` of the client and
+    can run code of a value, such as ``__repr__``. It never raises: it reports an error to
+    ``on_error`` and gives ``{}``."""
+    client = get_client()
+    try:
+        if isinstance(otel_context.get_value(_PROMPT_KEY), _PromptScope):
+            return {}
+        now = monotonic()
+        _expire(now)
+        tag = _newest_tag(messages)
+        if tag is None:
+            return {}
+        # One read: _expire in another thread can remove the variables of the tag.
+        variables = tag.variables
+        if tag.expires > now:
+            tag.expires = now + _VARIABLES_TTL_S
+        else:
+            variables = tag.variables = None
+        capture = client if client is not None and client.capture_input else None
+        return _attributes_of(tag.prompt, variables, capture)
+    except Exception as exc:
+        if client is not None:
+            client.report("prompt_attributes_for failed", exc)
+        return {}
+
+
+def _attributes_of(
+    prompt: Prompt, variables: dict[str, Any] | None, capture: Client | None
+) -> dict[str, AttributeValue]:
+    """The attributes of ``prompt``; ``capture`` is the client when input capture is on."""
     attrs: dict[str, AttributeValue] = {ATTR_PROMPT_NAME: prompt.name}
     if prompt.version is not None:
         attrs[ATTR_PROMPT_VERSION] = prompt.version
     if prompt.label is not None:
         attrs[ATTR_PROMPT_LABEL] = prompt.label
-    task = _task_variables.get()
-    variables = task[1] if task is not None and task[0] is scope else scope.variables
-    if variables is not None and capture_input:
-        serialized = client.serialize(variables, ATTR_PROMPT_VARIABLES)
+    if variables is not None and capture is not None:
+        serialized = capture.serialize(variables, ATTR_PROMPT_VARIABLES)
         if serialized is not None:
             attrs[ATTR_PROMPT_VARIABLES] = serialized
     return attrs
@@ -386,13 +453,93 @@ _task_variables: ContextVar[tuple[_PromptScope, dict[str, Any]] | None] = Contex
 def _record(
     prompt: Prompt, variables: Mapping[str, Any] | None, kwargs: Mapping[str, Any]
 ) -> dict[str, Any]:
-    values = {**(variables or {}), **kwargs}
+    # A copy of each list too, so that a change of the app's history after compile() does not
+    # change what a span records.
+    values: dict[str, Any] = {
+        name: list(cast("list[Any]", value)) if isinstance(value, list) else value
+        for name, value in {**(variables or {}), **kwargs}.items()
+    }
     _compiled_variables[prompt] = values
     scope = otel_context.get_value(_PROMPT_KEY)
     if isinstance(scope, _PromptScope) and scope.prompt is prompt:
         scope.variables = values
         _task_variables.set((scope, values))
     return values
+
+
+@dataclass(eq=False)
+class _CompileTag:
+    """The ``compile()`` call that made a chat message."""
+
+    prompt: ChatPrompt
+    variables: dict[str, Any] | None
+    """None when input capture was off, or after ``expires``; see _expire."""
+    serial: int
+    """Counts the compiles of the process, so a higher one is newer."""
+    expires: float
+    """When the tag removes its variables (monotonic). A call that names the tag moves it."""
+
+
+_compiles = itertools.count()
+# The tags that keep variables, by the minute of their deadline. A weak reference, so that the
+# variables of a message that the app dropped do not stay until the deadline.
+_deadlines: dict[int, list[ref[_CompileTag]]] = {}
+
+
+class _CompiledMessage(dict[str, Any]):
+    """A message that ``compile()`` made: a dict with the tag in a slot. The constructor is the one
+    of ``dict``, so ``type(message)(message)`` and ``dataclasses.asdict`` rebuild it, without the
+    tag. A copy, pickle, or ``copy.deepcopy`` of it is a plain dict without the tag."""
+
+    __slots__ = ("compiled_by",)
+    compiled_by: _CompileTag
+
+    def __reduce__(self) -> tuple[type[dict[str, Any]], tuple[dict[str, Any]]]:
+        return dict, (dict(self),)
+
+
+def _expire(now: float) -> None:
+    """Remove the variables of each expired tag, also when the app keeps its messages. Thus a chat
+    history keeps the variables of the last 5 minutes only, and other compiles do not change the
+    time of a request. A tag that a call named gets its new deadline. Threads add only to minutes
+    that are not due, and ``list()`` and ``pop()`` of a dict are atomic, so the threads share the
+    minutes without a lock."""
+    minute = int(now // _MINUTE_S)
+    for due in list(_deadlines):
+        if due >= minute:
+            continue
+        for tag_ref in _deadlines.pop(due, ()):
+            tag = tag_ref()
+            if tag is None:
+                continue
+            if tag.expires > now:
+                _add_deadline(tag_ref, tag.expires)
+            else:
+                tag.variables = None
+
+
+def _add_deadline(tag_ref: ref[_CompileTag], at: float) -> None:
+    _deadlines.setdefault(int(at // _MINUTE_S), []).append(tag_ref)
+
+
+def _newest_tag(messages: object) -> _CompileTag | None:
+    """The messages of a placeholder come from an older compile, so the newest compile, not the
+    last tagged message, names the prompt of the request. Its own messages are at the start or the
+    end of the list, unless placeholders put more than 1000 messages on each side of them."""
+    if type(messages) is _CompiledMessage:
+        return getattr(messages, "compiled_by", None)
+    # Exact types: a subclass of list or tuple could run code of the app on each read.
+    if type(messages) is not list and type(messages) is not tuple:
+        return None
+    items = cast("list[object]", messages)
+    if len(items) > 2 * _TAG_LOOKUP:
+        items = [*items[:_TAG_LOOKUP], *items[-_TAG_LOOKUP:]]
+    newest: _CompileTag | None = None
+    for item in items:
+        tag = getattr(item, "compiled_by", None) if type(item) is _CompiledMessage else None
+        if tag is not None and (newest is None or tag.serial > newest.serial):
+            newest = tag
+    return newest
 
 
 def _fill(text: str, values: Mapping[str, Any]) -> str:

@@ -8,7 +8,14 @@ import {
   InMemoryMetricExporter,
   type PushMetricExporter,
 } from "@opentelemetry/sdk-metrics";
-import { flush, init, shutdown, type TelemetryOptions } from "@telemetry-dev/sdk";
+import {
+  type ChatMessage,
+  flush,
+  getPrompt,
+  init,
+  shutdown,
+  type TelemetryOptions,
+} from "@telemetry-dev/sdk";
 import * as telemetrySdk from "@telemetry-dev/sdk";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
@@ -189,7 +196,7 @@ function setupSpans(
   metricExporter?: PushMetricExporter,
   options: Pick<
     TelemetryOptions,
-    "captureOutput" | "mask" | "maxAttributeLength" | "onError" | "sampler"
+    "captureInput" | "captureOutput" | "mask" | "maxAttributeLength" | "onError" | "sampler"
   > = {},
 ): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
@@ -2886,6 +2893,102 @@ test("chat streams preserve caller-requested usage chunks", async () => {
   const span = await exportedSpan(spans);
   expect(span.attributes["gen_ai.usage.total_tokens"]).toBe(7);
 });
+
+test.each([
+  { api: "chat completions", messages: "compiled", captureInput: false, olderCore: false },
+  { api: "responses", messages: "compiled", captureInput: true, olderCore: false },
+  { api: "chat completions", messages: "copied", captureInput: true, olderCore: false },
+  { api: "chat completions", messages: "compiled", captureInput: true, olderCore: true },
+])(
+  "$api outside withPrompt records the prompt of $messages messages, input capture $captureInput, older core $olderCore",
+  async ({ api, messages: kind, captureInput, olderCore }) => {
+    if (olderCore) {
+      vi.spyOn(
+        telemetrySdk as { promptAttributesFor: unknown },
+        "promptAttributesFor",
+        "get",
+      ).mockReturnValue(undefined);
+    }
+
+    const prompt = await getPrompt("support/reply", {
+      apiKey: "td_live_a",
+      baseUrl: "https://prompts.openai.test",
+      fetch: async () =>
+        Response.json({
+          name: "support/reply",
+          type: "chat",
+          label: "production",
+          version: 12,
+          messages: [
+            { role: "system", content: "You answer for the {{team}} desk." },
+            { role: "user", content: "Where is order {{order}}?" },
+          ],
+          text: null,
+          model: { provider: "openai", name: "gpt-4o" },
+          parameters: {},
+          tools: [],
+          responseFormat: { type: "text" },
+          rollout: null,
+        }),
+    });
+    const compiled = prompt.compile({ team: "billing", order: "#4" }) as ChatMessage[];
+    const messages = kind === "compiled" ? compiled : compiled.map((message) => ({ ...message }));
+    const spans = setupSpans(undefined, { captureInput });
+    const client = clientWith(
+      createFakeFetch(
+        jsonResponse(
+          api === "responses"
+            ? {
+                id: "resp_1",
+                object: "response",
+                status: "completed",
+                model: "gpt-4.1",
+                output: [],
+                usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+              }
+            : {
+                id: "chatcmpl_1",
+                object: "chat.completion",
+                created: 1,
+                model: "gpt-4o",
+                choices: [
+                  {
+                    index: 0,
+                    message: { role: "assistant", content: "Soon." },
+                    finish_reason: "stop",
+                  },
+                ],
+                usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+              },
+        ),
+      ).fetch,
+    );
+
+    if (api === "responses") {
+      await client.responses.create({ model: "gpt-4.1", input: messages });
+    } else {
+      await client.chat.completions.create({ model: "gpt-4o", messages });
+    }
+
+    const { attributes } = await exportedSpan(spans);
+    expect(attributes["gen_ai.input.messages"] !== undefined).toBe(captureInput);
+
+    if (olderCore || kind === "copied") {
+      expect(attributes["td.prompt.name"]).toBeUndefined();
+
+      return;
+    }
+
+    expect(attributes).toMatchObject({
+      "td.prompt.name": "support/reply",
+      "td.prompt.version": 12,
+      "td.prompt.label": "production",
+    });
+    expect(attributes["td.prompt.variables"]).toBe(
+      captureInput ? '{"team":"billing","order":"#4"}' : undefined,
+    );
+  },
+);
 
 test("responses create maps instructions to system instructions", async () => {
   const spans = setupSpans();

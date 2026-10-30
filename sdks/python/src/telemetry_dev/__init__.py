@@ -39,6 +39,7 @@ from ._prompts import (
     TextPrompt,
     get_prompt,
     get_prompt_async,
+    prompt_attributes_for,
     with_prompt,
 )
 from ._scores import ScoreError, score, score_async
@@ -89,6 +90,7 @@ __all__ = [
     "init",
     "log",
     "observe",
+    "prompt_attributes_for",
     "propagate_attributes",
     "run_experiment",
     "run_experiment_async",

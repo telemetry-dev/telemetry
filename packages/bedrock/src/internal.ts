@@ -192,6 +192,16 @@ export function captureMaskedBeforeStart(): boolean {
   }
 }
 
+// Cores older than promptAttributesFor record a prompt only inside withPrompt. A namespace read
+// keeps them loadable without the export.
+export function promptAttributes(messages: unknown): SpanFields["attributes"] {
+  const read = (
+    telemetrySdk as { promptAttributesFor?: (messages: unknown) => SpanFields["attributes"] }
+  ).promptAttributesFor;
+
+  return typeof read === "function" ? read(messages) : undefined;
+}
+
 // The decision is made before the span starts so samplers see the same attributes as before.
 function startRequestSpan(name: string, options: StartSpanOptions): SpanHandle {
   const withheld = options.input !== undefined && isCut(options) && captureMaskedBeforeStart();
