@@ -15,6 +15,7 @@ import {
   clean,
   type Column,
   DASH,
+  displayWidth,
   formatAge,
   formatCost,
   formatCount,
@@ -196,13 +197,59 @@ const choice = <T extends string | number>(
 
 const DAYS = { "7d": 7, "30d": 30, "90d": 90 } as const;
 
-/** `arg` quoted for a POSIX shell, so a suggested command runs as shown when pasted. */
+/**
+ * `arg` quoted for a POSIX shell, so a suggested command runs as shown when pasted. A
+ * leading `=` is quoted too: zsh expands `=name` to a command's path.
+ */
 const shellQuote = (arg: string) =>
-  /^[\w@%+=:,./-]+$/.test(arg) ? arg : `'${arg.replaceAll("'", `'\\''`)}'`;
+  /^[\w@%+:,./-][\w@%+=:,./-]*$/.test(arg) ? arg : `'${arg.replaceAll("'", `'\\''`)}'`;
 
-/** Suggests the same command with the next page's cursor. */
-const suggestNextPage = (context: Context, cursor: string | null) => {
-  if (!cursor || json(context)) return;
+/**
+ * A telemetry command to suggest, quoted for a POSIX shell, that keeps this command's
+ * project so it reads the same one when pasted. Option values are joined with `=`, so a
+ * value starting with `-` isn't read as an option. Undefined when an id starts with `-`
+ * or a value holds characters the terminal line can't show as they are, since the
+ * printed command would then name something else.
+ */
+const suggestion = (
+  context: Context,
+  command: string,
+  ids: readonly string[],
+  options: Readonly<Record<string, string>> = {},
+) => {
+  const project = string(context, "project");
+  const values = { ...options, ...(project ? { project } : {}) };
+  const shown = (text: string) => clean(text) === text && !/[\n\t]/.test(text);
+
+  if (ids.some((id) => id.startsWith("-") || !shown(id))) return undefined;
+
+  if (!Object.values(values).every(shown)) return undefined;
+
+  return [
+    "telemetry",
+    command,
+    ...ids,
+    ...Object.entries(values).map(([name, value]) => `--${name}=${value}`),
+  ]
+    .map(shellQuote)
+    .join(" ");
+};
+
+const labelled = (label: string, command: string | undefined) =>
+  command === undefined ? undefined : `${label}: ${command}`;
+
+/** Prints likely next commands as one dim block on stderr, never with --json. */
+const suggest = (context: Context, ...lines: (string | undefined)[]) => {
+  const shown = lines.filter((line): line is string => line !== undefined);
+
+  if (json(context) || shown.length === 0) return;
+
+  note(style.dim(`\n${shown.join("\n")}`, process.stderr));
+};
+
+/** The same command with the next page's cursor. */
+const nextPage = (context: Context, cursor: string | null) => {
+  if (!cursor) return undefined;
 
   const kept: string[] = [];
 
@@ -218,9 +265,10 @@ const suggestNextPage = (context: Context, cursor: string | null) => {
     kept.push(arg);
   }
 
-  const command = [...kept, "--cursor", cursor].map((arg) => shellQuote(clean(arg))).join(" ");
+  // A cursor is base64url, which can start with `-`.
+  const command = [...kept, `--cursor=${cursor}`].map((arg) => shellQuote(clean(arg))).join(" ");
 
-  note(style.dim(`\nMore: telemetry ${command}`, process.stderr));
+  return `More: telemetry ${command}`;
 };
 
 const statusCell = (status: string): Cell =>
@@ -517,7 +565,15 @@ export async function tracesCommand(context: Context) {
       ),
     );
 
-    suggestNextPage(context, page.next_cursor);
+    const failure = page.traces.find((trace) => trace.status === "error");
+
+    suggest(
+      context,
+      failure
+        ? labelled("Inspect the newest failure", suggestion(context, "trace", [failure.id]))
+        : labelled("Inspect the newest trace", suggestion(context, "trace", [page.traces[0]!.id])),
+      nextPage(context, page.next_cursor),
+    );
   });
 }
 
@@ -579,7 +635,14 @@ export async function sessionsCommand(context: Context) {
       ),
     );
 
-    suggestNextPage(context, page.next_cursor);
+    suggest(
+      context,
+      labelled(
+        "List the most recent session's traces",
+        suggestion(context, "traces", [], { session: page.sessions[0]!.id }),
+      ),
+      nextPage(context, page.next_cursor),
+    );
   });
 }
 
@@ -676,7 +739,7 @@ export async function traceCommand(context: Context) {
 
   if (!traceId) throw usageError("Name the trace to show: telemetry trace <trace-id>");
 
-  await withApi(async (api) => {
+  await withApi(async (api, session) => {
     const project = await resolveProject(api, context);
     let page = await api.call<TraceDetailPage>(
       "get_trace",
@@ -721,8 +784,208 @@ export async function traceCommand(context: Context) {
         ),
       );
     }
+
+    // The span list carries only the start of an error; payload reads all of it.
+    const explained = failureCauses(spans).find((span) => span.error?.trim());
+
+    suggest(
+      context,
+      explained && grantedScopes(session).has(PAYLOADS_SCOPE)
+        ? labelled(
+            "Read the full error",
+            suggestion(context, "payload", [page.trace.id, explained.id], { field: "error" }),
+          )
+        : undefined,
+    );
   });
 }
+
+/**
+ * Failed spans with no failed child, in the order they started. Instrumentation marks
+ * every span an exception passes through as failed, so these are where failures began.
+ */
+const failureCauses = (spans: readonly Span[]) => {
+  const failed = spans.filter((span) => span.status === "error");
+  const failedParents = new Set(failed.map((span) => span.parent_span_id));
+
+  return failed
+    .filter((span) => !failedParents.has(span.id))
+    .sort((left, right) => Date.parse(left.started_at) - Date.parse(right.started_at));
+};
+
+// The Errors and Repeated sections each show this many rows, then a count of the rest.
+const SECTION_ROWS = 5;
+
+/** A section title like Logs, saying so when it covers only the spans read so far. */
+const sectionTitle = (title: string, count: number, partialOf: number | undefined) =>
+  style.bold(
+    `${title} ${style.dim(`(${formatInteger(count)}${partialOf === undefined ? "" : ` in the first ${formatInteger(partialOf)} spans`})`)}`,
+  );
+
+const more = (count: number) =>
+  count > SECTION_ROWS ? [style.dim(`  and ${formatInteger(count - SECTION_ROWS)} more`)] : [];
+
+/** The first line of the span's error text, after its type unless the text starts with it. */
+const errorSummary = (span: Span) => {
+  const type = oneLine(span.error_type ?? "");
+  const first =
+    (span.error ?? "")
+      .split(/\r\n|\r|\n/)
+      .map(oneLine)
+      .find(Boolean) ?? "";
+
+  if (!first) return type || "error";
+
+  return !type || first.startsWith(type) ? first : `${type}: ${first}`;
+};
+
+const PATH = " › ";
+
+// On a narrow terminal the error text is cut to this many columns before any ancestor
+// is dropped from the path, and is left out when fewer than ERROR_MIN columns remain.
+const ERROR_ROOM = 30;
+const ERROR_MIN = 8;
+// The fewest columns worth giving the ancestors before leaving them out.
+const ANCESTRY_MIN = 4;
+
+/**
+ * A failed span on one line: its ancestors, the span, and its error, fitted to `width`.
+ * The span's full error text is in the tree below, so the path keeps priority.
+ */
+const failureLine = (span: Span, byId: ReadonlyMap<string, Span>, width: number) => {
+  const ancestors: string[] = [];
+  const seen = new Set([span.id]);
+  let parent = span.parent_span_id ? byId.get(span.parent_span_id) : undefined;
+
+  while (parent && !seen.has(parent.id)) {
+    seen.add(parent.id);
+    ancestors.push(spanLabel(parent));
+    parent = parent.parent_span_id ? byId.get(parent.parent_span_id) : undefined;
+  }
+
+  ancestors.reverse();
+
+  const leaf = spanLabel(span);
+  const error = errorSummary(span);
+  const room = width - 2;
+  const errorWidth = displayWidth(error);
+  const reserve = Math.min(errorWidth, ERROR_ROOM);
+  const pathWidth = (kept: readonly string[]) => displayWidth([...kept, leaf].join(PATH));
+  let kept = ancestors;
+
+  // The root stays, so the path still says which agent or request it was under.
+  for (
+    let dropped = 1;
+    dropped < ancestors.length && pathWidth(kept) + 2 + reserve > room;
+    dropped += 1
+  ) {
+    kept = [ancestors[0]!, "…", ...ancestors.slice(dropped + 1)];
+  }
+
+  // When even the shortened path is too wide, the ancestors are cut, not the failed span.
+  const ancestry = kept.join(PATH);
+  const ancestryRoom = room - displayWidth(leaf) - displayWidth(PATH);
+  const lead =
+    kept.length === 0
+      ? ""
+      : displayWidth(ancestry) <= ancestryRoom
+        ? `${ancestry}${PATH}`
+        : ancestryRoom >= ANCESTRY_MIN
+          ? `${fit(ancestry, ancestryRoom)}${PATH}`
+          : "";
+  const path = fit(`${lead}${leaf}`, room);
+  const painted = path === `${lead}${leaf}` ? `${style.dim(lead)}${leaf}` : path;
+  const left = room - displayWidth(path) - 2;
+  const shown = left >= Math.min(errorWidth, ERROR_MIN) ? `  ${style.red(fit(error, left))}` : "";
+
+  return `  ${painted}${shown}`;
+};
+
+/** Milliseconds covered by at least one interval, so calls that overlap count once. */
+const wallTime = (intervals: readonly (readonly [number, number])[]) => {
+  let covered = 0;
+  let reached = Number.NEGATIVE_INFINITY;
+
+  for (const [start, end] of [...intervals].sort((left, right) => left[0] - right[0])) {
+    if (end <= reached) continue;
+    covered += end - Math.max(start, reached);
+    reached = end;
+  }
+
+  return covered;
+};
+
+/**
+ * Where a long trace went wrong and where its time went, above the span tree: failed
+ * spans with their path, and operations that ran more than once.
+ */
+const traceSummary = (spans: readonly Span[], total: number, partialOf: number | undefined) => {
+  const lines: string[] = [];
+  const byId = new Map(spans.map((span) => [span.id, span]));
+  const failed = failureCauses(spans);
+  const only = failed.length === 1 ? failed[0] : undefined;
+  // A root that failed with no message says nothing the header doesn't.
+  const rootOnly =
+    only !== undefined &&
+    !only.error?.trim() &&
+    !(only.parent_span_id && byId.has(only.parent_span_id));
+
+  if (failed.length > 0 && !rootOnly) {
+    lines.push(sectionTitle("Errors", failed.length, partialOf));
+
+    for (const span of failed.slice(0, SECTION_ROWS))
+      lines.push(failureLine(span, byId, outputWidth()));
+    lines.push(...more(failed.length), "");
+  }
+
+  // Grouped by the label the span tree shows: the name with its model, tool, or agent.
+  const groups = new Map<string, (readonly [number, number])[]>();
+
+  for (const span of spans) {
+    const start = Date.parse(span.started_at);
+
+    if (!Number.isFinite(start)) continue;
+
+    const label = spanLabel(span);
+    const intervals = groups.get(label) ?? [];
+
+    intervals.push([start, start + Math.max(0, span.duration_ms ?? 0)]);
+    groups.set(label, intervals);
+  }
+
+  const repeated = [...groups]
+    .filter(([, intervals]) => intervals.length > 1)
+    .map(([label, intervals]) => ({ label, count: intervals.length, wall: wallTime(intervals) }))
+    .sort((left, right) => right.wall - left.wall);
+
+  if (repeated.length > 0) {
+    lines.push(sectionTitle("Repeated", repeated.length, partialOf));
+
+    // The empty first column indents the rows; its header line is dropped.
+    const rows = table(
+      [
+        { header: "" },
+        { header: "", flex: true },
+        { header: "", align: "right" },
+        { header: "", align: "right" },
+        { header: "", align: "right" },
+      ],
+      repeated
+        .slice(0, SECTION_ROWS)
+        .map(({ label, count, wall }) => [
+          "",
+          label,
+          `×${formatInteger(count)}`,
+          formatDuration(wall),
+          { text: total > 0 ? formatPercent((wall / total) * 100) : DASH, paint: dim },
+        ]),
+    );
+
+    lines.push(...rows.split("\n").slice(1), ...more(repeated.length), "");
+  }
+
+  return lines;
+};
 
 function renderTrace(page: TraceDetailPage, spans: readonly Span[], logs: TraceDetailPage["logs"]) {
   const { trace } = page;
@@ -764,6 +1027,13 @@ function renderTrace(page: TraceDetailPage, spans: readonly Span[], logs: TraceD
   const origin = Math.min(...starts);
   const end = Math.max(...spans.map((span, index) => starts[index]! + (span.duration_ms ?? 0)));
   const total = Math.max(end - origin, trace.duration_ms ?? 0);
+
+  for (const line of traceSummary(
+    spans,
+    total,
+    page.next_cursor === null ? undefined : spans.length,
+  ))
+    out(line);
 
   const terminal = process.stdout.isTTY === true;
   const timelineWidth = terminal ? Math.min(60, Math.max(16, outputWidth() - 72)) : 0;

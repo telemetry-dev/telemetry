@@ -12,11 +12,14 @@ import {
   beforeRefresh,
   calls,
   EMAIL,
+  PARALLEL_TRACE_ID,
   PAYLOADS,
   PROJECTS,
+  QUIET_TRACE_ID,
   REFRESH_TOKEN,
   startFixture,
   TOKEN,
+  TRACE_ID,
   traces,
 } from "./fixture.ts";
 
@@ -35,17 +38,16 @@ afterAll(async () => {
 
 const sessionPath = () => join(home, sessionFile(fixture.url));
 
-const signIn = (project?: (typeof PROJECTS)[number]) =>
+const signIn = (
+  project?: (typeof PROJECTS)[number],
+  scope = "openid email offline_access telemetry:read telemetry:payloads",
+) =>
   writeFile(
     sessionPath(),
     JSON.stringify({
       server: fixture.url,
       client: { client_id: "fixture-client" },
-      tokens: {
-        access_token: TOKEN,
-        token_type: "Bearer",
-        scope: "openid email offline_access telemetry:read telemetry:payloads",
-      },
+      tokens: { access_token: TOKEN, token_type: "Bearer", scope },
       email: "ada@acme.dev",
       ...(project ? { project: { id: project.id, name: "support-bot" } } : {}),
     }),
@@ -153,6 +155,100 @@ test("payload --field prints the whole text across pages", async () => {
   expect(result.code).toBe(0);
   expect(result.stdout).toBe(PAYLOADS.output);
   expect(calls.filter((call) => call.tool === "get_span_payload").length).toBeGreaterThan(1);
+});
+
+test("trace leads with where the run failed and which calls repeated, counting parallel calls once", async () => {
+  await signIn(PROJECTS[0]);
+
+  const result = await run("trace", PARALLEL_TRACE_ID);
+  expect(result.code).toBe(0);
+
+  const lines = result.stdout.split("\n");
+  // Three 1 s searches started 50 ms apart cover 100 ms to 1,200 ms: 1.1 s of the 3 s
+  // trace, where adding them up would say 3 s and 100%.
+  expect(lines).toContain("  execute_tool web_search  ×3  1.10s  37%");
+  // The request that failed, under the tool that made it, under the agent.
+  expect(lines).toContain(
+    "  invoke_agent researcher › execute_tool fetch_page › GET /page  TimeoutError: Request timed out after 700 ms",
+  );
+  expect(lines.indexOf("Errors (1)")).toBeGreaterThan(0);
+  expect(lines.indexOf("Repeated (1)")).toBeGreaterThan(lines.indexOf("Errors (1)"));
+  expect(lines.findIndex((line) => line.startsWith("SPAN"))).toBeGreaterThan(
+    lines.indexOf("Repeated (1)"),
+  );
+  // Only the request where the failure began is listed and offered, not the tool and the
+  // agent it passed through.
+  expect(result.stderr.match(/telemetry payload .*/g)).toEqual([
+    `telemetry payload ${PARALLEL_TRACE_ID} t2 --field=error`,
+  ]);
+
+  // Two chat calls that don't overlap cover 1.18 s + 1.42 s of the 4.21 s trace. Measuring
+  // from the first start to the last end would say 2.64 s.
+  const sequential = await run("trace", TRACE_ID);
+  expect(sequential.stdout.split("\n")).toContain("  chat gpt-5  ×2  2.60s  62%");
+
+  // A sign-in without the payloads scope isn't pointed at a command that would refuse it.
+  await signIn(PROJECTS[0], "openid email offline_access telemetry:read");
+  const unscoped = await run("trace", PARALLEL_TRACE_ID);
+  expect(unscoped.code).toBe(0);
+  expect(unscoped.stderr).not.toContain("telemetry payload");
+});
+
+test("a trace with no failures and no repeated calls goes straight to the span tree", async () => {
+  await signIn(PROJECTS[0]);
+
+  const result = await run("trace", QUIET_TRACE_ID);
+  expect(result.code).toBe(0);
+  expect(result.stdout).toMatch(/^SPAN /m);
+  expect(result.stdout).not.toMatch(/^(Errors|Repeated) /m);
+  expect(result.stderr).toBe("");
+});
+
+/** The words a POSIX shell makes of a pasted command line. */
+const shellWords = (command: string) =>
+  new Promise<string[]>((resolve, reject) => {
+    execFile("sh", ["-c", `printf '%s\\n' ${command}`], (error, stdout) =>
+      error ? reject(error) : resolve(stdout.trimEnd().split("\n")),
+    );
+  });
+
+test("suggested next commands run as pasted, in the same project, and never print with --json", async () => {
+  await signIn();
+
+  // The newest trace succeeded, so the suggestion names the failed one after it.
+  const listed = await run("traces", "-p", "support-bot");
+  expect(listed.code).toBe(0);
+  const inspect = listed.stderr.match(/Inspect the newest failure: (.*)/)?.[1];
+  expect(await shellWords(inspect!)).toEqual([
+    "telemetry",
+    "trace",
+    TRACE_ID,
+    "--project=support-bot",
+  ]);
+
+  const sessions = await run("sessions", "--project=support-bot");
+  expect(sessions.code).toBe(0);
+  const words = await shellWords(sessions.stderr.match(/telemetry traces .*/)![0]);
+  expect(words).toEqual([
+    "telemetry",
+    "traces",
+    "--session=Ada's thread 42",
+    "--project=support-bot",
+  ]);
+
+  // Run as pasted, it asks for that session in that project.
+  calls.length = 0;
+  expect((await run(...words.slice(1))).code).toBe(0);
+  expect(calls.find((call) => call.tool === "search_traces")?.args).toMatchObject({
+    project_id: PROJECTS[0]!.id,
+    session_id: "Ada's thread 42",
+  });
+
+  for (const args of [["traces"], ["sessions"], ["trace", PARALLEL_TRACE_ID]]) {
+    const result = await run(...args, "-p", "support-bot", "--json");
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+  }
 });
 
 test("use saves the default project in a file only its owner can read", async () => {
