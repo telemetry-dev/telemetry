@@ -184,12 +184,16 @@ task.
 
 ## Experiments and scores
 
-`runExperiment(options)` / `run_experiment(...)` (and `run_experiment_async`) and `score(options)`
-/ `score(...)` (and `score_async`) call the Evals routes on `{baseUrl}`, with the API key, the base
+`runExperiment(options)` / `run_experiment(...)` (and `run_experiment_async`) and `score(options)` /
+`score(...)` (and `score_async`) call the Evals routes on `{baseUrl}`, with the API key, the base
 URL, and the empty-value rules of getPrompt. The requests have the `Authorization: Bearer <key>`
-header, the SDK header, and a JSON body. The redirect rule of getPrompt applies. An error has the
-code of the `{ error: { code, message } }` body, or `http_<status>`, or `missing_api_key`,
-`timeout`, `network_error`, or `invalid_response`.
+header, the SDK header, and a JSON body. Python also sends
+`User-Agent: telemetry-dev-python/<version>`, because bot filters refuse the default
+`Python-urllib/3.x`. The body is the JSON of `JSON.stringify`: a lone surrogate goes as a
+`\uXXXX` escape. The TypeScript SDK calls `fetch` as a plain function, because Workers and
+browsers reject a call whose `this` is another object. The redirect rule of getPrompt applies. An
+error has the code of the `{ error: { code, message } }` body, or `http_<status>`, or
+`missing_api_key`, `timeout`, `network_error`, or `invalid_response`.
 
 An experiment run sends these requests in this sequence:
 
@@ -203,21 +207,28 @@ An experiment run sends these requests in this sequence:
    value are left out.
 3. `POST /v1/experiments/{id}/items` with at most 100 item runs and at most 4 MiB of JSON. An item
    run has `itemId`, `runIndex`, `output` (a string as it is, other values as `JSON.stringify` JSON,
-   `null` for no value, cut to 100,000 UTF-16 units), `traceId` (when the span records),
-   `latencyMs`, and, for a task that failed, `error` (`<name>: <message>`, cut to 4,000 UTF-16
-   units) or, for a task that succeeded, `scores`. The posts go one at a time, in order. A post
-   that fails stops the run: no item starts after it, and the run fails when the running items end.
+   `null` for no value and for a value that JSON cannot hold, such as an object that holds itself,
+   cut to 100,000 UTF-16 units), `traceId` (when the span records), `latencyMs`, and, for a task
+   that failed, `error` (`<name>: <message>`, cut to 4,000 UTF-16 units) or, for a task that
+   succeeded, `scores`. Python sends a lone surrogate of an output or an error as U+FFFD. Each run
+   gets its own deep copy of the item, so a task that changes its input does not change the next
+   run. The posts go one at a time, in order. A post or a page fetch that fails stops the run: no
+   item starts after it. When the running items end, the SDK sends the request of step 4, sends its
+   failure to `onError` / `on_error`, and fails with the first error. The server then ends the
+   experiment with the item runs that it has, or fails it when it has none. Python does the same
+   after `KeyboardInterrupt` and cancellation.
 4. `POST /v1/experiments/{id}/complete`, after `flush()`.
 5. `GET /v1/experiments/{id}`, after 1, 2, 4, and then each 5 seconds, until the `status` is
    `completed`, `failed`, or `stopped`, for 30 minutes at most (`timeout`).
 
 Retries: the GET requests, the item posts, and the complete request try 3 times in all after a
 timeout, a network error, a 429, or a 5xx. The server skips an item run that it has. The POST that
-makes the experiment tries again only after a 429 or a 503. A retry waits for the `Retry-After` of
-a 429 or 503 (seconds or an HTTP date), at most 60 seconds, or else 1 second and then 2 seconds.
-`POST /v1/scores` makes one request, with no retry. The TypeScript request timeouts abort the
-request: 30 seconds for the experiment requests and 10 seconds for a score. The Python timeouts
-apply to each socket operation of urllib.
+makes the experiment tries again only after a 429, which the rate limit answers before any work: the
+server answers 503 when its database work times out, which can be after the commit. A retry waits
+for the `Retry-After` of a 429 or 503 (seconds or an HTTP date), at most 60 seconds, or else 1
+second and then 2 seconds. `POST /v1/scores` makes one request, with no retry. The TypeScript
+request timeouts abort the request: 30 seconds for the experiment requests and 10 seconds for a
+score. The Python timeouts apply to each socket operation of urllib.
 
 Options and limits: `runsPerItem` / `runs_per_item` is an integer from 1 to 5 (default 1).
 `concurrency` is an integer from 1 to 100 (default 4). `evaluators` has at most 20 trimmed names
@@ -244,13 +255,18 @@ not all zeros, a `spanId` is 16 lowercase hex digits and not all zeros and needs
 never throws: it returns the id, or no value after it sends the `ScoreError` to `onError` /
 `on_error`.
 
+The result of step 5 needs `id`, `name`, `status`, `url`, `itemsTotal`, `itemsDone`, `scores`,
+and `checkStatus`, else it is `invalid_response`: `checkStatus` decides CI mode, so a missing one
+does not read as no check. A field of a score that can be null can also be missing.
+
 CI mode is on when the `ci` option is true, or with no option when `CI` is `true` or `1`. Then:
 
 - In GitHub Actions (`GITHUB_ACTIONS=true` and a `GITHUB_REPOSITORY` of `owner/name`, at most 200
   characters), `ci` is `{ provider: "github_actions", repository, commit, prNumber, prTitle, prUrl,
 runUrl }`. The commit is the `pull_request.head.sha` of `GITHUB_EVENT_PATH`, else `GITHUB_SHA`,
-  and must be 7 to 64 hex digits. The title is cut to 256 UTF-16 units. A URL must be `https://`
-  with no space, at most 2,048 UTF-16 units. The run URL is
+  and must be 7 to 64 hex digits. The title is cut to 256 UTF-16 units, with no half of a
+  surrogate pair at the end, because Postgres rejects a lone surrogate in jsonb. A URL must be
+  `https://` with no space, at most 2,048 UTF-16 units. The run URL is
   `<GITHUB_SERVER_URL>/<repository>/actions/runs/<GITHUB_RUN_ID>`. Keys without a value are left
   out.
 - After the result, a status other than `completed` is `experiment_failed`, and a `checkStatus` of
