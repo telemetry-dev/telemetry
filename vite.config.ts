@@ -4,7 +4,7 @@ export default defineConfig({
   staged: {
     "*": "vp check --fix --no-error-on-unmatched-pattern",
   },
-  fmt: { ignorePatterns: ["sdks/**", "packages/*/CHANGELOG.md"] },
+  fmt: { ignorePatterns: ["sdks/**", "packages/*/CHANGELOG.md", "actions/*/CHANGELOG.md"] },
   lint: {
     ignorePatterns: ["sdks/**"],
     options: { typeAware: true, typeCheck: true },
