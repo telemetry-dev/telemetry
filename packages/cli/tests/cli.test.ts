@@ -194,8 +194,16 @@ test("input that isn't valid exits 2 before calling telemetry.dev, even from a s
 
 const savedSession = async () => JSON.parse(await readFile(sessionPath(), "utf8"));
 
-test("a shell without a terminal signs in with --no-browser, then --finish, keeping the old sign-in until then", async () => {
-  await signIn(PROJECTS[0]);
+test("a shell without a terminal signs in with --no-browser, then --finish, keeping the old sign-in until then and revoking it after", async () => {
+  await writeFile(
+    sessionPath(),
+    JSON.stringify({
+      server: fixture.url,
+      client: { client_id: "fixture-client" },
+      tokens: { access_token: TOKEN, token_type: "Bearer", refresh_token: "previous-refresh" },
+    }),
+    { mode: 0o600 },
+  );
 
   const started = await run("login", "--no-browser");
   expect(started.code).toBe(0);
@@ -216,6 +224,7 @@ test("a shell without a terminal signs in with --no-browser, then --finish, keep
   expect(refused.code).toBe(4);
   expect(refused.stderr).toContain("telemetry login");
   expect(refused.stderr).not.toContain("    at ");
+  expect(calls.some((call) => call.tool === "oauth:revoke")).toBe(false);
   expect(await savedSession()).toMatchObject({ tokens: { access_token: TOKEN }, pending: {} });
 
   const finished = await run("login", "--finish", address);
@@ -226,6 +235,11 @@ test("a shell without a terminal signs in with --no-browser, then --finish, keep
   const session = await savedSession();
   expect(session).toMatchObject({ email: EMAIL, tokens: { refresh_token: REFRESH_TOKEN } });
   expect(session.pending).toBeUndefined();
+
+  // The sign-in it replaced no longer works at the server.
+  expect(calls.filter((call) => call.tool === "oauth:revoke").map((call) => call.args)).toEqual([
+    expect.objectContaining({ token: "previous-refresh", client_id: "fixture-client" }),
+  ]);
 
   // The fixture rejects a code without the verifier its challenge came from.
   expect(calls.some((call) => call.tool === "oauth:authorization_code")).toBe(true);
