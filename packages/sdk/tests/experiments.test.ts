@@ -21,6 +21,7 @@ interface Request {
   method: string;
   url: URL;
   body: any;
+  signal: AbortSignal | undefined;
 }
 
 const EXPERIMENT_ID = "6f9619ff-8b86-4011-b42d-00c04fc964ff";
@@ -34,7 +35,7 @@ function datasetItem(number: number, split: string | null = null) {
   return {
     id: itemId(number),
     number,
-    input: { question: `q${number}` },
+    input: { question: `q${number}` } as Record<string, unknown>,
     expectedOutput: `a${number}`,
     metadata: { source: "test" },
     tags: ["golden"],
@@ -67,7 +68,7 @@ function fakeApi(
     items?: ReturnType<typeof datasetItem>[];
     pageSize?: number;
     results?: Record<string, unknown>[];
-    override?: (request: Request) => Response | undefined;
+    override?: (request: Request) => Response | Promise<Response> | undefined;
   } = {},
 ) {
   const items = options.items ?? [datasetItem(1), datasetItem(2)];
@@ -82,6 +83,7 @@ function fakeApi(
       method: init?.method ?? "GET",
       url,
       body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+      signal: init?.signal ?? undefined,
     };
     requests.push(request);
 
@@ -381,6 +383,66 @@ test("a task that throws fails only its item", async () => {
   expect(passed).not.toHaveProperty("error");
 });
 
+test("an output or an error that cannot be encoded does not stop the run", async () => {
+  const api = fakeApi({ items: [datasetItem(1), datasetItem(2), datasetItem(3)] });
+  const cycle: Record<string, unknown> = {};
+  cycle.self = cycle;
+  const unreadable = Object.defineProperty(new Error(), "message", {
+    get() {
+      throw new Error("no message");
+    },
+  });
+
+  const outcome = await experiment(api, {
+    task: (item) => {
+      if (item.number === 3) throw unreadable;
+
+      return item.number === 1 ? cycle : 10n;
+    },
+    // A lone surrogate, which UTF-8 cannot hold.
+    scorers: { tone: () => "\ud83d" },
+  });
+
+  expect(outcome.status).toBe("completed");
+  expect(
+    api
+      .posts()
+      .flat()
+      .sort((a: { itemId: string }, b: { itemId: string }) => a.itemId.localeCompare(b.itemId))
+      .map((run: { output: unknown; error?: unknown; scores?: unknown }) => [
+        run.output,
+        run.error,
+        run.scores,
+      ]),
+  ).toEqual([
+    [null, undefined, [{ name: "tone", label: "\ud83d" }]],
+    [null, undefined, [{ name: "tone", label: "\ud83d" }]],
+    [null, "A value that cannot be converted to a string was thrown", undefined],
+  ]);
+  expect(routes(api.requests)).toContain(`POST /v1/experiments/${EXPERIMENT_ID}/complete`);
+});
+
+test("each run of an item starts from the dataset input, also when a task changes it", async () => {
+  const api = fakeApi({
+    items: [{ ...datasetItem(1), input: { messages: [{ role: "user", content: "Hi" }] } }],
+  });
+  const seen: number[] = [];
+
+  await experiment(api, {
+    runsPerItem: 3,
+    concurrency: 1,
+    task: (item) => {
+      const messages = item.input.messages as unknown[];
+      seen.push(messages.length);
+      messages.push({ role: "assistant", content: "Hello" });
+
+      return "ok";
+    },
+  });
+
+  expect(seen).toEqual([1, 1, 1]);
+});
+
 test("scorers give pass/fail, numbers, labels, and reasons, and a bad result drops only its score", async () => {
   const errors: Error[] = [];
   setup({ environment: "experiment", onError: (error) => errors.push(error) });
@@ -418,14 +480,14 @@ test("scorers give pass/fail, numbers, labels, and reasons, and a bad result dro
   ]);
 });
 
-test("a failed post of items stops new items, never completes, and rejects with the API error", async () => {
+test("a failed post of items stops new items, completes the experiment, and rejects with the API error", async () => {
   const api = fakeApi({
     items: Array.from({ length: 300 }, (_, index) => datasetItem(index + 1)),
     override: (request) =>
       request.url.pathname.endsWith("/items")
         ? Response.json(
-            { error: { code: "experiment_ended", message: "support-golden-v3 has ended." } },
-            { status: 409 },
+            { error: { code: "item_not_found", message: "support-golden v3 has no item" } },
+            { status: 422 },
           )
         : undefined,
   });
@@ -441,10 +503,35 @@ test("a failed post of items stops new items, never completes, and rejects with 
   }).catch((caught: unknown) => caught);
 
   expect(error).toBeInstanceOf(ExperimentError);
-  expect(error).toMatchObject({ code: "experiment_ended", status: 409 });
+  expect(error).toMatchObject({ code: "item_not_found", status: 422 });
   // The one worker waits for the post of the first 100, which fails, so no item starts after it.
   expect(started).toBe(100);
-  expect(routes(api.requests)).not.toContain(`POST /v1/experiments/${EXPERIMENT_ID}/complete`);
+  // The complete ends the experiment, which would else stay running.
+  expect(routes(api.requests).slice(-2)).toEqual([
+    `POST /v1/experiments/${EXPERIMENT_ID}/items`,
+    `POST /v1/experiments/${EXPERIMENT_ID}/complete`,
+  ]);
+});
+
+test("a complete that fails after a failed run goes to onError, and the run rejects with the first error", async () => {
+  const errors: Error[] = [];
+  setup({ environment: "experiment", onError: (error) => errors.push(error) });
+  const api = fakeApi({
+    override: (request) =>
+      request.url.pathname.endsWith("/items") || request.url.pathname.endsWith("/complete")
+        ? Response.json(
+            { error: { code: "invalid_api_key", message: "The API key was revoked" } },
+            { status: 401 },
+          )
+        : undefined,
+  });
+
+  await expect(experiment(api)).rejects.toMatchObject({
+    code: "invalid_api_key",
+    message: "The API key was revoked",
+  });
+  expect(routes(api.requests).filter((route) => route.endsWith("/complete"))).toHaveLength(1);
+  expect(errors.map((error) => (error as ExperimentError).code)).toEqual(["invalid_api_key"]);
 });
 
 test("an item post that fails with 500 goes again, and the server skips the runs it has", async () => {
@@ -462,17 +549,97 @@ test("an item post that fails with 500 goes again, and the server skips the runs
   expect(api.posts()[1]).toEqual(api.posts()[0]);
 });
 
-test("a create that fails with 500 does not go again, so it cannot start two experiments", async () => {
+test("a post of items holds at most 4 MiB of JSON", async () => {
+  const api = fakeApi({ items: Array.from({ length: 20 }, (_, index) => datasetItem(index + 1)) });
+
+  // 100,000 characters of 3 UTF-8 bytes: about 300 KB of JSON for each item run.
+  await experiment(api, { task: () => "中".repeat(100_000) });
+
+  expect(api.posts().map((items) => items.length)).toEqual([13, 7]);
+});
+
+test.each([
+  ["10,000 items in pages run", 10_000, undefined],
+  ["10,001 items in pages stop the run", 10_001, "invalid_response"],
+])("%s", async (_, count, code) => {
   const api = fakeApi({
-    override: (request) =>
-      request.method === "POST" && request.url.pathname === "/v1/experiments"
-        ? new Response("upstream", { status: 500 })
-        : undefined,
+    items: Array.from({ length: count }, (_, index) => datasetItem(index + 1)),
+    pageSize: 5_000,
   });
 
-  await expect(experiment(api)).rejects.toMatchObject({ code: "http_500", status: 500 });
-  expect(routes(api.requests).filter((route) => route === "POST /v1/experiments")).toHaveLength(1);
+  const outcome = await experiment(api, { concurrency: 20, task: () => "ok" }).catch(
+    (caught: unknown) => caught,
+  );
+
+  expect((outcome as ExperimentError).code).toBe(code);
+  expect(api.posts().flat()).toHaveLength(10_000);
+  expect(routes(api.requests).filter((route) => route.endsWith("/complete"))).toHaveLength(1);
 });
+
+test.each([
+  ["a dataset page", "GET /v1/datasets/support-golden", "timeout", 2, undefined],
+  ["an item post", `POST /v1/experiments/${EXPERIMENT_ID}/items`, "network", 2, undefined],
+  ["the create", "POST /v1/experiments", "timeout", 1, "timeout"],
+  ["the create", "POST /v1/experiments", "network", 1, "network_error"],
+])("a %s %s, after a %s, sends %i times in all", async (_, route, failure, sends, code) => {
+  vi.useFakeTimers();
+
+  try {
+    let failures = 1;
+    const api = fakeApi({
+      override: (request) => {
+        if (`${request.method} ${request.url.pathname}` !== route || failures-- <= 0) {
+          return undefined;
+        }
+
+        if (failure === "network") return Promise.reject(new TypeError("fetch failed"));
+
+        // A server that never answers: the request ends when its timeout aborts it.
+        return new Promise<Response>((_, reject) =>
+          request.signal!.addEventListener("abort", () => reject(request.signal!.reason)),
+        );
+      },
+    });
+
+    const outcome = experiment(api).catch((caught: unknown) => caught);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(((await outcome) as ExperimentError).code).toBe(code);
+    expect(routes(api.requests).filter((sent) => sent === route)).toHaveLength(sends);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test.each([
+  ["500", () => new Response("upstream", { status: 500 }), "http_500"],
+  // The server answers 503 when its database work times out, which can be after the commit.
+  [
+    "503",
+    () =>
+      Response.json(
+        { error: { code: "evals_unavailable", message: "Evals are unavailable right now" } },
+        { status: 503 },
+      ),
+    "evals_unavailable",
+  ],
+])(
+  "a create that fails with %s does not go again, so it cannot start two experiments",
+  async (status, reply, code) => {
+    const api = fakeApi({
+      override: (request) =>
+        request.method === "POST" && request.url.pathname === "/v1/experiments"
+          ? reply()
+          : undefined,
+    });
+
+    await expect(experiment(api)).rejects.toMatchObject({ code, status: Number(status) });
+    expect(routes(api.requests)).toEqual([
+      "GET /v1/datasets/support-golden",
+      "POST /v1/experiments",
+    ]);
+  },
+);
 
 test("a create that gets a 429 goes again after its Retry-After", async () => {
   let limited = 1;
@@ -503,6 +670,38 @@ test("waits until the server evaluators end the experiment", async () => {
   expect(
     routes(api.requests).filter((route) => route.startsWith("GET /v1/experiments/")),
   ).toHaveLength(2);
+});
+
+test("gives up when the experiment does not end in 30 minutes, with the result", async () => {
+  vi.useFakeTimers();
+
+  try {
+    const polls: number[] = [];
+    const api = fakeApi({
+      override: (request) => {
+        if (request.method === "GET" && request.url.pathname.startsWith("/v1/experiments/")) {
+          polls.push(Date.now());
+
+          return Response.json(result({ status: "running", itemsDone: 1 }));
+        }
+
+        return undefined;
+      },
+    });
+
+    const outcome = experiment(api).catch((caught: unknown) => caught);
+    await vi.advanceTimersByTimeAsync(31 * 60_000);
+    const error = (await outcome) as ExperimentError;
+
+    expect(error.code).toBe("timeout");
+    expect(error.result?.status).toBe("running");
+    // The last poll is the one whose next wait of 5 seconds would end past the 30 minutes.
+    const waited = polls.at(-1)! - polls[0]!;
+    expect(waited).toBeGreaterThan(30 * 60_000 - 5_000);
+    expect(waited).toBeLessThanOrEqual(30 * 60_000);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test.each([
@@ -608,6 +807,35 @@ test.each([
   await expect(experiment(api, options)).resolves.toMatchObject({ checkStatus: "failed" });
 });
 
+test("a result score that leaves out its null fields reads them as null", async () => {
+  const api = fakeApi({
+    results: [result({ scores: [{ name: "length", passCount: 0, failCount: 0 }] })],
+  });
+
+  const outcome = await experiment(api);
+
+  expect(outcome.scores).toEqual([
+    {
+      name: "length",
+      kind: null,
+      value: null,
+      passCount: 0,
+      failCount: 0,
+      baselineValue: null,
+      delta: null,
+      minScore: null,
+      passed: null,
+    },
+  ]);
+});
+
+test("a result without checkStatus is an invalid response, not a run with no check", async () => {
+  const { checkStatus: _, ...missing } = failedCheck;
+  const api = fakeApi({ results: [missing] });
+
+  await expect(experiment(api)).rejects.toMatchObject({ code: "invalid_response" });
+});
+
 test("in CI mode an experiment that fails rejects with its error", async () => {
   vi.stubEnv("CI", "1");
   const api = fakeApi({
@@ -664,6 +892,23 @@ test("in GitHub Actions the experiment records the pull request, its head commit
     },
   });
   expect(readFileSync(results, "utf8")).toBe(`${JSON.stringify(result())}\n`);
+});
+
+test("a pull request title is cut to 256 UTF-16 units without half of an emoji", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "td-experiment-"));
+  const event = join(dir, "event.json");
+  // GitHub counts the emoji as one character, thus the title fits its limit of 256.
+  writeFileSync(event, JSON.stringify({ pull_request: { title: `${"a".repeat(255)}😀` } }));
+  vi.stubEnv("CI", "true");
+  vi.stubEnv("GITHUB_ACTIONS", "true");
+  vi.stubEnv("GITHUB_REPOSITORY", "acme/support");
+  vi.stubEnv("GITHUB_SHA", "a1b2c3d");
+  vi.stubEnv("GITHUB_EVENT_PATH", event);
+  const api = fakeApi();
+
+  await experiment(api);
+
+  expect(api.requests[1]!.body.ci.prTitle).toBe("a".repeat(255));
 });
 
 test.each([

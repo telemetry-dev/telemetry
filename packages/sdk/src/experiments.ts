@@ -220,8 +220,10 @@ const RATE_KINDS = new Set(["pass_fail", "up_down"]);
  * runExperiment waits for the `evaluators` of the server, prints the result, and returns it.
  *
  * The run cannot start without its dataset, so runExperiment rejects with an `ExperimentError`
- * when a request fails. A task that throws fails only its item. In CI mode, runExperiment rejects
- * when the check fails, so the process exits with an error.
+ * when a request fails. When the run stops after it made the experiment, it first sends the
+ * complete request, so that telemetry.dev ends the experiment with the item runs that it has. A
+ * task that throws fails only its item. In CI mode, runExperiment rejects when the check fails, so
+ * the process exits with an error.
  */
 export async function runExperiment(options: RunExperimentOptions): Promise<ExperimentResult> {
   const env = resolveEnv();
@@ -266,23 +268,24 @@ export async function runExperiment(options: RunExperimentOptions): Promise<Expe
     }),
   );
 
-  console.log(
-    `Experiment ${created.name}: ${created.itemsTotal / run.runsPerItem} items` +
-      (run.runsPerItem > 1 ? `, ${run.runsPerItem} runs each` : "") +
-      `. ${created.url}`,
-  );
+  try {
+    console.log(
+      `Experiment ${created.name}: ${created.itemsTotal / run.runsPerItem} items` +
+        (run.runsPerItem > 1 ? `, ${run.runsPerItem} runs each` : "") +
+        `. ${created.url}`,
+    );
+    await runItems(api, run, created, itemRuns(api, run, first));
+  } catch (error) {
+    // Without the complete, the experiment would stay running: the server ends it with the item
+    // runs that it has, or fails it when it has none.
+    await complete(api, created.id).catch((cause: unknown) => reportError(api.onError, cause));
 
-  await runItems(api, run, created, itemRuns(api, run, first));
+    throw error;
+  }
+
   // The spans of the items reach ingest before the server reads their cost.
   await flush();
-
-  await request(
-    api,
-    ExperimentError,
-    "POST",
-    `/v1/experiments/${encodeURIComponent(created.id)}/complete`,
-    { timeoutMs: REQUEST_TIMEOUT_MS, idempotent: true },
-  );
+  await complete(api, created.id);
 
   const { result, body } = await waitForResult(api, created.id);
   writeResult(env, body, api.onError);
@@ -456,7 +459,10 @@ async function* itemRuns(
     }
 
     for (const item of page.items) {
-      for (let runIndex = 0; runIndex < run.runsPerItem; runIndex++) yield { ...item, runIndex };
+      // A copy for each run, so that a task that changes its input does not change the next run.
+      for (let runIndex = 0; runIndex < run.runsPerItem; runIndex++) {
+        yield { ...structuredClone(item), runIndex };
+      }
     }
 
     if (page.nextCursor === null) return;
@@ -496,7 +502,7 @@ async function fetchPage(
 
 /**
  * Runs the items, `concurrency` at a time, and posts each result. A post or a page fetch that
- * fails stops the run: no new item starts, and runExperiment rejects when the running items end.
+ * fails stops the run: no new item starts, and runItems rejects when the running items end.
  */
 async function runItems(
   api: Authed,
@@ -527,11 +533,11 @@ async function runItems(
 
       if (next.done) return;
 
-      const result = await runItem(run, experiment, next.value, api.onError);
-
-      await batch.add(result).catch((error: unknown) => {
-        failure ??= { error };
-      });
+      await runItem(run, experiment, next.value, api.onError)
+        .then((result) => batch.add(result))
+        .catch((error: unknown) => {
+          failure ??= { error };
+        });
     }
   };
 
@@ -733,13 +739,21 @@ function outputText(output: unknown): string | null {
 }
 
 function errorText(error: unknown): string {
-  if (error instanceof Error) return `${error.name}: ${error.message}`;
-
   try {
-    return String(error);
+    return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
   } catch {
     return "A value that cannot be converted to a string was thrown";
   }
+}
+
+function complete(api: Authed, id: string): Promise<unknown> {
+  return request(
+    api,
+    ExperimentError,
+    "POST",
+    `/v1/experiments/${encodeURIComponent(id)}/complete`,
+    { timeoutMs: REQUEST_TIMEOUT_MS, idempotent: true },
+  );
 }
 
 /** Waits until the server evaluators finish and the experiment ends. */
@@ -896,6 +910,7 @@ function parseResult(body: unknown): ExperimentResult {
     typeof body.name !== "string" ||
     typeof body.status !== "string" ||
     typeof body.url !== "string" ||
+    // Required: it decides the result of CI mode, so a missing one must not read as no check.
     !(
       body.checkStatus === null ||
       body.checkStatus === "passed" ||
@@ -925,34 +940,33 @@ function parseResult(body: unknown): ExperimentResult {
   };
 }
 
-function parseScore(value: unknown): ExperimentScore | undefined {
+/** A score of the result. A field that can be null can also be missing. */
+function parseScore(raw: unknown): ExperimentScore | undefined {
+  if (!isRecord(raw)) return undefined;
+
+  const score = {
+    name: raw.name,
+    kind: raw.kind ?? null,
+    value: raw.value ?? null,
+    passCount: raw.passCount,
+    failCount: raw.failCount,
+    baselineValue: raw.baselineValue ?? null,
+    delta: raw.delta ?? null,
+    minScore: raw.minScore ?? null,
+    passed: raw.passed ?? null,
+  };
+  const numbers = [score.value, score.baselineValue, score.delta, score.minScore];
+
   if (
-    !isRecord(value) ||
-    typeof value.name !== "string" ||
-    !(value.kind === null || typeof value.kind === "string") ||
-    typeof value.passCount !== "number" ||
-    typeof value.failCount !== "number"
+    typeof score.name !== "string" ||
+    !(score.kind === null || typeof score.kind === "string") ||
+    typeof score.passCount !== "number" ||
+    typeof score.failCount !== "number" ||
+    !numbers.every((field) => field === null || typeof field === "number") ||
+    !(score.passed === null || typeof score.passed === "boolean")
   ) {
     return undefined;
   }
 
-  const nullable = ["value", "baselineValue", "delta", "minScore"] as const;
-
-  if (!nullable.every((key) => value[key] === null || typeof value[key] === "number")) {
-    return undefined;
-  }
-
-  if (value.passed !== null && typeof value.passed !== "boolean") return undefined;
-
-  return {
-    name: value.name,
-    kind: value.kind,
-    value: value.value as number | null,
-    passCount: value.passCount,
-    failCount: value.failCount,
-    baselineValue: value.baselineValue as number | null,
-    delta: value.delta as number | null,
-    minScore: value.minScore as number | null,
-    passed: value.passed,
-  };
+  return score as ExperimentScore;
 }

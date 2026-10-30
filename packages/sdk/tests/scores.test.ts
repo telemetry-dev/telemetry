@@ -85,6 +85,31 @@ test("posts the score with the key and base URL of init, and resolves with its i
   });
 });
 
+test("calls the global fetch as a plain function, as Workers and browsers need", async () => {
+  vi.stubEnv("TELEMETRY_DEV_API_KEY", "td_live_key");
+  // A strict function called as a method of an object gets that object as `this`.
+  vi.stubGlobal("fetch", function (this: unknown) {
+    if (this !== undefined && this !== globalThis) throw new TypeError("Illegal invocation");
+
+    return Promise.resolve(Response.json({ id: "score-3" }, { status: 202 }));
+  });
+
+  try {
+    await expect(score({ name: "helpful", traceId: TRACE_ID, value: 1 })).resolves.toBe("score-3");
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+test("score with no options reports invalid_score and resolves undefined", async () => {
+  const errors = errorsOf();
+
+  await expect((score as (options?: ScoreOptions) => Promise<unknown>)()).resolves.toBeUndefined();
+  expect(errors.map((error) => [error.code, error.message])).toEqual([
+    ["invalid_score", "name must be a string of 1 to 64 characters"],
+  ]);
+});
+
 test("a session score needs no trace, and a label goes trimmed", async () => {
   const { fetch, calls } = fakeFetch(() => Response.json({ id: "score-2" }, { status: 202 }));
 

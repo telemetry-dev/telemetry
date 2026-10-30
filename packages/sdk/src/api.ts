@@ -34,8 +34,8 @@ interface RequestOptions {
   timeoutMs: number;
   /**
    * The server takes a repeat of this request at most once, so a retry after a timeout, a network
-   * error, or a 5xx is safe. Other requests try again only after a 429 or a 503: the server did
-   * not take the request then.
+   * error, or a 5xx is safe. Other requests try again only after a 429, which the rate limit
+   * answers before the server does any work. A 503 can come after the work committed.
    */
   idempotent: boolean;
   /** Default 3. */
@@ -141,8 +141,12 @@ async function send<E extends Error>(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
+  // A plain call, not a method call: Workers and browsers reject a fetch whose `this` is not the
+  // global object.
+  const { fetchImpl } = api;
+
   try {
-    const res = await api.fetchImpl(url, {
+    const res = await fetchImpl(url, {
       method,
       headers: {
         authorization: `Bearer ${api.apiKey}`,
@@ -193,7 +197,7 @@ async function send<E extends Error>(
 }
 
 function retryable(status: number | undefined, idempotent: boolean): boolean {
-  if (status === 429 || status === 503) return true;
+  if (status === 429) return true;
 
   return idempotent && (status === undefined || status >= 500);
 }

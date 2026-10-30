@@ -598,7 +598,6 @@ function keyFingerprint(apiKey: string): string {
   return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-/** The Retry-After of a 429 or 503 response, as seconds or an IMF-fixdate HTTP date, capped. */
 function parseResponse(body: unknown): PromptResponse | undefined {
   if (!isRecord(body)) return undefined;
   const { name, type, label, version, rollout } = body;

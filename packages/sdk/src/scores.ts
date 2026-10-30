@@ -51,12 +51,14 @@ const TIMEOUT_MS = 10_000;
  * from a client that is not initialized is all zeros, and score reports it as `invalid_score`.
  */
 export async function score(options: ScoreOptions): Promise<string | undefined> {
-  const api = resolveApi(options);
+  // A caller without types can pass no options, and score must not reject then either.
+  const fields: Partial<ScoreOptions> = isRecord(options) ? options : {};
+  const api = resolveApi(fields);
 
   try {
-    const name = typeof options.name === "string" ? options.name.trim() : options.name;
-    const label = typeof options.label === "string" ? options.label.trim() : options.label;
-    const problem = checkScore({ ...options, name, label });
+    const name = typeof fields.name === "string" ? fields.name.trim() : fields.name;
+    const label = typeof fields.label === "string" ? fields.label.trim() : fields.label;
+    const problem = checkScore({ ...fields, name, label });
 
     if (problem) throw new ScoreError("invalid_score", problem);
 
@@ -69,13 +71,13 @@ export async function score(options: ScoreOptions): Promise<string | undefined> 
 
     const body = await request({ ...api, apiKey: api.apiKey }, ScoreError, "POST", "/v1/scores", {
       body: {
-        traceId: options.traceId,
-        spanId: options.spanId,
-        sessionId: options.sessionId,
+        traceId: fields.traceId,
+        spanId: fields.spanId,
+        sessionId: fields.sessionId,
         name,
-        value: options.value,
+        value: fields.value,
         label,
-        comment: options.comment,
+        comment: fields.comment,
       },
       timeoutMs: TIMEOUT_MS,
       idempotent: false,
@@ -131,8 +133,8 @@ export function checkValue(
   return undefined;
 }
 
-function checkScore(options: ScoreOptions): string | undefined {
-  const { name, traceId, spanId, sessionId, value, label, comment } = options;
+function checkScore(fields: Partial<ScoreOptions>): string | undefined {
+  const { name, traceId, spanId, sessionId, value, label, comment } = fields;
 
   if (typeof name !== "string" || name.length === 0 || name.length > MAX_SCORE_NAME_LENGTH) {
     return `name must be a string of 1 to ${MAX_SCORE_NAME_LENGTH} characters`;

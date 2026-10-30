@@ -141,10 +141,22 @@ function pullRequest(
       Number.isSafeInteger(pull.number) && (pull.number as number) > 0
         ? (pull.number as number)
         : undefined,
-    title: typeof pull.title === "string" ? pull.title.slice(0, MAX_PR_TITLE_LENGTH) : undefined,
+    title: typeof pull.title === "string" ? cut(pull.title, MAX_PR_TITLE_LENGTH) : undefined,
     url: typeof pull.html_url === "string" ? httpsUrl(pull.html_url) : undefined,
     commit: typeof head?.sha === "string" ? head.sha : undefined,
   };
+}
+
+/**
+ * `text` cut to `max` UTF-16 units, with no half of a surrogate pair at the end: the API stores the
+ * run as jsonb, and Postgres rejects a lone surrogate there.
+ */
+function cut(text: string, max: number): string {
+  if (text.length <= max) return text;
+
+  const last = text.charCodeAt(max - 1);
+
+  return text.slice(0, last >= 0xd800 && last <= 0xdbff ? max - 1 : max);
 }
 
 function httpsUrl(url: string): string | undefined {
