@@ -446,6 +446,89 @@ class ToolFailure {
 
 const SERVER_ERROR = "telemetry.dev could not complete this request. Try again shortly.";
 
+const DURATION = /^([1-9]\d{0,4})([mhd])$/;
+// telemetry.dev's pattern; it also refuses offsets past ±15:59.
+const INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+const UNIT_MS = { m: 60_000, h: 3_600_000, d: 86_400_000 } as const;
+
+/**
+ * The window a list covers, as telemetry.dev resolves it: durations against this clock,
+ * `defaultMs` back from `until` without `since` (the whole retention when null), and the start
+ * moved up to retention.
+ */
+const resolveWindow = (args: Record<string, unknown>, defaultMs: number | null) => {
+  const now = Date.now();
+  const at = (value: unknown) => {
+    if (value === undefined) return undefined;
+
+    if (typeof value !== "string") return Number.NaN;
+
+    const duration = DURATION.exec(value);
+
+    if (duration) return now - Number(duration[1]) * UNIT_MS[duration[2] as "m" | "h" | "d"];
+
+    return INSTANT.test(value) ? Date.parse(value) : Number.NaN;
+  };
+  const since = at(args.since);
+  const until = at(args.until) ?? now;
+  const windowed = args.since !== undefined || args.until !== undefined;
+
+  // telemetry.dev's messages.
+  for (const name of ["since", "until"] as const) {
+    if (Number.isNaN(name === "since" ? since : until)) {
+      return new ToolFailure(
+        `${name} must be an RFC 3339 time with Z or an offset, such as 2026-10-30T14:00:00Z or 2026-10-30T16:00:00+02:00, or a duration before now, such as 30m, 2h, or 7d. Got ${JSON.stringify(args[name])}.`,
+        "invalid_arguments",
+      );
+    }
+  }
+
+  const range = args.range_hours !== undefined ? "range_hours" : "range_days";
+
+  if (windowed && args[range] !== undefined) {
+    return new ToolFailure(
+      `${range} cannot be combined with since or until. Use since and until, or ${range} alone.`,
+      "invalid_arguments",
+    );
+  }
+
+  const retentionDays =
+    PROJECTS.find((project) => project.id === args.project_id)?.retention_days ?? 30;
+  const retained = now - retentionDays * UNIT_MS.d;
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const end = Math.min(until, now);
+
+  if (end <= retained) {
+    return new ToolFailure(
+      `until ${iso(until)} is not after the start of this project's ${retentionDays}-day retention, ${iso(retained)}, so no data is left in the window. Use a later until.`,
+      "invalid_arguments",
+    );
+  }
+
+  const start = since ?? (defaultMs === null ? retained : end - defaultMs);
+
+  if (start > now) {
+    return new ToolFailure(
+      `since ${iso(start)} is in the future. Use an earlier time, or a duration before now such as 2h.`,
+      "invalid_arguments",
+    );
+  }
+
+  if (start >= end) {
+    return new ToolFailure(
+      `since ${iso(start)} must be earlier than until ${iso(end)}.`,
+      "invalid_arguments",
+    );
+  }
+
+  return {
+    since: new Date(Math.max(start, retained)).toISOString(),
+    until: new Date(end).toISOString(),
+    // As telemetry.dev sets it: also true when the default window is the whole retention.
+    capped_by_retention: start <= retained,
+  };
+};
+
 const server = () => {
   const mcp = new McpServer({ name: "telemetry.dev fixture", version: "1.0.0" });
   const tool = (name: string, handler: (args: Record<string, unknown>) => unknown) =>
@@ -483,9 +566,19 @@ const server = () => {
       );
     }
 
-    return traces();
+    if (!serverState.windows) return traces();
+
+    const window = resolveWindow(args, null);
+
+    return window instanceof ToolFailure ? window : { ...traces(), window };
   });
-  tool("search_sessions", () => sessions());
+  tool("search_sessions", (args) => {
+    if (!serverState.windows) return sessions();
+
+    const window = resolveWindow(args, Number(args.range_hours ?? 24) * UNIT_MS.h);
+
+    return window instanceof ToolFailure ? window : { ...sessions(), window };
+  });
   tool("get_trace", (args) =>
     Object.hasOwn(TRACE_DETAILS, String(args.trace_id))
       ? TRACE_DETAILS[String(args.trace_id)]!()
@@ -524,6 +617,12 @@ export const serverState = {
   errorCodes: true,
   /** The quiet trace's `url`; undefined acts as a server from before trace links. */
   traceUrl: QUIET_TRACE_URL as string | undefined,
+  /**
+   * search_traces and search_sessions take since and until and answer with a window,
+   * and search_traces takes the filters that came with them. False acts as a server from
+   * before them, which drops those arguments and answers without them.
+   */
+  windows: true,
 };
 
 /**

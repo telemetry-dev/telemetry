@@ -57,6 +57,16 @@ const cursor: Option = {
   value: "cursor",
   description: "Continue from a previous page",
 };
+const since: Option = {
+  type: "string",
+  value: "when",
+  description: "Start of the window: 30m, 2h, or 7d ago, a date, or a time",
+};
+const until: Option = {
+  type: "string",
+  value: "when",
+  description: "End of the window, in the same forms (default now)",
+};
 
 const COMMANDS: Readonly<Record<string, Command>> = {
   login: {
@@ -124,14 +134,34 @@ const COMMANDS: Readonly<Record<string, Command>> = {
       env: { type: "string", value: "name", description: "Environment, such as production" },
       session: { type: "string", value: "id", description: "Traces in this session" },
       user: { type: "string", value: "id", description: "Traces for this end user" },
+      framework: {
+        type: "string",
+        value: "name",
+        description: "Traces from this framework, such as vercel-ai-sdk",
+      },
+      service: { type: "string", value: "name", description: "Traces from this service" },
+      model: { type: "string", value: "name", description: "Traces with a span on this model" },
+      provider: {
+        type: "string",
+        value: "name",
+        description: "Traces with a span on this provider, such as openai",
+      },
+      operation: {
+        type: "string",
+        value: "name",
+        description: "Traces with a span of this operation, such as chat",
+      },
+      since,
+      until,
       limit,
       cursor,
       project,
       json,
     },
     examples: [
-      "telemetry traces --errors",
+      "telemetry traces --errors --since 2h",
       "telemetry traces --name checkout --env production",
+      "telemetry traces --model gpt-5 --since 2026-10-29 --until 2026-10-30",
       "telemetry traces --session conv_8f2 --json",
     ],
     run: tracesCommand,
@@ -153,6 +183,8 @@ const COMMANDS: Readonly<Record<string, Command>> = {
         value: "24h|72h|7d|30d",
         description: "Active within this window (default 24h)",
       },
+      since,
+      until,
       errors: { type: "boolean", description: "Only sessions with a failed trace" },
       contains: {
         type: "string",
@@ -167,7 +199,10 @@ const COMMANDS: Readonly<Record<string, Command>> = {
       project,
       json,
     },
-    examples: ["telemetry sessions --range 7d --errors", "telemetry sessions --agent support-bot"],
+    examples: [
+      "telemetry sessions --range 7d --errors",
+      "telemetry sessions --agent support-bot --since 2026-10-29T09:00",
+    ],
     run: sessionsCommand,
   },
   logs: {

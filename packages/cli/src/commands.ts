@@ -41,6 +41,7 @@ import type {
   TracePage,
   UsageSummary,
   UsageTotals,
+  Window,
 } from "./tools.ts";
 
 export type Values = Record<string, string | boolean | undefined>;
@@ -196,6 +197,162 @@ const choice = <T extends string | number>(
 };
 
 const DAYS = { "7d": 7, "30d": 30, "90d": 90 } as const;
+
+// As telemetry.dev reads them: a duration back from the server's clock, or an RFC 3339 time.
+const DURATION = /^[1-9]\d{0,4}[mhd]$/;
+const TIME =
+  /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2})(\.\d{1,9})?)?(Z|([+-])(\d{2}):(\d{2}))?)?$/;
+
+const pad = (value: number, width = 2) => String(value).padStart(width, "0");
+
+/** A time to send, and the instant it names when that doesn't depend on the server's clock. */
+type Time = { readonly sent: string; readonly instant?: number };
+
+/**
+ * --since or --until as telemetry.dev takes it. A duration and a time with a zone go as
+ * typed, so the server's clock resolves the duration. A date or a time without a zone is
+ * read in this machine's zone and sent with its offset that day; a date means the start
+ * of that local day. Undefined when the option is absent, or for `--until now`.
+ */
+const timeOption = (context: Context, name: "since" | "until"): Time | undefined => {
+  // An empty value, as from an unset shell variable, would otherwise search the default window.
+  if (context.values[name] === "") throw usageError(`--${name} needs a value.`);
+
+  const value = string(context, name);
+
+  if (value === undefined || (name === "until" && value === "now")) return undefined;
+
+  if (DURATION.test(value)) return { sent: value };
+
+  const invalid = () =>
+    usageError(
+      `--${name} must be a duration such as 30m, 2h, or 7d, a date such as 2026-10-30, or a time such as 2026-10-30T14:00 or 2026-10-30T14:00:00Z${name === "until" ? ", or now" : ""}, not "${value}".`,
+    );
+  const match = TIME.exec(value);
+
+  if (!match) throw invalid();
+
+  const [, year, month, day, hour = "0", minute = "0", second, fraction = "", zone, sign] = match;
+  const [y, mo, d, h, mi, s, zoneHours, zoneMinutes] = [
+    year,
+    month,
+    day,
+    hour,
+    minute,
+    second ?? "0",
+    match[10] ?? "0",
+    match[11] ?? "0",
+  ].map(Number) as [number, number, number, number, number, number, number, number];
+  const ms = Number(fraction.slice(1, 4).padEnd(3, "0"));
+
+  // RFC 3339 has seconds whenever it has a zone.
+  if (
+    h > 23 ||
+    mi > 59 ||
+    s > 59 ||
+    zoneHours > 15 ||
+    zoneMinutes > 59 ||
+    (zone !== undefined && second === undefined)
+  )
+    throw invalid();
+
+  if (zone !== undefined) {
+    const utc = new Date(Date.UTC(y, mo - 1, d, h, mi, s, ms));
+    const offset = (sign === "-" ? -1 : 1) * (zoneHours * 60 + zoneMinutes);
+
+    // Date.UTC rolls 2026-02-30 over to March, and reads years below 100 as 19xx.
+    if (utc.getUTCFullYear() !== y || utc.getUTCMonth() !== mo - 1 || utc.getUTCDate() !== d)
+      throw invalid();
+
+    return { sent: value, instant: utc.getTime() - offset * 60_000 };
+  }
+
+  // The Date constructor applies the offset in force at that local time, so a DST change
+  // that day is handled; a time the clocks skip moves forward past the gap.
+  const local = new Date(y, mo - 1, d, h, mi, s, ms);
+
+  if (local.getFullYear() !== y || local.getMonth() !== mo - 1 || local.getDate() !== d)
+    throw invalid();
+
+  const offset = -Math.round(local.getTimezoneOffset());
+  const clock = `${pad(local.getHours())}:${pad(local.getMinutes())}:${pad(local.getSeconds())}${ms ? `.${pad(ms, 3)}` : ""}`;
+  const zoneText = `${offset < 0 ? "-" : "+"}${pad(Math.floor(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)}`;
+
+  return { sent: `${year}-${month}-${day}T${clock}${zoneText}`, instant: local.getTime() };
+};
+
+/**
+ * The --since and --until a command sends, checked before any call. --range is the older
+ * way to choose a window, so it can't be combined with them.
+ */
+const timeWindow = (context: Context) => {
+  const since = timeOption(context, "since");
+  const until = timeOption(context, "until");
+
+  if (string(context, "range") !== undefined && (since || until))
+    throw usageError("--range can't be combined with --since or --until. Use one or the other.");
+
+  if (
+    since?.instant !== undefined &&
+    until?.instant !== undefined &&
+    since.instant >= until.instant
+  ) {
+    throw usageError(
+      `--since must be earlier than --until: ${string(context, "since")} is not before ${string(context, "until")}.`,
+    );
+  }
+
+  return {
+    args: { since: since?.sent, until: until?.sent },
+    flags: [...(since ? ["since"] : []), ...(until ? ["until"] : [])],
+  };
+};
+
+/**
+ * Fails when the result lacks `key`, which telemetry.dev adds to answer `flags`. A server
+ * from before them drops arguments it doesn't know and returns results without them, so
+ * the CLI says so rather than print a list that looks filtered, or page 1 again.
+ */
+const requireSupport = (
+  result: object,
+  key: string,
+  flags: readonly string[],
+  alternative?: string,
+) => {
+  if (flags.length === 0 || Object.hasOwn(result, key)) return;
+
+  const named = flags.map((flag) => `--${flag}`);
+  const list =
+    named.length === 1
+      ? named[0]
+      : `${named.slice(0, -1).join(", ")}${named.length > 2 ? "," : ""} and ${named.at(-1)}`;
+  const them = named.length === 1 ? "it" : "them";
+
+  throw new CliError(
+    `This telemetry.dev deployment doesn't support ${list} yet and would have ignored ${them}. Run the command without ${them}${alternative ? `, or ${alternative}` : ""}.`,
+    { code: "server_unsupported" },
+  );
+};
+
+/** The window a list covers, in this machine's zone, such as "from Oct 30 09:00:00 to …". */
+const windowText = (window: Window) =>
+  `from ${formatTimestamp(window.since)} to ${formatTimestamp(window.until)}`;
+
+/**
+ * Says on stderr when the project's retention cut the --since asked for. Without --since a
+ * window can start at the retention by default, which needs no note.
+ */
+const noteCapped = (context: Context, window: Window | undefined) => {
+  if (json(context) || string(context, "since") === undefined || !window?.capped_by_retention)
+    return;
+
+  note(
+    style.dim(
+      `\nThis project keeps data from ${formatTimestamp(window.since)} on, so the window starts there.`,
+      process.stderr,
+    ),
+  );
+};
 
 /**
  * `arg` quoted for a POSIX shell, so a suggested command runs as shown when pasted. A
@@ -569,7 +726,14 @@ export async function useCommand(context: Context) {
   });
 }
 
+// Added with windows: a server from before them would ignore these, so the result must
+// have a window.
+const TRACE_FILTERS = ["framework", "service", "model", "provider", "operation"] as const;
+
 export async function tracesCommand(context: Context) {
+  const window = timeWindow(context);
+  const filters = Object.fromEntries(TRACE_FILTERS.map((name) => [name, string(context, name)]));
+
   await withApi(async (api) => {
     const project = await resolveProject(api, context);
 
@@ -582,15 +746,30 @@ export async function tracesCommand(context: Context) {
         environment: string(context, "env"),
         session_id: string(context, "session"),
         user_id: string(context, "user"),
+        ...filters,
+        ...window.args,
         limit: limit(context),
         cursor: string(context, "cursor"),
       },
       "Searching traces",
     );
 
+    requireSupport(page, "window", [
+      ...window.flags,
+      ...TRACE_FILTERS.filter((name) => filters[name] !== undefined),
+    ]);
+
     if (json(context)) return printJson(page);
 
-    if (page.traces.length === 0) return nothing("No traces match.");
+    if (page.traces.length === 0) {
+      nothing(
+        window.flags.length > 0 && page.window
+          ? `No traces match ${windowText(page.window)}.`
+          : "No traces match.",
+      );
+
+      return noteCapped(context, page.window);
+    }
 
     out(
       table(
@@ -617,6 +796,8 @@ export async function tracesCommand(context: Context) {
       ),
     );
 
+    noteCapped(context, page.window);
+
     const failure = page.traces.find((trace) => trace.status === "error");
 
     suggest(
@@ -631,6 +812,7 @@ export async function tracesCommand(context: Context) {
 
 export async function sessionsCommand(context: Context) {
   const RANGE = { "24h": 24, "72h": 72, "7d": 168, "30d": 720 } as const;
+  const window = timeWindow(context);
 
   await withApi(async (api) => {
     const project = await resolveProject(api, context);
@@ -640,6 +822,7 @@ export async function sessionsCommand(context: Context) {
       {
         project_id: project.id,
         range_hours: choice(context, "range", RANGE),
+        ...window.args,
         contains: string(context, "contains"),
         agent: string(context, "agent"),
         model: string(context, "model"),
@@ -651,14 +834,21 @@ export async function sessionsCommand(context: Context) {
       "Searching sessions",
     );
 
+    requireSupport(page, "window", window.flags, "use --range");
+
     if (json(context)) return printJson(page);
 
-    if (page.sessions.length === 0)
-      return nothing(
-        string(context, "range") === "30d"
-          ? "No sessions match."
-          : "No sessions match. Widen the window with --range 7d or --range 30d.",
+    if (page.sessions.length === 0) {
+      nothing(
+        window.flags.length > 0 && page.window
+          ? `No sessions match ${windowText(page.window)}.`
+          : string(context, "range") === "30d"
+            ? "No sessions match."
+            : "No sessions match. Widen the window with --range 7d or --range 30d.",
       );
+
+      return noteCapped(context, page.window);
+    }
 
     out(
       table(
@@ -686,6 +876,8 @@ export async function sessionsCommand(context: Context) {
         ]),
       ),
     );
+
+    noteCapped(context, page.window);
 
     suggest(
       context,

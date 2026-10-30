@@ -31,6 +31,7 @@ export type ErrorCode =
   | "server_error"
   | "tool_error"
   | "result_too_large"
+  | "server_unsupported"
   | "request_failed";
 
 type ErrorDetails = {
@@ -99,9 +100,15 @@ export const toolError = (text: string, meta: unknown): CliError => {
       );
     case "invalid_cursor":
       return usageError(
-        "That cursor isn't from an earlier page of this command. Run it again without --cursor.",
+        "That cursor isn't from an earlier page of this command with these options. Run it again without --cursor.",
         { code: "invalid_cursor" },
       );
+    // The server checks what the CLI can't: a window that starts after it ends once a
+    // duration is resolved, or one that ends before the project's retention.
+    case "invalid_arguments":
+      return usageError(text || "telemetry.dev didn't accept these options.", {
+        code: "invalid_arguments",
+      });
     case "trace_not_found":
     case "span_not_found":
       return new CliError(text, { code: error.code });
