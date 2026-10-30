@@ -1052,6 +1052,13 @@ const traceSummary = (spans: readonly Span[], total: number, partialOf: number |
   return lines;
 };
 
+/** The server's link, if it is a web address; the server's text is not trusted to be one. */
+const dashboardLink = (url: string | undefined) => {
+  const parsed = url && URL.canParse(url) ? new URL(url) : undefined;
+
+  return parsed?.protocol === "https:" || parsed?.protocol === "http:" ? parsed.href : undefined;
+};
+
 function renderTrace(page: TraceDetailPage, spans: readonly Span[], logs: TraceDetailPage["logs"]) {
   const { trace } = page;
   const failed = trace.status === "error";
@@ -1080,6 +1087,11 @@ function renderTrace(page: TraceDetailPage, spans: readonly Span[], logs: TraceD
   ].filter(Boolean);
 
   out(style.dim(`  ${ids.join("  ")}`));
+
+  const link = dashboardLink(trace.url);
+
+  if (link) out(style.dim(`  View: ${link}`));
+
   out();
 
   if (spans.length === 0) {

@@ -27,6 +27,7 @@ const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).
 export const TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
 export const QUIET_TRACE_ID = "9a0b7c6d5e4f30211a2b3c4d5e6f7081";
 export const PARALLEL_TRACE_ID = "3e8a1c5b7d9f40e2a6b4c8d0e2f4a6b8";
+export const QUIET_TRACE_URL = `https://telemetry.dev/o/org_1/p/proj_1/traces/${QUIET_TRACE_ID}`;
 
 export const traces = () => ({
   traces: [
@@ -191,6 +192,7 @@ export const traceDetail = () => ({
 const quietTraceDetail = () => ({
   trace: {
     id: QUIET_TRACE_ID,
+    url: serverState.traceUrl,
     name: "support.answer",
     status: "success",
     error_type: null,
@@ -520,6 +522,8 @@ export const serverState = {
   removedFromWorkspace: false,
   /** Tool errors carry a code in `_meta`; false acts as a server from before codes. */
   errorCodes: true,
+  /** The quiet trace's `url`; undefined acts as a server from before trace links. */
+  traceUrl: QUIET_TRACE_URL as string | undefined,
 };
 
 /**
