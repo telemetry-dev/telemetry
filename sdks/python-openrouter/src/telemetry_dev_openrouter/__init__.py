@@ -12,7 +12,7 @@ from openrouter.chat import Chat
 from openrouter.embeddings import Embeddings
 from openrouter.responses import Responses
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 RequestMapper = Callable[[Mapping[str, Any]], tuple[str, dict[str, Any]]]
 ResponseMapper = Callable[[Any], dict[str, Any]]

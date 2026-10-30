@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/opencode",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "opencode coding-agent telemetry integration for telemetry.dev.",
   "keywords": [
     "agents",

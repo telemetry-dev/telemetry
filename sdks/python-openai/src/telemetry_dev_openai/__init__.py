@@ -20,7 +20,7 @@ from openai.resources.embeddings import AsyncEmbeddings, Embeddings
 from openai.resources.images import AsyncImages, Images
 from openai.resources.responses.responses import AsyncResponses, Responses
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 ProviderResolver = Callable[[object | None], str]
 RequestMapper = Callable[[Mapping[str, Any]], tuple[str, dict[str, Any]]]

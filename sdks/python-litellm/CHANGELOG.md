@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/telemetry-dev/telemetry/compare/python-litellm-v0.2.1...python-litellm-v0.2.2) (2026-10-30)
+
+
+### Features
+
+* **sdk:** record the prompt of compiled messages outside withPrompt ([6435fb6](https://github.com/telemetry-dev/telemetry/commit/6435fb6d2d7488c968a6ce9f9c6437f2cf426456))
+
 ## [0.2.1](https://github.com/telemetry-dev/telemetry/compare/python-litellm-v0.2.0...python-litellm-v0.2.1) (2026-10-30)
 
 
