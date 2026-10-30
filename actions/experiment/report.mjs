@@ -177,13 +177,22 @@ async function comment(body) {
 
   const api = (env.GITHUB_API_URL ?? "https://api.github.com").replace(/\/+$/, "");
   const issue = `${api}/repos/${env.GITHUB_REPOSITORY}/issues`;
+  // Anyone can paste the marker into a comment, so the action changes only a comment that its token
+  // wrote. A user token knows its login. The GITHUB_TOKEN and app tokens cannot read /user, and
+  // they write as a bot.
+  const login = await github("GET", `${api}/user`).then(
+    (user) => (typeof user?.login === "string" ? user.login : undefined),
+    () => undefined,
+  );
+  const ours = (item) =>
+    login === undefined ? item.user?.type === "Bot" : item.user?.login === login;
   let existing;
 
   for (let page = 1; page <= MAX_COMMENT_PAGES && existing === undefined; page++) {
     const comments = await github("GET", `${issue}/${pull}/comments?per_page=100&page=${page}`);
 
     existing = comments.find(
-      (item) => typeof item.body === "string" && item.body.startsWith(marker),
+      (item) => typeof item.body === "string" && item.body.startsWith(marker) && ours(item),
     );
 
     if (comments.length < 100) break;

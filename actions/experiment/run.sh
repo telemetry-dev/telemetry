@@ -31,12 +31,29 @@ results=$(mktemp "${RUNNER_TEMP:-/tmp}/telemetry-dev-experiment.XXXXXX") || fail
 echo "results=$results" >>"$GITHUB_OUTPUT"
 export TELEMETRY_DEV_EXPERIMENT_RESULTS=$results
 
+# The tsx of the project, from node_modules/.bin here or in a directory above. The action does not
+# download one: a package from npm at run time would run with the API key in its environment.
+project_tsx() {
+  dir=$PWD
+  while :; do
+    if [ -x "$dir/node_modules/.bin/tsx" ]; then
+      echo "$dir/node_modules/.bin/tsx"
+      return 0
+    fi
+    [ "$dir" = / ] && return 1
+    dir=$(dirname "$dir")
+  done
+}
+
 code=0
 if [ -n "$command" ]; then
   bash -c "$command" || code=$?
 else
   case "$script" in
-    *.ts | *.mts | *.cts | *.tsx) npx --yes tsx "$script" || code=$? ;;
+    *.ts | *.mts | *.cts | *.tsx)
+      tsx=$(project_tsx) || fail "No tsx in node_modules. Add tsx to the devDependencies of the project and install them, or give a command."
+      "$tsx" "$script" || code=$?
+      ;;
     *.js | *.mjs | *.cjs) node "$script" || code=$? ;;
     *.py)
       python=$(command -v python || command -v python3) || fail "No python on the PATH. Use actions/setup-python, or give a command."

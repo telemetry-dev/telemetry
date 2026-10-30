@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -99,15 +99,36 @@ interface GithubRequest {
   body: unknown;
 }
 
-/** The comment routes of the GitHub REST API for one pull request. */
+interface GithubComment {
+  id: number;
+  body: string;
+  user: { login: string; type: "Bot" | "User" };
+}
+
+const BOT = { login: "github-actions[bot]", type: "Bot" } as const;
+
+/**
+ * The comment routes of the GitHub REST API for one pull request. Without `user`, GET /user fails
+ * as it does for the GITHUB_TOKEN.
+ */
 async function fakeGithub(
-  options: { comments?: { id: number; body: string }[]; status?: number } = {},
+  options: { comments?: GithubComment[]; status?: number; user?: { login: string } } = {},
 ) {
   const requests: GithubRequest[] = [];
   const server = createServer(async (req: IncomingMessage, res) => {
     let raw = "";
     for await (const chunk of req) raw += chunk;
     requests.push({ method: req.method!, url: req.url!, body: raw ? JSON.parse(raw) : undefined });
+
+    if (req.url === "/user") {
+      res.writeHead(options.user ? 200 : 403, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify(options.user ?? { message: "Resource not accessible by integration" }),
+      );
+
+      return;
+    }
+
     res.writeHead(options.status ?? 200, { "content-type": "application/json" });
     res.end(JSON.stringify(req.method === "GET" ? (options.comments ?? []) : { id: 9 }));
   });
@@ -181,6 +202,37 @@ test("run.sh passes the inputs to the script and records its exit code without f
   expect(statSync(written.results!).mode & 0o777).toBe(0o600);
 });
 
+test("run.sh runs a .ts script with the tsx of the project, from a directory above", () => {
+  const project = workdir();
+  const evals = join(project, "evals");
+  const output = join(project, "output");
+  mkdirSync(join(project, "node_modules", ".bin"), { recursive: true });
+  mkdirSync(evals);
+  writeFileSync(output, "");
+  // A stand-in for the tsx of the project that records the script it gets.
+  writeFileSync(
+    join(project, "node_modules", ".bin", "tsx"),
+    `#!/bin/sh\necho "$1" > "${join(project, "ran")}"\n`,
+    { mode: 0o755 },
+  );
+
+  const run = spawnSync("bash", [join(action, "run.sh")], {
+    cwd: evals,
+    encoding: "utf8",
+    env: {
+      PATH: process.env.PATH,
+      RUNNER_TEMP: project,
+      GITHUB_OUTPUT: output,
+      INPUT_SCRIPT: "reply.eval.ts",
+      TELEMETRY_DEV_API_KEY: "td_live_job",
+    },
+  });
+
+  expect(run.status).toBe(0);
+  expect(readFileSync(join(project, "ran"), "utf8")).toBe("reply.eval.ts\n");
+  expect(outputs(output)["exit-code"]).toBe("0");
+});
+
 test("run.sh keeps the environment of the job, and runs a .js script with node", () => {
   const { run, outputs: written } = runScript(
     {
@@ -219,6 +271,11 @@ test.each([
     { INPUT_SCRIPT: "eval.rb", TELEMETRY_DEV_API_KEY: "k" },
     "The script must end in .ts, .js, or .py. For another runner, give a command.",
   ],
+  [
+    "a .ts script in a project without tsx",
+    { INPUT_SCRIPT: "reply.eval.ts", TELEMETRY_DEV_API_KEY: "k" },
+    "No tsx in node_modules. Add tsx to the devDependencies of the project and install them, or give a command.",
+  ],
 ])("run.sh stops with an error for %s", (_, env, message) => {
   const { run, outputs: written } = runScript(env);
 
@@ -239,33 +296,74 @@ test("report.mjs writes the summary, posts it on the pull request, and sets the 
   expect(written).toBe(`${summary}\n`);
   expect(set).toEqual({ "check-status": "failed", url: result.url });
   expect(github.requests.map((request) => `${request.method} ${request.url}`)).toEqual([
+    "GET /user",
     "GET /repos/acme/support/issues/42/comments?per_page=100&page=1",
     "POST /repos/acme/support/issues/42/comments",
   ]);
-  expect(github.requests[1]!.body).toEqual({
+  expect(github.requests[2]!.body).toEqual({
     body: expect.stringMatching(
       /^<!-- telemetry-dev-experiment:[0-9a-f]{12} -->\n### telemetry\.dev experiment\n/,
     ),
   });
-  expect((github.requests[1]!.body as { body: string }).body.endsWith(summary)).toBe(true);
+  expect((github.requests[2]!.body as { body: string }).body.endsWith(summary)).toBe(true);
 });
 
+/** The body of the comment that the action posts for the result. */
+async function commentBody(env: Record<string, string> = {}): Promise<string> {
+  const github = await fakeGithub();
+  await report({ GITHUB_API_URL: github.url, ...env }, [result]);
+
+  return (github.requests.find((request) => request.method === "POST")!.body as { body: string })
+    .body;
+}
+
+function changes(github: Awaited<ReturnType<typeof fakeGithub>>): string[] {
+  return github.requests
+    .filter((request) => request.method !== "GET")
+    .map((request) => `${request.method} ${request.url}`);
+}
+
 test("report.mjs changes its comment from an earlier push, and a step with another dataset adds its own", async () => {
-  const first = await fakeGithub();
-  await report({ GITHUB_API_URL: first.url }, [result]);
-  const own = { id: 8, body: (first.requests[1]!.body as { body: string }).body };
+  const own = { id: 8, body: await commentBody(), user: BOT };
 
   const other = await fakeGithub({ comments: [own] });
   await report({ GITHUB_API_URL: other.url, INPUT_DATASET: "billing-golden" }, [result]);
 
-  const again = await fakeGithub({ comments: [{ id: 7, body: "Looks good" }, own] });
+  const again = await fakeGithub({
+    comments: [{ id: 7, body: "Looks good", user: { login: "dana", type: "User" } }, own],
+  });
   await report({ GITHUB_API_URL: again.url }, [result]);
 
-  expect(other.requests.map((request) => request.method)).toEqual(["GET", "POST"]);
-  expect(again.requests.map((request) => `${request.method} ${request.url}`)).toEqual([
-    "GET /repos/acme/support/issues/42/comments?per_page=100&page=1",
-    "PATCH /repos/acme/support/issues/comments/8",
-  ]);
+  expect(changes(other)).toEqual(["POST /repos/acme/support/issues/42/comments"]);
+  expect(changes(again)).toEqual(["PATCH /repos/acme/support/issues/comments/8"]);
+});
+
+test.each([
+  ["a person pasted under the GITHUB_TOKEN", undefined, { login: "mallory", type: "User" }],
+  ["another bot wrote under a user token", { login: "dana" }, BOT],
+] as const)(
+  "report.mjs does not change a comment with its marker that %s",
+  async (_, user, author) => {
+    const github = await fakeGithub({
+      user,
+      comments: [{ id: 7, body: await commentBody(), user: author }],
+    });
+
+    await report({ GITHUB_API_URL: github.url }, [result]);
+
+    expect(changes(github)).toEqual(["POST /repos/acme/support/issues/42/comments"]);
+  },
+);
+
+test("report.mjs changes the comment of the user of a user token", async () => {
+  const github = await fakeGithub({
+    user: { login: "dana" },
+    comments: [{ id: 7, body: await commentBody(), user: { login: "dana", type: "User" } }],
+  });
+
+  await report({ GITHUB_API_URL: github.url }, [result]);
+
+  expect(changes(github)).toEqual(["PATCH /repos/acme/support/issues/comments/7"]);
 });
 
 test("report.mjs warns and succeeds when the token cannot write the comment", async () => {

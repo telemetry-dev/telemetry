@@ -7,7 +7,7 @@ branding:
 
 inputs:
   script:
-    description: The eval script, which calls runExperiment or run_experiment. A .ts script runs with tsx, a .js script with node, and a .py script with python. Give script or command.
+    description: The eval script, which calls runExperiment or run_experiment. A .ts script runs with the tsx in the node_modules of the project, a .js script with node, and a .py script with python. Give script or command.
     required: false
   command:
     description: A shell command that runs the eval script, for example `uv run python evals/reply_eval.py`. Give script or command.
