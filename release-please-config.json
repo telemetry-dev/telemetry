@@ -191,6 +191,11 @@
           "jsonpath": "$.package[?(@.name.value=='telemetry-dev-openrouter')].version"
         }
       ]
+    },
+    "actions/experiment": {
+      "component": "experiment-action",
+      "release-type": "simple",
+      "initial-version": "1.0.0"
     }
   }
 }

@@ -96,6 +96,8 @@ jobs:
             case "$release_type" in
               node) npm+=("$path") ;;
               python) python+=("$path") ;;
+              # The experiment action has no package: the tag-experiment-action job moves its major tag.
+              simple) continue ;;
               *)
                 echo "Unsupported release type for $path: $release_type" >&2
                 exit 1
@@ -289,3 +291,39 @@ jobs:
             .github/scripts/verify-python-release-dependencies.sh "$wheel"
             uv publish --trusted-publishing always --check-url https://pypi.org/simple "python/$package"/*
           done < python/publish-order.txt
+
+  tag-experiment-action:
+    needs: release-please
+    concurrency:
+      group: tag-experiment-action
+      cancel-in-progress: false
+      # The default queue cancels a waiting job when another push arrives, and that release then keeps the old major tag.
+      queue: max
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(jq -r '.["actions/experiment"] // empty' .release-please-manifest.json)
+          # A rerun after release-please failed partway gets no outputs for the release, so its tag selects it.
+          if [[ -z "$version" || "$(git rev-parse -q --verify "refs/tags/experiment-action-v$version^{commit}" || true)" != "$GITHUB_SHA" ]]; then
+            exit 0
+          fi
+
+          # Workflows use the major tag, which moves to each release of its major version, but never back.
+          major="experiment-action-v${version%%.*}"
+          current=$(git rev-parse -q --verify "refs/tags/$major^{commit}" || true)
+          if [[ -z "$current" ]]; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$major" -f "sha=$GITHUB_SHA"
+          elif git merge-base --is-ancestor "$current" "$GITHUB_SHA"; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$major" -f "sha=$GITHUB_SHA" -F force=true
+          else
+            echo "$major is at a release after experiment-action-v$version"
+          fi
