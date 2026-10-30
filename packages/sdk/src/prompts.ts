@@ -212,7 +212,10 @@ interface CompileTag {
   variables: PromptVariables<unknown> | undefined;
   /** Counts the compiles of the process, so a higher one is newer. */
   readonly serial: number;
-  /** When the tag removes its variables (Date.now). A call that names the tag moves it. */
+  /**
+   * When the tag removes its variables, in `performance.now()` time. A call that names the tag
+   * moves it.
+   */
   expires: number;
 }
 
@@ -242,8 +245,8 @@ const retryAfter = new WeakMap<PromptError, number>();
 let compiles = 0;
 /**
  * The tags that keep variables, by the minute of their deadline. A weak reference, so that the
- * variables of a message that the app dropped do not stay until the deadline. A minute that a
- * clock change puts in the future does not stop the minutes after it.
+ * variables of a message that the app dropped do not stay until the deadline. The minutes are not
+ * sorted, since a tag that a call named goes back in at its new minute.
  */
 const deadlines = new Map<number, WeakRef<CompileTag>[]>();
 
@@ -400,7 +403,7 @@ export function promptAttributesFor(messages: unknown): Record<string, Attribute
   try {
     if (activeContext().getValue(PROMPT_KEY) !== undefined) return undefined;
 
-    const now = Date.now();
+    const now = performance.now();
     expire(now);
     const tag = newestTag(messages);
 
@@ -651,7 +654,7 @@ function createPrompt(input: {
 
       if (type === "text") return fill(content.text ?? "", values);
       compiles += 1;
-      const now = Date.now();
+      const now = performance.now();
       expire(now);
       const tag: CompileTag = {
         prompt,

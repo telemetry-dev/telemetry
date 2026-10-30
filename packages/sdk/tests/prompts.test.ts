@@ -1161,7 +1161,7 @@ test.each<[string, ChatTurn]>([
     },
   ],
 ])("a chat history in %s keeps the variables of the last 5 minutes", async (_shape, run) => {
-  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.useFakeTimers({ toFake: ["Date", "performance"] });
   setup();
   const prompts = await chatPrompts();
   const markers: WeakRef<ChatMessage>[] = [];
@@ -1339,7 +1339,7 @@ test.each<[string, LiveRequests]>([
 });
 
 test("a compile keeps its variables for 5 minutes after it or after the last call that names it", async () => {
-  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.useFakeTimers({ toFake: ["Date", "performance"] });
   setup();
   const chat = await promptOf(CHAT_PROMPT);
   let history: ChatMessage[] = [];
@@ -1362,6 +1362,8 @@ test("a compile keeps its variables for 5 minutes after it or after the last cal
   expect(variablesOf(earlier)).toBeUndefined();
   // The call 1 ms before moved the deadline of q4.
   expect(variablesOf(summary)).toContain('"question":"q4"');
+  // The system clock moves back an hour; 5 minutes still pass.
+  vi.setSystemTime(Date.now() - 3_600_000);
   vi.advanceTimersByTime(300_000);
   expect(promptAttributesFor(summary)).toEqual({
     "td.prompt.name": "support/reply",

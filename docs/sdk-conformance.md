@@ -212,7 +212,8 @@ their text:
   whose effective captureInput is off drops `td.prompt.variables` from its attributes, also when
   the app passes the result of these functions to its own span.
 - A tag keeps the variables of its compile for 5 minutes. A call of these functions keeps them
-  for 5 more minutes when the newest compile of the call is that compile. After that time,
+  for 5 more minutes when the newest compile of the call is that compile. The SDKs measure this
+  time in elapsed time, so a change of the system clock does not move it. After that time,
   they give the attributes of the tag without `td.prompt.variables`, and the next compile or call
   removes the variables from the tag, at most one minute late, also when the app keeps the
   message. Other compiles do not change this time. Thus a chat history keeps the variables of the
