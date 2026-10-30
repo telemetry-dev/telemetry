@@ -96,17 +96,22 @@ Branch on `code`, not on `message`, whose wording can change. `hint` is a comman
 | `invalid_arguments`    | 2    | An option or argument is not valid                                               |
 | `unknown_command`      | 2    | There is no command with that name                                               |
 | `project_not_found`    | 2    | No project in the workspace has that name or id                                  |
+| `invalid_cursor`       | 2    | `--cursor` isn't from an earlier page of this command                            |
 | `project_ambiguous`    | 2    | Several projects have that name; pass its id                                     |
 | `project_required`     | 2    | The workspace has several projects and none was chosen                           |
 | `no_projects`          | 1    | The workspace has no projects yet                                                |
 | `not_signed_in`        | 4    | No sign-in is saved for this deployment                                          |
 | `sign_in_expired`      | 4    | The sign-in expired or was disconnected                                          |
 | `payloads_not_allowed` | 4    | The sign-in doesn't include reading captured prompts and outputs                 |
+| `access_denied`        | 4    | The account no longer has access to the workspace                                |
 | `sign_in_failed`       | 4    | The sign-in was cancelled, refused, or used an address from another sign-in      |
 | `no_pending_sign_in`   | 4    | `login --finish` found no sign-in waiting to finish                              |
+| `trace_not_found`      | 1    | No trace has that id, or it is past the project's retention                      |
+| `span_not_found`       | 1    | The trace has no span with that id, or it is past the project's retention        |
 | `unreachable`          | 1    | telemetry.dev could not be reached                                               |
 | `timeout`              | 1    | telemetry.dev took too long to answer                                            |
-| `tool_error`           | 1    | telemetry.dev returned an error; `message` says what it was                      |
+| `server_error`         | 1    | telemetry.dev failed to complete the request; try again                          |
+| `tool_error`           | 1    | telemetry.dev returned another error; `message` says what it was                 |
 | `result_too_large`     | 1    | The result was too large to read; narrow it with filters or `--limit`            |
 | `request_failed`       | 1    | The request failed for another reason                                            |
 | `failed`               | 1    | The command failed for another reason                                            |

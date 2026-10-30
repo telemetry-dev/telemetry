@@ -12,12 +12,12 @@ import {
   beforeRefresh,
   calls,
   EMAIL,
-  failProjects,
   PARALLEL_TRACE_ID,
   PAYLOADS,
   PROJECTS,
   QUIET_TRACE_ID,
   REFRESH_TOKEN,
+  serverState,
   startFixture,
   TOKEN,
   TRACE_ID,
@@ -59,7 +59,11 @@ beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), "telemetry-cli-"));
   calls.length = 0;
   delete beforeRefresh.run;
-  failProjects.value = false;
+  Object.assign(serverState, {
+    failProjects: false,
+    removedFromWorkspace: false,
+    errorCodes: true,
+  });
 
   return () => rm(home, { recursive: true, force: true });
 });
@@ -330,8 +334,8 @@ test("with --json, an error is one JSON line on stderr with a code to branch on,
   });
   expect(await errorOf(await run("trace", "0000", "--json"))).toMatchObject({
     exit: 1,
-    code: "tool_error",
-    message: "Trace not found.",
+    code: "trace_not_found",
+    message: "Trace not found or outside retention",
   });
 
   const closed = await closedServer();
@@ -359,7 +363,79 @@ test("with --json, an error is one JSON line on stderr with a code to branch on,
   // The same failures without --json keep the line a person reads.
   const human = await run("trace", "0000");
   expect(human.code).toBe(1);
-  expect(human.stderr).toBe("error Trace not found.\n");
+  expect(human.stderr).toBe("error Trace not found or outside retention\n");
+});
+
+test("the code telemetry.dev gives a tool error becomes the CLI's code, exit code, and hint", async () => {
+  const errorOf = async (...args: string[]) => {
+    const result = await run(...args, "--json");
+    expect(result.stdout).toBe("");
+
+    return { exit: result.code, ...JSON.parse(result.stderr).error };
+  };
+
+  // A default project or a project id goes to telemetry.dev without a lookup first.
+  const deleted = "0f0e0d0c-0b0a-4908-8706-050403020100";
+  await signIn({ ...PROJECTS[0]!, id: deleted });
+  expect(await errorOf("traces")).toMatchObject({
+    exit: 2,
+    code: "project_not_found",
+    hint: "telemetry projects",
+  });
+  expect(await errorOf("traces", "--project", deleted)).toMatchObject({
+    code: "project_not_found",
+  });
+  // People read the CLI's own words, not the text written for an agent.
+  expect((await run("traces", "--project", deleted)).stderr).toMatch(
+    /^error That project isn't in this workspace/,
+  );
+
+  await signIn(PROJECTS[0]);
+  expect(await errorOf("traces", "--cursor", "bm90LWEtY3Vyc29y")).toMatchObject({
+    exit: 2,
+    code: "invalid_cursor",
+    retryable: false,
+  });
+
+  serverState.failProjects = true;
+  expect(await errorOf("projects")).toMatchObject({
+    exit: 1,
+    code: "server_error",
+    message: "telemetry.dev could not complete this request. Try again shortly.",
+    retryable: true,
+  });
+
+  serverState.removedFromWorkspace = true;
+  expect(await errorOf("traces")).toMatchObject({
+    exit: 4,
+    code: "access_denied",
+    hint: "telemetry login",
+  });
+
+  // A server from before the codes, and a code this CLI doesn't know, stay tool_error.
+  serverState.errorCodes = false;
+  expect(await errorOf("traces")).toMatchObject({
+    exit: 1,
+    code: "tool_error",
+    message: "Not a member of this workspace",
+    retryable: false,
+  });
+
+  const { toolError } = await import("../src/errors.ts");
+  expect(
+    toolError("Plan limit reached", { "dev.telemetry/error": { code: "plan_limit" } }),
+  ).toMatchObject({
+    code: "tool_error",
+    message: "Plan limit reached",
+  });
+  expect(
+    toolError("…", { "dev.telemetry/error": { code: "payloads_not_allowed", retryable: false } }),
+  ).toMatchObject({ code: "payloads_not_allowed", exitCode: 4, hint: "telemetry login" });
+  expect(
+    toolError("Span not found", {
+      "dev.telemetry/error": { code: "span_not_found", retryable: false },
+    }),
+  ).toMatchObject({ code: "span_not_found", exitCode: 1, message: "Span not found" });
 });
 
 test("a request that times out inside fetch is a retryable timeout, not a failed request", async () => {
@@ -527,7 +603,7 @@ test("login --json returns the link at once even when stdin is a terminal", asyn
 });
 
 test("a sign-in whose project list fails still signs in, without a default project", async () => {
-  failProjects.value = true;
+  serverState.failProjects = true;
 
   for (const format of [[], ["--json"]]) {
     const started = await run("login", "--json");

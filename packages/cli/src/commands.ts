@@ -1,6 +1,6 @@
 import { Api } from "./api.ts";
 import { grantedScopes, login, logout, PAYLOADS_SCOPE } from "./auth.ts";
-import { CliError, EXIT, notSignedIn, usageError } from "./errors.ts";
+import { CliError, EXIT, notSignedIn, payloadsNotAllowed, usageError } from "./errors.ts";
 import { printMark } from "./mark.ts";
 import {
   DEFAULT_SERVER,
@@ -803,11 +803,24 @@ export async function traceCommand(context: Context) {
     let pages = 1;
 
     while (page.next_cursor && pages < MAX_TRACE_PAGES) {
-      page = await api.call<TraceDetailPage>(
-        "get_trace",
-        { project_id: project.id, trace_id: traceId, cursor: page.next_cursor },
-        `Loading spans (${spans.length} of ${page.span_count})`,
-      );
+      page = await api
+        .call<TraceDetailPage>(
+          "get_trace",
+          { project_id: project.id, trace_id: traceId, cursor: page.next_cursor },
+          `Loading spans (${spans.length} of ${page.span_count})`,
+        )
+        .catch((error: unknown) => {
+          // The cursor came from the server, so a refused one means the server changed
+          // between pages, not that the person passed a bad --cursor.
+          if (error instanceof CliError && error.code === "invalid_cursor") {
+            throw new CliError(
+              "telemetry.dev stopped accepting this trace's pages while it loaded. Run the command again.",
+              { code: "server_error", retryable: true },
+            );
+          }
+
+          throw error;
+        });
       spans.push(...page.spans);
       logs.push(...page.logs);
       pages += 1;
@@ -1413,10 +1426,7 @@ export async function payloadCommand(context: Context) {
 
   await withApi(async (api, session) => {
     if (!grantedScopes(session).has(PAYLOADS_SCOPE)) {
-      throw new CliError(
-        'This sign-in can\'t read captured prompts and outputs. Run `telemetry login`, check "Also read captured prompts, outputs, and tool arguments", and select Allow.',
-        { exitCode: EXIT.auth, code: "payloads_not_allowed", hint: "telemetry login" },
-      );
+      throw payloadsNotAllowed();
     }
 
     const project = await resolveProject(api, context);

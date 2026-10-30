@@ -1,7 +1,7 @@
 import type { Client } from "@modelcontextprotocol/client";
 
 import { SessionAuthProvider } from "./auth.ts";
-import { CliError, notSignedIn, translateError } from "./errors.ts";
+import { CliError, notSignedIn, toolError, translateError } from "./errors.ts";
 import { mcpUrl, type Session } from "./session.ts";
 import { withSpinner } from "./terminal.ts";
 
@@ -74,10 +74,7 @@ export class Api {
 
     const text = result.content.find((block) => block.type === "text")?.text ?? "";
 
-    if (result.isError)
-      throw new CliError(text || "telemetry.dev could not complete this request.", {
-        code: "tool_error",
-      });
+    if (result.isError) throw toolError(text, result._meta);
 
     try {
       return JSON.parse(text) as T;
