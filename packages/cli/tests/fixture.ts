@@ -24,10 +24,31 @@ export const PROJECTS = [
 
 const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
 
-const TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
+export const TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
+export const QUIET_TRACE_ID = "9a0b7c6d5e4f30211a2b3c4d5e6f7081";
+export const PARALLEL_TRACE_ID = "3e8a1c5b7d9f40e2a6b4c8d0e2f4a6b8";
 
 export const traces = () => ({
   traces: [
+    // The newest trace succeeded, so a suggestion to inspect a failure has to look past it.
+    {
+      id: QUIET_TRACE_ID,
+      name: "support.answer",
+      status: "success",
+      error_type: null,
+      started_at: minutesAgo(1),
+      duration_ms: 1870,
+      environment: "production",
+      service_name: "support-api",
+      session_id: "conv_8f2a91",
+      user_id: "user_4821",
+      models: ["gpt-5"],
+      span_count: 3,
+      error_span_count: 0,
+      input_tokens: 1934,
+      output_tokens: 211,
+      cost_usd: 0.00718,
+    },
     {
       id: TRACE_ID,
       name: "support.answer",
@@ -45,24 +66,6 @@ export const traces = () => ({
       input_tokens: 2841,
       output_tokens: 373,
       cost_usd: 0.01234,
-    },
-    {
-      id: "9a0b7c6d5e4f30211a2b3c4d5e6f7081",
-      name: "support.answer",
-      status: "success",
-      error_type: null,
-      started_at: minutesAgo(9),
-      duration_ms: 1870,
-      environment: "production",
-      service_name: "support-api",
-      session_id: "conv_8f2a91",
-      user_id: "user_4821",
-      models: ["gpt-5"],
-      span_count: 5,
-      error_span_count: 0,
-      input_tokens: 1934,
-      output_tokens: 211,
-      cost_usd: 0.00718,
     },
     {
       id: "1f2e3d4c5b6a79880a9b8c7d6e5f4a3b",
@@ -184,8 +187,116 @@ export const traceDetail = () => ({
   next_cursor: null,
 });
 
+/** A run that succeeded with each operation once: nothing to summarize above the tree. */
+const quietTraceDetail = () => ({
+  trace: {
+    id: QUIET_TRACE_ID,
+    name: "support.answer",
+    status: "success",
+    error_type: null,
+    started_at: minutesAgo(1),
+    duration_ms: 1870,
+    environment: "production",
+    service_name: "support-api",
+    framework: "ai-sdk",
+    session_id: "conv_8f2a91",
+    user_id: "user_4821",
+    input_tokens: 1934,
+    output_tokens: 211,
+    cost_usd: 0.00718,
+  },
+  span_count: 3,
+  log_count: 0,
+  spans: [
+    span("q1", null, "invoke_agent support-bot", 0, 1870, {
+      agent_name: "support-bot",
+      operation: "invoke_agent",
+    }),
+    span("q2", "q1", "execute_tool lookup_order", 30, 240, { tool_name: "lookup_order" }),
+    span("q3", "q1", "chat gpt-5", 290, 1560, {
+      model: "gpt-5",
+      provider: "openai",
+      input_tokens: 1934,
+      output_tokens: 211,
+      cost_usd: 0.00718,
+    }),
+  ],
+  logs: [],
+  next_cursor: null,
+});
+
+/**
+ * An agent that runs three 1 s searches at once, so they cover 1.1 s of a 3 s trace, then
+ * fails two levels down, in the request a tool made. The failure is marked on the tool
+ * and the agent too, as instrumentation does when an exception passes through them.
+ */
+const parallelTraceDetail = () => ({
+  trace: {
+    id: PARALLEL_TRACE_ID,
+    name: "research.report",
+    status: "error",
+    error_type: "TimeoutError",
+    started_at: minutesAgo(2),
+    duration_ms: 3000,
+    environment: "production",
+    service_name: "research-api",
+    framework: "ai-sdk",
+    session_id: null,
+    user_id: null,
+    input_tokens: null,
+    output_tokens: null,
+    cost_usd: null,
+  },
+  span_count: 6,
+  log_count: 0,
+  spans: [
+    span("r1", null, "invoke_agent researcher", 0, 3000, {
+      agent_name: "researcher",
+      operation: "invoke_agent",
+      status: "error",
+      error_type: "TimeoutError",
+      error: "TimeoutError: tool fetch_page failed",
+    }),
+    span("s1", "r1", "execute_tool web_search", 100, 1000, { tool_name: "web_search" }),
+    span("s2", "r1", "execute_tool web_search", 150, 1000, { tool_name: "web_search" }),
+    span("s3", "r1", "execute_tool web_search", 200, 1000, { tool_name: "web_search" }),
+    span("t1", "r1", "execute_tool fetch_page", 1300, 800, {
+      tool_name: "fetch_page",
+      status: "error",
+      error_type: "TimeoutError",
+      error: "TimeoutError: Request timed out after 700 ms",
+    }),
+    span("t2", "t1", "GET /page", 1350, 700, {
+      status: "error",
+      error_type: "TimeoutError",
+      error: "Request timed out after 700 ms\n    at fetchPage (tools.ts:41:11)",
+    }),
+  ],
+  logs: [],
+  next_cursor: null,
+});
+
+const TRACE_DETAILS: Record<string, () => unknown> = {
+  [TRACE_ID]: traceDetail,
+  [QUIET_TRACE_ID]: quietTraceDetail,
+  [PARALLEL_TRACE_ID]: parallelTraceDetail,
+};
+
 export const sessions = () => ({
   sessions: [
+    {
+      // Session ids come from the user's app and can hold spaces and quotes.
+      id: "Ada's thread 42",
+      last_active_at: minutesAgo(1),
+      user_id: "user_4821",
+      agent_name: "support-bot",
+      models: ["gpt-5"],
+      trace_count: 2,
+      error_trace_count: 0,
+      input_tokens: 3120,
+      output_tokens: 402,
+      cost_usd: 0.0114,
+    },
     {
       id: "conv_8f2a91",
       last_active_at: minutesAgo(2),
@@ -337,7 +448,11 @@ const server = () => {
   tool("list_projects", () => ({ organization_id: "org_fixture", projects: PROJECTS }));
   tool("search_traces", () => traces());
   tool("search_sessions", () => sessions());
-  tool("get_trace", (args) => (args.trace_id === TRACE_ID ? traceDetail() : "Trace not found."));
+  tool("get_trace", (args) =>
+    Object.hasOwn(TRACE_DETAILS, String(args.trace_id))
+      ? TRACE_DETAILS[String(args.trace_id)]!()
+      : "Trace not found.",
+  );
   tool("list_logs", () => logs());
   tool("get_usage_summary", () => usage());
   tool("get_span_payload", (args) => {
