@@ -15,11 +15,11 @@
   "packages/pi": "0.2.1",
   "packages/tanstack-ai": "0.2.0",
   "sdks/python": "0.3.1",
-  "sdks/python-anthropic": "0.2.0",
-  "sdks/python-bedrock": "0.2.0",
-  "sdks/python-google-genai": "0.2.0",
-  "sdks/python-litellm": "0.2.0",
-  "sdks/python-openai": "0.2.0",
-  "sdks/python-openrouter": "0.2.0",
+  "sdks/python-anthropic": "0.2.1",
+  "sdks/python-bedrock": "0.2.1",
+  "sdks/python-google-genai": "0.2.1",
+  "sdks/python-litellm": "0.2.1",
+  "sdks/python-openai": "0.2.1",
+  "sdks/python-openrouter": "0.2.1",
   "packages/cli": "0.1.0"
 }

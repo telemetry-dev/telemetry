@@ -30,6 +30,11 @@ class MaskContext:
 Mask = Callable[[Any, MaskContext], Any]
 
 
+def utf16_length(text: str) -> int:
+    """The length of ``text`` in UTF-16 units, as JavaScript and the telemetry.dev API count it."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
 def truncate(text: str, max_len: int, *, keep_end: bool = False) -> str:
     """Cap ``text`` at ``max_len`` UTF-16 units, marking the cut.
 

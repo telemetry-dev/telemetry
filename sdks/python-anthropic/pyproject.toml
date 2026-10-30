@@ -1,6 +1,6 @@
 [project]
 name = "telemetry-dev-anthropic"
-version = "0.2.0"
+version = "0.2.1"
 description = "Anthropic integration for telemetry.dev Python SDK"
 readme = "README.md"
 license = "MIT"
@@ -19,7 +19,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "telemetry-dev>=0.2.11",
+  "telemetry-dev>=0.3.0",
   "anthropic>=0.116,<2",
 ]
 

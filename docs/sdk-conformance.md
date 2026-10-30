@@ -45,6 +45,10 @@ repository, not this SDK workspace. Paths below refer to that product repository
 | `prompt.version`                                                                                                                                                                                                                                                                                                                                                                                                      | `td.prompt.version` (int)                                                                                                            | omitted for a fallback prompt (`version` null / None)                                                                   |
 | `prompt.label`                                                                                                                                                                                                                                                                                                                                                                                                        | `td.prompt.label`                                                                                                                    | only for a fetch by label; a fetch without label or version is the `production` label                                   |
 | variables of the last `prompt.compile()` before `withPrompt` / `with_prompt` starts, or in its scope; outside a scope, of the newest `compile()` that made a message of the request                                                                                                                                                                                                                                   | `td.prompt.variables` (JSON object)                                                                                                  | mask → JSON stringify → truncate; gated by the effective captureInput of the span                                       |
+| `runExperiment` / `run_experiment` → each span and log record of an item run                                                                                                                                                                                                                                                                                                                                          | `td.experiment.id`                                                                                                                   | the id that `POST /v1/experiments` returns; set like a propagated attribute, so the provider integration spans get it   |
+| the item of the run                                                                                                                                                                                                                                                                                                                                                                                                   | `td.dataset.item_id`                                                                                                                 | the `id` of the dataset item: its key, the same across dataset versions                                                 |
+| the item run                                                                                                                                                                                                                                                                                                                                                                                                          | `gen_ai.conversation.id = "<experiment id>:<item id>:<run index>"`                                                                   | one session and one trace for each run; replaces an ambient or process session, and the run drops the active span       |
+| the root span of an item run                                                                                                                                                                                                                                                                                                                                                                                          | name `experiment <experiment name>`, `gen_ai.operation.name = "function"`                                                            | `input` is the item input; `output` is the task result; gated by capture flags                                          |
 
 `SpanHandle.serializeContent(value, key)` / `SpanHandle.serialize_content(value, key)` returns
 what `input` / `output` would emit for `value` under `key`: mask → JSON stringify → truncate. It
@@ -143,6 +147,11 @@ Concurrent calls share one fetch.
   and not to the full response. Only an address lookup can continue after the call stops waiting,
   until the system resolver gives up. Both SDKs measure the TTL and Retry-After in elapsed time, so
   a change of the system clock does not move them.
+- Fork (Python): a process that `os.fork()` makes gets the copies of the parent, but not the fetch
+  threads of the parent. A call that starts in the child does not wait for a fetch of the parent.
+  If the call must fetch, it starts a new fetch. If a signal handler forks while a call waits for a
+  fetch, that call continues in the child. The call gets `timeout` 10 seconds after the start of
+  the fetch, because no thread of the child completes the fetch.
 - Failure: when a fetch fails, the SDKs keep the last copy for another TTL and send the error to
   `onError` / `on_error`. With no copy, the call gets the fallback. With no fallback, the call gets
   a `PromptError`. With no copy, the calls of the next 10 seconds (or the TTL, if it is shorter)
@@ -243,6 +252,106 @@ their text:
 - A provider integration reads the function from the core module when it runs, thus it also
   operates with an older core that does not have it. With such a core, the prompt is recorded
   only in a scope.
+
+## Experiments and scores
+
+`runExperiment(options)` / `run_experiment(...)` (and `run_experiment_async`) and `score(options)` /
+`score(...)` (and `score_async`) call the Evals routes on `{baseUrl}`, with the API key, the base
+URL, and the empty-value rules of getPrompt. The requests have the `Authorization: Bearer <key>`
+header, the SDK header, and a JSON body. Python also sends
+`User-Agent: telemetry-dev-python/<version>`, because bot filters refuse the default
+`Python-urllib/3.x`. The body is the JSON of `JSON.stringify`: a lone surrogate goes as a
+`\uXXXX` escape. The TypeScript SDK calls `fetch` as a plain function, because Workers and
+browsers reject a call whose `this` is another object. The redirect rule of getPrompt applies. An
+error has the code of the `{ error: { code, message } }` body, or `http_<status>`, or
+`missing_api_key`, `timeout`, `network_error`, or `invalid_response`.
+
+An experiment run sends these requests in this sequence:
+
+1. `GET /v1/datasets/{name}?version=&split=&cursor=`. The first page names the `datasetVersion`
+   option, or no version. Each next page names the `version` of the first page and its
+   `nextCursor`. A page with a different version, a cursor that repeats, a cursor with no items,
+   or more than 10,000 items in all is `invalid_response`. A first page with no items is
+   `dataset_empty`, and no experiment starts.
+2. `POST /v1/experiments` with `name`, `dataset`, `datasetVersion` (the version of the first
+   page), `split`, `evaluators`, `minScores`, `runsPerItem`, `ci`, and `metadata`. Keys without a
+   value are left out.
+3. `POST /v1/experiments/{id}/items` with at most 100 item runs and at most 4 MiB of JSON. An item
+   run has `itemId`, `runIndex`, `output` (a string as it is, other values as `JSON.stringify` JSON,
+   `null` for no value and for a value that JSON cannot hold, such as an object that holds itself,
+   cut to 100,000 UTF-16 units), `traceId` (when the span records), `latencyMs`, and, for a task
+   that failed, `error` (`<name>: <message>`, cut to 4,000 UTF-16 units) or, for a task that
+   succeeded, `scores`. Python sends a lone surrogate of an output or an error as U+FFFD. Each run
+   gets its own deep copy of the item, so a task that changes its input does not change the next
+   run. The posts go one at a time, in order. A post or a page fetch that fails stops the run: no
+   item starts after it. When the running items end, the SDK sends the request of step 4, sends its
+   failure to `onError` / `on_error`, and fails with the first error. The server then ends the
+   experiment with the item runs that it has, or fails it when it has none. Python does the same
+   after `KeyboardInterrupt` and cancellation.
+4. `POST /v1/experiments/{id}/complete`, after `flush()`.
+5. `GET /v1/experiments/{id}`, after 1, 2, 4, and then each 5 seconds, until the `status` is
+   `completed`, `failed`, or `stopped`, for 30 minutes at most (`timeout`).
+
+Retries: the GET requests, the item posts, and the complete request try 3 times in all after a
+timeout, a network error, a 429, or a 5xx. The server skips an item run that it has. The POST that
+makes the experiment tries again only after a 429, which the rate limit answers before any work: the
+server answers 503 when its database work times out, which can be after the commit. A retry waits
+for the `Retry-After` of a 429 or 503 (seconds or an HTTP date), at most 60 seconds, or else 1
+second and then 2 seconds. `POST /v1/scores` makes one request, with no retry. The TypeScript
+request timeouts abort the request: 30 seconds for the experiment requests and 10 seconds for a
+score. The Python timeouts apply to each socket operation of urllib.
+
+Options and limits: `runsPerItem` / `runs_per_item` is an integer from 1 to 5 (default 1).
+`concurrency` is an integer from 1 to 100 (default 4). `evaluators` has at most 20 trimmed names
+of 1 to 64 UTF-16 units. `scorers` has at most 20 scorers with trimmed names of 1 to 64 UTF-16
+units, and no scorer has the name `user_feedback` or the name of an evaluator of the run in a
+different case. `minScores` / `min_scores` has at most 20 trimmed names, with finite numbers. A
+Python bool is not an integer or a number for these options. Option errors are `TypeError` and
+`RangeError` (TypeScript) or `TypeError` and `ValueError` (Python), before any request.
+
+Scorers run after the span of the item ends, one after the other. A result of `true` or `false`
+is `{ value: 1, label: "pass" }` or `{ value: 0, label: "fail" }`. A number is the `value`. A
+string is the trimmed `label`. An object or mapping gives `value` (a boolean there is a pass or a
+fail), the trimmed `label`, and `reason` (cut to 4,000 UTF-16 units). `null` / `None` gives no
+score. A result that the score rules below reject, or a scorer that throws, gives no score and
+sends an error with the code `scorer_failed` to `onError` / `on_error`.
+
+Score rules, for `score` and for scorer results: the trimmed name has 1 to 64 UTF-16 units. A
+value is a finite number. A label has 1 to 64 UTF-16 units after the trim. A score has a value, a
+label, or the two. `user_feedback` has the value 0 or 1 and no label. The label `pass` goes with no
+value or 1, and `fail` with no value or 0. For `score`: a `traceId` is 32 lowercase hex digits and
+not all zeros, a `spanId` is 16 lowercase hex digits and not all zeros and needs a `traceId`, a
+`sessionId` has 1 to 1,024 UTF-16 units, and a `comment` has at most 4,000. A score needs a
+`traceId` or a `sessionId`. A score that breaks a rule is `invalid_score`, with no request. `score`
+never throws: it returns the id, or no value after it sends the `ScoreError` to `onError` /
+`on_error`.
+
+The result of step 5 needs `id`, `name`, `status`, `url`, `itemsTotal`, `itemsDone`, `scores`,
+and `checkStatus`, else it is `invalid_response`: `checkStatus` decides CI mode, so a missing one
+does not read as no check. A field of a score that can be null can also be missing.
+
+CI mode is on when the `ci` option is true, or with no option when `CI` is `true` or `1`. Then:
+
+- In GitHub Actions (`GITHUB_ACTIONS=true` and a `GITHUB_REPOSITORY` of `owner/name`, at most 200
+  characters), `ci` is `{ provider: "github_actions", repository, commit, prNumber, prTitle, prUrl,
+runUrl }`. The commit is the `pull_request.head.sha` of `GITHUB_EVENT_PATH`, else `GITHUB_SHA`,
+  and must be 7 to 64 hex digits. The title is cut to 256 UTF-16 units, with no half of a
+  surrogate pair at the end, because Postgres rejects a lone surrogate in jsonb. A URL must be
+  `https://` with no space, at most 2,048 UTF-16 units. The run URL is
+  `<GITHUB_SERVER_URL>/<repository>/actions/runs/<GITHUB_RUN_ID>`. Keys without a value are left
+  out.
+- After the result, a status other than `completed` is `experiment_failed`, and a `checkStatus` of
+  `failed` is `check_failed`. The error has the `result`.
+
+The experiment action sets these variables: `TELEMETRY_DEV_EXPERIMENT_DATASET` is the dataset when
+the `dataset` option has no value, and a different `dataset` option is a `TypeError`.
+`TELEMETRY_DEV_EXPERIMENT_MIN_SCORES` holds `name=value` pairs that commas or new lines separate.
+The value must match `-?\d+(\.\d+)?` (ASCII digits), else it is a `TypeError`. These marks win over
+the `minScores` option for the same name. When `TELEMETRY_DEV_EXPERIMENT_RESULTS` names a file, the
+SDK adds the JSON of the `GET /v1/experiments/{id}` body to it as one line.
+
+The SDKs print one line when the experiment starts and the result when it ends. A run with no
+enabled client, or in an environment other than `experiment`, logs a warning.
 
 ## The shared scenario
 

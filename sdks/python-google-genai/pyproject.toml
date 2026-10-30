@@ -1,6 +1,6 @@
 [project]
 name = "telemetry-dev-google-genai"
-version = "0.2.0"
+version = "0.2.1"
 description = "Google GenAI (Gemini) integration for telemetry.dev Python SDK"
 readme = "README.md"
 license = "MIT"
@@ -19,7 +19,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "telemetry-dev>=0.2.11",
+  "telemetry-dev>=0.3.0",
   "google-genai>=2,<3",
 ]
 

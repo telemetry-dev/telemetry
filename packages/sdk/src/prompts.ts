@@ -6,16 +6,15 @@ import {
 } from "@opentelemetry/api";
 import {
   activeContext,
-  DEFAULT_BASE_URL,
   jsonAttr,
   omitUndefined,
   reportError,
-  resolveEnv,
   sessionIdOf,
   sha256,
   withContext,
 } from "@telemetry-dev/otel";
 
+import { isRecord, resolveApi, retryAfterMs } from "./api.ts";
 import type { FieldCaptureConfig } from "./attrs.ts";
 import { prepareCaptureValue } from "./capture.ts";
 import { currentClient } from "./client.ts";
@@ -128,7 +127,10 @@ interface GetPromptOptionsBase {
   version?: number;
   /** Seconds before a call fetches a kept prompt again, in the background. Default 60. */
   cacheTtlSeconds?: number;
-  /** API key with the prompts:read scope. Falls back to the initialized client, then `TELEMETRY_DEV_API_KEY`. */
+  /**
+   * API key with Read prompts in its Access (the prompts:read scope). Falls back to the initialized
+   * client, then `TELEMETRY_DEV_API_KEY`.
+   */
   apiKey?: string;
   /** Falls back to the initialized client, then `TELEMETRY_DEV_BASE_URL`, then `https://api.telemetry.dev`. */
   baseUrl?: string;
@@ -225,8 +227,6 @@ const MAX_RETRY_AFTER_MS = 3_600_000;
 /** How long a failed fetch with no copy answers calls, so that they do not each fetch again. */
 const ERROR_TTL_MS = 10_000;
 const MAX_CACHE_ENTRIES = 1_000;
-/** IMF-fixdate, the HTTP date that servers send: `Sun, 06 Nov 1994 08:49:37 GMT`. */
-const HTTP_DATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
 const VARIABLE = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
 const MODEL_CALL_OPERATIONS = new Set<unknown>(["chat", "text_completion", "generate_content"]);
 const PROMPT_KEY = createContextKey("telemetry.dev prompt");
@@ -268,20 +268,8 @@ export async function getPrompt(name: string, options: GetPromptOptions = {}): P
   const type = options.type ?? "chat";
   checkOptions(name, options, type);
 
-  const core = currentClient().core;
-  const env = resolveEnv();
-  const apiKey = options.apiKey ?? core?.config.apiKey ?? env.TELEMETRY_DEV_API_KEY;
-
-  // An empty value counts as unset, as in the Python SDK.
-  const baseUrl = (
-    options.baseUrl ||
-    core?.config.baseUrl ||
-    env.TELEMETRY_DEV_BASE_URL ||
-    DEFAULT_BASE_URL
-  ).replace(/\/+$/, "");
-
+  const { apiKey, baseUrl, sdkName, fetchImpl, onError } = resolveApi(options);
   const label = options.version === undefined ? (options.label ?? "production") : null;
-  const onError = core?.config.onError;
   let response: PromptResponse;
 
   try {
@@ -309,11 +297,8 @@ export async function getPrompt(name: string, options: GetPromptOptions = {}): P
       () =>
         fetchPrompt(
           url,
-          {
-            authorization: `Bearer ${apiKey}`,
-            "x-telemetry-dev-sdk": core?.config.sdkName ?? "@telemetry-dev/sdk",
-          },
-          options.fetch ?? core?.config.fetchImpl ?? globalThis.fetch,
+          { authorization: `Bearer ${apiKey}`, "x-telemetry-dev-sdk": sdkName },
+          fetchImpl,
         ),
       onError,
     );
@@ -595,7 +580,7 @@ async function fetchPrompt(
       );
 
       const delay = retryAfterMs(res);
-      if (delay !== undefined) retryAfter.set(failure, delay);
+      if (delay !== undefined) retryAfter.set(failure, Math.min(delay, MAX_RETRY_AFTER_MS));
 
       throw failure;
     }
@@ -782,23 +767,6 @@ function keyFingerprint(apiKey: string): string {
   return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-/** The Retry-After of a 429 or 503 response, as seconds or an IMF-fixdate HTTP date, capped. */
-function retryAfterMs(res: Response): number | undefined {
-  if (res.status !== 429 && res.status !== 503) return undefined;
-
-  const value = res.headers.get("retry-after")?.trim();
-
-  if (!value) return undefined;
-
-  let ms: number;
-
-  if (/^\d+$/.test(value)) ms = Number(value) * 1000;
-  else if (HTTP_DATE.test(value)) ms = Date.parse(value) - Date.now();
-  else return undefined;
-
-  return ms > 0 ? Math.min(ms, MAX_RETRY_AFTER_MS) : undefined;
-}
-
 function parseResponse(body: unknown): PromptResponse | undefined {
   if (!isRecord(body)) return undefined;
   const { name, type, label, version, rollout } = body;
@@ -888,10 +856,6 @@ function isPromptMessage(value: unknown): value is PromptMessage {
 
 function isVersion(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 1;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 // Prompt objects share the cached response, so an app cannot change the cache through them.

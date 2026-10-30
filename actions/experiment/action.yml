@@ -1,0 +1,82 @@
+name: telemetry.dev experiment
+description: Run an experiment of your code on a telemetry.dev dataset, check its scores, and post the result on the pull request.
+author: telemetry.dev
+branding:
+  icon: check-circle
+  color: gray-dark
+
+inputs:
+  script:
+    description: The eval script, which calls runExperiment or run_experiment. A .ts script runs with the tsx in the node_modules of the project, a .js script with node, and a .py script with python. Give script or command.
+    required: false
+  command:
+    description: A shell command that runs the eval script, for example `uv run python evals/reply_eval.py`. Give script or command.
+    required: false
+  dataset:
+    description: The dataset to run on. When the script also names a dataset, the two must be the same.
+    required: false
+  min-scores:
+    description: Pass marks, as name=value pairs that commas or new lines separate, for example `correctness=0.9`. A pass rate is 0 to 1. They win over the minScores of the script for the same name.
+    required: false
+  api-key:
+    description: A telemetry.dev API key with the datasets:read and experiments:write scopes. Default the TELEMETRY_DEV_API_KEY variable of the job.
+    required: false
+  base-url:
+    description: The telemetry.dev API. Default https://api.telemetry.dev.
+    required: false
+  working-directory:
+    description: The directory that the script or the command runs in.
+    required: false
+    default: "."
+  comment:
+    description: Set to false to write the job summary only, with no comment on the pull request.
+    required: false
+    default: "true"
+  github-token:
+    description: The token that writes the comment. It needs the pull-requests write permission.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  check-status:
+    description: passed, failed, or none, for the last experiment of the script.
+    value: ${{ steps.report.outputs.check-status }}
+  url:
+    description: The page of the last experiment in telemetry.dev.
+    value: ${{ steps.report.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        INPUT_SCRIPT: ${{ inputs.script }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_DATASET: ${{ inputs.dataset }}
+        INPUT_MIN_SCORES: ${{ inputs.min-scores }}
+        INPUT_API_KEY: ${{ inputs.api-key }}
+        INPUT_BASE_URL: ${{ inputs.base-url }}
+      run: bash "$GITHUB_ACTION_PATH/run.sh"
+
+    - id: report
+      if: always()
+      shell: bash
+      env:
+        TELEMETRY_DEV_EXPERIMENT_RESULTS: ${{ steps.run.outputs.results }}
+        EXPERIMENT_EXIT_CODE: ${{ steps.run.outputs.exit-code }}
+        INPUT_DATASET: ${{ inputs.dataset }}
+        INPUT_SCRIPT: ${{ inputs.script }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_COMMENT: ${{ inputs.comment }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: node "$GITHUB_ACTION_PATH/report.mjs"
+
+    - if: always() && steps.run.outputs.exit-code != '0'
+      shell: bash
+      env:
+        EXIT_CODE: ${{ steps.run.outputs.exit-code }}
+      run: |
+        echo "::error title=telemetry.dev experiment::The experiment script exited with code ${EXIT_CODE:-unknown}."
+        exit "${EXIT_CODE:-1}"

@@ -6,6 +6,7 @@ import copy
 import hashlib
 import itertools
 import json
+import os
 import random
 import re
 import socket
@@ -18,18 +19,16 @@ from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from email.message import Message
-from email.utils import parsedate_to_datetime
 from time import monotonic
-from typing import IO, Any, Literal, TypeAlias, TypedDict, cast, overload
+from typing import Any, Literal, TypeAlias, TypedDict, cast, overload
 from weakref import WeakKeyDictionary, ref
 
 from opentelemetry import context as otel_context
 from opentelemetry.context import Context
 
+from ._api import NoRedirect, api_error, auth_headers, resolve_api, retry_after
 from ._client import Client, get_client
-from ._config import SDK_VERSION, report_error, resolve_config
+from ._config import report_error
 from ._context import propagated_attributes
 from ._semconv import (
     ATTR_PROMPT_LABEL,
@@ -46,8 +45,6 @@ _ERROR_TTL_S = 10.0
 # The longest Retry-After that get_prompt honors, so that a bad header cannot stop fetches.
 _MAX_RETRY_AFTER_S = 3600.0
 _MAX_CACHE_ENTRIES = 1000
-# IMF-fixdate, the HTTP date that servers send: Sun, 06 Nov 1994 08:49:37 GMT.
-_HTTP_DATE = re.compile(r"[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT", re.ASCII)
 _VARIABLE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _MODEL_CALL_OPERATIONS = frozenset({"chat", "text_completion", "generate_content"})
 _PROMPT_KEY = otel_context.create_key("telemetry_dev.prompt")
@@ -377,11 +374,11 @@ def _get_prompt(
     _check(name, type, label, version, cache_ttl_seconds, fallback)
     client = get_client()
     enabled = client if client is not None and client.enabled else None
-    config = enabled.config if enabled is not None else resolve_config()
-    key = api_key if api_key is not None else config.api_key
-    url = (base_url or config.base_url).rstrip("/")
+    api = resolve_api(api_key, base_url)
+    key = api.api_key
+    url = api.base_url
     asked_label = (label if label is not None else "production") if version is None else None
-    on_error = enabled.on_error if enabled is not None else None
+    on_error = api.on_error
 
     try:
         if not key:
@@ -403,13 +400,7 @@ def _get_prompt(
             cache_ttl_seconds,
             lambda: _fetch(
                 f"{url}/v1/prompts?{urllib.parse.urlencode(query)}",
-                {
-                    "Authorization": f"Bearer {key}",
-                    "X-Telemetry-Dev-SDK": "telemetry-dev",
-                    # urllib's default User-Agent, Python-urllib/3.x, is refused by bot filters
-                    # such as Cloudflare's Browser Integrity Check.
-                    "User-Agent": f"telemetry-dev-python/{SDK_VERSION}",
-                },
+                auth_headers(key),
             ),
             on_error,
         )
@@ -602,12 +593,57 @@ class _Entry:
     retry_at: float = 0.0
     # Set when the running fetch ends.
     pending: threading.Event | None = None
+    # The process whose thread runs the fetch. A forked process gets the entry, but not the thread.
+    pending_pid: int = 0
     # When calls stop waiting for the running fetch.
     deadline: float = 0.0
 
 
 _cache: OrderedDict[tuple[str, str, str, str], _Entry] = OrderedDict()
-_cache_lock = threading.Lock()
+# Reentrant, so that a fork in a thread that holds the lock, for example in a signal handler, does
+# not wait for itself in _lock_for_fork. _reset_in_child can replace it, so read it from the module
+# each time.
+_cache_lock = threading.RLock()
+# Whether _lock_for_fork got the lock in this thread. os.fork() runs the after hooks also when a
+# before hook raises, for example in a signal handler.
+_forking = threading.local()
+
+
+def _lock_for_fork() -> None:
+    _cache_lock.acquire()
+    _forking.locked = True
+
+
+def _unlock_after_fork() -> None:
+    if getattr(_forking, "locked", False):
+        _forking.locked = False
+        _cache_lock.release()
+
+
+def _reset_in_child() -> None:
+    """Unlock the cache, and drop the fetches of the parent: the child has none of its threads."""
+    global _cache_lock
+    if getattr(_forking, "locked", False):
+        _forking.locked = False
+        _cache_lock.release()
+    else:
+        # The before hook did not get the lock, because a signal stopped its wait, or did not run,
+        # as in uWSGI with py-call-osafterfork. A thread of the parent can hold the lock, and only
+        # this thread exists here.
+        _cache_lock = threading.RLock()
+    for entry in _cache.values():
+        entry.pending = None
+
+
+# A fork that runs these hooks waits for a thread that holds the lock, so that the child gets no
+# entry that a thread changed only in part. os.register_at_fork cannot remove a hook, and
+# importlib.reload runs this module again with the same globals. Thus the hooks of the first run
+# stay, and they find the lock and the cache when they run. Windows has no fork.
+if hasattr(os, "register_at_fork") and "_fork_hooks" not in globals():
+    _fork_hooks = True
+    os.register_at_fork(
+        before=_lock_for_fork, after_in_parent=_unlock_after_fork, after_in_child=_reset_in_child
+    )
 
 
 def _load(
@@ -628,15 +664,23 @@ def _load(
             entry = _cache[key] = _Entry()
         now = monotonic()
         ttl = ttl_seconds if entry.response is not None else min(ttl_seconds, _ERROR_TTL_S)
-        if now >= max(entry.checked_at + ttl, entry.retry_at) and entry.pending is None:
-            entry.pending = threading.Event()
+        if entry.pending is not None and entry.pending_pid != os.getpid():
+            # A fork in C code that runs no hooks copied the fetch but not its thread. This check
+            # does not replace the lock. If a thread of the parent held the lock at that fork, a
+            # call in the child waits for the lock with no limit.
+            entry.pending = None
+        # A local, because a fork in this thread, as in a signal handler, can clear entry.pending.
+        pending = entry.pending
+        if now >= max(entry.checked_at + ttl, entry.retry_at) and pending is None:
+            pending = entry.pending = threading.Event()
+            entry.pending_pid = os.getpid()
             entry.deadline = now + _FETCH_TIMEOUT_S
             threading.Thread(
-                target=_refresh, args=(entry, entry.pending, fetch, on_error), daemon=True
+                target=_refresh, args=(entry, pending, fetch, on_error), daemon=True
             ).start()
         if entry.response is not None:
             return entry.response
-        pending, deadline = entry.pending, entry.deadline
+        deadline = entry.deadline
     if pending is not None and not pending.wait(deadline - monotonic()):
         raise _timeout()
     with _cache_lock:
@@ -680,21 +724,6 @@ def _refresh(
     if error is not None and stale is not None:
         report_error(on_error, "fetching the prompt failed; using the last copy", error)
     done.set()
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    # A redirect to another host must not get the API key, so a 3xx fails like any status that is
-    # not 2xx.
-    def redirect_request(
-        self,
-        req: urllib.request.Request,
-        fp: IO[bytes],
-        code: int,
-        msg: str,
-        headers: Message,
-        newurl: str,
-    ) -> urllib.request.Request | None:
-        return None
 
 
 class _Deadline:
@@ -795,12 +824,12 @@ class _HTTPSHandler(urllib.request.HTTPSHandler):
         return super().do_open(_on_deadline(http_class, req), req, **http_conn_args)
 
 
-_opener = urllib.request.build_opener(_NoRedirect, _HTTPHandler, _HTTPSHandler)
+_opener = urllib.request.build_opener(NoRedirect, _HTTPHandler, _HTTPSHandler)
 
 
 def _fetch(url: str, headers: dict[str, str]) -> dict[str, Any]:
     deadline = _Deadline()
-    retry_after: str | None = None
+    retry_header: str | None = None
     try:
         try:
             with _opener.open(
@@ -811,7 +840,7 @@ def _fetch(url: str, headers: dict[str, str]) -> dict[str, Any]:
         except urllib.error.HTTPError as exc:
             with exc:
                 status, body = exc.code, exc.read()
-                retry_after = exc.headers.get("Retry-After")
+                retry_header = exc.headers.get("Retry-After")
     except Exception as exc:
         if (
             deadline.expired
@@ -828,9 +857,10 @@ def _fetch(url: str, headers: dict[str, str]) -> dict[str, Any]:
     if deadline.expired:
         raise _timeout()
     if not 200 <= status < 300:
-        error = _api_error(status, body)
-        if status in (429, 503):
-            error._retry_after = _retry_after(retry_after)  # pyright: ignore[reportPrivateUsage]
+        error = api_error(PromptError, status, body)
+        wait = retry_after(status, retry_header)
+        if wait is not None:
+            error._retry_after = min(wait, _MAX_RETRY_AFTER_S)  # pyright: ignore[reportPrivateUsage]
         raise error
     try:
         parsed = _parse_response(json.loads(body))
@@ -843,40 +873,6 @@ def _fetch(url: str, headers: dict[str, str]) -> dict[str, Any]:
 
 def _timeout() -> PromptError:
     return PromptError("timeout", f"Fetching the prompt took more than {_FETCH_TIMEOUT_S:g} s")
-
-
-def _api_error(status: int, body: bytes) -> PromptError:
-    try:
-        error = json.loads(body).get("error")
-    except (ValueError, AttributeError):
-        error = None
-    fields = cast("dict[str, Any]", error) if isinstance(error, dict) else {}
-    code = fields.get("code")
-    message = fields.get("message")
-    return PromptError(
-        code if isinstance(code, str) else f"http_{status}",
-        message if isinstance(message, str) else f"telemetry.dev returned {status}",
-        status,
-    )
-
-
-def _retry_after(value: str | None) -> float | None:
-    """Seconds to wait from a Retry-After header of seconds or an IMF-fixdate HTTP date
-    (``Sun, 06 Nov 1994 08:49:37 GMT``), capped."""
-    value = (value or "").strip()
-    if not value:
-        return None
-    if value.isascii() and value.isdigit():
-        seconds = float(value)
-    elif _HTTP_DATE.fullmatch(value):
-        try:
-            date = parsedate_to_datetime(value)
-        except (TypeError, ValueError):
-            return None
-        seconds = (date - datetime.now(timezone.utc)).total_seconds()
-    else:
-        return None
-    return min(seconds, _MAX_RETRY_AFTER_S) if seconds > 0 else None
 
 
 def _parse_response(data: object) -> dict[str, Any] | None:

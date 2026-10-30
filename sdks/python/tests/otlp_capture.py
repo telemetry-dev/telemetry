@@ -33,7 +33,8 @@ class CaptureServer:
     status: int = 200
     # The (status, JSON body) replies to GET requests, in order; the last one repeats.
     replies: list[tuple[int, object]] = field(default_factory=lambda: [])
-    # Seconds that the server waits before it answers a GET request.
+    # Seconds that the server waits before it answers a GET request. The server reads it before the
+    # request shows in requests, so that a test that sees the request can change it for the next.
     delay: float = 0
     # The location header of GET replies, for a redirect status.
     location: str | None = None
@@ -66,6 +67,7 @@ def otlp_capture_server() -> Generator[CaptureServer]:
             self.end_headers()
 
         def do_GET(self) -> None:
+            delay = capture.delay
             captured.append(
                 CapturedRequest(
                     path=self.requestline.split(" ")[1],
@@ -73,7 +75,7 @@ def otlp_capture_server() -> Generator[CaptureServer]:
                     body=b"",
                 )
             )
-            time.sleep(capture.delay)
+            time.sleep(delay)
             status, reply = (
                 capture.replies[0] if len(capture.replies) == 1 else capture.replies.pop(0)
             )
