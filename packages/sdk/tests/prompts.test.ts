@@ -11,7 +11,6 @@ import {
   getPrompt,
   type Prompt,
   promptAttributesFor,
-  type PromptVariables,
   propagateAttributes,
   PromptError,
   shutdown,
@@ -114,6 +113,7 @@ afterEach(async () => {
   await shutdown();
   vi.useRealTimers();
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
@@ -1007,15 +1007,27 @@ test("the variables of a compile are freed with its messages", async () => {
   expect(freed.deref()).toBeUndefined();
 });
 
-test("with input capture off, compiled messages keep no variables", async () => {
-  setup({ captureInput: false });
+// A row removes the global WeakRef, so the test keeps its own.
+const TrackedRef = WeakRef;
+
+test.each<[string, () => void]>([
+  ["input capture is off", () => setup({ captureInput: false })],
+  [
+    "the runtime has no WeakRef (Cloudflare Workers before 2025-05-05)",
+    () => {
+      setup();
+      vi.stubGlobal("WeakRef", undefined);
+    },
+  ],
+])("when %s, compiled messages keep no variables", async (_case, start) => {
+  start();
   const prompt = await promptOf(RAG_PROMPT);
   const documents: WeakRef<ChatMessage>[] = [];
   const questions: ChatMessage[] = [];
 
   for (let turn = 0; turn < 200; turn += 1) {
     const document: ChatMessage = { role: "user", content: `document ${turn}` };
-    documents.push(new WeakRef(document));
+    documents.push(new TrackedRef(document));
     const compiled = prompt.compile({ documents: [document], question: `question ${turn}` });
     questions.push(compiled.at(-1) as ChatMessage);
   }
@@ -1025,6 +1037,7 @@ test("with input capture off, compiled messages keep no variables", async () => 
   expect(documents.filter((document) => document.deref()).length).toBe(1);
 
   await shutdown();
+  vi.unstubAllGlobals();
   setup();
   expect(promptAttributesFor(questions)).toEqual({
     "td.prompt.name": "support/reply",
@@ -1033,101 +1046,328 @@ test("with input capture off, compiled messages keep no variables", async () => 
   });
 });
 
-// Each row keeps the compiled question and the answer of a turn for the next turn: the variable
-// that gets them, and the value of that variable after the turn.
-test.each<[string, string, (kept: unknown, question: object, answer: object) => unknown]>([
-  ["a new list each turn", "history", (kept, ...turn) => [...(kept as object[]), ...turn]],
-  [
-    "one list trimmed in place to 20 messages",
-    "history",
-    (kept, ...turn) => {
-      const history = kept as object[];
-      history.push(...turn);
-      history.splice(0, history.length - 20);
+const CHAT_PROMPT = {
+  messages: [
+    { role: "system", content: "Answer as the {{team}} desk." },
+    { role: "placeholder", name: "history" },
+    { role: "user", content: "{{question}}" },
+  ],
+};
 
-      return history;
+interface ChatPrompts {
+  chat: Prompt;
+  question: Prompt;
+  rag: Prompt;
+  reply: Prompt;
+}
+
+async function chatPrompts(): Promise<ChatPrompts> {
+  return {
+    chat: await promptOf(CHAT_PROMPT),
+    question: await promptOf({
+      messages: [{ role: "user", content: "Context: {{documents}}\n\n{{question}}" }],
+    }),
+    rag: await promptOf({
+      messages: [
+        { role: "system", content: "Answer as the {{team}} desk." },
+        { role: "placeholder", name: "history" },
+        { role: "placeholder", name: "current" },
+      ],
+    }),
+    reply: await promptOf({ messages: [{ role: "assistant", content: "{{answer}}" }] }),
+  };
+}
+
+function answer(turn: number): ChatMessage {
+  return { role: "assistant", content: `answer ${turn}` };
+}
+
+// A row runs one turn of a chat. It puts `marker` in the variables of the compile that made the
+// message that the chat keeps. It gives the request, the history for the next turn, and that message.
+type ChatTurn = (
+  prompts: ChatPrompts,
+  history: ChatMessage[],
+  turn: number,
+  marker: ChatMessage,
+) => [request: ChatMessage[], history: ChatMessage[], kept: ChatMessage];
+
+test.each<[string, ChatTurn]>([
+  [
+    "a new list each turn",
+    ({ chat }, history, turn, marker) => {
+      const request = chat.compile({
+        team: "billing",
+        history,
+        question: `question ${turn}`,
+        marker: [marker],
+      }) as ChatMessage[];
+      const kept = request.at(-1)!;
+
+      return [request, [...history, kept, answer(turn)], kept];
     },
   ],
   [
     "a new list of the last 20 messages",
-    "history",
-    (kept, ...turn) => [...(kept as object[]), ...turn].slice(-20),
+    ({ chat }, history, turn, marker) => {
+      const request = chat.compile({
+        team: "billing",
+        history,
+        question: `question ${turn}`,
+        marker: [marker],
+      }) as ChatMessage[];
+      const kept = request.at(-1)!;
+
+      return [request, [...history, kept, answer(turn)].slice(-20), kept];
+    },
   ],
-  ["the last question, not in a list", "previous", (_kept, question) => question],
-])(
-  "a chat history in %s keeps the variables of its last two turns",
-  async (_shape, variable, next) => {
-    setup();
-    const prompt = await promptOf({
+  [
+    "a full list that compile gets as copies",
+    ({ chat }, history, turn, marker) => {
+      const request = chat.compile({
+        team: "billing",
+        history: history.map((message) => ({ ...message })),
+        question: `question ${turn}`,
+        marker: [marker],
+      }) as ChatMessage[];
+      const kept = request.at(-1)!;
+
+      return [request, [...history, kept, answer(turn)], kept];
+    },
+  ],
+  [
+    "a question prompt for each turn, in a placeholder of the chat prompt",
+    ({ question, rag }, history, turn, marker) => {
+      const [kept] = question.compile({
+        documents: `document ${turn}`,
+        question: `question ${turn}`,
+        marker: [marker],
+      }) as ChatMessage[];
+      const request = rag.compile({ team: "billing", history, current: [kept!] }) as ChatMessage[];
+
+      return [request, [...history, kept!, answer(turn)], kept!];
+    },
+  ],
+  [
+    "raw questions and a reply prompt for each answer",
+    ({ chat, reply }, history, turn, marker) => {
+      const request = chat.compile({
+        team: "billing",
+        history,
+        question: `question ${turn}`,
+      }) as ChatMessage[];
+      const [kept] = reply.compile({ answer: `answer ${turn}`, marker: [marker] }) as ChatMessage[];
+
+      return [request, [...history, { role: "user", content: `question ${turn}` }, kept!], kept!];
+    },
+  ],
+])("a chat history in %s keeps the variables of the last 5 minutes", async (_shape, run) => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  setup();
+  const prompts = await chatPrompts();
+  const markers: WeakRef<ChatMessage>[] = [];
+  let history: ChatMessage[] = [];
+  let request: ChatMessage[] = [];
+  let older: ChatMessage | undefined;
+
+  // One turn in 2 minutes, for 300 turns. An unused variable marks the variables of each turn.
+  for (let turn = 0; turn < 300; turn += 1) {
+    if (turn > 0) vi.advanceTimersByTime(120_000);
+    const marker: ChatMessage = { role: "user", content: `turn ${turn}` };
+    markers.push(new WeakRef(marker));
+    let kept: ChatMessage;
+    [request, history, kept] = run(prompts, history, turn, marker);
+    // The model call of the turn.
+    promptAttributesFor(request);
+
+    if (turn === 296) older = kept;
+  }
+  await collect();
+
+  // Turns 297, 298, and 299: 4, 2, and 0 minutes old.
+  expect(markers.filter((marker) => marker.deref()).length).toBe(3);
+  expect(promptAttributesFor(request)?.["td.prompt.variables"]).toContain("question 299");
+  expect(promptAttributesFor(older)).toEqual({
+    "td.prompt.name": "support/reply",
+    "td.prompt.version": 12,
+    "td.prompt.label": "production",
+  });
+});
+
+function variablesOf(messages: unknown): unknown {
+  return promptAttributesFor(messages)?.["td.prompt.variables"];
+}
+
+const REFUND_VARIABLES = '{"documents":"The refund policy","question":"Where is #4?"}';
+
+interface LivePrompts {
+  answer: Prompt;
+  guard: Prompt;
+  judge: Prompt;
+  other: Prompt;
+  chat: Prompt;
+  system: Prompt;
+  withSystem: Prompt;
+}
+
+// A row compiles one or more requests and runs other compiles before their calls. It gives the
+// variables that each call records and the variables of the compile of its request.
+type LiveRequests = (prompts: LivePrompts) => Promise<[recorded: unknown, compiled: string][]>;
+
+test.each<[string, LiveRequests]>([
+  [
+    "150 compiles of other requests, then a guard",
+    async ({ answer, guard, other }) => {
+      const request = answer.compile({ documents: "The refund policy", question: "Where is #4?" });
+      for (let index = 0; index < 150; index += 1) other.compile({ q: `${index}` });
+      guard.compile({ conversation: request });
+
+      return [[variablesOf(request), REFUND_VARIABLES]];
+    },
+  ],
+  [
+    "a guard before each of 150 agent steps",
+    async ({ answer, guard }) => {
+      const conversation = answer.compile({
+        documents: "The refund policy",
+        question: "Where is #4?",
+      }) as ChatMessage[];
+
+      for (let step = 0; step < 150; step += 1) {
+        guard.compile({ conversation });
+        conversation.push({ role: "assistant", content: `step ${step}` });
+      }
+
+      return [[variablesOf(conversation), REFUND_VARIABLES]];
+    },
+  ],
+  [
+    "a guard, then a judge of the messages of the guard",
+    async ({ answer, guard, judge }) => {
+      const request = answer.compile({ documents: "The refund policy", question: "Where is #4?" });
+      judge.compile({ conversation: guard.compile({ conversation: request }) });
+
+      return [[variablesOf(request), REFUND_VARIABLES]];
+    },
+  ],
+  [
+    "three turns of a session that add their question to the history before their calls",
+    async ({ chat }) => {
+      const history: ChatMessage[] = [];
+      let open!: () => void;
+      const queue = new Promise<void>((resolve) => {
+        open = resolve;
+      });
+      const turn = async (question: string) => {
+        const request = chat.compile({ team: "billing", history, question }) as ChatMessage[];
+        history.push(request.at(-1)!);
+        await queue;
+
+        return variablesOf(request);
+      };
+      const turns = ["q1", "q2", "q3"].map(turn);
+      open();
+      const [first, second, third] = await Promise.all(turns);
+
+      return [
+        [first, '{"team":"billing","history":[],"question":"q1"}'],
+        [second, '{"team":"billing","history":[{"role":"user","content":"q1"}],"question":"q2"}'],
+        [
+          third,
+          '{"team":"billing","history":[{"role":"user","content":"q1"},{"role":"user","content":"q2"}],"question":"q3"}',
+        ],
+      ];
+    },
+  ],
+  [
+    "a system message compiled at startup, after 3 turns of a chat that gets it",
+    async ({ system, withSystem }) => {
+      const startup = system.compile({ product: "Acme" }) as ChatMessage[];
+      let history: ChatMessage[] = [];
+
+      for (let turn = 0; turn < 3; turn += 1) {
+        const request = withSystem.compile({
+          system: startup,
+          history,
+          question: `question ${turn}`,
+        }) as ChatMessage[];
+        promptAttributesFor(request);
+        history = [...history, request.at(-1)!, answer(turn)];
+      }
+
+      return [
+        [
+          variablesOf([...startup, { role: "user", content: "Where is #4?" }]),
+          '{"product":"Acme"}',
+        ],
+      ];
+    },
+  ],
+])("a request keeps its variables until its call: %s", async (_case, run) => {
+  setup();
+  const calls = await run({
+    answer: await promptOf(RAG_PROMPT),
+    guard: await promptOf({
+      name: "guard",
       messages: [
-        { role: "system", content: "Answer as the {{team}} desk." },
+        { role: "system", content: "Is this safe?" },
+        { role: "placeholder", name: "conversation" },
+      ],
+    }),
+    judge: await promptOf({
+      name: "judge",
+      messages: [
+        { role: "system", content: "Check the answer of the guard." },
+        { role: "placeholder", name: "conversation" },
+      ],
+    }),
+    other: await promptOf({ name: "other", messages: [{ role: "user", content: "{{q}}" }] }),
+    chat: await promptOf(CHAT_PROMPT),
+    system: await promptOf({
+      name: "system",
+      messages: [{ role: "system", content: "You support {{product}}." }],
+    }),
+    withSystem: await promptOf({
+      messages: [
+        { role: "placeholder", name: "system" },
         { role: "placeholder", name: "history" },
         { role: "user", content: "{{question}}" },
       ],
-    });
-    const turns: WeakRef<ChatMessage>[] = [];
-    let kept: unknown = variable === "history" ? [] : undefined;
-    let last: ChatMessage[] = [];
-    let older: ChatMessage | undefined;
-
-    // An unused variable marks the variables of each turn.
-    for (let turn = 0; turn < 300; turn += 1) {
-      const marker: ChatMessage = { role: "user", content: `turn ${turn}` };
-      turns.push(new WeakRef(marker));
-      last = prompt.compile({
-        team: "billing",
-        question: `question ${turn}`,
-        marker: [marker],
-        [variable]: kept,
-      } as PromptVariables) as ChatMessage[];
-      const question = last.at(-1)!;
-
-      if (turn === 297) older = question;
-      kept = next(kept, question, { role: "assistant", content: `answer ${turn}` });
-    }
-    await collect();
-
-    expect(turns.filter((turn) => turn.deref()).length).toBe(2);
-    expect(promptAttributesFor(last)?.["td.prompt.variables"]).toContain(
-      '"question":"question 299"',
-    );
-    expect(promptAttributesFor(older)).toEqual({
-      "td.prompt.name": "support/reply",
-      "td.prompt.version": 12,
-      "td.prompt.label": "production",
-    });
-  },
-);
-
-test("a guard prompt keeps the variables of its request, also after other compiles", async () => {
-  setup();
-  const answer = await promptOf(RAG_PROMPT);
-  const guard = await promptOf({
-    name: "guard",
-    messages: [
-      { role: "system", content: "Is this safe?" },
-      { role: "placeholder", name: "conversation" },
-    ],
+    }),
   });
-  const other = await promptOf({ name: "other", messages: [{ role: "user", content: "{{q}}" }] });
-  const variables = '{"documents":"The refund policy","question":"Where is #4?"}';
 
-  const messages = answer.compile({
-    documents: "The refund policy",
-    question: "Where is #4?",
-  }) as ChatMessage[];
-  // Other requests of the server compile before this request runs its guard.
-  for (let index = 0; index < 150; index += 1) other.compile({ q: `${index}` });
-  guard.compile({ conversation: messages });
-  expect(promptAttributesFor(messages)?.["td.prompt.variables"]).toBe(variables);
+  for (const [recorded, compiled] of calls) expect(recorded).toBe(compiled);
+});
 
-  // An agent loop runs the guard before each step.
-  const conversation = [...messages];
-  for (let step = 0; step < 150; step += 1) {
-    guard.compile({ conversation });
-    conversation.push({ role: "assistant", content: `step ${step}` });
+test("a compile keeps its variables for 5 minutes after it or after the last call that names it", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  setup();
+  const chat = await promptOf(CHAT_PROMPT);
+  let history: ChatMessage[] = [];
+
+  for (let turn = 0; turn < 5; turn += 1) {
+    const request = chat.compile({ team: "billing", history, question: `q${turn}` });
+    promptAttributesFor(request);
+    history = [...history, request.at(-1) as ChatMessage, answer(turn)];
   }
-  expect(promptAttributesFor(conversation)?.["td.prompt.variables"]).toBe(variables);
+  // These calls send only messages of the chat, so they name the newest compile among them.
+  const summary = [...history, { role: "user", content: "Summarize the chat." }];
+  const earlier = history.slice(0, -2);
+
+  expect(variablesOf(summary)).toContain('"question":"q4"');
+  expect(variablesOf(earlier)).toContain('"question":"q3"');
+
+  vi.advanceTimersByTime(299_999);
+  expect(variablesOf(summary)).toContain('"question":"q4"');
+  vi.advanceTimersByTime(1);
+  expect(variablesOf(earlier)).toBeUndefined();
+  // The call 1 ms before moved the deadline of q4.
+  expect(variablesOf(summary)).toContain('"question":"q4"');
+  vi.advanceTimersByTime(300_000);
+  expect(promptAttributesFor(summary)).toEqual({
+    "td.prompt.name": "support/reply",
+    "td.prompt.version": 12,
+    "td.prompt.label": "production",
+  });
 });
 
 test("withPrompt wins over a compiled message of another prompt, through a parent and in updates", async () => {

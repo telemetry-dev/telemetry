@@ -278,16 +278,16 @@ pydantic) do not change. A check of the exact type (`type(message) is dict`), `y
 and `marshal` reject it: give them `dict(message)`.
 
 With input capture on in the client when `compile()` runs, a compiled message keeps the variables
-of its `compile()` alive while the message lives. With input capture off, it keeps no variables.
-When `compile()` gets a compiled message in a variable, or in a list or tuple in a variable, the
-`compile()` that made the message keeps its variables. But each `compile()` whose message that
-`compile()` got removes its variables. For a chat history in a placeholder, turn 3 thus removes the
-variables of turn 1 and keeps those of turn 2. A chat history of compiled messages keeps the
-variables of its last two turns, also when you cut it, and a call that sends only messages of
-previous turns records its prompt without `td.prompt.variables`. A guard prompt that gets the
-messages before their call does not remove their variables. The SDK does not look deeper in a
-variable for messages. If you keep compiled messages and do not give them to `compile()`, each one
-keeps the variables of its `compile()`: keep copies (`dict(message)`) to free them.
+of its `compile()` for 5 minutes. A call keeps them for 5 more minutes when the newest `compile()`
+of the call is that one. After that time, a call records the prompt without
+`td.prompt.variables`, and the SDK removes the variables from the message, also when you keep the
+message. Other compiles do not change this time. Thus a chat history keeps the variables of the
+compiles of its last 5 minutes, and a guard prompt, a queue, or a compile in another thread before
+the call does not remove them. A message that you compile one time and send in many calls keeps its
+variables while a call names its `compile()` at least one time in 5 minutes. A call that sends only
+messages of earlier turns records the prompt of the newest `compile()` among them, and its
+variables when they are less than 5 minutes old. With input capture off, the message keeps no
+variables.
 
 For your own spans, `prompt_attributes_for(messages)` gives the attributes to pass as
 `attributes`. It gives `{}` inside `with_prompt`, and a span with `capture_input=False` drops

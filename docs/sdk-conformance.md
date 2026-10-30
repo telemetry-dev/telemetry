@@ -211,16 +211,21 @@ their text:
   at the call. Then they serialize the variables, which calls the `mask` of the client. A span
   whose effective captureInput is off drops `td.prompt.variables` from its attributes, also when
   the app passes the result of these functions to its own span.
-- A tag keeps the variables of its compile alive while a message of the compile lives. A chat
-  compile C can get a tagged message of a compile B as a variable, or as an item of a list
-  (Python: a list or tuple) in a variable. Then each compile A whose message B got in the same way
-  removes its variables, and B keeps its own. Thus a chat history that keeps a compiled message of
-  each turn keeps the variables of the last two turns, for a history of any length or window, and
-  a request with only messages of previous turns records no `td.prompt.variables`. A guard prompt
-  that gets the messages of a request before its call does not remove their variables, also after
-  other compiles in the process. The SDKs do not look deeper in a variable. They keep no other
-  reference to the variables, except those of the last compile of each prompt object and of each
-  running scope, for `withPrompt` / `with_prompt`.
+- A tag keeps the variables of its compile for 5 minutes. A call of these functions keeps them
+  for 5 more minutes when the newest compile of the call is that compile. After that time,
+  they give the attributes of the tag without `td.prompt.variables`, and the next compile or call
+  removes the variables from the tag, at most one minute late, also when the app keeps the
+  message. Other compiles do not change this time. Thus a chat history keeps the variables of the
+  compiles of the last 5 minutes, for a history of any length or window. A guard prompt, a queue,
+  or a compile in other code does not remove the variables of a request before a call in these 5
+  minutes. A message that more than one request sends keeps its variables while a call names its
+  compile at least one time in 5 minutes. A request with only messages of earlier compiles gives
+  the variables of the newest of them, when they are less than 5 minutes old.
+- The SDKs keep a weak reference to each tag with variables, by the minute of its time, thus the
+  reference does not keep a tag in memory. In a runtime without `WeakRef` (Cloudflare Workers with a
+  compatibility date before 2025-05-05, or with `disable_weak_ref`), the TypeScript tag keeps no
+  variables. The SDKs keep no other reference to the variables, except those of the last compile
+  of each prompt object and of each running scope, for `withPrompt` / `with_prompt`.
 - `compile()` of a text prompt returns a string, which cannot carry a tag. Outside a scope, the
   SDKs do not record a text prompt: use `withPrompt` / `with_prompt`.
 - The provider integrations call them with the request messages before the span starts, also

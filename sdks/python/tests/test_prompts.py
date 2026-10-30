@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
-from typing import Any, NoReturn
+from typing import Any, NoReturn, TypeAlias
 from urllib.parse import parse_qsl, urlsplit
 
 import pytest
@@ -1227,71 +1227,132 @@ def test_with_input_capture_off_compiled_messages_keep_no_variables(make: MakeCl
     }
 
 
-# How a chat keeps the compiled question and the answer of a turn for the next turn.
-def _new_list(kept: Any, question: dict[str, Any], answer: dict[str, Any]) -> Any:
-    return [*kept, question, answer]
+CHAT_MESSAGES = (
+    {"role": "system", "content": "Answer as the {{team}} desk."},
+    {"role": "placeholder", "name": "history"},
+    {"role": "user", "content": "{{question}}"},
+)
 
 
-def _list_trimmed_in_place(kept: Any, question: dict[str, Any], answer: dict[str, Any]) -> Any:
-    kept.extend((question, answer))
-    del kept[:-20]
-    return kept
+@dataclasses.dataclass
+class ChatPrompts:
+    chat: ChatPrompt
+    question: ChatPrompt
+    rag: ChatPrompt
+    reply: ChatPrompt
 
 
-def _new_list_of_20(kept: Any, question: dict[str, Any], answer: dict[str, Any]) -> Any:
-    return [*kept, question, answer][-20:]
+def _answer(turn: int) -> dict[str, Any]:
+    return {"role": "assistant", "content": f"answer {turn}"}
 
 
-def _tuple_of_20(kept: Any, question: dict[str, Any], answer: dict[str, Any]) -> Any:
-    return (*kept, question, answer)[-20:]
+# What a row gives for one turn of a chat: the request, the history for the next turn, and the kept
+# message. The row puts `marker` in the variables of the compile that made the kept message.
+ChatTurn: TypeAlias = tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]
 
 
-def _last_question(kept: Any, question: dict[str, Any], answer: dict[str, Any]) -> Any:
-    return question
+def _new_list(
+    p: ChatPrompts, history: list[dict[str, Any]], turn: int, marker: Document
+) -> ChatTurn:
+    request = p.chat.compile(
+        team="billing", history=history, question=f"question {turn}", marker=marker
+    )
+    return request, [*history, request[-1], _answer(turn)], request[-1]
+
+
+def _new_list_of_20(
+    p: ChatPrompts, history: list[dict[str, Any]], turn: int, marker: Document
+) -> ChatTurn:
+    request = p.chat.compile(
+        team="billing", history=history, question=f"question {turn}", marker=marker
+    )
+    return request, [*history, request[-1], _answer(turn)][-20:], request[-1]
+
+
+def _full_list_as_copies(
+    p: ChatPrompts, history: list[dict[str, Any]], turn: int, marker: Document
+) -> ChatTurn:
+    request = p.chat.compile(
+        team="billing",
+        history=[dict(message) for message in history],
+        question=f"question {turn}",
+        marker=marker,
+    )
+    return request, [*history, request[-1], _answer(turn)], request[-1]
+
+
+def _question_prompt_in_a_placeholder(
+    p: ChatPrompts, history: list[dict[str, Any]], turn: int, marker: Document
+) -> ChatTurn:
+    [kept] = p.question.compile(
+        documents=f"document {turn}", question=f"question {turn}", marker=marker
+    )
+    request = p.rag.compile(team="billing", history=history, current=[kept])
+    return request, [*history, kept, _answer(turn)], kept
+
+
+def _raw_questions_and_a_reply_prompt(
+    p: ChatPrompts, history: list[dict[str, Any]], turn: int, marker: Document
+) -> ChatTurn:
+    request = p.chat.compile(team="billing", history=history, question=f"question {turn}")
+    [kept] = p.reply.compile(answer=f"answer {turn}", marker=marker)
+    return request, [*history, {"role": "user", "content": f"question {turn}"}, kept], kept
 
 
 @pytest.mark.parametrize(
-    ("variable", "first", "keep"),
+    "run",
     [
-        ("history", [], _new_list),
-        ("history", [], _list_trimmed_in_place),
-        ("history", [], _new_list_of_20),
-        ("history", (), _tuple_of_20),
-        ("previous", None, _last_question),
+        _new_list,
+        _new_list_of_20,
+        _full_list_as_copies,
+        _question_prompt_in_a_placeholder,
+        _raw_questions_and_a_reply_prompt,
     ],
-    ids=["new-list", "list-trimmed-in-place", "new-list-of-20", "tuple-of-20", "not-in-a-list"],
+    ids=[
+        "new-list",
+        "new-list-of-20",
+        "full-list-as-copies",
+        "question-prompt-in-a-placeholder",
+        "raw-questions-and-a-reply-prompt",
+    ],
 )
-def test_a_chat_history_keeps_the_variables_of_its_last_two_turns(
+def test_a_chat_history_keeps_the_variables_of_the_last_5_minutes(
     make: MakeClient,
-    variable: str,
-    first: Any,
-    keep: Callable[[Any, dict[str, Any], dict[str, Any]], Any],
+    clock: list[float],
+    run: Callable[[ChatPrompts, list[dict[str, Any]], int, Document], ChatTurn],
 ) -> None:
     make()
-    prompt = chat_prompt(
-        {"role": "system", "content": "Answer as the {{team}} desk."},
-        {"role": "placeholder", "name": "history"},
-        {"role": "user", "content": "{{question}}"},
+    prompts = ChatPrompts(
+        chat=chat_prompt(*CHAT_MESSAGES),
+        question=chat_prompt({"role": "user", "content": "Context: {{documents}}\n\n{{question}}"}),
+        rag=chat_prompt(
+            {"role": "system", "content": "Answer as the {{team}} desk."},
+            {"role": "placeholder", "name": "history"},
+            {"role": "placeholder", "name": "current"},
+        ),
+        reply=chat_prompt({"role": "assistant", "content": "{{answer}}"}),
     )
-    turns: list[weakref.ref[Document]] = []
-    kept = copy.copy(first)
-    last: list[dict[str, Any]] = []
+    markers: list[weakref.ref[Document]] = []
+    history: list[dict[str, Any]] = []
+    request: list[dict[str, Any]] = []
     older: dict[str, Any] = {}
 
-    # An unused variable marks the variables of each turn.
+    # One turn in 2 minutes, for 300 turns. An unused variable marks the variables of each turn.
     for turn in range(300):
+        if turn > 0:
+            clock[0] += 120
         marker = Document(content=f"turn {turn}")
-        turns.append(weakref.ref(marker))
-        last = prompt.compile(
-            {"team": "billing", "question": f"question {turn}", "marker": marker, variable: kept}
-        )
-        if turn == 297:
-            older = last[-1]
-        kept = keep(kept, last[-1], {"role": "assistant", "content": f"answer {turn}"})
+        markers.append(weakref.ref(marker))
+        request, history, kept = run(prompts, history, turn, marker)
+        # The model call of the turn.
+        prompt_attributes_for(request)
+        if turn == 296:
+            older = kept
     gc.collect()
 
-    assert sum(1 for turn in turns if turn() is not None) == 2
-    assert '"question":"question 299"' in str(prompt_attributes_for(last)["td.prompt.variables"])
+    # Turns 297, 298, and 299: 4, 2, and 0 minutes old.
+    assert sum(1 for marker in markers if marker() is not None) == 3
+    assert "question 299" in str(prompt_attributes_for(request)["td.prompt.variables"])
     assert prompt_attributes_for(older) == {
         "td.prompt.name": "support/reply",
         "td.prompt.version": 12,
@@ -1299,32 +1360,184 @@ def test_a_chat_history_keeps_the_variables_of_its_last_two_turns(
     }
 
 
-def test_a_guard_prompt_keeps_the_variables_of_its_request_also_after_other_compiles(
-    make: MakeClient,
+def _variables_of(messages: object) -> object:
+    return prompt_attributes_for(messages).get("td.prompt.variables")
+
+
+REFUND_VARIABLES = '{"documents":"The refund policy","question":"Where is #4?"}'
+
+
+@dataclasses.dataclass
+class LivePrompts:
+    answer: ChatPrompt
+    guard: ChatPrompt
+    judge: ChatPrompt
+    other: ChatPrompt
+    chat: ChatPrompt
+    system: ChatPrompt
+    with_system: ChatPrompt
+
+
+# A row compiles one or more requests and runs other compiles before their calls. It gives the
+# variables that each call records and the variables of the compile of its request.
+LiveCalls: TypeAlias = list[tuple[object, str]]
+
+
+def _other_compiles_then_a_guard(p: LivePrompts) -> LiveCalls:
+    request = p.answer.compile(documents="The refund policy", question="Where is #4?")
+    for index in range(150):
+        p.other.compile(q=str(index))
+    p.guard.compile(conversation=request)
+    return [(_variables_of(request), REFUND_VARIABLES)]
+
+
+def _a_guard_before_each_agent_step(p: LivePrompts) -> LiveCalls:
+    conversation = p.answer.compile(documents="The refund policy", question="Where is #4?")
+    for step in range(150):
+        p.guard.compile(conversation=conversation)
+        conversation.append({"role": "assistant", "content": f"step {step}"})
+    return [(_variables_of(conversation), REFUND_VARIABLES)]
+
+
+def _a_guard_then_a_judge_of_the_guard(p: LivePrompts) -> LiveCalls:
+    request = p.answer.compile(documents="The refund policy", question="Where is #4?")
+    p.judge.compile(conversation=p.guard.compile(conversation=request))
+    return [(_variables_of(request), REFUND_VARIABLES)]
+
+
+def _turns_in_threads_that_share_a_history(p: LivePrompts) -> LiveCalls:
+    history: list[dict[str, Any]] = []
+    turns = [threading.Event() for _ in range(4)]
+    compiled = threading.Barrier(3, timeout=5)
+    recorded: list[object] = [None] * 3
+
+    def turn(index: int) -> None:
+        turns[index].wait(5)
+        request = p.chat.compile(team="billing", history=history, question=f"q{index + 1}")
+        history.append(request[-1])
+        turns[index + 1].set()
+        # A guard call or a queue: the call comes after the other turns compiled.
+        compiled.wait()
+        recorded[index] = _variables_of(request)
+
+    threads = [threading.Thread(target=turn, args=(index,)) for index in range(3)]
+    for thread in threads:
+        thread.start()
+    turns[0].set()
+    for thread in threads:
+        thread.join(5)
+    return list(
+        zip(
+            recorded,
+            [
+                '{"team":"billing","history":[],"question":"q1"}',
+                '{"team":"billing","history":[{"role":"user","content":"q1"}],"question":"q2"}',
+                '{"team":"billing","history":[{"role":"user","content":"q1"},'
+                '{"role":"user","content":"q2"}],"question":"q3"}',
+            ],
+            strict=True,
+        )
+    )
+
+
+def _a_system_message_from_startup_after_a_chat_that_gets_it(p: LivePrompts) -> LiveCalls:
+    startup = p.system.compile(product="Acme")
+    history: list[dict[str, Any]] = []
+    for turn in range(3):
+        request = p.with_system.compile(
+            system=startup, history=history, question=f"question {turn}"
+        )
+        prompt_attributes_for(request)
+        history = [*history, request[-1], _answer(turn)]
+    return [
+        (
+            _variables_of([*startup, {"role": "user", "content": "Where is #4?"}]),
+            '{"product":"Acme"}',
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        _other_compiles_then_a_guard,
+        _a_guard_before_each_agent_step,
+        _a_guard_then_a_judge_of_the_guard,
+        _turns_in_threads_that_share_a_history,
+        _a_system_message_from_startup_after_a_chat_that_gets_it,
+    ],
+    ids=[
+        "150-other-compiles-then-a-guard",
+        "a-guard-before-each-of-150-agent-steps",
+        "a-guard-then-a-judge-of-the-guard",
+        "turns-in-threads-that-share-a-history",
+        "a-system-message-from-startup-after-a-chat-that-gets-it",
+    ],
+)
+def test_a_request_keeps_its_variables_until_its_call(
+    make: MakeClient, run: Callable[[LivePrompts], LiveCalls]
 ) -> None:
     make()
-    answer = chat_prompt(*RAG_MESSAGES)
-    guard = chat_prompt(
-        {"role": "system", "content": "Is this safe?"},
-        {"role": "placeholder", "name": "conversation"},
-        name="guard",
+    calls = run(
+        LivePrompts(
+            answer=chat_prompt(*RAG_MESSAGES),
+            guard=chat_prompt(
+                {"role": "system", "content": "Is this safe?"},
+                {"role": "placeholder", "name": "conversation"},
+                name="guard",
+            ),
+            judge=chat_prompt(
+                {"role": "system", "content": "Check the answer of the guard."},
+                {"role": "placeholder", "name": "conversation"},
+                name="judge",
+            ),
+            other=chat_prompt({"role": "user", "content": "{{q}}"}, name="other"),
+            chat=chat_prompt(*CHAT_MESSAGES),
+            system=chat_prompt(
+                {"role": "system", "content": "You support {{product}}."}, name="system"
+            ),
+            with_system=chat_prompt(
+                {"role": "placeholder", "name": "system"},
+                {"role": "placeholder", "name": "history"},
+                {"role": "user", "content": "{{question}}"},
+            ),
+        )
     )
-    other = chat_prompt({"role": "user", "content": "{{q}}"}, name="other")
-    variables = '{"documents":"The refund policy","question":"Where is #4?"}'
 
-    messages = answer.compile(documents="The refund policy", question="Where is #4?")
-    # Other requests of the server compile before this request runs its guard.
-    for index in range(150):
-        other.compile(q=str(index))
-    guard.compile(conversation=messages)
-    assert prompt_attributes_for(messages)["td.prompt.variables"] == variables
+    for recorded, compiled in calls:
+        assert recorded == compiled
 
-    # An agent loop runs the guard before each step.
-    conversation = list(messages)
-    for step in range(150):
-        guard.compile(conversation=conversation)
-        conversation.append({"role": "assistant", "content": f"step {step}"})
-    assert prompt_attributes_for(conversation)["td.prompt.variables"] == variables
+
+def test_a_compile_keeps_its_variables_for_5_minutes_after_it_or_after_the_last_call_that_names_it(
+    make: MakeClient, clock: list[float]
+) -> None:
+    make()
+    chat = chat_prompt(*CHAT_MESSAGES)
+    history: list[dict[str, Any]] = []
+    for turn in range(5):
+        request = chat.compile(team="billing", history=history, question=f"q{turn}")
+        prompt_attributes_for(request)
+        history = [*history, request[-1], _answer(turn)]
+    # These calls send only messages of the chat, so they name the newest compile among them.
+    summary = [*history, {"role": "user", "content": "Summarize the chat."}]
+    earlier = history[:-2]
+    start = clock[0]
+
+    assert '"question":"q4"' in str(_variables_of(summary))
+    assert '"question":"q3"' in str(_variables_of(earlier))
+
+    clock[0] = start + 299.5
+    assert '"question":"q4"' in str(_variables_of(summary))
+    clock[0] = start + 300
+    assert _variables_of(earlier) is None
+    # The call 0.5 seconds before moved the deadline of q4.
+    assert '"question":"q4"' in str(_variables_of(summary))
+    clock[0] = start + 600
+    assert prompt_attributes_for(summary) == {
+        "td.prompt.name": "support/reply",
+        "td.prompt.version": 12,
+        "td.prompt.label": "production",
+    }
 
 
 def test_a_fallback_prompt_records_its_name_and_label_but_no_version(

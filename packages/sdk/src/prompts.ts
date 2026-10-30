@@ -99,11 +99,10 @@ export interface ChatPrompt extends PromptBase {
    * variable. `withPrompt` records the variables of the last call before it starts or inside it.
    * It tags each message object that it makes with this prompt and a copy of these variables and
    * of each list in them, so that a model call outside `withPrompt` that sends the message records
-   * them; see `promptAttributesFor`. The objects in a list are not copied. The tag keeps no
-   * variables when input capture is off in the client. When a newer compile gets one of these
-   * messages in a variable, the compiles whose messages this compile got remove their variables,
-   * and this compile keeps its own. Thus a chat history keeps the variables of its last two turns,
-   * and a guard prompt that gets the messages before their call does not remove them.
+   * them; see `promptAttributesFor`. The objects in a list are not copied. The tag keeps the
+   * variables for 5 minutes after this compile and after each call that names it. Other compiles
+   * do not change this. The tag keeps no variables when input capture is off in the client, or
+   * when the runtime has no `WeakRef`.
    */
   compile<M = ChatMessage>(variables?: PromptVariables<M>): (ChatMessage | M)[];
 }
@@ -209,12 +208,12 @@ interface PromptScope {
 /** The `compile()` call that made a chat message. */
 interface CompileTag {
   readonly prompt: Prompt;
-  /**
-   * Undefined when input capture was off, or when the messages became a history; see dropHistory.
-   */
+  /** Undefined when input capture was off, or after `expires`; see expire. */
   variables: PromptVariables<unknown> | undefined;
   /** Counts the compiles of the process, so a higher one is newer. */
   readonly serial: number;
+  /** When the tag removes its variables (Date.now). A call that names the tag moves it. */
+  expires: number;
 }
 
 const FETCH_TIMEOUT_MS = 10_000;
@@ -232,12 +231,21 @@ const PROMPT_KEY = createContextKey("telemetry.dev prompt");
 const COMPILED_BY = Symbol("telemetry.dev compiled by");
 /** How many messages promptAttributesFor looks at, at each end of the list. */
 const TAG_LOOKUP = 1_000;
+/** How long a tag keeps its variables after its compile, or after a call that names it. */
+const VARIABLES_TTL_MS = 300_000;
+const MINUTE_MS = 60_000;
 
 const cache = new Map<string, CacheEntry>();
 const compiledVariables = new WeakMap<Prompt, object>();
 /** The Retry-After of the response that failed with this error, in milliseconds. */
 const retryAfter = new WeakMap<PromptError, number>();
 let compiles = 0;
+/**
+ * The tags that keep variables, by the minute of their deadline. A weak reference, so that the
+ * variables of a message that the app dropped do not stay until the deadline. A minute that a
+ * clock change puts in the future does not stop the minutes after it.
+ */
+const deadlines = new Map<number, WeakRef<CompileTag>[]>();
 
 /**
  * Fetches a prompt version from telemetry.dev and keeps it. When the copy is older than
@@ -383,8 +391,8 @@ export function promptAttributes(
  * the messages. It looks at the first 1000 and the last 1000 messages. The tag is on the message
  * object, so a copy of it gives nothing. Gives undefined inside `withPrompt`, whose prompt the span
  * gets. `td.prompt.variables` needs input capture on in the client, at the compile and now, and
- * the span drops it when its own input capture is off. The compile of a previous turn of a chat
- * history gives no variables; see `compile()`. It never throws.
+ * the span drops it when its own input capture is off. A compile gives no variables 5 minutes
+ * after it or after the last call that named it; see `compile()`. It never throws.
  */
 export function promptAttributesFor(messages: unknown): Record<string, AttributeValue> | undefined {
   const config = currentClient().core?.config;
@@ -392,9 +400,14 @@ export function promptAttributesFor(messages: unknown): Record<string, Attribute
   try {
     if (activeContext().getValue(PROMPT_KEY) !== undefined) return undefined;
 
+    const now = Date.now();
+    expire(now);
     const tag = newestTag(messages);
 
     if (!tag) return undefined;
+
+    if (tag.expires > now) tag.expires = now + VARIABLES_TTL_MS;
+    else tag.variables = undefined;
 
     return attributesOf(tag.prompt, tag.variables, config) as Record<string, AttributeValue>;
   } catch (error) {
@@ -638,19 +651,58 @@ function createPrompt(input: {
 
       if (type === "text") return fill(content.text ?? "", values);
       compiles += 1;
-      dropHistory(values);
-      // promptAttributesFor cannot record the variables when input capture is off in the client.
-      const captureInput = currentClient().core?.config.captureInput ?? true;
-
-      return compileMessages(content.messages, values, {
+      const now = Date.now();
+      expire(now);
+      const tag: CompileTag = {
         prompt,
-        variables: captureInput ? values : undefined,
+        variables: undefined,
         serial: compiles,
-      });
+        expires: now + VARIABLES_TTL_MS,
+      };
+
+      // promptAttributesFor cannot record the variables when input capture is off in the client.
+      // Without WeakRef (Cloudflare Workers before 2025-05-05), expire could not remove them.
+      if ((currentClient().core?.config.captureInput ?? true) && typeof WeakRef === "function") {
+        tag.variables = values;
+        addDeadline(new WeakRef(tag), tag.expires);
+      }
+
+      return compileMessages(content.messages, values, tag);
     },
   }) as Prompt;
 
   return prompt;
+}
+
+/**
+ * Removes the variables of each expired tag, also when the app keeps its messages. Thus a chat
+ * history keeps the variables of the last 5 minutes only, and other compiles do not change the time
+ * of a request. A tag that a call named gets its new deadline.
+ */
+function expire(now: number): void {
+  const minute = Math.floor(now / MINUTE_MS);
+
+  for (const [due, refs] of deadlines) {
+    if (due >= minute) continue;
+    deadlines.delete(due);
+
+    for (const ref of refs) {
+      const tag = ref.deref();
+
+      if (!tag) continue;
+
+      if (tag.expires > now) addDeadline(ref, tag.expires);
+      else tag.variables = undefined;
+    }
+  }
+}
+
+function addDeadline(ref: WeakRef<CompileTag>, at: number): void {
+  const minute = Math.floor(at / MINUTE_MS);
+  const refs = deadlines.get(minute);
+
+  if (refs) refs.push(ref);
+  else deadlines.set(minute, [ref]);
 }
 
 // A copy of each list too, so that a change of the app's history after compile() does not change
@@ -662,30 +714,6 @@ function copyVariables(variables: PromptVariables<unknown>): PromptVariables<unk
       Array.isArray(value) ? [...value] : value,
     ]),
   );
-}
-
-/**
- * When a compile gets a message of a previous compile in `variables`, the compiles whose messages
- * that previous compile got are the history of a chat and remove their variables. The previous
- * compile keeps its own, because its model call can come after this compile, as with a guard
- * prompt. Thus a chain of tags with variables is at most two tags long, for a history of any
- * length.
- */
-function dropHistory(variables: PromptVariables<unknown>): void {
-  for (const tag of tagsIn(variables)) {
-    if (tag.variables) for (const older of tagsIn(tag.variables)) older.variables = undefined;
-  }
-}
-
-/** The tags of the messages in `variables`: a value, or an item of a list in a value. */
-function* tagsIn(variables: PromptVariables<unknown>): Generator<CompileTag> {
-  for (const value of Object.values(variables)) {
-    for (const item of Array.isArray(value) ? value : [value]) {
-      const tag = tagOf(item);
-
-      if (tag) yield tag;
-    }
-  }
 }
 
 function compileMessages(
