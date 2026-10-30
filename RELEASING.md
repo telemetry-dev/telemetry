@@ -32,3 +32,16 @@ Each registry's publish job stops at the first package that fails, so the packag
 To retry an existing published release, run the `Release` workflow from `main` and set `release_tag` to that release's full tag. This is a real publication attempt, not a dry run. The tag must be an ancestor of the selected `main` commit. Every configured SDK directory, shared build scripts, lockfiles, release configuration, and root build configuration must be unchanged from the tag; only `packageManager` may differ within root `package.json`. Workflow-only recovery changes are allowed. Source-changing fixes need a new release, not a retry of an old version.
 
 Artifact names and versions are checked before upload. npm retries skip an existing version only when its SHA-512 integrity matches the local tarball, and publication waits about 10 minutes for published `@telemetry-dev/*` dependencies and peer dependencies to satisfy their declared ranges. Python publication likewise waits about 10 minutes for each wheel's dependencies to resolve on PyPI. PyPI retries use `uv publish --check-url` to check existing distributions. An integrity mismatch must be investigated, not bypassed or overwritten.
+
+## Experiment action
+
+The experiment action in `actions/experiment` has no package. Release Please gives it releases such as `experiment-action-v1.0.0`. The `tag-experiment-action` job of the `Release` workflow then moves the major tag, `experiment-action-v1`, to the release commit. The README of the action and the experiment page of telemetry.dev tell users to use the major tag. The job moves a major tag only forward on `main`, so a rerun of an earlier release does not move it back.
+
+A change that can break a workflow, for example a removed input or a changed output, must have a `feat!:` or `fix!:` commit. Release Please then gives the action a new major version, and `experiment-action-v1` stays at the last 1.x release. A `release_tag` retry does not apply to the action. If the job fails, re-run the failed job of the release run.
+
+The job uses `GITHUB_TOKEN`, which cannot have the `workflows` permission. Thus GitHub rejects the tag when no branch head has the same `.github/workflows` files as the release commit. If a merge changed a workflow before the job ran, move the tag with your own credentials:
+
+```sh
+git fetch origin --tags
+git push --force origin 'experiment-action-v1.0.1^{commit}:refs/tags/experiment-action-v1'
+```

@@ -27,7 +27,7 @@ jobs:
           node-version: 24
       # Installs tsx too, which runs the .ts script.
       - run: npm ci
-      - uses: telemetry-dev/telemetry/actions/experiment@main
+      - uses: telemetry-dev/telemetry/actions/experiment@experiment-action-v1
         with:
           dataset: support-golden
           script: evals/reply.eval.ts
@@ -48,8 +48,14 @@ await runExperiment({
 });
 ```
 
-Pin the action to a commit SHA of this repository for a run that does not change when `main`
-changes.
+## Versions
+
+The tag `experiment-action-v1` moves to each 1.x release of the action. A change that can break a
+workflow starts a new major version, `experiment-action-v2`, and `experiment-action-v1` stays at
+the last 1.x release. For a run that does not change, use the tag of one release, for example
+`experiment-action-v1.0.0`, or its commit SHA. The
+[releases](https://github.com/telemetry-dev/telemetry/releases) of this repository list the
+changes of each release.
 
 ## Inputs
 

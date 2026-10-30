@@ -152,6 +152,19 @@ mv "$repo/release-please-config.json.next" "$repo/release-please-config.json"
 run_push_discovery false '["packages/mcp"]'
 grep -Fxq 'npm=["packages/otel","packages/mcp"]' "$tmp/output"
 git -C "$repo" checkout --quiet -- release-please-config.json
+jq '.packages["actions/experiment"] = {"component": "experiment-action", "release-type": "simple"}' \
+  "$repo/release-please-config.json" > "$repo/release-please-config.json.next"
+mv "$repo/release-please-config.json.next" "$repo/release-please-config.json"
+jq '.["actions/experiment"] = "1.0.0"' "$repo/.release-please-manifest.json" > "$repo/.release-please-manifest.json.next"
+mv "$repo/.release-please-manifest.json.next" "$repo/.release-please-manifest.json"
+git -C "$repo" tag experiment-action-v1.0.0
+for released in '["actions/experiment","packages/mcp"]' '[]'; do
+  run_push_discovery false "$released"
+  grep -Fxq 'npm=["packages/otel","packages/mcp"]' "$tmp/output"
+  grep -Fxq 'python=["sdks/python"]' "$tmp/output"
+done
+git -C "$repo" tag --delete experiment-action-v1.0.0 > /dev/null
+git -C "$repo" checkout --quiet -- release-please-config.json .release-please-manifest.json
 expect_failure "Expected 2 configured packages for released paths, found 1" \
   run_push_discovery false '["packages/mcp","packages/unknown"]'
 expect_failure "Release otel-v0.1.0 is still a draft" run_push_discovery true '["packages/otel"]'
@@ -160,6 +173,60 @@ expect_failure "Release tag, event, and checkout commits do not match" \
 git -C "$repo" commit --quiet --allow-empty -m after-batch
 expect_failure "Release tag, event, and checkout commits do not match" \
   run_push_discovery false '["packages/otel"]' "$(git -C "$repo" rev-parse HEAD)"
+
+action_repo="$tmp/action-repo"
+git init --quiet --initial-branch=main "$action_repo"
+git -C "$action_repo" config user.name "Release Test"
+git -C "$action_repo" config user.email "release-test@example.invalid"
+action_commit() {
+  printf '%s\n' "$1" > "$action_repo/.release-please-manifest.json"
+  git -C "$action_repo" add .release-please-manifest.json
+  git -C "$action_repo" commit --quiet -m "$1"
+  git -C "$action_repo" rev-parse HEAD
+}
+unreleased_sha=$(action_commit '{}')
+v1_0_0_sha=$(action_commit '{"actions/experiment":"1.0.0"}')
+git -C "$action_repo" tag experiment-action-v1.0.0
+other_release_sha=$(action_commit '{"actions/experiment":"1.0.0","packages/mcp":"0.1.2"}')
+v1_0_1_sha=$(action_commit '{"actions/experiment":"1.0.1"}')
+git -C "$action_repo" tag experiment-action-v1.0.1
+v2_0_0_sha=$(action_commit '{"actions/experiment":"2.0.0"}')
+git -C "$action_repo" tag experiment-action-v2.0.0
+mkdir -p "$tmp/tag-bin"
+cat > "$tmp/tag-bin/gh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+SH
+chmod +x "$tmp/tag-bin/gh"
+extract_run tag-experiment-action > "$tmp/tag-action.sh"
+run_tag_action() {
+  (
+    cd "$action_repo"
+    git switch --quiet --detach "$1"
+    rm -f "$tmp/gh-log"
+    PATH="$tmp/tag-bin:$PATH" GH_LOG="$tmp/gh-log" GITHUB_REPOSITORY=telemetry-dev/telemetry GITHUB_SHA="$1" \
+      bash -eo pipefail "$tmp/tag-action.sh"
+  )
+}
+expect_gh_call() {
+  [[ $(wc -l < "$tmp/gh-log") -eq 1 ]]
+  grep -Fxq "$1" "$tmp/gh-log"
+}
+for sha in "$unreleased_sha" "$other_release_sha"; do
+  run_tag_action "$sha"
+  [[ ! -e "$tmp/gh-log" ]]
+done
+run_tag_action "$v1_0_0_sha"
+expect_gh_call "api --method POST repos/telemetry-dev/telemetry/git/refs -f ref=refs/tags/experiment-action-v1 -f sha=$v1_0_0_sha"
+git -C "$action_repo" tag experiment-action-v1 "$v1_0_0_sha"
+run_tag_action "$v1_0_1_sha"
+expect_gh_call "api --method PATCH repos/telemetry-dev/telemetry/git/refs/tags/experiment-action-v1 -f sha=$v1_0_1_sha -F force=true"
+git -C "$action_repo" tag --force experiment-action-v1 "$v1_0_1_sha" > /dev/null
+# A rerun of an earlier release must not move the major tag back.
+run_tag_action "$v1_0_0_sha"
+[[ ! -e "$tmp/gh-log" ]]
+run_tag_action "$v2_0_0_sha"
+expect_gh_call "api --method POST repos/telemetry-dev/telemetry/git/refs -f ref=refs/tags/experiment-action-v2 -f sha=$v2_0_0_sha"
 
 release_tree=$(git -C "$repo" show --no-patch --format=%T "$release_sha")
 unrelated_sha=$(printf 'unrelated\n' | git -C "$repo" commit-tree "$release_tree")
@@ -415,7 +482,8 @@ workflow_pnpm=$(
   ' "$root/.github/workflows/release.yml"
 )
 [[ "$workflow_pnpm" == "$package_pnpm" ]]
-[[ $(grep -Ec '^[[:space:]]*concurrency:' "$root/.github/workflows/release.yml") -eq 2 ]]
+[[ $(grep -Ec '^[[:space:]]*concurrency:' "$root/.github/workflows/release.yml") -eq 3 ]]
+grep -Fxq "      group: tag-experiment-action" "$root/.github/workflows/release.yml"
 grep -Fxq "  group: release-\${{ inputs.release_tag || github.sha }}" \
   "$root/.github/workflows/release.yml"
 grep -Fxq "      group: release-please-\${{ github.ref }}" \
@@ -455,13 +523,13 @@ for path, package in packages.items():
         manifest = json.loads((root / path / "package.json").read_text())
         paths[manifest["name"]] = path
         dependencies[path] = [*manifest.get("dependencies", {}), *manifest.get("peerDependencies", {})]
-    else:
+    elif package["release-type"] == "python":
         project = tomllib.loads((root / path / "pyproject.toml").read_text())["project"]
         paths[normalize(project["name"])] = path
         dependencies[path] = [
             normalize(re.match(r"[A-Za-z0-9._-]+", requirement)[0]) for requirement in project.get("dependencies", [])
         ]
-for path in order:
+for path in dependencies:
     for dependency in dependencies[path]:
         dependency_path = paths.get(dependency)
         if dependency_path and order.index(dependency_path) > order.index(path):
