@@ -65,11 +65,44 @@ Run `telemetry <command> --help` to see each command's options and examples.
 
 A command reads its project from `--project <name|id>`. Without that option, it uses `TELEMETRY_DEV_PROJECT`, then the default that you set with `telemetry use`. If the workspace has only one project, the command uses it.
 
-List commands return 20 results by default. Use `--limit` to return from 1 to 50 results. When more results are available, the command prints a `--cursor` command for the next page.
+List commands return 20 results by default. Use `--limit` to return from 1 to 50 results. When more results are available, the command prints the same command with `--cursor` for the next page. Keep the other options as they are when you pass `--cursor`. Only `--limit` may change between pages.
+
+### Time windows
+
+`traces` and `sessions` take `--since` and `--until` to choose the time they search:
+
+```sh
+telemetry traces --errors --since 2h
+telemetry sessions --since 2026-10-29 --until 2026-10-30
+```
+
+Each option takes one of these forms:
+
+| Form                | Example                                             | Meaning                                                                |
+| ------------------- | --------------------------------------------------- | ---------------------------------------------------------------------- |
+| Duration            | `30m`, `2h`, `7d`                                   | That many minutes, hours, or days before now, by telemetry.dev's clock |
+| Date                | `2026-10-29`                                        | The start of that day, in your time zone                               |
+| Time without a zone | `2026-10-29T14:00`, `2026-10-29T14:00:30`           | That time in your time zone                                            |
+| Time with a zone    | `2026-10-29T14:00:00Z`, `2026-10-29T14:00:00-04:00` | That instant, in RFC 3339 form, with seconds                           |
+| `now`               | `--until now`                                       | The same as leaving out `--until`                                      |
+
+A duration has up to five digits. The CLI sends a date or a time without a zone with your zone's offset on that day, so a day that changes to or from daylight saving time still starts at the start of your local day. Without `--since`, a command uses its usual window, and without `--until`, the window ends now. telemetry.dev doesn't search past the project's retention: when a window reaches further back, it starts at the retention limit, and the CLI says so on stderr.
+
+`--range` on `sessions` still picks one of the usual windows, and it can't be combined with `--since` or `--until`.
+
+`traces` also takes `--framework` and `--service`, which match the trace, and `--model`, `--provider`, and `--operation`, which match traces with a span that started in the window.
 
 ## Scripts and agents
 
 Add `--json` to any command for machine-readable output on stdout. Messages and progress go to stderr, so `telemetry traces --json > traces.json` writes only data. List commands print the MCP tool's result as returned, with the fields that the [MCP server documentation](https://telemetry.dev/docs/platform/mcp-server) describes.
+
+The results of `traces` and `sessions` include the window that telemetry.dev searched, with both ends resolved to ISO times. `capped_by_retention` is true when the window starts at the start of the project's retention, so older data wasn't searched. That is also the case for `traces` without `--since`, which searches the whole retention:
+
+```json
+"window": { "since": "2026-10-30T12:00:00.000Z", "until": "2026-10-30T14:00:00.000Z", "capped_by_retention": false }
+```
+
+An older telemetry.dev deployment may ignore `--since`, `--until`, and the `traces` filters and return unfiltered results. So when the CLI sends one of them and the result has no `window`, the command fails with `server_unsupported` and prints no results. A deployment that refuses arguments it doesn't know fails with `tool_error` instead.
 
 `telemetry trace` and `telemetry payload` read every page of a trace or a captured text, up to a limit: 2,000 spans for a trace, and 1,000,000 characters for each payload field. Their JSON output has `complete: false` when the limit cut it short, and human output says so on stderr.
 
@@ -93,10 +126,10 @@ Branch on `code`, not on `message`, whose wording can change. `hint` is a comman
 
 | Code                   | Exit | Meaning                                                                          |
 | ---------------------- | ---- | -------------------------------------------------------------------------------- |
-| `invalid_arguments`    | 2    | An option or argument is not valid                                               |
+| `invalid_arguments`    | 2    | An option or argument is not valid, by the CLI's checks or telemetry.dev's       |
 | `unknown_command`      | 2    | There is no command with that name                                               |
 | `project_not_found`    | 2    | No project in the workspace has that name or id                                  |
-| `invalid_cursor`       | 2    | `--cursor` isn't from an earlier page of this command                            |
+| `invalid_cursor`       | 2    | `--cursor` isn't from an earlier page of this command with the same options      |
 | `project_ambiguous`    | 2    | Several projects have that name; pass its id                                     |
 | `project_required`     | 2    | The workspace has several projects and none was chosen                           |
 | `no_projects`          | 1    | The workspace has no projects yet                                                |
@@ -113,6 +146,7 @@ Branch on `code`, not on `message`, whose wording can change. `hint` is a comman
 | `server_error`         | 1    | telemetry.dev failed to complete the request; try again                          |
 | `tool_error`           | 1    | telemetry.dev returned another error; `message` says what it was                 |
 | `result_too_large`     | 1    | The result was too large to read; narrow it with filters or `--limit`            |
+| `server_unsupported`   | 1    | The deployment doesn't support an option used and would have ignored it          |
 | `request_failed`       | 1    | The request failed for another reason                                            |
 | `failed`               | 1    | The command failed for another reason                                            |
 | `internal`             | 1    | An unexpected error, such as a configuration file the CLI couldn't read or write |

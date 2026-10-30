@@ -27,7 +27,14 @@ export type TraceSummary = {
   cost_usd: number | null;
 };
 
-export type TracePage = { traces: TraceSummary[]; next_cursor: string | null };
+/**
+ * The time a list covers, as ISO instants the server resolved, with `since` moved up to
+ * the project's retention when it reached further back. Servers from before
+ * `--since` and `--until` leave it out.
+ */
+export type Window = { since: string; until: string; capped_by_retention: boolean };
+
+export type TracePage = { traces: TraceSummary[]; next_cursor: string | null; window?: Window };
 
 export type SessionSummary = {
   id: string;
@@ -42,7 +49,11 @@ export type SessionSummary = {
   cost_usd: number | null;
 };
 
-export type SessionPage = { sessions: SessionSummary[]; next_cursor: string | null };
+export type SessionPage = {
+  sessions: SessionSummary[];
+  next_cursor: string | null;
+  window?: Window;
+};
 
 export type Span = {
   id: string;

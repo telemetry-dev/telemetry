@@ -67,6 +67,7 @@ beforeEach(async () => {
     removedFromWorkspace: false,
     errorCodes: true,
     traceUrl: QUIET_TRACE_URL,
+    windows: true,
   });
 
   return () => rm(home, { recursive: true, force: true });
@@ -470,6 +471,210 @@ test("the code telemetry.dev gives a tool error becomes the CLI's code, exit cod
       "dev.telemetry/error": { code: "span_not_found", retryable: false },
     }),
   ).toMatchObject({ code: "span_not_found", exitCode: 1, message: "Span not found" });
+});
+
+const argsOf = (tool: string) => calls.find((call) => call.tool === tool)?.args;
+
+test("a deployment from before --since and the new traces filters fails instead of printing results it didn't filter", async () => {
+  await signIn(PROJECTS[0]);
+  serverState.windows = false;
+
+  const human = await run("traces", "--since", "2h");
+  expect(human).toMatchObject({ code: 1, stdout: "" });
+  expect(human.stderr).toBe(
+    "error This telemetry.dev deployment doesn't support --since yet and would have ignored it. Run the command without it.\n",
+  );
+
+  const failures = await Promise.all(
+    [
+      ["traces", "--model", "gpt-5"],
+      ["traces", "--until", "1h", "--operation", "chat"],
+      ["sessions", "--since", "7d"],
+    ].map((args) => run(...args, "--json")),
+  );
+
+  for (const result of failures) {
+    expect(result).toMatchObject({ code: 1, stdout: "" });
+    expect(JSON.parse(result.stderr).error).toMatchObject({
+      code: "server_unsupported",
+      retryable: false,
+      exit_code: 1,
+    });
+  }
+
+  expect(failures.map((result) => JSON.parse(result.stderr).error.message)).toEqual([
+    "This telemetry.dev deployment doesn't support --model yet and would have ignored it. Run the command without it.",
+    "This telemetry.dev deployment doesn't support --until and --operation yet and would have ignored them. Run the command without them.",
+    "This telemetry.dev deployment doesn't support --since yet and would have ignored it. Run the command without it, or use --range.",
+  ]);
+
+  // Without them, and with `--until now`, which sends nothing, the same server answers.
+  calls.length = 0;
+  for (const args of [["traces"], ["traces", "--until", "now"], ["sessions", "--range", "7d"]]) {
+    expect((await run(...args)).code).toBe(0);
+  }
+  expect(calls.map((call) => Object.hasOwn(call.args, "until"))).toEqual([false, false, false]);
+});
+
+test("--since and --until are checked before any call, and --range can't be combined with them", async () => {
+  await signIn(PROJECTS[0]);
+
+  const invalid = [
+    ["traces", "--since", "yesterday"],
+    ["traces", "--since", "0h"],
+    ["traces", "--since", "100000d"],
+    ["traces", "--since", "90s"],
+    ["traces", "--since", "now"],
+    ["traces", "--since", "2026-02-30"],
+    ["traces", "--since", "2026-10-30T24:00"],
+    ["traces", "--since", "2026-10-30T14:00Z"],
+    ["traces", "--since", "2026-10-30T14:00:00+16:00"],
+    ["traces", "--until", "2026-10-30 14:00"],
+    ["traces", "--since", "2026-10-30", "--until", "2026-10-29"],
+    // The same instant written in two zones.
+    ["traces", "--since", "2026-10-30T10:00:00Z", "--until", "2026-10-30T06:00:00-04:00"],
+    ["sessions", "--range", "7d", "--since", "2h"],
+    ["sessions", "--range", "24h", "--until", "2026-10-30"],
+    // As from an unset shell variable.
+    ["sessions", "--since", ""],
+    ["traces", "--since", "2026-10-30T14:00:00.1234567890Z"],
+  ];
+  // With a project named, a check made after the project lookup would show as a call.
+  const results = await Promise.all(invalid.map((args) => run(...args, "-p", "support-bot")));
+
+  expect(results.map((result) => result.code)).toEqual(invalid.map(() => 2));
+  expect(calls).toEqual([]);
+  expect(results[0]!.stderr).toBe(
+    'error --since must be a duration such as 30m, 2h, or 7d, a date such as 2026-10-30, or a time such as 2026-10-30T14:00 or 2026-10-30T14:00:00Z, not "yesterday".\n',
+  );
+  expect(results[10]!.stderr).toBe(
+    "error --since must be earlier than --until: 2026-10-30 is not before 2026-10-29.\n",
+  );
+  expect(results[12]!.stderr).toBe(
+    "error --range can't be combined with --since or --until. Use one or the other.\n",
+  );
+});
+
+test("a date or a time without a zone is read in this machine's zone, with the offset in force that day", async () => {
+  await signIn(PROJECTS[0]);
+
+  // New York moved its clocks from 2:00 to 3:00 on 2026-03-08, so that day began at
+  // -05:00 and its noon was at -04:00. The fixture may refuse dates past retention; the
+  // arguments sent are what this checks.
+  await runWith(
+    { TZ: "America/New_York" },
+    "traces",
+    "--since",
+    "2026-03-08",
+    "--until",
+    "2026-03-08T12:00",
+    "--json",
+  );
+  expect(argsOf("search_traces")).toMatchObject({
+    since: "2026-03-08T00:00:00-05:00",
+    until: "2026-03-08T12:00:00-04:00",
+  });
+
+  calls.length = 0;
+  await runWith({ TZ: "Asia/Tokyo" }, "sessions", "--since", "2026-03-08T09:30:15.5", "--json");
+  expect(argsOf("search_sessions")).toMatchObject({ since: "2026-03-08T09:30:15.500+09:00" });
+
+  // A time the clocks skip moves past the gap and is sent as the clock then reads, so the
+  // instant sent is the one the CLI compared. Offsets keep their minutes: Chatham changes
+  // from +12:45 to +13:45 on 2026-09-27, and Kolkata is +05:30.
+  for (const [zone, typed, sent] of [
+    ["America/New_York", "2026-03-08T02:30", "2026-03-08T03:30:00-04:00"],
+    ["Pacific/Chatham", "2026-09-06T10:00", "2026-09-06T10:00:00+12:45"],
+    ["Pacific/Chatham", "2026-10-06T10:00", "2026-10-06T10:00:00+13:45"],
+    ["Asia/Kolkata", "2026-10-30", "2026-10-30T00:00:00+05:30"],
+  ] as const) {
+    calls.length = 0;
+    await runWith({ TZ: zone }, "traces", "--since", typed, "--json");
+    expect(argsOf("search_traces")).toMatchObject({ since: sent });
+  }
+});
+
+test("durations and times with a zone go to telemetry.dev as typed, and --json keeps the window", async () => {
+  await signIn(PROJECTS[0]);
+
+  const listed = await run("traces", "--since", "90m", "--until", "30m", "--json");
+  expect(listed.code).toBe(0);
+  expect(argsOf("search_traces")).toMatchObject({ since: "90m", until: "30m" });
+
+  const { window } = JSON.parse(listed.stdout);
+  expect(Date.parse(window.until) - Date.parse(window.since)).toBe(60 * 60_000);
+  expect(window.capped_by_retention).toBe(false);
+
+  // 09:00 UTC is before 06:00 in New York, which is 10:00 UTC.
+  calls.length = 0;
+  const zoned = await run(
+    "sessions",
+    "--since",
+    "2026-10-30T09:00:00Z",
+    "--until",
+    "2026-10-30T06:00:00-04:00",
+    "--json",
+  );
+  expect(zoned.code).toBe(0);
+  expect(argsOf("search_sessions")).toMatchObject({
+    since: "2026-10-30T09:00:00Z",
+    until: "2026-10-30T06:00:00-04:00",
+  });
+});
+
+test("a --since past the project's retention is noted, and the default whole-retention window isn't", async () => {
+  // This project keeps 30 days.
+  await signIn(PROJECTS[0]);
+
+  const capped = await run("traces", "--since", "45d");
+  expect(capped.code).toBe(0);
+  expect(capped.stderr).toMatch(/This project keeps data from .* on, so the window starts there\./);
+
+  // Without --since, traces searches the whole retention, which the server marks as capped.
+  const plain = await run("traces");
+  expect(plain.code).toBe(0);
+  expect(plain.stderr).not.toContain("keeps data from");
+});
+
+test("the next-page command keeps --since and the filters, and runs as pasted", async () => {
+  await signIn(PROJECTS[0]);
+
+  const argv = ["traces", "--since", "2h", "--model", "gpt-5", "--errors"];
+  const listed = await run(...argv);
+  expect(listed.code).toBe(0);
+
+  const words = await shellWords(listed.stderr.match(/More: (.*)/)![1]!);
+  expect(words).toEqual(["telemetry", ...argv, `--cursor=${traces().next_cursor}`]);
+
+  calls.length = 0;
+  expect((await run(...words.slice(1))).code).toBe(0);
+  expect(argsOf("search_traces")).toMatchObject({
+    since: "2h",
+    model: "gpt-5",
+    status: "error",
+    cursor: traces().next_cursor,
+  });
+});
+
+test("a window telemetry.dev refuses is a usage error with its reason", async () => {
+  await signIn(PROJECTS[0]);
+
+  // Only the server's clock can say that 1h ago comes after 2h ago.
+  const reversed = await run("traces", "--since", "1h", "--until", "2h", "--json");
+  expect(reversed).toMatchObject({ code: 2, stdout: "" });
+  expect(JSON.parse(reversed.stderr).error).toMatchObject({
+    code: "invalid_arguments",
+    message: expect.stringMatching(/^since \S+Z must be earlier than until \S+Z\.$/),
+    retryable: false,
+    exit_code: 2,
+  });
+
+  const expired = await run("sessions", "--since", "2000-01-01", "--until", "2000-01-02");
+  expect(expired.code).toBe(2);
+  expect(expired.stderr).toMatch(
+    /^error until 2000-01-02T\S+ is not after the start of this project's 30-day retention, \S+, so no data is left in the window\. Use a later until\.\n$/,
+  );
+  expect(calls.map((call) => call.tool)).toEqual(["search_traces", "search_sessions"]);
 });
 
 test("a request that times out inside fetch is a retryable timeout, not a failed request", async () => {
