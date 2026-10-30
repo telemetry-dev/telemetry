@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/telemetry-dev/telemetry/compare/python-google-genai-v0.2.0...python-google-genai-v0.2.1) (2026-10-30)
+
+
+### Bug Fixes
+
+* **sdk-python:** require telemetry-dev 0.3.0 in the python integrations ([#122](https://github.com/telemetry-dev/telemetry/issues/122)) ([fb6fe58](https://github.com/telemetry-dev/telemetry/commit/fb6fe58926c4078cc19af7b562dfefd833cdfed7))
+
 ## [0.2.0](https://github.com/telemetry-dev/telemetry/compare/python-google-genai-v0.1.8...python-google-genai-v0.2.0) (2026-10-29)
 
 

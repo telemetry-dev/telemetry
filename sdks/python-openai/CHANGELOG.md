@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/telemetry-dev/telemetry/compare/python-openai-v0.2.0...python-openai-v0.2.1) (2026-10-30)
+
+
+### Bug Fixes
+
+* **sdk-python:** require telemetry-dev 0.3.0 in the python integrations ([#122](https://github.com/telemetry-dev/telemetry/issues/122)) ([fb6fe58](https://github.com/telemetry-dev/telemetry/commit/fb6fe58926c4078cc19af7b562dfefd833cdfed7))
+
 ## [0.2.0](https://github.com/telemetry-dev/telemetry/compare/python-openai-v0.1.9...python-openai-v0.2.0) (2026-10-29)
 
 
