@@ -79,7 +79,9 @@ jobs:
           while IFS= read -r path; do
             component=$(jq -er --arg path "$path" '.packages[$path].component' release-please-config.json)
             release_type=$(jq -er --arg path "$path" '.packages[$path]["release-type"]' release-please-config.json)
-            version=$(jq -er --arg path "$path" '.[$path]' .release-please-manifest.json)
+            version=$(jq -r --arg path "$path" '.[$path] // empty' .release-please-manifest.json)
+            # A package added since the last release has no version until its first release.
+            [[ -n "$version" ]] || continue
             tag="$component-v$version"
 
             if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
