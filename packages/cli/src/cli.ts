@@ -175,7 +175,7 @@ const COMMANDS: Readonly<Record<string, Command>> = {
     run: traceCommand,
   },
   sessions: {
-    summary: "Find sessions, most recently active first",
+    summary: "Find sessions by the start of their latest trace, newest first",
     usage: "telemetry sessions [options]",
     options: {
       range: {
