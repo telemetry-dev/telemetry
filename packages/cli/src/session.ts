@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { link, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -117,38 +117,153 @@ const saveSession = async (session: Session) => {
 };
 
 const LOCK_RETRY_MS = 25;
-// A lock is held only for a read and a write, so one this old was left by a killed process.
+// For a lock whose holder can't be checked: one written by CLI 0.1.0, which holds only a
+// token, or by another machine sharing the config directory. A lock is held only for a
+// read and a write, so one this old was most likely left by a killed process.
 const LOCK_STALE_MS = 3000;
 const LOCK_WAIT_MS = 2 * LOCK_STALE_MS;
 
-const readLock = (path: string) => readFile(path, "utf8").catch(() => undefined);
+type LockOwner = { readonly token: string; readonly pid?: number; readonly host?: string };
+
+// The locks and markers this process holds, by token.
+const held = new Set<string>();
+
+const readLock = async (path: string): Promise<LockOwner | undefined> => {
+  const text = await readFile(path, "utf8").catch(() => undefined);
+
+  if (text === undefined) return undefined;
+
+  try {
+    const owner = JSON.parse(text) as Partial<LockOwner> | null;
+
+    if (typeof owner?.token === "string") return owner as LockOwner;
+  } catch {}
+
+  return { token: text };
+};
+
+/** Creates `path` naming this process as its owner, and returns its token; undefined when it exists. */
+const claim = async (path: string) => {
+  const owner: LockOwner = {
+    token: randomBytes(12).toString("hex"),
+    pid: process.pid,
+    host: hostname(),
+  };
+
+  const record = JSON.stringify(owner);
+  // Written whole first and linked into place, so where hard links work no command finds
+  // the file without its owner. Written fresh each time, so its modification time is when
+  // it was claimed.
+  const draft = `${path}.${owner.token}.tmp`;
+
+  // Recorded before the file appears: another update in this process can read it before
+  // the claim resolves, and would take it for one left by an earlier process.
+  held.add(owner.token);
+
+  try {
+    await writeFile(draft, record, { flag: "wx", mode: 0o600 });
+    await link(draft, path).catch(async (error: NodeJS.ErrnoException) => {
+      if (error.code === "EEXIST") throw error;
+
+      // A filesystem without hard links; the record is written in place instead.
+      await writeFile(path, record, { flag: "wx", mode: 0o600 });
+    });
+  } catch (error) {
+    held.delete(owner.token);
+
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return undefined;
+
+    throw error;
+  } finally {
+    // Best effort: a leftover draft has a unique name and nothing reads it, and a failure
+    // here must not turn a claim that succeeded into an error.
+    await rm(draft, { force: true }).catch(() => {});
+  }
+
+  return owner.token;
+};
 
 /**
- * Takes the lock at `path` and returns its owner token. Only a lock still holding the
- * token that was read is broken or released, so a command never removes another's lock.
+ * Whether the command holding a lock has exited without releasing it. On this machine a
+ * running holder keeps its lock however long it pauses, such as a laptop asleep mid-write.
+ * A lock from another machine or CLI 0.1.0, or one caught empty while being written on a
+ * filesystem without hard links, is judged by its age.
  */
+const abandoned = async (path: string, owner: LockOwner) => {
+  const { pid } = owner;
+
+  if (
+    typeof pid === "number" &&
+    Number.isSafeInteger(pid) &&
+    pid > 0 &&
+    owner.host === hostname()
+  ) {
+    // An earlier process with this one's pid left it, as when every run is pid 1 in a container.
+    if (pid === process.pid) return !held.has(owner.token);
+
+    try {
+      process.kill(pid, 0);
+
+      return false;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ESRCH";
+    }
+  }
+
+  const changed = await stat(path).catch(() => undefined);
+
+  return changed !== undefined && Date.now() - changed.mtimeMs > LOCK_STALE_MS;
+};
+
+/**
+ * Removes the lock at `path` if it still holds `token`. Every removal, whether a holder
+ * releasing its lock or a command breaking an abandoned one, first creates a marker named
+ * after the token, so while holders are judged by their pid, two commands never act on
+ * one lock, and one can't remove a lock another took after its check. A marker whose
+ * owner exited partway is removed the same way. Returns false when another command holds
+ * the marker.
+ */
+const removeLock = async (path: string, token: string): Promise<boolean> => {
+  const marker = `${path}.${createHash("sha256").update(token).digest("hex").slice(0, 16)}`;
+  const mine = await claim(marker);
+
+  if (!mine) {
+    const other = await readLock(marker);
+
+    if (other && (await abandoned(marker, other))) await removeLock(marker, other.token);
+
+    return false;
+  }
+
+  try {
+    if ((await readLock(path))?.token === token) await rm(path, { force: true });
+
+    return true;
+  } finally {
+    // Held for one read and one removal. Its owner is this running process, so on this
+    // machine no other command removes it meanwhile.
+    try {
+      await rm(marker, { force: true });
+    } finally {
+      held.delete(mine);
+    }
+  }
+};
+
+/** Takes the lock at `path` and returns its owner token. */
 const lock = async (path: string) => {
-  const token = randomBytes(12).toString("hex");
-  const deadline = Date.now() + LOCK_WAIT_MS;
+  const deadline = performance.now() + LOCK_WAIT_MS;
 
   for (;;) {
-    try {
-      await writeFile(path, token, { flag: "wx", mode: 0o600 });
+    const token = await claim(path);
 
-      return token;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    }
+    if (token) return token;
 
-    const held = await stat(path).catch(() => undefined);
     const owner = await readLock(path);
 
-    if (held && owner !== undefined && Date.now() - held.mtimeMs > LOCK_STALE_MS) {
-      if ((await readLock(path)) === owner) await rm(path, { force: true });
-      continue;
-    }
+    if (owner && (await abandoned(path, owner))) await removeLock(path, owner.token);
 
-    if (Date.now() > deadline) {
+    if (performance.now() > deadline) {
       throw new CliError(
         `Another telemetry command is holding the sign-in file. If none is running, delete ${path} and try again.`,
       );
@@ -158,8 +273,23 @@ const lock = async (path: string) => {
   }
 };
 
+// When another command holds the marker, it is breaking this lock under the age rule,
+// which can't see that this command is running. Waits for the lock or the marker to go,
+// but not past LOCK_WAIT_MS: once this process exits, its lock is broken by its pid.
 const unlock = async (path: string, token: string) => {
-  if ((await readLock(path)) === token) await rm(path, { force: true });
+  const deadline = performance.now() + LOCK_WAIT_MS;
+
+  try {
+    while (
+      !(await removeLock(path, token)) &&
+      (await readLock(path))?.token === token &&
+      performance.now() < deadline
+    ) {
+      await sleep(LOCK_RETRY_MS);
+    }
+  } finally {
+    held.delete(token);
+  }
 };
 
 /**
