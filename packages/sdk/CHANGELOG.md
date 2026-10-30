@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.2.0...sdk-v0.2.1) (2026-10-30)
+
+
+### Bug Fixes
+
+* **sdk:** bound prompt fetches and time them by elapsed time ([#117](https://github.com/telemetry-dev/telemetry/issues/117)) ([0741322](https://github.com/telemetry-dev/telemetry/commit/0741322071d2648cbb771750763847e3483c8fa0))
+
 ## [0.2.0](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.1.12...sdk-v0.2.0) (2026-10-29)
 
 
