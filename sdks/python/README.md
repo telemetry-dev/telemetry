@@ -219,6 +219,13 @@ pinned = telemetry_dev.get_prompt("support/reply", version=13)
   call returns it at once and fetches a new copy in a background thread. Only a call with no copy
   waits for a fetch, for 10 seconds at most, also when the network stops. Calls for the same
   prompt share one fetch. `get_prompt_async` runs the same function in a worker thread.
+- A process that `os.fork()` makes keeps the copies of its parent. This includes a process of
+  `multiprocessing` with the `fork` start method. A call that starts in the child does not wait
+  for a fetch of the parent. If the call must fetch, it starts a new fetch.
+- If a signal handler forks while a call waits for a fetch, that call continues in the child. No
+  thread of the child completes that fetch. Thus the call waits until 10 seconds after the start
+  of the fetch. Then the call returns the `fallback`, or raises `PromptError` with the code
+  `timeout`.
 - If a fetch fails, `get_prompt` returns the last copy that it fetched and reports the error
   through `on_error`. With no copy, it returns the `fallback` (`version` is `None` and
   `is_fallback` is `True`). With no fallback, it raises `PromptError` whose `code` tells why, for

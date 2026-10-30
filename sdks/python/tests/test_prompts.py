@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import importlib
 import itertools
+import os
+import signal
 import socket
+import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Generator
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from types import SimpleNamespace
+from types import FrameType, SimpleNamespace
 from typing import Any, NoReturn
 from urllib.parse import parse_qsl, urlsplit
 
@@ -33,6 +38,12 @@ from telemetry_dev import (
 
 from .conftest import MakeClient
 from .otlp_capture import CaptureServer, otlp_capture_server
+
+# Python 3.12+ gives a warning for fork() in a process with threads, and the capture server has one.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded:DeprecationWarning"
+)
+needs_fork = pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 
 
 def reply(**overrides: Any) -> dict[str, Any]:
@@ -91,6 +102,57 @@ def wait_for(check: Callable[[], bool]) -> None:
     while not check():
         assert time.monotonic() < deadline
         time.sleep(0.01)
+
+
+def in_fork(child: Callable[[], str], fork: Callable[[], int] | None = None) -> str:
+    """Run ``child`` in a process that ``fork`` (by default ``os.fork``) makes, and return its
+    result, or the repr of its exception or of an exception in a fork hook of the prompt module.
+    The parent kills a child that does not end in 10 s, and the test fails."""
+    # Python ignores an exception in a fork hook and only gives it to sys.unraisablehook. The
+    # hooks of OpenTelemetry raise after an earlier test discards its batch processor.
+    hook_errors: list[BaseException | None] = []
+
+    def record(unraisable: sys.UnraisableHookArgs) -> None:
+        frames = traceback.extract_tb(unraisable.exc_traceback)
+        if any(frame.filename == prompts_module.__file__ for frame in frames):
+            hook_errors.append(unraisable.exc_value)
+
+    previous_hook = sys.unraisablehook
+    parent = os.getpid()
+    read_end, write_end = os.pipe()
+    sys.unraisablehook = record
+    try:
+        pid = (fork or os.fork)()
+    finally:
+        sys.unraisablehook = previous_hook
+    # Not pid == 0: a fork function that forks more than one time can return a pid in a child.
+    if os.getpid() != parent:
+        try:
+            os.close(read_end)
+            try:
+                result = repr(hook_errors[0]) if hook_errors else child()
+            except BaseException as exc:
+                result = repr(exc)
+            os.write(write_end, result.encode())
+        finally:
+            # The child must not return into pytest.
+            os._exit(0)
+    os.close(write_end)
+    with os.fdopen(read_end, "rb") as reader:
+        deadline = time.monotonic() + 10
+        while os.waitpid(pid, os.WNOHANG) == (0, 0):
+            if time.monotonic() > deadline:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                pytest.fail("The forked process did not end in 10 s")
+            time.sleep(0.01)
+        result = reader.read().decode()
+    assert hook_errors == []
+    return result
+
+
+def version_of(server: CaptureServer) -> int | None:
+    return get_prompt("support/reply", api_key="td_live_a", base_url=server.url).version
 
 
 @pytest.mark.parametrize(
@@ -523,6 +585,245 @@ def test_a_fetch_starts_no_connection_after_its_deadline(monkeypatch: pytest.Mon
     time.sleep(0.3)
     assert len(timeouts) == 1
     assert timeouts[0] is not None and timeouts[0] <= 0.2
+
+
+@needs_fork
+@pytest.mark.parametrize("reused_pid", [False, True])
+def test_a_forked_process_fetches_the_prompt_that_the_parent_was_fetching(
+    server: CaptureServer, monkeypatch: pytest.MonkeyPatch, reused_pid: bool
+) -> None:
+    # This puts a limit on the wait of a child that waits for the fetch of the parent.
+    monkeypatch.setattr(prompts_module, "_FETCH_TIMEOUT_S", 3)
+    server.delay = 1
+    versions: list[int | None] = []
+    parent = threading.Thread(target=lambda: versions.append(version_of(server)))
+    parent.start()
+    wait_for(lambda: len(server.requests) == 1)
+    server.delay = 0
+    parent_pid = os.getpid()
+
+    def child() -> str:
+        if reused_pid:
+            # A reused pid: the child gets the id of the process that started the fetch.
+            monkeypatch.setattr(os, "getpid", lambda: parent_pid)
+        return str(version_of(server))
+
+    assert in_fork(child) == "12"
+    parent.join()
+    assert versions == [12]
+    # The fetch of the parent, and the fetch of the child.
+    assert len(server.requests) == 2
+
+
+def test_a_call_does_not_wait_for_a_fetch_that_another_process_started(
+    server: CaptureServer,
+) -> None:
+    server.delay = 1
+    first = threading.Thread(target=version_of, args=(server,))
+    first.start()
+    wait_for(lambda: len(server.requests) == 1)
+    server.delay = 0
+    # A fork that runs no fork hooks, as a fork in C code, copies the fetch of the parent but not
+    # the thread that runs it. Here this process is the child: the fetch gets the id of its parent.
+    (entry,) = prompts_module._cache.values()  # pyright: ignore[reportPrivateUsage]
+    entry.pending_pid = os.getppid()
+
+    assert version_of(server) == 12
+    assert len(server.requests) == 2
+    first.join()
+
+
+@needs_fork
+def test_a_forked_process_refreshes_the_copy_that_the_parent_was_refreshing(
+    server: CaptureServer, clock: list[float]
+) -> None:
+    assert version_of(server) == 12
+    clock[0] += 60
+    server.replies = [(200, reply(version=13))]
+    server.delay = 1
+    assert version_of(server) == 12
+    wait_for(lambda: len(server.requests) == 2)
+    server.delay = 0
+
+    def child() -> str:
+        kept = version_of(server)
+        wait_for(lambda: version_of(server) == 13)
+        return str(kept)
+
+    # The child returns the copy of the parent. Then its refresh gets version 13.
+    assert in_fork(child) == "12"
+
+
+@needs_fork
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_fork_waits_for_a_thread_that_holds_the_cache_lock(server: CaptureServer) -> None:
+    held = threading.Event()
+    released_at: list[float] = []
+    forked_at: list[float] = []
+    errors: list[BaseException] = []
+
+    def hold() -> None:
+        try:
+            with prompts_module._cache_lock:  # pyright: ignore[reportPrivateUsage]
+                held.set()
+                time.sleep(0.2)
+                released_at.append(time.monotonic())
+        except BaseException as exc:
+            errors.append(exc)
+
+    def fork() -> int:
+        pid = os.fork()
+        if pid != 0:
+            forked_at.append(time.monotonic())
+        return pid
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    held.wait()
+    # The child does not get a lock that a thread of the parent holds.
+    assert in_fork(lambda: str(version_of(server)), fork) == "12"
+    holder.join()
+    assert errors == []
+    assert forked_at[0] > released_at[0]
+
+
+@needs_fork
+def test_a_fork_in_the_thread_that_holds_the_cache_lock_returns(
+    server: CaptureServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A process that still holds the lock after the fork waits for its fetch until the timeout.
+    monkeypatch.setattr(prompts_module, "_FETCH_TIMEOUT_S", 3)
+
+    def fork_in_the_lock() -> int:
+        with prompts_module._cache_lock:  # pyright: ignore[reportPrivateUsage]
+            return os.fork()
+
+    def fork_and_fetch() -> str:
+        child = in_fork(lambda: str(version_of(server)), fork_in_the_lock)
+        return f"{child} {version_of(server)}"
+
+    # The fork runs in a child, so that a fork that waits for itself stops only that child.
+    assert in_fork(fork_and_fetch) == "12 12"
+
+
+@needs_fork
+def test_a_fork_in_a_call_that_starts_a_fetch_returns_the_prompt(
+    server: CaptureServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A process that waits for a fetch that it does not have waits until the timeout.
+    monkeypatch.setattr(prompts_module, "_FETCH_TIMEOUT_S", 3)
+    pids: list[int] = []
+    results: list[str] = []
+
+    class ForkingThread(threading.Thread):
+        def start(self) -> None:
+            # A fork in the call, as in a signal handler, after the call made its fetch and before
+            # the fetch thread starts. The child hook drops the fetch of the entry.
+            if not pids:
+                pids.append(os.fork())
+            super().start()
+
+    def fork() -> int:
+        with monkeypatch.context() as patch:
+            # Only the threads of the prompt module: a fork hook of OpenTelemetry starts a thread.
+            patch.setattr(
+                prompts_module,
+                "threading",
+                SimpleNamespace(**{**vars(threading), "Thread": ForkingThread}),
+            )
+            try:
+                results.append(str(version_of(server)))
+            except Exception as exc:
+                # The child must return the pid to in_fork, and not raise into pytest.
+                results.append(repr(exc))
+        return pids[0]
+
+    # The parent and the child each start the fetch thread, and each call returns its result.
+    assert in_fork(lambda: results[0], fork) == "12"
+    assert results == ["12"]
+
+
+@needs_fork
+def test_a_fork_after_a_reload_of_the_prompt_module_returns(
+    server: CaptureServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved = dict(prompts_module.__dict__)
+    importlib.reload(prompts_module)
+    try:
+        # The reload sets the timeout again. A process that still holds the lock after the fork
+        # waits for its fetch until the timeout.
+        monkeypatch.setattr(prompts_module, "_FETCH_TIMEOUT_S", 3)
+        assert in_fork(lambda: str(version_of(server))) == "12"
+        assert version_of(server) == 12
+    finally:
+        # The reload gave the module new classes and a new cache.
+        prompts_module.__dict__.update(saved)
+
+
+@needs_fork
+@pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="needs signal.setitimer")
+@pytest.mark.parametrize("before_hook", ["stopped by a signal", "not run"])
+def test_the_fork_hooks_handle_a_lock_that_the_before_hook_did_not_get(
+    server: CaptureServer, monkeypatch: pytest.MonkeyPatch, before_hook: str
+) -> None:
+    class Interrupted(Exception):
+        pass
+
+    lock = prompts_module._cache_lock  # pyright: ignore[reportPrivateUsage]
+    # The child hook replaces the lock. monkeypatch puts it back.
+    monkeypatch.setattr(prompts_module, "_cache_lock", lock)
+    held, done = threading.Event(), threading.Event()
+    errors: list[BaseException] = []
+
+    def hold() -> None:
+        try:
+            with lock:
+                held.set()
+                # The fork must end while this thread holds the lock. If no signal stops the
+                # before hook, the hook waits for this thread, and this assert fails after 5 s.
+                assert done.wait(5)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def interrupt(signum: int, frame: FrameType | None) -> NoReturn:
+        raise Interrupted
+
+    def fork_in_a_signal() -> int:
+        # SIGALRM raises while the before hook waits for the lock. os.fork() gives the error to
+        # sys.unraisablehook, forks, and then runs the after hooks.
+        in_fork_hook = sys.unraisablehook
+
+        def record(unraisable: sys.UnraisableHookArgs) -> None:
+            if not isinstance(unraisable.exc_value, Interrupted):
+                in_fork_hook(unraisable)
+
+        previous = signal.signal(signal.SIGALRM, interrupt)
+        sys.unraisablehook = record
+        signal.setitimer(signal.ITIMER_REAL, 0.1)
+        try:
+            return os.fork()
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            sys.unraisablehook = in_fork_hook
+            signal.signal(signal.SIGALRM, previous)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    held.wait()
+    try:
+        if before_hook == "stopped by a signal":
+            # In the child, the holder is a thread of the parent that does not exist there.
+            assert in_fork(lambda: str(version_of(server)), fork_in_a_signal) == "12"
+        else:
+            # uWSGI with py-call-osafterfork forks in C and runs only the child hook.
+            prompts_module._reset_in_child()  # pyright: ignore[reportPrivateUsage]
+            child_lock = prompts_module._cache_lock  # pyright: ignore[reportPrivateUsage]
+            assert child_lock.acquire(blocking=False)
+            child_lock.release()
+    finally:
+        done.set()
+        holder.join()
+    assert errors == []
 
 
 def test_get_prompt_rejects_a_prompt_of_the_other_type_and_bad_options(

@@ -5,6 +5,7 @@ import contextlib
 import copy
 import hashlib
 import json
+import os
 import random
 import re
 import socket
@@ -455,12 +456,57 @@ class _Entry:
     retry_at: float = 0.0
     # Set when the running fetch ends.
     pending: threading.Event | None = None
+    # The process whose thread runs the fetch. A forked process gets the entry, but not the thread.
+    pending_pid: int = 0
     # When calls stop waiting for the running fetch.
     deadline: float = 0.0
 
 
 _cache: OrderedDict[tuple[str, str, str, str], _Entry] = OrderedDict()
-_cache_lock = threading.Lock()
+# Reentrant, so that a fork in a thread that holds the lock, for example in a signal handler, does
+# not wait for itself in _lock_for_fork. _reset_in_child can replace it, so read it from the module
+# each time.
+_cache_lock = threading.RLock()
+# Whether _lock_for_fork got the lock in this thread. os.fork() runs the after hooks also when a
+# before hook raises, for example in a signal handler.
+_forking = threading.local()
+
+
+def _lock_for_fork() -> None:
+    _cache_lock.acquire()
+    _forking.locked = True
+
+
+def _unlock_after_fork() -> None:
+    if getattr(_forking, "locked", False):
+        _forking.locked = False
+        _cache_lock.release()
+
+
+def _reset_in_child() -> None:
+    """Unlock the cache, and drop the fetches of the parent: the child has none of its threads."""
+    global _cache_lock
+    if getattr(_forking, "locked", False):
+        _forking.locked = False
+        _cache_lock.release()
+    else:
+        # The before hook did not get the lock, because a signal stopped its wait, or did not run,
+        # as in uWSGI with py-call-osafterfork. A thread of the parent can hold the lock, and only
+        # this thread exists here.
+        _cache_lock = threading.RLock()
+    for entry in _cache.values():
+        entry.pending = None
+
+
+# A fork that runs these hooks waits for a thread that holds the lock, so that the child gets no
+# entry that a thread changed only in part. os.register_at_fork cannot remove a hook, and
+# importlib.reload runs this module again with the same globals. Thus the hooks of the first run
+# stay, and they find the lock and the cache when they run. Windows has no fork.
+if hasattr(os, "register_at_fork") and "_fork_hooks" not in globals():
+    _fork_hooks = True
+    os.register_at_fork(
+        before=_lock_for_fork, after_in_parent=_unlock_after_fork, after_in_child=_reset_in_child
+    )
 
 
 def _load(
@@ -481,15 +527,23 @@ def _load(
             entry = _cache[key] = _Entry()
         now = monotonic()
         ttl = ttl_seconds if entry.response is not None else min(ttl_seconds, _ERROR_TTL_S)
-        if now >= max(entry.checked_at + ttl, entry.retry_at) and entry.pending is None:
-            entry.pending = threading.Event()
+        if entry.pending is not None and entry.pending_pid != os.getpid():
+            # A fork in C code that runs no hooks copied the fetch but not its thread. This check
+            # does not replace the lock. If a thread of the parent held the lock at that fork, a
+            # call in the child waits for the lock with no limit.
+            entry.pending = None
+        # A local, because a fork in this thread, as in a signal handler, can clear entry.pending.
+        pending = entry.pending
+        if now >= max(entry.checked_at + ttl, entry.retry_at) and pending is None:
+            pending = entry.pending = threading.Event()
+            entry.pending_pid = os.getpid()
             entry.deadline = now + _FETCH_TIMEOUT_S
             threading.Thread(
-                target=_refresh, args=(entry, entry.pending, fetch, on_error), daemon=True
+                target=_refresh, args=(entry, pending, fetch, on_error), daemon=True
             ).start()
         if entry.response is not None:
             return entry.response
-        pending, deadline = entry.pending, entry.deadline
+        deadline = entry.deadline
     if pending is not None and not pending.wait(deadline - monotonic()):
         raise _timeout()
     with _cache_lock:
