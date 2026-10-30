@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/google-genai",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Google GenAI (Gemini) SDK instrumentation for telemetry.dev: generation and embedding spans for @google/genai.",
   "keywords": [
     "gemini",

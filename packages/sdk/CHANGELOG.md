@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.2](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.2.1...sdk-v0.2.2) (2026-10-30)
+
+
+### Features
+
+* **sdk:** record the prompt of compiled messages outside withPrompt ([6435fb6](https://github.com/telemetry-dev/telemetry/commit/6435fb6d2d7488c968a6ce9f9c6437f2cf426456))
+* **sdk:** record the prompt on model calls outside withPrompt ([339eb0c](https://github.com/telemetry-dev/telemetry/commit/339eb0c01c5754191eb7d1b5ec37db21ebd28855)), closes [#97](https://github.com/telemetry-dev/telemetry/issues/97)
+* **sdk:** run experiments on datasets and send scores ([fe00efa](https://github.com/telemetry-dev/telemetry/commit/fe00efa1326797f8fda647d665b388621a961d39))
+
+
+### Bug Fixes
+
+* **sdk:** find the prompt by message identity, not by text ([ae47605](https://github.com/telemetry-dev/telemetry/commit/ae47605555ef9f5dfed1d6f762ac56823e692edb))
+* **sdk:** give the base url to getPrompt in the prompt tests ([abb8d10](https://github.com/telemetry-dev/telemetry/commit/abb8d10f680d1fa7ace6913a1d53b43a3e0db703)), closes [#97](https://github.com/telemetry-dev/telemetry/issues/97)
+* **sdk:** keep compiled variables for 5 minutes, not two turns ([1b09916](https://github.com/telemetry-dev/telemetry/commit/1b099167bbd8acaf5008848ad9ba2a2ab8e35b0d)), closes [#97](https://github.com/telemetry-dev/telemetry/issues/97)
+* **sdk:** keep the variables of recent compiles only ([3bc6f53](https://github.com/telemetry-dev/telemetry/commit/3bc6f53a0afb0ad8b9fe19f8eaf7e5d812a93b0a)), closes [#97](https://github.com/telemetry-dev/telemetry/issues/97)
+* **sdk:** keep the variables of the last two chat turns ([f6aa1c1](https://github.com/telemetry-dev/telemetry/commit/f6aa1c159742123600d6499653916c4dbf7b2ab7)), closes [#97](https://github.com/telemetry-dev/telemetry/issues/97)
+* **sdk:** measure the variables time of compiled messages in elapsed time ([b2a0e09](https://github.com/telemetry-dev/telemetry/commit/b2a0e09e3a2fee5aa8c5d6951a0bac9dac019cfa)), closes [#97](https://github.com/telemetry-dev/telemetry/issues/97)
+* **sdk:** name the newest compile, not the last tagged message ([a6b98fe](https://github.com/telemetry-dev/telemetry/commit/a6b98fe916d5ed4b37bddd7972b07507182f2d2d)), closes [#97](https://github.com/telemetry-dev/telemetry/issues/97)
+
 ## [0.2.1](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.2.0...sdk-v0.2.1) (2026-10-30)
 
 

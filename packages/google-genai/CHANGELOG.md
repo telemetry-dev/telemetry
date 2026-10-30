@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.2.2](https://github.com/telemetry-dev/telemetry/compare/google-genai-v0.2.1...google-genai-v0.2.2) (2026-10-30)
+
+
+### Features
+
+* **sdk:** record the prompt of compiled messages outside withPrompt ([6435fb6](https://github.com/telemetry-dev/telemetry/commit/6435fb6d2d7488c968a6ce9f9c6437f2cf426456))
+* **sdk:** record the prompt on model calls outside withPrompt ([339eb0c](https://github.com/telemetry-dev/telemetry/commit/339eb0c01c5754191eb7d1b5ec37db21ebd28855)), closes [#97](https://github.com/telemetry-dev/telemetry/issues/97)
+
+
+### Bug Fixes
+
+* **sdk:** find the prompt by message identity, not by text ([ae47605](https://github.com/telemetry-dev/telemetry/commit/ae47605555ef9f5dfed1d6f762ac56823e692edb))
+* **sdk:** give the base url to getPrompt in the prompt tests ([abb8d10](https://github.com/telemetry-dev/telemetry/commit/abb8d10f680d1fa7ace6913a1d53b43a3e0db703)), closes [#97](https://github.com/telemetry-dev/telemetry/issues/97)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.2.2
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.2.2
+
 ## [0.2.1](https://github.com/telemetry-dev/telemetry/compare/google-genai-v0.2.0...google-genai-v0.2.1) (2026-10-30)
 
 

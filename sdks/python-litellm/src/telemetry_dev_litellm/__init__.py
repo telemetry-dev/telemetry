@@ -15,7 +15,7 @@ import litellm
 import telemetry_dev
 from opentelemetry import trace
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 RequestMapper = Callable[[tuple[Any, ...], Mapping[str, Any]], tuple[str, dict[str, Any]]]
 ResponseMapper = Callable[[Any], dict[str, Any]]
