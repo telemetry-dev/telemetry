@@ -146,6 +146,12 @@ done
 run_push_discovery false '[]' "$recovery_sha"
 grep -Fxq 'npm=[]' "$tmp/output"
 grep -Fxq 'python=[]' "$tmp/output"
+jq '.packages["packages/unreleased"] = {"component": "unreleased", "release-type": "node"}' \
+  "$repo/release-please-config.json" > "$repo/release-please-config.json.next"
+mv "$repo/release-please-config.json.next" "$repo/release-please-config.json"
+run_push_discovery false '["packages/mcp"]'
+grep -Fxq 'npm=["packages/otel","packages/mcp"]' "$tmp/output"
+git -C "$repo" checkout --quiet -- release-please-config.json
 expect_failure "Expected 2 configured packages for released paths, found 1" \
   run_push_discovery false '["packages/mcp","packages/unknown"]'
 expect_failure "Release otel-v0.1.0 is still a draft" run_push_discovery true '["packages/otel"]'
