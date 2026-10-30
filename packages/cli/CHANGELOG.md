@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.1...cli-v0.1.2) (2026-10-30)
+
+
+### Features
+
+* **cli:** add --json to login and logout ([#131](https://github.com/telemetry-dev/telemetry/issues/131)) ([505309b](https://github.com/telemetry-dev/telemetry/commit/505309bf84c00edf3036488348086e10a5870510))
+* **cli:** map telemetry.dev's tool error codes to cli error codes ([#134](https://github.com/telemetry-dev/telemetry/issues/134)) ([b639de9](https://github.com/telemetry-dev/telemetry/commit/b639de9f388ed3ce42335b82cff8728c61c2d322))
+
 ## [0.1.1](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.0...cli-v0.1.1) (2026-10-30)
 
 
