@@ -34,6 +34,18 @@ In a shell with no terminal to paste into, such as an agent's, `telemetry login 
 telemetry login --finish 'http://127.0.0.1:53124/callback?code=…'
 ```
 
+A script or agent can run `telemetry login --json` instead. It never opens a browser or waits. It prints the link to pass on to a person, then exits:
+
+```json
+{
+  "status": "pending",
+  "authorization_url": "https://telemetry.dev/api/auth/oauth2/authorize?…",
+  "next": "telemetry login --finish '<address>'"
+}
+```
+
+`telemetry login --finish '<address>' --json` then prints the sign-in, with the same fields as `telemetry status --json` and `"status": "signed_in"`. When the workspace has exactly one project, it becomes the default. `project` is `null` otherwise, and also when the projects couldn't be loaded.
+
 A sign-in covers one workspace. To read another workspace, run `telemetry login` again and choose it. The new sign-in replaces the old one, and the CLI asks telemetry.dev to revoke the old one.
 
 ## Use
@@ -57,7 +69,7 @@ List commands return 20 results by default. Use `--limit` to return from 1 to 50
 
 ## Scripts and agents
 
-Add `--json` to any command except `login` and `logout` for machine-readable output on stdout. Messages and progress go to stderr, so `telemetry traces --json > traces.json` writes only data. List commands print the MCP tool's result as returned, with the fields that the [MCP server documentation](https://telemetry.dev/docs/platform/mcp-server) describes.
+Add `--json` to any command for machine-readable output on stdout. Messages and progress go to stderr, so `telemetry traces --json > traces.json` writes only data. List commands print the MCP tool's result as returned, with the fields that the [MCP server documentation](https://telemetry.dev/docs/platform/mcp-server) describes.
 
 `telemetry trace` and `telemetry payload` read every page of a trace or a captured text, up to a limit: 2,000 spans for a trace, and 1,000,000 characters for each payload field. Their JSON output has `complete: false` when the limit cut it short, and human output says so on stderr.
 
@@ -77,7 +89,7 @@ With `--json`, an error is one line of JSON on stderr, and stdout stays empty. C
 {"error":{"code":"not_signed_in","message":"You're not signed in. Run `telemetry login` first.","hint":"telemetry login","retryable":false,"exit_code":4,"cli_version":"0.1.0"}}
 ```
 
-Branch on `code`, not on `message`, whose wording can change. `hint` is a command to run next, when there is one; `telemetry login` needs a person at a browser, so an agent should ask for it rather than run it. `retryable` is true when running the same command again may succeed. New codes may be added, and existing codes keep their meaning.
+Branch on `code`, not on `message`, whose wording can change. `hint` is a command to run next, when there is one. `telemetry login` needs a person at a browser, so an agent should run `telemetry login --json` and pass the link on rather than run `telemetry login`. `retryable` is true when running the same command again may succeed. New codes may be added, and existing codes keep their meaning.
 
 | Code                   | Exit | Meaning                                                                          |
 | ---------------------- | ---- | -------------------------------------------------------------------------------- |
@@ -90,6 +102,8 @@ Branch on `code`, not on `message`, whose wording can change. `hint` is a comman
 | `not_signed_in`        | 4    | No sign-in is saved for this deployment                                          |
 | `sign_in_expired`      | 4    | The sign-in expired or was disconnected                                          |
 | `payloads_not_allowed` | 4    | The sign-in doesn't include reading captured prompts and outputs                 |
+| `sign_in_failed`       | 4    | The sign-in was cancelled, refused, or used an address from another sign-in      |
+| `no_pending_sign_in`   | 4    | `login --finish` found no sign-in waiting to finish                              |
 | `unreachable`          | 1    | telemetry.dev could not be reached                                               |
 | `timeout`              | 1    | telemetry.dev took too long to answer                                            |
 | `tool_error`           | 1    | telemetry.dev returned an error; `message` says what it was                      |
@@ -107,4 +121,4 @@ Branch on `code`, not on `message`, whose wording can change. `hint` is a comman
 | `TELEMETRY_DEV_CONFIG_DIR` | `~/.config/telemetry-dev` | Where the sign-in is saved. The default follows `XDG_CONFIG_HOME` when set |
 | `NO_COLOR`                 | none                      | Turns off color. `--no-color` does the same                                |
 
-The sign-in is saved in `session.json`, which only your user can read. A sign-in to another deployment through `TELEMETRY_DEV_URL` gets its own file next to it. The file holds a refresh token, so keep it private. `telemetry logout` revokes the token at telemetry.dev and removes it from the file, and says so when the server doesn't confirm the revocation. To disconnect the CLI from your account entirely, open account settings at telemetry.dev.
+The sign-in is saved in `session.json`, which only your user can read. A sign-in to another deployment through `TELEMETRY_DEV_URL` gets its own file next to it. The file holds a refresh token, so keep it private. `telemetry logout` revokes the token at telemetry.dev and removes it from the file, and says so when the server doesn't confirm the revocation. `telemetry logout --json` prints `{"was_signed_in": true, "revoked": false}` in that case; `revoked` is `null` when there was no sign-in. To disconnect the CLI from your account entirely, open account settings at telemetry.dev.

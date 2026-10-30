@@ -12,6 +12,7 @@ import {
   beforeRefresh,
   calls,
   EMAIL,
+  failProjects,
   PARALLEL_TRACE_ID,
   PAYLOADS,
   PROJECTS,
@@ -58,6 +59,7 @@ beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), "telemetry-cli-"));
   calls.length = 0;
   delete beforeRefresh.run;
+  failProjects.value = false;
 
   return () => rm(home, { recursive: true, force: true });
 });
@@ -82,6 +84,15 @@ const runWith = (env: Record<string, string>, ...args: string[]) =>
   });
 
 const run = (...args: string[]) => runWith({}, ...args);
+
+/** The address of a port that was just closed, which refuses connections. */
+const closedServer = () =>
+  new Promise<string>((resolve) => {
+    const server = createServer().listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as AddressInfo;
+      server.close(() => resolve(`http://127.0.0.1:${port}`));
+    });
+  });
 
 const CONTROL = new RegExp(String.raw`[\u0000-\u0008\u000b-\u001f\u007f-\u009f]`);
 
@@ -323,13 +334,7 @@ test("with --json, an error is one JSON line on stderr with a code to branch on,
     message: "Trace not found.",
   });
 
-  // A port that was just closed refuses the connection.
-  const closed = await new Promise<string>((resolve) => {
-    const server = createServer().listen(0, "127.0.0.1", () => {
-      const { port } = server.address() as AddressInfo;
-      server.close(() => resolve(`http://127.0.0.1:${port}`));
-    });
-  });
+  const closed = await closedServer();
   await writeFile(
     join(home, sessionFile(closed)),
     JSON.stringify({ server: closed, tokens: { access_token: TOKEN, token_type: "Bearer" } }),
@@ -443,6 +448,109 @@ test("a shell without a terminal signs in with --no-browser, then --finish, keep
 
   const again = await run("login", "--finish", address);
   expect(again.code).toBe(4);
+});
+
+test("login --json prints the link without opening a browser or waiting, and --finish --json prints the sign-in", async () => {
+  // A browser that could open: an `open` and `xdg-open` that record being run.
+  const bin = await mkdtemp(join(tmpdir(), "telemetry-cli-bin-"));
+  const opened = join(bin, "opened");
+  for (const name of ["open", "xdg-open"]) {
+    await writeFile(join(bin, name), `#!/bin/sh\ntouch '${opened}'\n`, { mode: 0o755 });
+  }
+  const browser = { PATH: `${bin}:${process.env.PATH}`, DISPLAY: ":0" };
+
+  try {
+    const started = await runWith(browser, "login", "--json");
+    expect(started).toMatchObject({ code: 0, stderr: "" });
+
+    const pending = JSON.parse(started.stdout);
+    expect(pending).toEqual({
+      status: "pending",
+      authorization_url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/authorize\?/),
+      next: "telemetry login --finish '<address>'",
+    });
+
+    const approved = await fetch(pending.authorization_url, { redirect: "manual" });
+    const finished = await run("login", "--finish", approved.headers.get("location")!, "--json");
+    expect(finished).toMatchObject({ code: 0, stderr: "" });
+
+    const status = JSON.parse((await run("status", "--json")).stdout);
+    expect(status).toMatchObject({ signed_in: true, email: EMAIL });
+    expect(JSON.parse(finished.stdout)).toEqual({ status: "signed_in", ...status });
+
+    const again = await run("login", "--finish", approved.headers.get("location")!, "--json");
+    expect(again).toMatchObject({ code: 4, stdout: "" });
+    expect(JSON.parse(again.stderr).error.code).toBe("no_pending_sign_in");
+
+    expect(JSON.parse((await run("logout", "--json")).stdout)).toEqual({
+      was_signed_in: true,
+      revoked: true,
+    });
+    expect(JSON.parse((await run("logout", "--json")).stdout)).toEqual({
+      was_signed_in: false,
+      revoked: null,
+    });
+
+    // `open` runs detached, so by now, several commands later, it would have left its mark.
+    await expect(stat(opened)).rejects.toThrow();
+  } finally {
+    await rm(bin, { recursive: true });
+  }
+});
+
+test("login --json returns the link at once even when stdin is a terminal", async () => {
+  const { login } = await import("../src/auth.ts");
+  const { loadSession } = await import("../src/session.ts");
+
+  vi.stubEnv("TELEMETRY_DEV_CONFIG_DIR", home);
+  const isTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+
+  try {
+    const result = await login({
+      session: await loadSession(fixture.url),
+      browser: false,
+      defer: true,
+      onAuthorizationUrl: () => {},
+      onWaiting: () => {
+        throw new Error("login waited for a person");
+      },
+    });
+
+    expect(result).toEqual({ status: "pending" });
+    expect((await loadSession(fixture.url)).pending).toBeDefined();
+  } finally {
+    if (isTTY) Object.defineProperty(process.stdin, "isTTY", isTTY);
+    else delete (process.stdin as { isTTY?: boolean }).isTTY;
+    vi.unstubAllEnvs();
+  }
+});
+
+test("a sign-in whose project list fails still signs in, without a default project", async () => {
+  failProjects.value = true;
+
+  for (const format of [[], ["--json"]]) {
+    const started = await run("login", "--json");
+    const approved = await fetch(JSON.parse(started.stdout).authorization_url, {
+      redirect: "manual",
+    });
+    const finished = await run("login", "--finish", approved.headers.get("location")!, ...format);
+
+    expect(finished.code).toBe(0);
+    if (format.length) expect(JSON.parse(finished.stdout)).toMatchObject({ project: null });
+    else expect(finished.stderr).toContain("Couldn't load your projects");
+  }
+
+  expect(JSON.parse((await run("status", "--json")).stdout)).toMatchObject({
+    signed_in: true,
+    project: null,
+  });
+});
+
+test("a sign-in that can't reach the server says so, like any other command", async () => {
+  const result = await runWith({ TELEMETRY_DEV_URL: await closedServer() }, "login", "--json");
+  expect(result).toMatchObject({ code: 1, stdout: "" });
+  expect(JSON.parse(result.stderr).error).toMatchObject({ code: "unreachable", retryable: true });
 });
 
 test("an expired access token is refreshed and the new one saved", async () => {
