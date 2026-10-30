@@ -209,7 +209,7 @@ test.each([
 );
 
 test("getPrompt keeps a prompt for the TTL, then refreshes it in the background", async () => {
-  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.useFakeTimers({ toFake: ["Date", "performance"] });
   const refresh = deferred();
   const { fetch, calls } = fakeFetch(reply(), refresh.promise);
   const options = { apiKey: "td_live_a", baseUrl: newBaseUrl(), fetch };
@@ -238,6 +238,19 @@ test("getPrompt keeps a prompt for the TTL, then refreshes it in the background"
   expect(calls).toHaveLength(3);
 });
 
+test("getPrompt measures the TTL in elapsed time, not by the wall clock", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "performance"], now: Date.parse("2026-10-29T12:00:00Z") });
+  const { fetch, calls } = fakeFetch(reply());
+  const options = { apiKey: "td_live_a", baseUrl: newBaseUrl(), fetch };
+
+  await getPrompt("support/reply", options);
+  // The system clock moves back an hour; 60 seconds still pass.
+  vi.setSystemTime(Date.parse("2026-10-29T11:00:00Z"));
+  vi.advanceTimersByTime(60_000);
+  await getPrompt("support/reply", options);
+  expect(calls).toHaveLength(2);
+});
+
 test("concurrent calls share one fetch", async () => {
   const { fetch, calls } = fakeFetch(reply());
   const options = { apiKey: "td_live_a", baseUrl: newBaseUrl(), fetch };
@@ -253,7 +266,7 @@ test("concurrent calls share one fetch", async () => {
 });
 
 test("a failed refresh returns the last copy and reports the error", async () => {
-  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.useFakeTimers({ toFake: ["Date", "performance"] });
   const errors: Error[] = [];
   vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -283,7 +296,7 @@ test("a failed refresh returns the last copy and reports the error", async () =>
 });
 
 test("with no copy, a failed fetch returns the fallback, and so do calls for 10 seconds", async () => {
-  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.useFakeTimers({ toFake: ["Date", "performance"] });
   vi.spyOn(console, "error").mockImplementation(() => {});
   const { fetch, calls } = fakeFetch(
     apiError(404, "label_not_found", "support/reply has no production label"),
@@ -375,7 +388,7 @@ test.each([
 ])(
   "with no copy, getPrompt does not fetch before the Retry-After ($status, $retryAfter)",
   async ({ status, retryAfter, wait }) => {
-    vi.useFakeTimers({ toFake: ["Date"], now: Date.parse("2026-10-29T12:00:00Z") });
+    vi.useFakeTimers({ toFake: ["Date", "performance"], now: Date.parse("2026-10-29T12:00:00Z") });
     vi.spyOn(console, "error").mockImplementation(() => {});
     const header =
       retryAfter === "date" ? new Date(Date.now() + 120_000).toUTCString() : retryAfter;
@@ -406,7 +419,7 @@ test.each([
 );
 
 test("a refresh that gets a Retry-After keeps the copy until then", async () => {
-  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.useFakeTimers({ toFake: ["Date", "performance"] });
   vi.spyOn(console, "error").mockImplementation(() => {});
 
   const { fetch, calls } = fakeFetch(

@@ -251,8 +251,9 @@ ran in it, or before it started in the code that started it; with none, it recor
 for code that has not compiled in its own task. Model calls are the spans of type `generation`
 (operations `chat`, `text_completion`, and `generate_content`), including the spans of the provider
 integrations: OpenAI, Anthropic, Amazon Bedrock, Google GenAI, LiteLLM, and OpenRouter. Spans from
-other OpenTelemetry tracers do not get the attributes. Messages from `compile()` that you pass to a
-model call outside `with_prompt` are not recorded.
+other OpenTelemetry tracers do not get the attributes. A model call outside `with_prompt` does not
+get the attributes, even when it sends messages from `compile()`; with input capture on, the call
+still records those messages as its input.
 
 ## Auto-metrics
 
