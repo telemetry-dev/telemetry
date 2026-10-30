@@ -232,8 +232,8 @@ pinned = telemetry_dev.get_prompt("support/reply", version=13)
   without its prompt.
 - `get_prompt` uses the API key and base URL of an enabled `init()`, or `TELEMETRY_DEV_API_KEY`
   and `TELEMETRY_DEV_BASE_URL`, or its own `api_key` and `base_url`. It reads the same host that
-  telemetry goes to, `https://api.telemetry.dev` by default. The key needs the read scope for
-  prompts.
+  telemetry goes to, `https://api.telemetry.dev` by default. The key must have Read prompts in
+  its Access on the API keys page (the `prompts:read` scope).
 - When a label sends part of the traffic to a second version, each session keeps one version: the
   choice uses the session id of `propagate_attributes` (or of `session_mode="process"`). Without a
   session id, each call chooses at random.

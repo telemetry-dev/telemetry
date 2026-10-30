@@ -116,7 +116,10 @@ interface GetPromptOptionsBase {
   version?: number;
   /** Seconds before a call fetches a kept prompt again, in the background. Default 60. */
   cacheTtlSeconds?: number;
-  /** API key with the prompts:read scope. Falls back to the initialized client, then `TELEMETRY_DEV_API_KEY`. */
+  /**
+   * API key with Read prompts in its Access (the prompts:read scope). Falls back to the initialized
+   * client, then `TELEMETRY_DEV_API_KEY`.
+   */
   apiKey?: string;
   /** Falls back to the initialized client, then `TELEMETRY_DEV_BASE_URL`, then `https://api.telemetry.dev`. */
   baseUrl?: string;
