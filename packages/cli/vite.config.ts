@@ -26,4 +26,9 @@ export default defineConfig({
     },
   },
   fmt: {},
+  test: {
+    // Each test starts the CLI as a process, several times; one start takes up to 700ms
+    // on a CI runner, which pushes the longer tests past the 5s default.
+    testTimeout: 30_000,
+  },
 });
