@@ -22,7 +22,7 @@ inputs:
     description: A telemetry.dev API key with the datasets:read and experiments:write scopes. Default the TELEMETRY_DEV_API_KEY variable of the job.
     required: false
   base-url:
-    description: The telemetry.dev API. Default https://ingest.telemetry.dev.
+    description: The telemetry.dev API. Default https://api.telemetry.dev.
     required: false
   working-directory:
     description: The directory that the script or the command runs in.

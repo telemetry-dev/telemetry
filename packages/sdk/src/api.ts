@@ -6,7 +6,7 @@ import { currentClient } from "./client.ts";
 export interface ApiOptions {
   /** API key. Falls back to the initialized client, then `TELEMETRY_DEV_API_KEY`. */
   apiKey?: string;
-  /** Falls back to the initialized client, then `TELEMETRY_DEV_BASE_URL`, then `https://ingest.telemetry.dev`. */
+  /** Falls back to the initialized client, then `TELEMETRY_DEV_BASE_URL`, then `https://api.telemetry.dev`. */
   baseUrl?: string;
   /** Falls back to the initialized client's `fetch`, then `globalThis.fetch`. */
   fetch?: typeof fetch;
