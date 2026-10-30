@@ -61,7 +61,7 @@ const cursor: Option = {
 const COMMANDS: Readonly<Record<string, Command>> = {
   login: {
     summary: "Sign in with your browser",
-    usage: "telemetry login [--no-browser | --finish <address>]",
+    usage: "telemetry login [--no-browser | --finish <address>] [--json]",
     options: {
       "no-browser": {
         type: "boolean",
@@ -73,18 +73,23 @@ const COMMANDS: Readonly<Record<string, Command>> = {
         description:
           "Finish a sign-in started without a terminal, with the browser's final address",
       },
+      json: {
+        type: "boolean",
+        description: "Print JSON: the sign-in link without waiting, or the sign-in after --finish",
+      },
     },
     examples: [
       "telemetry login",
       "telemetry login --no-browser   # over SSH, in a container, or from an agent's shell",
       "telemetry login --finish 'http://127.0.0.1:53124/callback?code=…'",
+      "telemetry login --json         # a script passes the link on, then runs --finish",
     ],
     run: loginCommand,
   },
   logout: {
     summary: "Sign out on this machine",
-    usage: "telemetry logout",
-    options: {},
+    usage: "telemetry logout [--json]",
+    options: { json },
     examples: ["telemetry logout"],
     run: logoutCommand,
   },

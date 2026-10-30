@@ -323,20 +323,29 @@ export async function loginCommand(context: Context) {
   const server = serverUrl();
   const session = await loadSession(server);
   const stream = process.stderr;
+  const asJson = json(context);
 
   const finish = typeof context.values.finish === "string" ? context.values.finish : undefined;
 
-  if (process.stderr.isTTY && finish === undefined) {
+  if (process.stderr.isTTY && finish === undefined && !asJson) {
     stream.write("\n");
     await printMark(TAGLINE, { animate: true, stream });
     stream.write("\n");
   }
 
+  let authorizationUrl = "";
+
   const result = await login({
     session,
     browser: context.values["no-browser"] !== true,
+    // A program reading JSON can't wait for a person, so it gets the link to pass on.
+    defer: asJson,
     finish,
     onAuthorizationUrl: (url, opened) => {
+      authorizationUrl = url.href;
+
+      if (asJson) return;
+
       note(
         opened
           ? "Opening your browser to sign in to telemetry.dev."
@@ -350,11 +359,21 @@ export async function loginCommand(context: Context) {
       note(style.dim("Waiting for you to choose a workspace and select Allow…", stream));
     },
   }).catch((error: unknown) => {
-    reportStatus("error");
+    if (!asJson) reportStatus("error");
     throw error;
   });
 
   if (result.status === "pending") {
+    if (asJson) {
+      printJson({
+        status: "pending",
+        authorization_url: authorizationUrl,
+        next: "telemetry login --finish '<address>'",
+      });
+
+      return;
+    }
+
     note(
       "After you select Allow, the browser opens an http://127.0.0.1 address that doesn't load. Copy the whole address and run:",
     );
@@ -366,64 +385,94 @@ export async function loginCommand(context: Context) {
 
   const signedIn = result.session;
 
-  reportStatus("done");
+  if (!asJson) reportStatus("done");
 
+  // The sign-in is saved by now, so a failed lookup leaves the project unset rather than
+  // failing a sign-in that worked.
   const api = new Api(signedIn);
+  let projects: ProjectList["projects"] | undefined;
+  let lookupFailure: CliError | undefined;
 
   try {
-    const { projects } = await api.call<ProjectList>("list_projects", {}, "Loading projects");
+    ({ projects } = await api.call<ProjectList>("list_projects", {}, "Loading projects"));
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
 
-    if (projects.length === 1) {
-      const project = toProject(projects[0]!);
-
-      signedIn.project = project;
-      await updateSession(signedIn.server, (saved) => ({ ...saved, project }));
-    }
-
-    note();
-    note(
-      `${style.green("✓", stream)} Signed in${signedIn.email ? ` as ${style.bold(signedIn.email, stream)}` : ""}`,
-    );
-
-    if (!grantedScopes(signedIn).has(PAYLOADS_SCOPE)) {
-      note(
-        style.dim(
-          "  Captured prompts and outputs stay hidden. Sign in again and allow them to use `telemetry payload`.",
-          stream,
-        ),
-      );
-    }
-
-    if (signedIn.project) {
-      note(`  Project ${style.bold(signedIn.project.name, stream)}`);
-      note();
-      note(
-        `Try ${style.bold("telemetry traces", stream)} or ${style.bold("telemetry usage", stream)}.`,
-      );
-    } else if (projects.length > 1) {
-      note(`  ${projects.length} projects: ${projectNames(projects)}`);
-      note();
-      note(
-        `Choose a default: ${style.bold(`telemetry use ${shellQuote(toProject(projects[0]!).name)}`, stream)}`,
-      );
-    } else {
-      note("  This workspace has no projects yet. Create one at telemetry.dev.");
-    }
+    lookupFailure = error;
   } finally {
     await api.close();
   }
+
+  if (projects?.length === 1) {
+    const project = toProject(projects[0]!);
+
+    signedIn.project = project;
+    await updateSession(signedIn.server, (saved) => ({ ...saved, project }));
+  }
+
+  if (asJson) {
+    printJson({ status: "signed_in", ...sessionJson(signedIn) });
+
+    return;
+  }
+
+  note();
+  note(
+    `${style.green("✓", stream)} Signed in${signedIn.email ? ` as ${style.bold(signedIn.email, stream)}` : ""}`,
+  );
+
+  if (!grantedScopes(signedIn).has(PAYLOADS_SCOPE)) {
+    note(
+      style.dim(
+        "  Captured prompts and outputs stay hidden. Sign in again and allow them to use `telemetry payload`.",
+        stream,
+      ),
+    );
+  }
+
+  if (lookupFailure) {
+    note(style.dim(`  Couldn't load your projects: ${oneLine(lookupFailure.message)}`, stream));
+    note(style.dim("  Run telemetry projects to list them.", stream));
+  } else if (signedIn.project) {
+    note(`  Project ${style.bold(signedIn.project.name, stream)}`);
+    note();
+    note(
+      `Try ${style.bold("telemetry traces", stream)} or ${style.bold("telemetry usage", stream)}.`,
+    );
+  } else if (projects && projects.length > 1) {
+    note(`  ${projects.length} projects: ${projectNames(projects)}`);
+    note();
+    note(
+      `Choose a default: ${style.bold(`telemetry use ${shellQuote(toProject(projects[0]!).name)}`, stream)}`,
+    );
+  } else {
+    note("  This workspace has no projects yet. Create one at telemetry.dev.");
+  }
 }
 
-export async function logoutCommand() {
+export async function logoutCommand(context: Context) {
   const session = await loadSession(serverUrl());
 
   if (!session.tokens) {
+    if (json(context)) {
+      printJson({ was_signed_in: false, revoked: null });
+
+      return;
+    }
+
     note("You're not signed in.");
 
     return;
   }
 
   const { revoked } = await logout(session);
+
+  if (json(context)) {
+    printJson({ was_signed_in: true, revoked });
+
+    return;
+  }
+
   note(
     `${style.green("✓", process.stderr)} Signed out${session.email ? ` of ${session.email}` : ""}.`,
   );
@@ -437,19 +486,22 @@ export async function logoutCommand() {
     );
 }
 
+/** What `status --json` and `login --json` say about a sign-in. */
+const sessionJson = (session: Session) => ({
+  signed_in: Boolean(session.tokens),
+  server: session.server,
+  email: session.email ?? null,
+  project: session.project ?? null,
+  payloads_allowed: grantedScopes(session).has(PAYLOADS_SCOPE),
+});
+
 export async function statusCommand(context: Context) {
   const server = serverUrl();
   const session = await loadSession(server);
   const scopes = grantedScopes(session);
 
   if (json(context)) {
-    printJson({
-      signed_in: Boolean(session.tokens),
-      server,
-      email: session.email ?? null,
-      project: session.project ?? null,
-      payloads_allowed: scopes.has(PAYLOADS_SCOPE),
-    });
+    printJson(sessionJson(session));
   } else if (session.tokens) {
     out(
       `${style.green("✓")} Signed in${session.email ? ` as ${style.bold(oneLine(session.email))}` : ""}`,

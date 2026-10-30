@@ -445,7 +445,11 @@ const server = () => {
         : result(value);
     });
 
-  tool("list_projects", () => ({ organization_id: "org_fixture", projects: PROJECTS }));
+  tool("list_projects", () =>
+    failProjects.value
+      ? "telemetry.dev could not complete this request. Try again shortly."
+      : { organization_id: "org_fixture", projects: PROJECTS },
+  );
   tool("search_traces", () => traces());
   tool("search_sessions", () => sessions());
   tool("get_trace", (args) =>
@@ -475,6 +479,9 @@ const server = () => {
 };
 
 export const calls: { tool: string; args: Record<string, unknown> }[] = [];
+
+/** Makes list_projects answer with a tool error, as a server failure would. */
+export const failProjects = { value: false };
 
 /**
  * Runs before the token endpoint answers a refresh, to act as another CLI process or a

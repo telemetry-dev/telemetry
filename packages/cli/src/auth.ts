@@ -12,7 +12,7 @@ import type {
   StoredOAuthTokens,
 } from "@modelcontextprotocol/client";
 
-import { CliError, EXIT } from "./errors.ts";
+import { CliError, EXIT, translateError } from "./errors.ts";
 import { loadSession, mcpUrl, type Session, updateSession } from "./session.ts";
 import { oneLine } from "./terminal.ts";
 
@@ -426,6 +426,8 @@ const readPastedCallback = async (state: string, signal: AbortSignal): Promise<C
 export type LoginOptions = {
   readonly session: Session;
   readonly browser: boolean;
+  /** Return as soon as the link exists, leaving a pending sign-in for `finish`. */
+  readonly defer?: boolean;
   /** The address the browser ended on, to finish a sign-in started without a terminal. */
   readonly finish?: string | undefined;
   readonly onAuthorizationUrl: (url: URL, opened: boolean) => void;
@@ -458,8 +460,13 @@ const authorize = async (
   provider: SessionAuthProvider,
   options: { authorizationCode?: string; iss?: string },
 ) => {
-  const { auth, AuthorizationServerMismatchError, IssuerMismatchError, OAuthError } =
-    await import("@modelcontextprotocol/client");
+  const {
+    auth,
+    AuthorizationServerMismatchError,
+    IssuerMismatchError,
+    OAuthClientFlowError,
+    OAuthError,
+  } = await import("@modelcontextprotocol/client");
 
   try {
     return await auth(provider, {
@@ -487,7 +494,16 @@ const authorize = async (
       );
     }
 
-    throw error;
+    // Such as a refused client registration or a token endpoint that isn't https.
+    if (error instanceof OAuthClientFlowError) {
+      throw new CliError(`Sign-in failed: ${oneLine(error.message).slice(0, 300)}`, {
+        exitCode: EXIT.auth,
+        code: "sign_in_failed",
+        hint: "telemetry login",
+      });
+    }
+
+    return translateError(error, []);
   }
 };
 
@@ -549,6 +565,7 @@ const redeem = async (provider: SessionAuthProvider, params: URLSearchParams) =>
 export const login = async ({
   session,
   browser,
+  defer = false,
   finish,
   onAuthorizationUrl,
   onWaiting,
@@ -612,8 +629,8 @@ export const login = async ({
   const state = randomBytes(16).toString("base64url");
   const callback = await listenForCallback(state);
   const abort = new AbortController();
-  const useBrowser = browser && canOpenBrowser();
-  const deferred = !useBrowser && !process.stdin.isTTY;
+  const useBrowser = browser && !defer && canOpenBrowser();
+  const deferred = defer || (!useBrowser && !process.stdin.isTTY);
 
   const provider = new SessionAuthProvider(signedIn, {
     redirectUrl: callback.redirectUrl,
