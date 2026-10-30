@@ -22,6 +22,9 @@ export const PAYLOADS_SCOPE = "telemetry:payloads";
 // unchecked unless the person ticks it, openid and email name the account in
 // `telemetry status`, and offline_access keeps the CLI signed in past the hour an
 // access token lasts.
+//
+// telemetry.dev's /oauth/cli.json lists these scopes and the loopback redirect below;
+// change both together.
 const SCOPES = ["openid", "email", "offline_access", "telemetry:read", PAYLOADS_SCOPE].join(" ");
 
 const CALLBACK_PATH = "/callback";
@@ -33,6 +36,33 @@ const OAUTH_TIMEOUT_MS = 15_000;
  * open. The SDK follows only same-origin redirects with it; the CLI's own requests carry
  * a token and follow none.
  */
+/**
+ * The URL of the CLI's client ID metadata document when `server` publishes one. A
+ * server that accepts these documents then uses the URL as the CLI's client_id, and its
+ * consent page names the site as the publisher. Without one the CLI registers itself.
+ */
+const publishedClientDocument = async (server: string) => {
+  const url = `${server}/oauth/cli.json`;
+
+  // The SDK takes only an https document URL.
+  if (new URL(server).protocol !== "https:") return undefined;
+
+  try {
+    const response = await oauthFetch(url, {
+      redirect: "error",
+      headers: { Accept: "application/json" },
+    });
+
+    if (!response.ok) return undefined;
+
+    const { client_id: clientId } = (await response.json()) as { client_id?: unknown };
+
+    return clientId === url ? url : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 const oauthFetch = (url: string | URL, init?: RequestInit) =>
   fetch(url, { ...init, signal: init?.signal ?? AbortSignal.timeout(OAUTH_TIMEOUT_MS) });
 
@@ -51,6 +81,7 @@ type LoginHooks = {
   readonly redirectUrl: string;
   readonly state: string;
   readonly open: (url: URL) => void;
+  readonly clientMetadataUrl?: string;
 };
 
 // The token that names a sign-in: the refresh token when there is one.
@@ -91,11 +122,17 @@ export class SessionAuthProvider implements OAuthClientProvider {
     return clientMetadata(this.redirectUrl);
   }
 
+  get clientMetadataUrl() {
+    return this.#login?.clientMetadataUrl;
+  }
+
   state() {
     return this.#login?.state ?? randomBytes(16).toString("base64url");
   }
 
-  clientInformation() {
+  async clientInformation() {
+    await this.#adoptNewer();
+
     return this.session.client;
   }
 
@@ -105,21 +142,31 @@ export class SessionAuthProvider implements OAuthClientProvider {
   }
 
   /** Tokens saved by another command since this one loaded the session, if any. */
-  async #newerTokens() {
-    const { tokens } = await loadSession(this.session.server);
+  /**
+   * Takes up tokens another command saved since this one loaded the session, with the
+   * client they were issued to. Returns whether there were any.
+   */
+  async #adoptNewer() {
+    if (this.#login) return false;
 
-    return tokens && tokenKey(tokens) !== tokenKey(this.session.tokens) ? tokens : undefined;
+    const saved = await loadSession(this.session.server);
+
+    if (!saved.tokens || tokenKey(saved.tokens) === tokenKey(this.session.tokens)) return false;
+
+    this.session = {
+      ...this.session,
+      tokens: saved.tokens,
+      ...(saved.client ? { client: saved.client } : {}),
+    };
+
+    return true;
   }
 
   // Read again before each use: the server revokes every token of a sign-in when it sees
   // a rotated refresh token again, so a long command must not refresh with the one it
   // started with after another command replaced it.
   async tokens() {
-    if (!this.#login) {
-      const newer = await this.#newerTokens();
-
-      if (newer) this.session = { ...this.session, tokens: newer };
-    }
+    await this.#adoptNewer();
 
     return this.session.tokens;
   }
@@ -189,18 +236,23 @@ export class SessionAuthProvider implements OAuthClientProvider {
     // command refreshed with the same token and is about to save the new one; deleting
     // them here would make that command think the person signed out and discard its
     // tokens. When the new tokens arrive, the SDK retries with them.
-    let newer: StoredOAuthTokens | undefined;
+    let adopted = false;
 
     for (let waited = 0; drops("tokens") && waited < REFRESH_RACE_WAIT_MS; ) {
-      newer = await this.#newerTokens();
+      adopted = await this.#adoptNewer();
 
-      if (newer) break;
+      if (adopted) break;
 
       await sleep(REFRESH_RACE_POLL_MS);
       waited += REFRESH_RACE_POLL_MS;
     }
 
-    this.session = { ...forget(this.session), ...(newer ? { tokens: newer } : {}) };
+    const { tokens, client } = this.session;
+    this.session = {
+      ...forget(this.session),
+      ...(adopted && tokens ? { tokens } : {}),
+      ...(adopted && client ? { client } : {}),
+    };
 
     if (drops("client") || drops("discovery")) {
       await this.#save((saved) => ({
@@ -487,9 +539,25 @@ export const login = async ({
   onAuthorizationUrl,
   onWaiting,
 }: LoginOptions): Promise<LoginResult> => {
+  // A client the CLI registered before the server published its metadata document is
+  // left behind on the next sign-in, so the consent page can name the publisher. A
+  // pending sign-in finishes with the client it started with.
+  const documentUrl =
+    finish === undefined ? await publishedClientDocument(session.server) : undefined;
+  const documentSupported =
+    (
+      session.discovery?.authorizationServerMetadata as
+        | { client_id_metadata_document_supported?: unknown }
+        | undefined
+    )?.client_id_metadata_document_supported === true;
+  const client =
+    documentUrl && documentSupported && session.client?.client_id !== documentUrl
+      ? undefined
+      : session.client;
+
   const signedIn: Session = {
     server: session.server,
-    ...(session.client ? { client: session.client } : {}),
+    ...(client ? { client } : {}),
     ...(session.discovery ? { discovery: session.discovery } : {}),
   };
 
@@ -510,12 +578,16 @@ export const login = async ({
       );
     }
 
-    const provider = new SessionAuthProvider(signedIn, {
-      ...pending,
-      open: () => {
-        throw sessionExpired();
+    const { client: pendingClient, ...hooks } = pending;
+    const provider = new SessionAuthProvider(
+      { ...signedIn, ...(pendingClient ? { client: pendingClient } : {}) },
+      {
+        ...hooks,
+        open: () => {
+          throw sessionExpired();
+        },
       },
-    });
+    );
 
     return {
       status: "signed-in",
@@ -532,6 +604,7 @@ export const login = async ({
   const provider = new SessionAuthProvider(signedIn, {
     redirectUrl: callback.redirectUrl,
     state,
+    ...(documentUrl ? { clientMetadataUrl: documentUrl } : {}),
     open: (url) => {
       if (useBrowser) openBrowser(url);
       onAuthorizationUrl(url, useBrowser);
@@ -549,12 +622,15 @@ export const login = async ({
         redirectUrl: callback.redirectUrl,
         state,
         verifier: provider.codeVerifier(),
+        ...(client ? { client } : {}),
       };
 
-      // The current sign-in keeps working until the pending one finishes.
+      // The current sign-in, and the client its tokens belong to, keep working until
+      // the pending one finishes. Without a saved client, the new one is kept so a
+      // restarted sign-in doesn't register again.
       await updateSession(session.server, (saved) => ({
         ...saved,
-        ...(client ? { client } : {}),
+        ...(!saved.client && client ? { client } : {}),
         ...(discovery ? { discovery } : {}),
         pending,
       }));

@@ -37,6 +37,8 @@ export type PendingLogin = {
   readonly redirectUrl: string;
   readonly state: string;
   readonly verifier: string;
+  /** The client the sign-in started with; the saved one stays with the current tokens. */
+  readonly client?: StoredOAuthClientInformation;
 };
 
 /** What one sign-in keeps on disk. The client registration outlives sign-outs. */
