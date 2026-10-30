@@ -14,6 +14,7 @@ import {
   beforeRefresh,
   calls,
   EMAIL,
+  logs,
   PARALLEL_TRACE_ID,
   PAYLOADS,
   PROJECTS,
@@ -536,7 +537,7 @@ test("--since and --until are checked before any call, and --range can't be comb
     ["sessions", "--range", "7d", "--since", "2h"],
     ["sessions", "--range", "24h", "--until", "2026-10-30"],
     // As from an unset shell variable.
-    ["sessions", "--since", ""],
+    ["logs", "--since", ""],
     ["traces", "--since", "2026-10-30T14:00:00.1234567890Z"],
   ];
   // With a project named, a check made after the project lookup would show as a call.
@@ -630,6 +631,12 @@ test("a --since past the project's retention is noted, and the default whole-ret
   expect(capped.code).toBe(0);
   expect(capped.stderr).toMatch(/This project keeps data from .* on, so the window starts there\./);
 
+  // An empty list is when the note matters most.
+  const empty = await run("logs", "--since", "45d", "--level", "debug");
+  expect(empty.code).toBe(0);
+  expect(empty.stderr).toContain("No logs match.");
+  expect(empty.stderr).toMatch(/This project keeps data from .* on, so the window starts there\./);
+
   // Without --since, traces searches the whole retention, which the server marks as capped.
   const plain = await run("traces");
   expect(plain.code).toBe(0);
@@ -675,6 +682,99 @@ test("a window telemetry.dev refuses is a usage error with its reason", async ()
     /^error until 2000-01-02T\S+ is not after the start of this project's 30-day retention, \S+, so no data is left in the window\. Use a later until\.\n$/,
   );
   expect(calls.map((call) => call.tool)).toEqual(["search_traces", "search_sessions"]);
+});
+
+const messages = (stdout: string) =>
+  (JSON.parse(stdout) as { logs: { message: string }[] }).logs.map((log) => log.message);
+
+test("logs --cursor against a deployment from before log pages fails instead of printing the first page again", async () => {
+  await signIn(PROJECTS[0]);
+
+  const { next_cursor: cursor } = JSON.parse((await run("logs", "--limit", "2", "--json")).stdout);
+  expect(cursor).toEqual(expect.any(String));
+
+  serverState.windows = false;
+  calls.length = 0;
+
+  const human = await run("logs", "--limit", "2", "--cursor", cursor);
+  expect(human).toMatchObject({ code: 1, stdout: "" });
+  expect(human.stderr).toBe(
+    "error This telemetry.dev deployment doesn't support --cursor yet and would have ignored it. Run the command without it.\n",
+  );
+
+  const json = await run("logs", "--limit", "2", "--cursor", cursor, "--json");
+  expect(json).toMatchObject({ code: 1, stdout: "" });
+  expect(JSON.parse(json.stderr).error).toMatchObject({
+    code: "server_unsupported",
+    retryable: false,
+  });
+  expect(calls.filter((call) => call.tool === "list_logs")).toHaveLength(2);
+
+  const windowed = await run("logs", "--since", "2h", "--json");
+  expect(JSON.parse(windowed.stderr).error).toMatchObject({
+    code: "server_unsupported",
+    message:
+      "This telemetry.dev deployment doesn't support --since yet and would have ignored it. Run the command without it, or use --range.",
+  });
+
+  // Without a cursor, the same server lists its newest logs, with no next page to offer.
+  const plain = await run("logs");
+  expect(plain.code).toBe(0);
+  expect(plain.stdout).toMatch(/^10,128 logs in the last 7 days · /);
+  expect(plain.stderr).toContain("Raise --limit");
+  expect(plain.stderr).not.toContain("More:");
+});
+
+test("a logs cursor reused with another --level is refused, and with another --limit it continues", async () => {
+  await signIn(PROJECTS[0]);
+
+  const first = JSON.parse((await run("logs", "--limit", "1", "--json")).stdout);
+  const cursor = first.next_cursor as string;
+
+  const changed = await run("logs", "--level", "error", "--limit", "1", "--cursor", cursor);
+  expect(changed).toMatchObject({ code: 2, stdout: "" });
+  expect(changed.stderr).toBe(
+    "error That cursor isn't from an earlier page of this command with these options. Run it again without --cursor.\n",
+  );
+  expect(calls.at(-1)?.args).toMatchObject({ level: "error", cursor });
+
+  const relimited = await run("logs", "--limit", "2", "--cursor", cursor, "--json");
+  expect(relimited.code).toBe(0);
+  expect(messages(relimited.stdout)).toEqual(
+    logs()
+      .logs.slice(1, 3)
+      .map((log) => log.message),
+  );
+});
+
+test("logs pages through with the More command, without repeating a log", async () => {
+  await signIn(PROJECTS[0]);
+
+  let argv = ["logs", "--limit", "2", "--since", "2h"];
+  const seen: string[] = [];
+
+  for (let page = 1; page <= 4; page += 1) {
+    const human = await run(...argv);
+    expect(human.code).toBe(0);
+    // With --since, the header says which times the counts cover.
+    expect(human.stdout).toMatch(/^10,128 logs from \w{3} \d+ \d\d:\d\d:\d\d to \w{3} \d+ /);
+
+    const json = await run(...argv, "--json");
+    expect(JSON.parse(json.stdout).range_days).toBeNull();
+    seen.push(...messages(json.stdout));
+
+    const more = human.stderr.match(/More: (.*)/)?.[1];
+
+    if (more === undefined) {
+      expect(JSON.parse(json.stdout).next_cursor).toBeNull();
+      break;
+    }
+
+    argv = (await shellWords(more)).slice(1);
+    expect(argv.slice(0, 5)).toEqual(["logs", "--limit", "2", "--since", "2h"]);
+  }
+
+  expect(seen).toEqual(logs().logs.map((log) => log.message));
 });
 
 test("a request that times out inside fetch is a retryable timeout, not a failed request", async () => {
