@@ -17,6 +17,18 @@ from ._client import Client, flush, get_client, init, shutdown
 from ._config import SDK_VERSION as __version__
 from ._config import LogLevelOption
 from ._context import get_traceparent, propagate_attributes
+from ._experiments import (
+    AsyncScorer,
+    DatasetItem,
+    ExperimentError,
+    ExperimentItem,
+    ExperimentResult,
+    ExperimentScore,
+    Scorer,
+    ScorerResult,
+    run_experiment,
+    run_experiment_async,
+)
 from ._logs import log
 from ._observe import observe
 from ._prompts import (
@@ -29,6 +41,7 @@ from ._prompts import (
     get_prompt_async,
     with_prompt,
 )
+from ._scores import ScoreError, score, score_async
 from ._semconv import LogLevel, SpanType
 from ._serialize import AttributeValue, Mask, MaskContext
 from ._spans import (
@@ -42,10 +55,16 @@ from .otel import TelemetrySpanProcessor
 
 __all__ = [
     "NOT_GIVEN",
+    "AsyncScorer",
     "AttributeValue",
     "CaptureBudget",
     "ChatPrompt",
     "Client",
+    "DatasetItem",
+    "ExperimentError",
+    "ExperimentItem",
+    "ExperimentResult",
+    "ExperimentScore",
     "LogLevel",
     "LogLevelOption",
     "Mask",
@@ -53,6 +72,9 @@ __all__ = [
     "Prompt",
     "PromptError",
     "PromptModel",
+    "ScoreError",
+    "Scorer",
+    "ScorerResult",
     "SpanHandle",
     "SpanType",
     "TelemetrySpanProcessor",
@@ -68,6 +90,10 @@ __all__ = [
     "log",
     "observe",
     "propagate_attributes",
+    "run_experiment",
+    "run_experiment_async",
+    "score",
+    "score_async",
     "shutdown",
     "start_span",
     "update_current_span",

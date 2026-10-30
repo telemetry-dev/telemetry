@@ -89,6 +89,8 @@ later `init()` generates a new ID. It is not persisted across processes.
 | `get_traceparent() -> str \| None` | W3C traceparent of the current context. |
 | `get_prompt(name, *, label=, version=, type="chat", cache_ttl_seconds=60, fallback=, api_key=, base_url=)` / `get_prompt_async(...)` | Fetch a prompt by label or version; see [Prompts](#prompts). |
 | `with_prompt(prompt)` | Context manager recording the prompt on each model call started inside. |
+| `run_experiment(*, task, dataset=, name=, dataset_version=, split=, evaluators=, scorers=, min_scores=, runs_per_item=1, concurrency=4, metadata=, ci=, api_key=, base_url=)` / `run_experiment_async(...)` | Run your code on a dataset as an experiment; see [Experiments](#experiments). |
+| `score(*, name, trace_id=, span_id=, session_id=, value=, label=, comment=, api_key=, base_url=)` / `score_async(...)` | Record a score on a trace, a span, or a session; see [Scores](#scores). |
 | `flush(timeout_s=10.0)` / `shutdown(timeout_s=10.0)` | Force-flush / tear down traces + logs + metrics. Shutdown also runs atexit unless `disable_atexit=True`. |
 | `TelemetrySpanProcessor` / `telemetry_dev.otel.create_telemetry_span_exporter` | Bring-your-own-OTel helpers (below). |
 | `MaskContext`, `Usage`, `SpanHandle`, `Client`, `NOT_GIVEN` | Supporting types. |
@@ -261,6 +263,123 @@ integrations: OpenAI, Anthropic, Amazon Bedrock, Google GenAI, LiteLLM, and Open
 other OpenTelemetry tracers do not get the attributes. A model call outside `with_prompt` does not
 get the attributes, even when it sends messages from `compile()`; with input capture on, the call
 still records those messages as its input.
+
+## Experiments
+
+`run_experiment` runs your code on each item of a dataset that you manage in telemetry.dev, and
+records the outputs and the scores as an experiment. The experiment page compares it with the
+baseline of the dataset.
+
+```python
+import telemetry_dev
+
+telemetry_dev.init(environment="experiment")
+
+result = telemetry_dev.run_experiment(
+    name="reply-v13-gpt-4o",
+    dataset="support-golden",
+    task=lambda item: reply_to_customer(item.input),
+    evaluators=["correctness", "helpfulness"],
+    scorers={"short": lambda output, item: len(output) < 600},
+    min_scores={"correctness": 0.9},
+)
+```
+
+- `run_experiment` reads the newest version of the dataset, or `dataset_version`, 100 items at a
+  time. With `split`, it runs only the items of that split. Then it makes the experiment, with a
+  name that telemetry.dev picks when you give no `name`.
+- `task(item)` gets an `ExperimentItem`: `id`, `number`, `input`, `expected_output`, `metadata`,
+  `tags`, `split`, and `run_index`. Its return value is the output. A string stays as it is, and a
+  different value becomes JSON, cut to 100,000 UTF-16 units. A value that JSON cannot hold, such
+  as a dict that holds itself, gives no output. A task that raises fails only its item, and the
+  item records the type and the message of the exception.
+- `concurrency` (1 to 100, default 4) threads run the items, each in a copy of the context of the
+  caller, so `propagate_attributes` around the call applies to each item. With `runs_per_item`
+  (default 1, at most 5), each item runs more than one time. Each run gets its own copy of the
+  item, so a task that changes its input does not change the next run. The pass rate and the mean
+  of each score use all runs.
+- `run_experiment_async` takes async tasks and scorers. `concurrency` asyncio tasks run the items,
+  and the requests go in worker threads. A task that is not async runs on the event loop, so use
+  `run_experiment` for it. `run_experiment` raises `TypeError` for an async task or scorer.
+- Each item run is a trace of its own, with the span `experiment <name>`. The SDK puts
+  `td.experiment.id` and `td.dataset.item_id` on each span of the run, also on the spans of the
+  provider integrations. Each run also gets its own session id,
+  `<experiment id>:<item id>:<run index>`, as `gen_ai.conversation.id`.
+- Call `init(environment="experiment")` before the run. Pages, metrics, and alerts leave out the
+  `experiment` environment by default. In a different environment, `run_experiment` logs a
+  warning. Without an enabled client, the items record no traces and no cost.
+- `evaluators` names evaluators of the project: LLM judges, code checks, and rules. telemetry.dev
+  runs them on the outputs. `scorers` run on your machine, after the span of the item ends. A
+  scorer returns `True` or `False` for a pass or a fail, a number, a label, or a mapping with
+  `value`, `label`, and `reason`. A scorer that raises, or returns a score that is not valid, gives
+  no score for that item and sends a `scorer_failed` error to `on_error`. A scorer cannot have the
+  name of an evaluator of the run, or the name `user_feedback`.
+- `run_experiment` sends the outputs in batches of 100 items at most, and then waits up to 30
+  minutes for the server evaluators. Then it prints the scores and returns an `ExperimentResult`:
+  `status`, `check_status`, item counts, `scores` with the value, the baseline value, the change,
+  and the pass mark of each score, and the `url` of the experiment page.
+- `min_scores` sets a pass mark for each score name: the lowest pass rate (0 to 1) of a pass/fail
+  score, or the lowest mean of a number score. A score under its mark fails the check.
+- A failed request raises `ExperimentError` whose `code` tells why, for example
+  `dataset_not_found`, `dataset_empty`, `evaluator_not_found`, `insufficient_scope`,
+  `missing_api_key`, or `timeout`. A read of the dataset or the result, a post of outputs, and the
+  completion go again up to 2 times after a timeout, a network error, a 429, or a 5xx. The server
+  skips an item run that it has. The request that makes the experiment goes again only after a
+  429, thus a lost response or a 503 cannot make a second experiment. When the run stops after it
+  made the experiment, also after Ctrl-C or a cancellation, `run_experiment` sends the completion
+  before it raises: telemetry.dev then ends the experiment with the item runs that it got, or fails
+  it when it got none.
+- The key needs the `datasets:read` and `experiments:write` scopes. `run_experiment` uses the same
+  API key and base URL as `get_prompt`, or its own `api_key` and `base_url`. With
+  `environment="experiment"`, the key of the telemetry client must be for all environments or for
+  `experiment`: a key for another environment cannot send the traces of the items, and the items
+  then have no trace and no cost.
+
+The outputs, the exceptions of failed tasks, the scorer reasons, and `metadata` go to telemetry.dev
+and stay with the experiment, because they are its result. `capture_output`, `mask`, and the
+capture setting of the environment in the project do not apply to them. They apply only to the
+spans of the run.
+
+### CI mode
+
+When the `CI` variable is `true` or `1`, or with `ci=True`, `run_experiment` raises when the check
+fails (`check_failed`) or when the experiment does not complete (`experiment_failed`), so the
+process exits with an error. The error has the `result`. In GitHub Actions, the experiment also
+records the repository, the commit, the run URL, and the number, the title, and the URL of the pull
+request. The commit of a pull request is its head commit.
+
+The [experiment action](../../actions/experiment) runs your eval script in a workflow, and posts
+the result on the pull request. It gives `run_experiment` the `dataset` input in
+`TELEMETRY_DEV_EXPERIMENT_DATASET`, which must agree with the `dataset` of the script, and the
+`min-scores` input in `TELEMETRY_DEV_EXPERIMENT_MIN_SCORES`, which wins over `min_scores` for the
+same name.
+
+## Scores
+
+`score` records a score on a trace, a span, or a session, for example the thumbs up or down of a
+user on a reply:
+
+```python
+import telemetry_dev
+
+# When the app replies, keep the trace id of the reply with the message:
+with telemetry_dev.start_span("reply") as span:
+    text = reply_to_customer(message)
+    trace_id = f"{span.span.get_span_context().trace_id:032x}"
+
+# Later, when the user clicks thumbs down:
+telemetry_dev.score(name="user_feedback", trace_id=trace_id, value=0, comment="Wrong amount")
+```
+
+- Give `trace_id`, `session_id`, or the two, and a `span_id` of the trace for a score on one span.
+  Give `value`, `label`, or the two. `user_feedback` takes the value 1 for up or 0 for down, and
+  no label. A pass/fail score has the label `pass` with the value 1, or `fail` with 0.
+- Like the telemetry functions, `score` never raises. It returns the id of the score, or `None`
+  after it sends a `ScoreError` to `on_error`. It checks the score before it sends it
+  (`invalid_score`). The trace id of a span from a client that is not enabled is all zeros, and
+  `score` reports it as `invalid_score`.
+- `score` makes one request, with no retry. `score_async` runs it in a worker thread. The key
+  needs the `scores:write` scope.
 
 ## Auto-metrics
 

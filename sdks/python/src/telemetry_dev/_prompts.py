@@ -18,18 +18,16 @@ from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from email.message import Message
-from email.utils import parsedate_to_datetime
 from time import monotonic
-from typing import IO, Any, Literal, TypeAlias, TypedDict, cast, overload
+from typing import Any, Literal, TypeAlias, TypedDict, cast, overload
 from weakref import WeakKeyDictionary
 
 from opentelemetry import context as otel_context
 from opentelemetry.context import Context
 
+from ._api import NoRedirect, api_error, auth_headers, resolve_api, retry_after
 from ._client import Client, get_client
-from ._config import SDK_VERSION, report_error, resolve_config
+from ._config import report_error
 from ._context import propagated_attributes
 from ._semconv import (
     ATTR_PROMPT_LABEL,
@@ -46,8 +44,6 @@ _ERROR_TTL_S = 10.0
 # The longest Retry-After that get_prompt honors, so that a bad header cannot stop fetches.
 _MAX_RETRY_AFTER_S = 3600.0
 _MAX_CACHE_ENTRIES = 1000
-# IMF-fixdate, the HTTP date that servers send: Sun, 06 Nov 1994 08:49:37 GMT.
-_HTTP_DATE = re.compile(r"[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT", re.ASCII)
 _VARIABLE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _MODEL_CALL_OPERATIONS = frozenset({"chat", "text_completion", "generate_content"})
 _PROMPT_KEY = otel_context.create_key("telemetry_dev.prompt")
@@ -311,11 +307,11 @@ def _get_prompt(
     _check(name, type, label, version, cache_ttl_seconds, fallback)
     client = get_client()
     enabled = client if client is not None and client.enabled else None
-    config = enabled.config if enabled is not None else resolve_config()
-    key = api_key if api_key is not None else config.api_key
-    url = (base_url or config.base_url).rstrip("/")
+    api = resolve_api(api_key, base_url)
+    key = api.api_key
+    url = api.base_url
     asked_label = (label if label is not None else "production") if version is None else None
-    on_error = enabled.on_error if enabled is not None else None
+    on_error = api.on_error
 
     try:
         if not key:
@@ -337,13 +333,7 @@ def _get_prompt(
             cache_ttl_seconds,
             lambda: _fetch(
                 f"{url}/v1/prompts?{urllib.parse.urlencode(query)}",
-                {
-                    "Authorization": f"Bearer {key}",
-                    "X-Telemetry-Dev-SDK": "telemetry-dev",
-                    # urllib's default User-Agent, Python-urllib/3.x, is refused by bot filters
-                    # such as Cloudflare's Browser Integrity Check.
-                    "User-Agent": f"telemetry-dev-python/{SDK_VERSION}",
-                },
+                auth_headers(key),
             ),
             on_error,
         )
@@ -589,21 +579,6 @@ def _refresh(
     done.set()
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    # A redirect to another host must not get the API key, so a 3xx fails like any status that is
-    # not 2xx.
-    def redirect_request(
-        self,
-        req: urllib.request.Request,
-        fp: IO[bytes],
-        code: int,
-        msg: str,
-        headers: Message,
-        newurl: str,
-    ) -> urllib.request.Request | None:
-        return None
-
-
 class _Deadline:
     """Ends one prompt fetch after ``_FETCH_TIMEOUT_S``. The timeout of urllib applies to each
     socket operation, so a server that sends a byte now and then could keep a fetch reading forever,
@@ -702,12 +677,12 @@ class _HTTPSHandler(urllib.request.HTTPSHandler):
         return super().do_open(_on_deadline(http_class, req), req, **http_conn_args)
 
 
-_opener = urllib.request.build_opener(_NoRedirect, _HTTPHandler, _HTTPSHandler)
+_opener = urllib.request.build_opener(NoRedirect, _HTTPHandler, _HTTPSHandler)
 
 
 def _fetch(url: str, headers: dict[str, str]) -> dict[str, Any]:
     deadline = _Deadline()
-    retry_after: str | None = None
+    retry_header: str | None = None
     try:
         try:
             with _opener.open(
@@ -718,7 +693,7 @@ def _fetch(url: str, headers: dict[str, str]) -> dict[str, Any]:
         except urllib.error.HTTPError as exc:
             with exc:
                 status, body = exc.code, exc.read()
-                retry_after = exc.headers.get("Retry-After")
+                retry_header = exc.headers.get("Retry-After")
     except Exception as exc:
         if (
             deadline.expired
@@ -735,9 +710,10 @@ def _fetch(url: str, headers: dict[str, str]) -> dict[str, Any]:
     if deadline.expired:
         raise _timeout()
     if not 200 <= status < 300:
-        error = _api_error(status, body)
-        if status in (429, 503):
-            error._retry_after = _retry_after(retry_after)  # pyright: ignore[reportPrivateUsage]
+        error = api_error(PromptError, status, body)
+        wait = retry_after(status, retry_header)
+        if wait is not None:
+            error._retry_after = min(wait, _MAX_RETRY_AFTER_S)  # pyright: ignore[reportPrivateUsage]
         raise error
     try:
         parsed = _parse_response(json.loads(body))
@@ -750,40 +726,6 @@ def _fetch(url: str, headers: dict[str, str]) -> dict[str, Any]:
 
 def _timeout() -> PromptError:
     return PromptError("timeout", f"Fetching the prompt took more than {_FETCH_TIMEOUT_S:g} s")
-
-
-def _api_error(status: int, body: bytes) -> PromptError:
-    try:
-        error = json.loads(body).get("error")
-    except (ValueError, AttributeError):
-        error = None
-    fields = cast("dict[str, Any]", error) if isinstance(error, dict) else {}
-    code = fields.get("code")
-    message = fields.get("message")
-    return PromptError(
-        code if isinstance(code, str) else f"http_{status}",
-        message if isinstance(message, str) else f"telemetry.dev returned {status}",
-        status,
-    )
-
-
-def _retry_after(value: str | None) -> float | None:
-    """Seconds to wait from a Retry-After header of seconds or an IMF-fixdate HTTP date
-    (``Sun, 06 Nov 1994 08:49:37 GMT``), capped."""
-    value = (value or "").strip()
-    if not value:
-        return None
-    if value.isascii() and value.isdigit():
-        seconds = float(value)
-    elif _HTTP_DATE.fullmatch(value):
-        try:
-            date = parsedate_to_datetime(value)
-        except (TypeError, ValueError):
-            return None
-        seconds = (date - datetime.now(timezone.utc)).total_seconds()
-    else:
-        return None
-    return min(seconds, _MAX_RETRY_AFTER_S) if seconds > 0 else None
 
 
 def _parse_response(data: object) -> dict[str, Any] | None:
