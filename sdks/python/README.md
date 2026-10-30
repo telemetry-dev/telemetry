@@ -283,19 +283,21 @@ result = telemetry_dev.run_experiment(
   name that telemetry.dev picks when you give no `name`.
 - `task(item)` gets an `ExperimentItem`: `id`, `number`, `input`, `expected_output`, `metadata`,
   `tags`, `split`, and `run_index`. Its return value is the output. A string stays as it is, and a
-  different value becomes JSON, cut to 100,000 UTF-16 units. A task that raises fails only its
-  item, and the item records the type and the message of the exception.
+  different value becomes JSON, cut to 100,000 UTF-16 units. A value that JSON cannot hold, such
+  as a dict that holds itself, gives no output. A task that raises fails only its item, and the
+  item records the type and the message of the exception.
 - `concurrency` (1 to 100, default 4) threads run the items, each in a copy of the context of the
-  caller, so `propagate_attributes` around the call applies to each item. `runs_per_item` (1 to 5,
-  default 1) runs each item more than one time. The pass rate and the mean of each score use all
-  runs.
+  caller, so `propagate_attributes` around the call applies to each item. With `runs_per_item`
+  (default 1, at most 5), each item runs more than one time. Each run gets its own copy of the
+  item, so a task that changes its input does not change the next run. The pass rate and the mean
+  of each score use all runs.
 - `run_experiment_async` takes async tasks and scorers. `concurrency` asyncio tasks run the items,
   and the requests go in worker threads. A task that is not async runs on the event loop, so use
   `run_experiment` for it. `run_experiment` raises `TypeError` for an async task or scorer.
 - Each item run is a trace of its own, with the span `experiment <name>`. The SDK puts
   `td.experiment.id` and `td.dataset.item_id` on each span of the run, also on the spans of the
-  provider integrations. Each run also gets its own session id, `<experiment id>:<item id>:<run
-  index>`, as `gen_ai.conversation.id`.
+  provider integrations. Each run also gets its own session id,
+  `<experiment id>:<item id>:<run index>`, as `gen_ai.conversation.id`.
 - Call `init(environment="experiment")` before the run. Pages, metrics, and alerts leave out the
   `experiment` environment by default. In a different environment, `run_experiment` logs a
   warning. Without an enabled client, the items record no traces and no cost.
@@ -315,15 +317,21 @@ result = telemetry_dev.run_experiment(
   `dataset_not_found`, `dataset_empty`, `evaluator_not_found`, `insufficient_scope`,
   `missing_api_key`, or `timeout`. A read of the dataset or the result, a post of outputs, and the
   completion go again up to 2 times after a timeout, a network error, a 429, or a 5xx. The server
-  skips an item run that it has. The request that makes the experiment goes again only after a 429
-  or a 503, thus a lost response cannot make a second experiment. If the run stops before the end,
-  the experiment does not complete in telemetry.dev.
+  skips an item run that it has. The request that makes the experiment goes again only after a
+  429, thus a lost response or a 503 cannot make a second experiment. When the run stops after it
+  made the experiment, also after Ctrl-C or a cancellation, `run_experiment` sends the completion
+  before it raises: telemetry.dev then ends the experiment with the item runs that it got, or fails
+  it when it got none.
 - The key needs the `datasets:read` and `experiments:write` scopes. `run_experiment` uses the same
-  API key and base URL as `get_prompt`, or its own `api_key` and `base_url`.
+  API key and base URL as `get_prompt`, or its own `api_key` and `base_url`. With
+  `environment="experiment"`, the key of the telemetry client must be for all environments or for
+  `experiment`: a key for another environment cannot send the traces of the items, and the items
+  then have no trace and no cost.
 
 The outputs, the exceptions of failed tasks, the scorer reasons, and `metadata` go to telemetry.dev
-also when `capture_output` is off, because they are the result of the experiment. The capture
-options and `mask` apply only to the spans of the run.
+and stay with the experiment, because they are its result. `capture_output`, `mask`, and the
+capture setting of the environment in the project do not apply to them. They apply only to the
+spans of the run.
 
 ### CI mode
 

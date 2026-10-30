@@ -17,7 +17,8 @@ from email.utils import parsedate_to_datetime
 from typing import IO, Any, Literal, TypeVar, cast
 
 from ._client import get_client
-from ._config import resolve_config
+from ._config import SDK_VERSION, resolve_config
+from ._serialize import json_dumps
 
 # A longer Retry-After waits only this long: the API counts requests by the minute.
 _MAX_RETRY_AFTER_S = 60.0
@@ -71,18 +72,20 @@ def request(
 
     A response that is not 2xx raises the ``{"error": {"code", "message"}}`` of its body, or
     ``http_<status>``. With ``idempotent``, the server takes a repeat at most once, so a timeout, a
-    network error, or a 5xx tries again. Other requests try again only after a 429 or a 503: the
-    server did not take the request then. A retry waits for the Retry-After of the response, or
-    for 1 and then 2 seconds. The timeout applies to each socket operation of urllib.
+    network error, or a 5xx tries again. Other requests try again only after a 429, which the rate
+    limit answers before the server does any work: a 503 can come after the work committed. A
+    retry waits for the Retry-After of the response, or for 1 and then 2 seconds. The timeout
+    applies to each socket operation of urllib.
     """
     url = f"{api.base_url}{path}"
     params = {key: value for key, value in (query or {}).items() if value is not None}
     if params:
         url = f"{url}?{urllib.parse.urlencode(params)}"
-    headers = {"Authorization": f"Bearer {api.api_key}", "X-Telemetry-Dev-SDK": "telemetry-dev"}
+    headers = auth_headers(api.api_key)
     data = None
     if body is not None:
-        data = json.dumps(body, ensure_ascii=False, allow_nan=False).encode()
+        # The JSON of JSON.stringify, which escapes a lone surrogate that UTF-8 cannot hold.
+        data = json_dumps(body, default=None).encode()
         headers["Content-Type"] = "application/json"
     attempt = 1
     while True:
@@ -93,6 +96,16 @@ def request(
             raise result.error
         time.sleep(min(result.retry_after or float(attempt), _MAX_RETRY_AFTER_S))
         attempt += 1
+
+
+def auth_headers(api_key: str | None) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "X-Telemetry-Dev-SDK": "telemetry-dev",
+        # urllib's default User-Agent, Python-urllib/3.x, is refused by bot filters such as
+        # Cloudflare's Browser Integrity Check.
+        "User-Agent": f"telemetry-dev-python/{SDK_VERSION}",
+    }
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -185,6 +198,6 @@ def _send(
 
 
 def _retryable(status: int | None, idempotent: bool) -> bool:
-    if status in (429, 503):
+    if status == 429:
         return True
     return idempotent and (status is None or status >= 500)

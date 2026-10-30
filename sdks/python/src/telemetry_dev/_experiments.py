@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import copy
 import inspect
-import json
 import math
 import os
 import threading
@@ -184,9 +184,11 @@ def run_experiment(
     them and wins for the same name. ``runs_per_item`` is 1 to 5.
 
     The run cannot start without its dataset, so run_experiment raises ``ExperimentError`` when a
-    request fails. A task that raises fails only its item. In CI mode (``ci``, default on when
-    ``CI`` is ``true`` or ``1``), it records the GitHub Actions run, and it raises when the check
-    fails or the experiment does not complete, so the process exits with an error.
+    request fails. When the run stops after it made the experiment, it first sends the complete
+    request, so that telemetry.dev ends the experiment with the item runs that it has. A task that
+    raises fails only its item. In CI mode (``ci``, default on when ``CI`` is ``true`` or ``1``),
+    it records the GitHub Actions run, and it raises when the check fails or the experiment does
+    not complete, so the process exits with an error.
     """
     run, api = _prepare(
         task,
@@ -206,7 +208,12 @@ def run_experiment(
         asynchronous=False,
     )
     runs, created = _start(api, run)
-    _run_items(api, run, created, runs)
+    try:
+        _announce(run, created)
+        _run_items(api, run, created, runs)
+    except BaseException:
+        _complete_after_failure(api, created)
+        raise
     return _finish(api, run, created)
 
 
@@ -248,7 +255,12 @@ async def run_experiment_async(
         asynchronous=True,
     )
     runs, created = await asyncio.to_thread(_start, api, run)
-    await _run_items_async(api, run, created, runs)
+    try:
+        _announce(run, created)
+        await _run_items_async(api, run, created, runs)
+    except BaseException:
+        await asyncio.to_thread(_complete_after_failure, api, created)
+        raise
     return await asyncio.to_thread(_finish, api, run, created)
 
 
@@ -464,13 +476,25 @@ def _start(api: Api, run: _Run) -> tuple[_Runs, _Created]:
             idempotent=False,
         )
     )
+    return _Runs(api, run, first), created
+
+
+def _announce(run: _Run, created: _Created) -> None:
     each = f", {run.runs_per_item} runs each" if run.runs_per_item > 1 else ""
     print(
         f"Experiment {created.name}: {created.items_total // run.runs_per_item} items{each}. "
         f"{created.url}",
         flush=True,
     )
-    return _Runs(api, run, first), created
+
+
+def _complete_after_failure(api: Api, created: _Created) -> None:
+    """Without the complete, the experiment would stay running: the server ends it with the item
+    runs that it has, or fails it when it has none."""
+    try:
+        _complete(api, created)
+    except Exception as exc:
+        report_error(api.on_error, "completing the experiment after a failed run failed", exc)
 
 
 class _Runs:
@@ -500,8 +524,10 @@ def _item_runs(api: Api, run: _Run, first: _Page) -> Generator[ExperimentItem]:
                 "invalid_response", f"telemetry.dev returned more than {_MAX_DATASET_ITEMS} items"
             )
         for item in page.items:
+            # A copy for each run, so that a task that changes its input does not change the next
+            # run.
             for run_index in range(run.runs_per_item):
-                yield ExperimentItem(**vars(item), run_index=run_index)
+                yield ExperimentItem(**copy.deepcopy(vars(item)), run_index=run_index)
         if page.next_cursor is None:
             return
         page = _fetch_page(api, run, page.version, page.next_cursor)
@@ -543,7 +569,7 @@ class _Batch:
         self._lock = threading.Lock()
 
     def add(self, result: dict[str, Any]) -> None:
-        size = len(json.dumps(result, ensure_ascii=False).encode())
+        size = len(json_dumps(result, default=None).encode())
         with self._lock:
             if self._pending and self._bytes + size > _MAX_BATCH_BYTES:
                 self._send()
@@ -582,8 +608,8 @@ def _batch(api: Api, created: _Created) -> _Batch:
 
 def _run_items(api: Api, run: _Run, created: _Created, runs: _Runs) -> None:
     """Run the items, ``concurrency`` at a time, and post each result. A post or a page fetch
-    that fails stops the run: no new item starts, and run_experiment raises when the running
-    items end."""
+    that fails stops the run: no new item starts, and _run_items raises when the running items
+    end."""
     batch = _batch(api, created)
     failures: list[BaseException] = []
     caller = contextvars.copy_context()
@@ -592,15 +618,10 @@ def _run_items(api: Api, run: _Run, created: _Created, runs: _Runs) -> None:
         while not failures:
             try:
                 item = runs.next()
-            except Exception as exc:
-                failures.append(exc)
-                return
-            if item is None:
-                return
-            # A copy for each item: one Context cannot run in two threads at the same time.
-            result = caller.copy().run(_run_item, run, created, item, api.on_error)
-            try:
-                batch.add(result)
+                if item is None:
+                    return
+                # A copy for each item: one Context cannot run in two threads at the same time.
+                batch.add(caller.copy().run(_run_item, run, created, item, api.on_error))
             except Exception as exc:
                 failures.append(exc)
 
@@ -624,13 +645,9 @@ async def _run_items_async(api: Api, run: _Run, created: _Created, runs: _Runs) 
         while not failures:
             try:
                 item = await asyncio.to_thread(runs.next)
-            except Exception as exc:
-                failures.append(exc)
-                return
-            if item is None:
-                return
-            result = await _run_item_async(run, created, item, api.on_error)
-            try:
+                if item is None:
+                    return
+                result = await _run_item_async(run, created, item, api.on_error)
                 await asyncio.to_thread(batch.add, result)
             except Exception as exc:
                 failures.append(exc)
@@ -840,14 +857,29 @@ def _pass_fail(passed: bool) -> dict[str, Any]:
 
 
 def _output_text(output: Any) -> str | None:
+    """The output as text. An output that JSON cannot hold, such as a dict that holds itself, is
+    None."""
     if output is None:
         return None
-    text = output if isinstance(output, str) else json_dumps(output)
-    return truncate(text, _MAX_OUTPUT_LENGTH)
+    try:
+        text = output if isinstance(output, str) else json_dumps(output)
+    except Exception:
+        return None
+    return truncate(_well_formed(text), _MAX_OUTPUT_LENGTH)
 
 
 def _error_text(error: BaseException) -> str:
-    return f"{type(error).__name__}: {error}"
+    try:
+        text = f"{type(error).__name__}: {error}"
+    except Exception:
+        # A __str__ that raises.
+        return type(error).__name__
+    return _well_formed(text)
+
+
+def _well_formed(text: str) -> str:
+    # truncate fails on a lone surrogate, which a str can hold, so each one becomes U+FFFD.
+    return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
 
 
 def _close(awaitable: object) -> None:
@@ -860,6 +892,16 @@ def _close(awaitable: object) -> None:
 def _finish(api: Api, run: _Run, created: _Created) -> ExperimentResult:
     # The spans of the items reach ingest before the server reads their cost.
     flush()
+    _complete(api, created)
+    result, body = _wait_for_result(api, created.id)
+    write_result(os.environ, body, api.on_error)
+    print(_describe(result), flush=True)
+    if run.in_ci:
+        _check_result(result)
+    return result
+
+
+def _complete(api: Api, created: _Created) -> None:
     request(
         api,
         ExperimentError,
@@ -868,12 +910,6 @@ def _finish(api: Api, run: _Run, created: _Created) -> ExperimentResult:
         timeout_s=_REQUEST_TIMEOUT_S,
         idempotent=True,
     )
-    result, body = _wait_for_result(api, created.id)
-    write_result(os.environ, body, api.on_error)
-    print(_describe(result), flush=True)
-    if run.in_ci:
-        _check_result(result)
-    return result
 
 
 def _wait_for_result(api: Api, experiment_id: str) -> tuple[ExperimentResult, object]:
@@ -1035,6 +1071,7 @@ def _parse_result(body: object) -> ExperimentResult:
         if isinstance(raw_scores, list)
         else None
     )
+    # Required: it decides the result of CI mode, so a missing one must not read as no check.
     check_status = fields.get("checkStatus", "missing")
     items_failed = fields.get("itemsFailed", 0)
     error = fields.get("error")
@@ -1067,6 +1104,7 @@ def _parse_result(body: object) -> ExperimentResult:
 
 
 def _parse_score(raw: object) -> ExperimentScore | None:
+    """A score of the result. A field that can be None can also be missing."""
     if not isinstance(raw, dict):
         return None
     score = cast("dict[str, Any]", raw)

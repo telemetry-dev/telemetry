@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+import telemetry_dev
 from telemetry_dev import ScoreError, score, score_async
 
 from .conftest import MakeClient
@@ -54,6 +55,7 @@ def test_posts_the_score_with_the_key_and_base_url_of_init_and_returns_its_id(
     assert request.route == "POST /v1/scores"
     assert request.headers["authorization"] == "Bearer td_live_key"
     assert request.headers["x-telemetry-dev-sdk"] == "telemetry-dev"
+    assert request.headers["user-agent"] == f"telemetry-dev-python/{telemetry_dev.__version__}"
     assert request.headers["content-type"] == "application/json"
     assert request.body == {
         "name": "user_feedback",

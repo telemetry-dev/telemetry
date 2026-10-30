@@ -24,9 +24,9 @@ from weakref import WeakKeyDictionary
 from opentelemetry import context as otel_context
 from opentelemetry.context import Context
 
-from ._api import NoRedirect, api_error, resolve_api, retry_after
+from ._api import NoRedirect, api_error, auth_headers, resolve_api, retry_after
 from ._client import Client, get_client
-from ._config import SDK_VERSION, report_error
+from ._config import report_error
 from ._context import propagated_attributes
 from ._semconv import (
     ATTR_PROMPT_LABEL,
@@ -332,13 +332,7 @@ def _get_prompt(
             cache_ttl_seconds,
             lambda: _fetch(
                 f"{url}/v1/prompts?{urllib.parse.urlencode(query)}",
-                {
-                    "Authorization": f"Bearer {key}",
-                    "X-Telemetry-Dev-SDK": "telemetry-dev",
-                    # urllib's default User-Agent, Python-urllib/3.x, is refused by bot filters
-                    # such as Cloudflare's Browser Integrity Check.
-                    "User-Agent": f"telemetry-dev-python/{SDK_VERSION}",
-                },
+                auth_headers(key),
             ),
             on_error,
         )

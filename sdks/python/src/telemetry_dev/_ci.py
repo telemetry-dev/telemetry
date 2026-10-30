@@ -127,7 +127,9 @@ def _https_url(url: str) -> str | None:
 
 
 def _cut(text: str, max_units: int) -> str:
-    """``text`` cut to ``max_units`` UTF-16 units, the length that the API counts."""
+    """``text`` cut to ``max_units`` UTF-16 units, the length that the API counts, with no half of
+    a surrogate pair at the end: the API stores the run as jsonb, and Postgres rejects a lone
+    surrogate there."""
     encoded = text.encode("utf-16-le", "surrogatepass")
     if len(encoded) <= max_units * 2:
         return text

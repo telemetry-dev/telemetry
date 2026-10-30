@@ -4,7 +4,9 @@ cursor, an experiment that takes item posts of at most 100 and skips repeats, an
 from __future__ import annotations
 
 import json
+import sys
 import threading
+import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -66,13 +68,26 @@ class ApiRequest:
 Reply = tuple[int, object, dict[str, str]]
 
 
+@dataclass(frozen=True)
+class Drop:
+    """Closes the connection with no answer, as a network failure does."""
+
+
+@dataclass(frozen=True)
+class Late:
+    """Answers after a wait, as a server that is slower than the timeout of the client."""
+
+    seconds: float
+    reply: Reply
+
+
 @dataclass
 class FakeApi:
     url: str
     items: list[dict[str, Any]] = field(default_factory=lambda: [dataset_item(1), dataset_item(2)])
     page_size: int = 100
     results: list[dict[str, Any]] = field(default_factory=lambda: [result()])
-    override: Callable[[ApiRequest], Reply | None] | None = None
+    override: Callable[[ApiRequest], Reply | Drop | Late | None] | None = None
     requests: list[ApiRequest] = field(default_factory=lambda: [])
     stored: set[str] = field(default_factory=lambda: set[str]())
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -85,7 +100,7 @@ class FakeApi:
             request.body["items"] for request in self.requests if request.path.endswith("/items")
         ]
 
-    def answer(self, request: ApiRequest) -> Reply:
+    def answer(self, request: ApiRequest) -> Reply | Drop | Late:
         with self.lock:
             self.requests.append(request)
             overridden = self.override(request) if self.override else None
@@ -157,7 +172,7 @@ def fake_api(**options: Any) -> Generator[FakeApi]:
             length = int(self.headers.get("content-length") or 0)
             raw = self.rfile.read(length) if length else b""
             target = urlsplit(self.path)
-            status, body, headers = api.answer(
+            reply = api.answer(
                 ApiRequest(
                     method=self.command,
                     path=target.path,
@@ -166,6 +181,13 @@ def fake_api(**options: Any) -> Generator[FakeApi]:
                     body=json.loads(raw) if raw else None,
                 )
             )
+            if isinstance(reply, Drop):
+                self.close_connection = True
+                return
+            if isinstance(reply, Late):
+                time.sleep(reply.seconds)
+                reply = reply.reply
+            status, body, headers = reply
             data = body if isinstance(body, bytes) else json.dumps(body).encode()
             self.send_response(status)
             self.send_header("content-type", "application/json")
@@ -178,7 +200,13 @@ def fake_api(**options: Any) -> Generator[FakeApi]:
         def log_message(self, format: str, *args: object) -> None:
             pass
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    class Server(ThreadingHTTPServer):
+        def handle_error(self, request: Any, client_address: Any) -> None:
+            # The answer of a Late reply can go to a client that has stopped waiting.
+            if not isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+                super().handle_error(request, client_address)
+
+    server = Server(("127.0.0.1", 0), Handler)
     thread = threading.Thread(
         target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
     )

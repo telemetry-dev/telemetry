@@ -10,6 +10,8 @@ from typing import Any
 
 import pytest
 
+import telemetry_dev
+import telemetry_dev._experiments as experiments_module
 from telemetry_dev import (
     ExperimentError,
     ExperimentItem,
@@ -28,7 +30,9 @@ from .fake_api import (
     EXPERIMENT_ID,
     EXPERIMENT_URL,
     ApiRequest,
+    Drop,
     FakeApi,
+    Late,
     Reply,
     dataset_item,
     fake_api,
@@ -114,6 +118,10 @@ def test_runs_each_item_of_each_page_posts_batches_of_100_on_one_version_then_co
     }
     assert api.requests[1].headers["authorization"] == "Bearer td_live_test"
     assert api.requests[1].headers["x-telemetry-dev-sdk"] == "telemetry-dev"
+    # Cloudflare refuses the default Python-urllib User-Agent.
+    assert api.requests[1].headers["user-agent"] == (
+        f"telemetry-dev-python/{telemetry_dev.__version__}"
+    )
 
     posts = api.posts()
     assert [len(items) for items in posts] == [100, 50]
@@ -293,7 +301,32 @@ def test_an_output_is_cut_to_100000_utf16_units(api: FakeApi) -> None:
     assert output.endswith("...[truncated]")
 
 
-def test_a_failed_post_of_items_stops_new_items_never_completes_and_raises() -> None:
+def run_both(api: FakeApi, asynchronous: bool, **options: Any) -> ExperimentResult:
+    """``experiment`` through run_experiment or run_experiment_async."""
+    if not asynchronous:
+        return experiment(api, **options)
+    arguments: dict[str, Any] = {
+        "api_key": "td_live_test",
+        "base_url": api.url,
+        "dataset": "support-golden",
+        "task": answer,
+    }
+    arguments.update(options)
+    return asyncio.run(run_experiment_async(**arguments))
+
+
+def unknown_item(request: ApiRequest) -> Reply | None:
+    if request.path.endswith("/items"):
+        return answer_with(
+            422, {"error": {"code": "item_not_found", "message": "support-golden v3 has no item"}}
+        )
+    return None
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_a_failed_post_of_items_stops_new_items_completes_the_experiment_and_raises(
+    asynchronous: bool,
+) -> None:
     started = 0
 
     def task(item: ExperimentItem) -> str:
@@ -301,22 +334,167 @@ def test_a_failed_post_of_items_stops_new_items_never_completes_and_raises() -> 
         started += 1
         return "ok"
 
-    def ended(request: ApiRequest) -> Reply | None:
-        if request.path.endswith("/items"):
+    with fake_api(items=[dataset_item(n) for n in range(1, 301)], override=unknown_item) as api:
+        with pytest.raises(ExperimentError) as caught:
+            run_both(api, asynchronous, concurrency=1, task=task)
+
+    assert (caught.value.code, caught.value.status) == ("item_not_found", 422)
+    # The one worker waits for the post of the first 100, which fails, so no item starts after.
+    assert started == 100
+    # The complete ends the experiment, which would else stay running.
+    assert api.routes()[-2:] == [
+        f"POST /v1/experiments/{EXPERIMENT_ID}/items",
+        f"POST /v1/experiments/{EXPERIMENT_ID}/complete",
+    ]
+
+
+def test_a_complete_that_fails_after_a_failed_run_goes_to_on_error(make: MakeClient) -> None:
+    errors: list[BaseException] = []
+    make(environment="experiment", on_error=errors.append)
+
+    def revoked(request: ApiRequest) -> Reply | None:
+        if request.path.endswith(("/items", "/complete")):
             return answer_with(
-                409,
-                {"error": {"code": "experiment_ended", "message": "support-golden-v3 has ended."}},
+                401, {"error": {"code": "invalid_api_key", "message": "The API key was revoked"}}
             )
         return None
 
-    with fake_api(items=[dataset_item(n) for n in range(1, 301)], override=ended) as api:
+    with fake_api(override=revoked) as api:
         with pytest.raises(ExperimentError) as caught:
-            experiment(api, concurrency=1, task=task)
+            experiment(api)
 
-    assert (caught.value.code, caught.value.status) == ("experiment_ended", 409)
-    # The one worker waits for the post of the first 100, which fails, so no item starts after.
-    assert started == 100
-    assert f"POST /v1/experiments/{EXPERIMENT_ID}/complete" not in api.routes()
+    assert (caught.value.code, str(caught.value)) == ("invalid_api_key", "The API key was revoked")
+    assert api.routes().count(f"POST /v1/experiments/{EXPERIMENT_ID}/complete") == 1
+    assert [getattr(error, "code", None) for error in errors] == ["invalid_api_key"]
+
+
+def test_an_interrupted_run_completes_the_experiment(api: FakeApi) -> None:
+    def task(item: ExperimentItem) -> str:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        experiment(api, task=task)
+
+    assert api.routes()[-1] == f"POST /v1/experiments/{EXPERIMENT_ID}/complete"
+
+
+class UnreadableError(Exception):
+    def __str__(self) -> str:
+        raise RuntimeError("no message")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_an_output_or_an_error_that_cannot_be_encoded_does_not_stop_the_run(
+    asynchronous: bool,
+) -> None:
+    cycle: dict[str, Any] = {}
+    cycle["self"] = cycle
+
+    def task(item: ExperimentItem) -> object:
+        if item.number == 3:
+            raise UnreadableError
+        # A lone surrogate, which UTF-8 cannot hold, becomes U+FFFD.
+        return cycle if item.number == 1 else "\ud83d"
+
+    def tone(output: Any, item: ExperimentItem) -> str:
+        return "\ud83d"
+
+    with fake_api(items=[dataset_item(1), dataset_item(2), dataset_item(3)]) as api:
+        outcome = run_both(api, asynchronous, task=task, scorers={"tone": tone})
+
+    assert outcome.status == "completed"
+    posted = sorted((run for items in api.posts() for run in items), key=lambda run: run["itemId"])
+    tones = [{"name": "tone", "label": "\ud83d"}]
+    assert [(run["output"], run.get("error"), run.get("scores")) for run in posted] == [
+        (None, None, tones),
+        ("\ufffd", None, tones),
+        (None, "UnreadableError", None),
+    ]
+    assert f"POST /v1/experiments/{EXPERIMENT_ID}/complete" in api.routes()
+
+
+def test_each_run_of_an_item_starts_from_the_dataset_input() -> None:
+    seen: list[int] = []
+
+    def task(item: ExperimentItem) -> str:
+        messages = item.input["messages"]
+        seen.append(len(messages))
+        messages.append({"role": "assistant", "content": "Hello"})
+        return "ok"
+
+    item = {**dataset_item(1), "input": {"messages": [{"role": "user", "content": "Hi"}]}}
+    with fake_api(items=[item]) as api:
+        experiment(api, runs_per_item=3, concurrency=1, task=task)
+
+    assert seen == [1, 1, 1]
+
+
+def test_a_post_of_items_holds_at_most_4_mib_of_json() -> None:
+    def task(item: ExperimentItem) -> str:
+        # 100,000 characters of 3 UTF-8 bytes: about 300 KB of JSON for each item run.
+        return "\u4e2d" * 100_000
+
+    with fake_api(items=[dataset_item(number) for number in range(1, 21)]) as api:
+        experiment(api, task=task)
+
+    assert [len(items) for items in api.posts()] == [13, 7]
+
+
+@pytest.mark.parametrize(
+    ("count", "code"),
+    [(10_000, None), (10_001, "invalid_response")],
+    ids=["10,000 items in pages run", "10,001 items in pages stop the run"],
+)
+def test_a_dataset_has_at_most_10000_items(count: int, code: str | None) -> None:
+    items = [dataset_item(number) for number in range(1, count + 1)]
+    with fake_api(items=items, page_size=5_000) as api:
+        try:
+            experiment(api, concurrency=20)
+            error = None
+        except ExperimentError as exc:
+            error = exc.code
+
+    assert error == code
+    assert len([run for items in api.posts() for run in items]) == 10_000
+    assert api.routes().count(f"POST /v1/experiments/{EXPERIMENT_ID}/complete") == 1
+
+
+@pytest.mark.parametrize(
+    ("route", "failure", "sends", "code"),
+    [
+        ("GET /v1/datasets/support-golden", "timeout", 2, None),
+        (f"POST /v1/experiments/{EXPERIMENT_ID}/items", "network", 2, None),
+        ("POST /v1/experiments", "timeout", 1, "timeout"),
+        ("POST /v1/experiments", "network", 1, "network_error"),
+    ],
+    ids=[
+        "a timeout of a dataset page goes again",
+        "a network error of an item post goes again",
+        "a timeout of the create does not go again",
+        "a network error of the create does not go again",
+    ],
+)
+def test_a_request_after_a_timeout_or_a_network_error(
+    monkeypatch: pytest.MonkeyPatch, route: str, failure: str, sends: int, code: str | None
+) -> None:
+    monkeypatch.setattr(experiments_module, "_REQUEST_TIMEOUT_S", 0.2)
+    failures = [1]
+
+    def fail_once(request: ApiRequest) -> Reply | Drop | Late | None:
+        if request.route != route or not failures:
+            return None
+        failures.pop()
+        return Drop() if failure == "network" else Late(1.0, answer_with(500, {}))
+
+    with fake_api(override=fail_once) as api:
+        try:
+            experiment(api)
+            error = None
+        except ExperimentError as exc:
+            error = exc.code
+
+    assert error == code
+    assert api.routes().count(route) == sends
 
 
 def test_an_item_post_that_fails_with_500_goes_again() -> None:
@@ -335,16 +513,31 @@ def test_an_item_post_that_fails_with_500_goes_again() -> None:
     assert api.posts()[1] == api.posts()[0]
 
 
-def test_a_create_that_fails_with_500_does_not_go_again() -> None:
+@pytest.mark.parametrize(
+    ("reply", "code"),
+    [
+        (answer_with(500, {}), "http_500"),
+        # The server answers 503 when its database work times out, which can be after the commit.
+        (
+            answer_with(
+                503,
+                {"error": {"code": "evals_unavailable", "message": "Evals are unavailable"}},
+            ),
+            "evals_unavailable",
+        ),
+    ],
+    ids=["500", "503"],
+)
+def test_a_create_that_fails_does_not_go_again(reply: Reply, code: str) -> None:
     def broken(request: ApiRequest) -> Reply | None:
-        return answer_with(500, {}) if request.route == "POST /v1/experiments" else None
+        return reply if request.route == "POST /v1/experiments" else None
 
     with fake_api(override=broken) as api:
         with pytest.raises(ExperimentError) as caught:
             experiment(api)
 
-    assert (caught.value.code, caught.value.status) == ("http_500", 500)
-    assert api.routes().count("POST /v1/experiments") == 1
+    assert (caught.value.code, caught.value.status) == (code, reply[0])
+    assert api.routes() == ["GET /v1/datasets/support-golden", "POST /v1/experiments"]
 
 
 def test_a_create_that_gets_a_429_goes_again_after_its_retry_after() -> None:
@@ -375,6 +568,41 @@ def test_waits_until_the_server_evaluators_end_the_experiment() -> None:
 
     assert outcome.status == "completed"
     assert api.routes().count(f"GET /v1/experiments/{EXPERIMENT_ID}") == 2
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_gives_up_when_the_experiment_does_not_end_in_30_minutes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(experiments_module, "time", clock)
+    polls: list[float] = []
+
+    def running(request: ApiRequest) -> Reply | None:
+        if request.route == f"GET /v1/experiments/{EXPERIMENT_ID}":
+            polls.append(clock.now)
+            return answer_with(200, result(status="running", itemsDone=1))
+        return None
+
+    with fake_api(override=running) as api:
+        with pytest.raises(ExperimentError) as caught:
+            experiment(api)
+
+    assert caught.value.code == "timeout"
+    assert caught.value.result is not None
+    assert caught.value.result.status == "running"
+    # The last poll is the one whose next wait of 5 seconds would end past the 30 minutes.
+    assert 30 * 60 - 5 < polls[-1] - polls[0] <= 30 * 60
 
 
 @pytest.mark.parametrize(
@@ -495,6 +723,35 @@ def test_a_failed_check_returns_when(
         assert experiment(api, **options).check_status == "failed"
 
 
+def test_a_result_score_that_leaves_out_its_null_fields_reads_them_as_none() -> None:
+    scores = [{"name": "length", "passCount": 0, "failCount": 0}]
+    with fake_api(results=[result(scores=scores)]) as api:
+        outcome = experiment(api)
+
+    assert outcome.scores == (
+        ExperimentScore(
+            name="length",
+            kind=None,
+            value=None,
+            pass_count=0,
+            fail_count=0,
+            baseline_value=None,
+            delta=None,
+            min_score=None,
+            passed=None,
+        ),
+    )
+
+
+def test_a_result_without_check_status_is_an_invalid_response() -> None:
+    missing = {key: value for key, value in FAILED_CHECK.items() if key != "checkStatus"}
+    with fake_api(results=[missing]) as api:
+        with pytest.raises(ExperimentError) as caught:
+            experiment(api)
+
+    assert caught.value.code == "invalid_response"
+
+
 def test_in_ci_mode_an_experiment_that_fails_raises_with_its_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -561,11 +818,20 @@ def test_in_github_actions_it_records_the_pull_request_its_head_commit_and_the_r
     assert results.stat().st_mode & 0o777 == 0o600
 
 
-def test_a_pull_request_title_is_cut_to_256_utf16_units(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, api: FakeApi
+@pytest.mark.parametrize(
+    ("title", "sent"),
+    [
+        ("\U0001f600" * 200, "\U0001f600" * 128),
+        # GitHub counts the emoji as one character, thus the title fits its limit of 256.
+        ("a" * 255 + "\U0001f600", "a" * 255),
+    ],
+    ids=["200 emoji", "255 letters and an emoji"],
+)
+def test_a_pull_request_title_is_cut_to_256_utf16_units_without_half_of_an_emoji(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, api: FakeApi, title: str, sent: str
 ) -> None:
     event = tmp_path / "event.json"
-    event.write_text(json.dumps({"pull_request": {"title": "\U0001f600" * 200}}))
+    event.write_text(json.dumps({"pull_request": {"title": title}}))
     for name, value in {
         "CI": "true",
         "GITHUB_ACTIONS": "true",
@@ -577,7 +843,7 @@ def test_a_pull_request_title_is_cut_to_256_utf16_units(
 
     experiment(api)
 
-    assert api.requests[1].body["ci"]["prTitle"] == "\U0001f600" * 128
+    assert api.requests[1].body["ci"]["prTitle"] == sent
 
 
 def one(output: Any, item: ExperimentItem) -> int:
