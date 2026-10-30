@@ -263,10 +263,11 @@ records. A chat call that sends such messages gets `td.prompt.name`, `td.prompt.
 the call. A message from a placeholder variable keeps the prompt of its own, older `compile()`, so
 it does not win over the `compile()` that put it in the list. A copy of a message (`dict()`,
 `.copy()`, `copy.copy`, `copy.deepcopy`, pickle, JSON, `type(message)(message)`, or
-`dataclasses.asdict`) and a new message with the same text do not hold the prompt, so the SDK does
-not record them. Bedrock Converse and Google GenAI take another message shape: change the compiled
-dicts in place, or use `with_prompt`. A text prompt compiles to a string, which cannot hold its
-prompt: use `with_prompt`. `with_prompt` wins over the message. The integrations do it for OpenAI
+`dataclasses.asdict`) and a new message with the same text do not hold the prompt, so a call that
+sends only such messages gets no `td.prompt.*` attributes; with input capture on, the call still
+records them as its input. Bedrock Converse and Google GenAI take another message shape: change the
+compiled dicts in place, or use `with_prompt`. A text prompt compiles to a string, which cannot hold
+its prompt: use `with_prompt`. `with_prompt` wins over the message. The integrations do it for OpenAI
 chat completions and responses, Anthropic messages (for `messages.stream()`, at `__enter__`),
 Bedrock Converse, Google GenAI `generate_content`, LiteLLM completion and responses, and OpenRouter
 chat and responses, but not for Bedrock InvokeModel (its body is bytes), embeddings, images, audio,

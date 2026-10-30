@@ -190,9 +190,10 @@ among them, also when input capture is off, and `td.prompt.variables` when it is
 at the first 1000 and the last 1000 messages of the call. A message from a placeholder variable
 keeps the tag of its own, older `compile()`, so it does not win over the `compile()` that put it in
 the list. A copy of a message (a spread, `structuredClone`, or JSON) and a new message with the same
-text have no tag, so the SDK does not record them. Bedrock Converse and Google GenAI take another
-message shape: change the compiled messages in place, or use `withPrompt`. A text prompt compiles to
-a string, which cannot carry a tag: use `withPrompt`. `withPrompt` wins over the tag. The
+text have no tag, so a call that sends only such messages gets no `td.prompt.*` attributes; with
+input capture on, the call still records them as its input. Bedrock Converse and Google GenAI take
+another message shape: change the compiled messages in place, or use `withPrompt`. A text prompt
+compiles to a string, which cannot carry a tag: use `withPrompt`. `withPrompt` wins over the tag. The
 integrations do it for OpenAI chat completions and responses, Anthropic messages, Bedrock Converse,
 Google GenAI `generateContent`, and OpenRouter chat and responses, but not for Bedrock InvokeModel
 (its body is bytes), embeddings, images, audio, video, or OpenAI Realtime.

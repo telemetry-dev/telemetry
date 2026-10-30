@@ -195,7 +195,7 @@ their text:
 - A copy has no tag: a spread, `structuredClone`, or a JSON round trip (TypeScript); `dict()`,
   `.copy()`, `copy.copy`, `copy.deepcopy`, pickle, a JSON round trip, `type(message)(message)`, or
   `dataclasses.asdict` (Python). A new message with the same text has no tag either, thus a
-  message from another call, task, or prompt version is never recorded.
+  call never records the prompt of a message from another call, task, or prompt version.
 - `promptAttributesFor(messages)` / `prompt_attributes_for(messages)` take a list of messages or
   one message (Python: a `list` or `tuple`, not a subclass, so the read runs no code of the app).
   They look at the first 1000 and the last 1000 items and give the name, version, label, and
