@@ -22,8 +22,13 @@ export type ErrorCode =
   | "sign_in_failed"
   | "no_pending_sign_in"
   | "payloads_not_allowed"
+  | "access_denied"
+  | "invalid_cursor"
+  | "trace_not_found"
+  | "span_not_found"
   | "unreachable"
   | "timeout"
+  | "server_error"
   | "tool_error"
   | "result_too_large"
   | "request_failed";
@@ -61,6 +66,54 @@ export class CliError extends Error {
 
 export const usageError = (message: string, details: Omit<ErrorDetails, "exitCode"> = {}) =>
   new CliError(message, { ...details, exitCode: EXIT.usage });
+
+export const payloadsNotAllowed = () =>
+  new CliError(
+    'This sign-in can\'t read captured prompts and outputs. Run `telemetry login`, check "Also read captured prompts, outputs, and tool arguments", and select Allow.',
+    { exitCode: EXIT.auth, code: "payloads_not_allowed", hint: "telemetry login" },
+  );
+
+/**
+ * The CliError for a tool error, from the code telemetry.dev puts in the result's
+ * `_meta`. A server without codes, or a code this CLI doesn't know, gives `tool_error`.
+ * The result's text is written for agents, so codes a person acts on get the CLI's own.
+ */
+export const toolError = (text: string, meta: unknown): CliError => {
+  const error = (meta as Record<string, unknown> | undefined)?.["dev.telemetry/error"] as
+    | { code?: unknown; retryable?: unknown }
+    | undefined;
+  const retryable = error?.retryable === true;
+
+  switch (error?.code) {
+    case "access_denied":
+      return new CliError(
+        "Your account no longer has access to this workspace. Run `telemetry login` and choose a workspace you belong to.",
+        { exitCode: EXIT.auth, code: "access_denied", hint: "telemetry login" },
+      );
+    case "payloads_not_allowed":
+      return payloadsNotAllowed();
+    case "project_not_found":
+      return usageError(
+        "That project isn't in this workspace; it may have been deleted. Run `telemetry projects` to list the projects, and `telemetry use <name>` to change the default.",
+        { code: "project_not_found", hint: "telemetry projects" },
+      );
+    case "invalid_cursor":
+      return usageError(
+        "That cursor isn't from an earlier page of this command. Run it again without --cursor.",
+        { code: "invalid_cursor" },
+      );
+    case "trace_not_found":
+    case "span_not_found":
+      return new CliError(text, { code: error.code });
+    case "server_error":
+      return new CliError(text, { code: "server_error", retryable });
+    default:
+      return new CliError(text || "telemetry.dev could not complete this request.", {
+        code: "tool_error",
+        retryable,
+      });
+  }
+};
 
 export const notSignedIn = () =>
   new CliError("You're not signed in. Run `telemetry login` first.", {

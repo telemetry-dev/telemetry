@@ -433,29 +433,61 @@ const result = (value: unknown) => ({
   content: [{ type: "text" as const, text: JSON.stringify(value) }],
 });
 
+/** A tool error as telemetry.dev returns it: text for the agent, a code in `_meta`. */
+class ToolFailure {
+  constructor(
+    readonly text: string,
+    readonly code: string,
+    readonly retryable = false,
+  ) {}
+}
+
+const SERVER_ERROR = "telemetry.dev could not complete this request. Try again shortly.";
+
 const server = () => {
   const mcp = new McpServer({ name: "telemetry.dev fixture", version: "1.0.0" });
   const tool = (name: string, handler: (args: Record<string, unknown>) => unknown) =>
     mcp.registerTool(name, { inputSchema: loose }, (args: Record<string, unknown>) => {
       calls.push({ tool: name, args });
-      const value = handler(args);
+      const value = serverState.removedFromWorkspace
+        ? new ToolFailure("Not a member of this workspace", "access_denied")
+        : handler(args);
 
-      return typeof value === "string"
-        ? { isError: true, content: [{ type: "text" as const, text: value }] }
-        : result(value);
+      if (!(value instanceof ToolFailure)) return result(value);
+
+      return {
+        isError: true,
+        content: [{ type: "text" as const, text: value.text }],
+        ...(serverState.errorCodes
+          ? { _meta: { "dev.telemetry/error": { code: value.code, retryable: value.retryable } } }
+          : {}),
+      };
     });
 
   tool("list_projects", () =>
-    failProjects.value
-      ? "telemetry.dev could not complete this request. Try again shortly."
+    serverState.failProjects
+      ? new ToolFailure(SERVER_ERROR, "server_error", true)
       : { organization_id: "org_fixture", projects: PROJECTS },
   );
-  tool("search_traces", () => traces());
+  tool("search_traces", (args) => {
+    if (!PROJECTS.some((project) => project.id === args.project_id)) {
+      return new ToolFailure("Project not found", "project_not_found");
+    }
+
+    if (args.cursor !== undefined && args.cursor !== traces().next_cursor) {
+      return new ToolFailure(
+        "cursor is not a next_cursor value from search_traces. Omit it to start over.",
+        "invalid_cursor",
+      );
+    }
+
+    return traces();
+  });
   tool("search_sessions", () => sessions());
   tool("get_trace", (args) =>
     Object.hasOwn(TRACE_DETAILS, String(args.trace_id))
       ? TRACE_DETAILS[String(args.trace_id)]!()
-      : "Trace not found.",
+      : new ToolFailure("Trace not found or outside retention", "trace_not_found"),
   );
   tool("list_logs", () => logs());
   tool("get_usage_summary", () => usage());
@@ -480,8 +512,15 @@ const server = () => {
 
 export const calls: { tool: string; args: Record<string, unknown> }[] = [];
 
-/** Makes list_projects answer with a tool error, as a server failure would. */
-export const failProjects = { value: false };
+/** How the fixture server misbehaves; tests reset it before each run. */
+export const serverState = {
+  /** list_projects fails as a server failure would. */
+  failProjects: false,
+  /** Every tool refuses, as for a user removed from the workspace. */
+  removedFromWorkspace: false,
+  /** Tool errors carry a code in `_meta`; false acts as a server from before codes. */
+  errorCodes: true,
+};
 
 /**
  * Runs before the token endpoint answers a refresh, to act as another CLI process or a
