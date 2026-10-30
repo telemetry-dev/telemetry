@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.4...cli-v0.1.5) (2026-10-30)
+
+
+### Bug Fixes
+
+* **cli:** say how sessions orders its results ([#140](https://github.com/telemetry-dev/telemetry/issues/140)) ([ebf7fdf](https://github.com/telemetry-dev/telemetry/commit/ebf7fdf904cee4ab6b38a1925926f69d899ecc73))
+
 ## [0.1.4](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.3...cli-v0.1.4) (2026-10-30)
 
 
