@@ -7,9 +7,10 @@ repository, not this SDK workspace. Paths below refer to that product repository
 
 - `apps/ingest/tests/sdk_otlp_e2e_test.ts` — TypeScript SDK, capture-fetch → replay through
   `handleOtlpRequest`.
-- `apps/ingest/tests/python_sdk_otlp_e2e_test.ts` — Python SDK, real HTTP against a `Bun.serve`
-  ingest on an ephemeral port, scenario driven by `sdks/python/tests/e2e_scenarios.py`
-  (skipped with a warning when `uv` is missing; CI must not skip it).
+- `apps/ingest/tests/python_sdk_otlp_e2e_test.ts` — Python SDK, real HTTP against the ingest
+  server (`HttpRouter.serve(AllRoutes)` on `BunHttpServer`) on an ephemeral port, scenario driven
+  by `sdks/python/tests/e2e_scenarios.py` (skipped with a warning when `uv` is missing; CI must
+  not skip it).
 
 ## Attribute contract
 
@@ -435,7 +436,7 @@ to it. These rules do not sanitize raw OpenTelemetry events or arbitrary attribu
 | C14 | captureInput:false strips content from inputJson and attributesJson                                                                                                                                                                       |
 | C15 | `costUsd` client override stored verbatim (0.5)                                                                                                                                                                                           |
 | C16 | Oversized content truncated to 65536 chars ending with `...[truncated]`, extracted into inputJson and stored once (source attribute stripped from the attribute columns); mask hook output replaces SECRET-bearing input                  |
-| C17 | Exact span census (19) — the fail-open no-key phase contributes nothing                                                                                                                                                                   |
+| C17 | Exact span census (19). Without a key the SDK sends nothing and does not throw; the census cannot see that, so the TypeScript test counts captured requests and the Python scenario checks only that nothing raised                       |
 | C18 | Streaming generation: `timeToFirstChunkMs` stored as 250 ms; wire attribute `gen_ai.response.time_to_first_chunk` = 0.25 s                                                                                                                |
 | C19 | OpenRouter generation: provider stored as `openrouter`                                                                                                                                                                                    |
 | C20 | Session trace: `follow-up-turn` (a second root call of the same session) lands in the same trace, parented to the session parent, started at or after the agent ended                                                                     |
