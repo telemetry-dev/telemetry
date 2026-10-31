@@ -61,3 +61,16 @@ if [[ "$packed_version" != "$expected_version" ]]; then
   echo "Packed version $packed_version does not match release version $expected_version" >&2
   exit 1
 fi
+
+if [[ "$release_type" == node ]]; then
+  # pnpm pack writes publishConfig.exports into exports. A missing target fails only on import.
+  packed_files=$(tar -tf "$artifact")
+  targets=$(jq -r '.exports, .bin | .. | strings' <<< "$metadata")
+  while IFS= read -r target; do
+    [[ -n "$target" ]] || continue
+    if ! grep -Fxq "package/${target#./}" <<< "$packed_files"; then
+      echo "Packed $packed_name has no $target, a target of its exports or bin" >&2
+      exit 1
+    fi
+  done <<< "$targets"
+fi
