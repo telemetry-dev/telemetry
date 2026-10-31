@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import atexit
+import os
+import sys
 import threading
 import uuid
 from collections.abc import Callable
@@ -11,7 +13,7 @@ from opentelemetry._logs import Logger as OtelLogger
 from opentelemetry.exporter.otlp.proto.http import Compression
 from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk._logs import LoggerProvider
+from opentelemetry.sdk._logs import LoggerProvider, LogRecordProcessor
 from opentelemetry.sdk._logs.export import (
     BatchLogRecordProcessor,
     LogRecordExporter,
@@ -40,7 +42,13 @@ from ._config import (
     resolve_config,
 )
 from ._context import SessionSampler
-from ._export import ExportFailures, ReportingLogExporter, ReportingSpanExporter
+from ._export import (
+    DEFAULT_MAX_QUEUE_BYTES,
+    ExportFailures,
+    ExportQueueBudget,
+    ReportingLogExporter,
+    ReportingSpanExporter,
+)
 from ._metrics import (
     GuardedOTLPMetricExporter,
     MetricsRecorder,
@@ -49,7 +57,7 @@ from ._metrics import (
 )
 from ._processor import ExportMode, StampingSpanProcessor
 from ._semconv import SCOPE_NAME
-from ._serialize import DEFAULT_MAX_ATTRIBUTE_LENGTH, Mask, serialize_content
+from ._serialize import Mask, serialize_content
 
 _lock = threading.RLock()
 _client: Client | None = None
@@ -58,6 +66,45 @@ _client: Client | None = None
 def _default_scope_filter(span: ReadableSpan) -> bool:
     scope = span.instrumentation_scope
     return scope is not None and scope.name == SCOPE_NAME
+
+
+_LOG_MAX_QUEUE_SIZE = 2048
+
+
+def _log_max_queue_size() -> int:
+    """The queue size that BatchLogRecordProcessor uses by default, passed to it explicitly
+    because the budget must use the same count."""
+    try:
+        return int(os.environ.get("OTEL_BLRP_MAX_QUEUE_SIZE", _LOG_MAX_QUEUE_SIZE))
+    except ValueError:
+        return _LOG_MAX_QUEUE_SIZE
+
+
+class _BoundedLogRecordProcessor(LogRecordProcessor):
+    def __init__(self, inner: LogRecordProcessor, budget: ExportQueueBudget) -> None:
+        self._inner = inner
+        self._budget = budget
+
+    def on_emit(self, log_record: Any) -> None:
+        if self._budget.admit(log_record):
+            self._inner.on_emit(log_record)
+
+    def shutdown(self) -> None:
+        self._inner.shutdown()
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return self._inner.force_flush(timeout_millis)
+
+
+def _bounded_log_processor(
+    exporter: LogRecordExporter, on_error: Callable[[BaseException], None] | None
+) -> LogRecordProcessor:
+    max_queue_size = _log_max_queue_size()
+    budget = ExportQueueBudget(max_queue_size, DEFAULT_MAX_QUEUE_BYTES, "log", on_error)
+    return _BoundedLogRecordProcessor(
+        BatchLogRecordProcessor(budget.releasing(exporter), max_queue_size=max_queue_size),
+        budget,
+    )
 
 
 class Client:
@@ -74,7 +121,7 @@ class Client:
         capture_input: bool = True,
         capture_output: bool = True,
         mask: Mask | None = None,
-        max_attribute_length: int = 65536,
+        max_attribute_length: int = sys.maxsize,
         span_filter: Callable[[ReadableSpan], bool] | None = None,
         sampler: Sampler | None = None,
         on_error: Callable[[BaseException], None] | None = None,
@@ -122,7 +169,7 @@ class Client:
         # The funnel keeps capped content (marker included) within max_attribute_length, so
         # the backstop can use the same cap for raw attributes set outside the funnel. A zero
         # cap only drops content; as a backstop it would blank every string attribute.
-        backstop_length = max_attribute_length or DEFAULT_MAX_ATTRIBUTE_LENGTH
+        backstop_length = max_attribute_length or SpanLimits.UNSET
         self._tracer_provider = TracerProvider(
             resource=resource,
             sampler=sampler,
@@ -168,6 +215,7 @@ class Client:
                     timeout=timeout,
                 ),
                 failures,
+                on_error,
             )
         if span_filter is None and register_global:
             span_filter = _default_scope_filter
@@ -190,6 +238,7 @@ class Client:
                     timeout=timeout,
                 ),
                 failures,
+                on_error,
             )
         if log_exporter is not None:
             self._logger_provider = LoggerProvider(resource=resource, shutdown_on_exit=False)
@@ -199,7 +248,7 @@ class Client:
                 )
             else:
                 self._logger_provider.add_log_record_processor(
-                    BatchLogRecordProcessor(log_exporter)
+                    _bounded_log_processor(log_exporter, on_error)
                 )
             self.otel_logger = self._logger_provider.get_logger(SCOPE_NAME, SDK_VERSION)
 
@@ -279,7 +328,7 @@ def init(
     capture_input: bool = True,
     capture_output: bool = True,
     mask: Mask | None = None,
-    max_attribute_length: int = 65536,
+    max_attribute_length: int | None = None,
     span_filter: Callable[[ReadableSpan], bool] | None = None,
     sampler: Sampler | None = None,
     on_error: Callable[[BaseException], None] | None = None,
@@ -308,13 +357,14 @@ def init(
         if session_mode not in ("explicit", "process"):
             raise ValueError(f"invalid session_mode: {session_mode!r}")
         raw_max_attribute_length: Any = max_attribute_length
-        if (
+        if raw_max_attribute_length is None:
+            raw_max_attribute_length = sys.maxsize
+        elif (
             isinstance(raw_max_attribute_length, bool)
             or not isinstance(raw_max_attribute_length, int)
             or raw_max_attribute_length < 0
         ):
-            raise ValueError("max_attribute_length must be a non-negative integer")
-        max_attribute_length = raw_max_attribute_length
+            raise ValueError("max_attribute_length must be None or a non-negative integer")
         client = Client(
             config=config,
             enabled=effective_enabled,
@@ -324,7 +374,7 @@ def init(
             capture_input=capture_input,
             capture_output=capture_output,
             mask=mask,
-            max_attribute_length=max_attribute_length,
+            max_attribute_length=raw_max_attribute_length,
             span_filter=span_filter,
             sampler=sampler,
             on_error=on_error,

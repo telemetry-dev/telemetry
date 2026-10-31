@@ -142,11 +142,15 @@ def test_serialize_content_withholds_content_the_mask_cannot_handle(make: MakeCl
     span.end()
 
 
-def test_truncation_cap_and_marker(memory: SimpleNamespace) -> None:
+def test_content_is_whole_by_default_and_marked_at_a_custom_cap(make: MakeClient) -> None:
+    uncapped = make()
     telemetry_dev.start_span("big", input="x" * 70_000).end()
-    value = str(attrs(only_span(memory))["gen_ai.input.messages"])
-    assert value.endswith(TRUNCATION_MARKER)
-    assert len(value) == 65_536
+    assert attrs(only_span(uncapped))["gen_ai.input.messages"] == "x" * 70_000
+
+    capped = make(max_attribute_length=100)
+    telemetry_dev.start_span("small-cap", input="y" * 500).end()
+    value = str(attrs(only_span(capped))["gen_ai.input.messages"])
+    assert value == "y" * (100 - len(TRUNCATION_MARKER)) + TRUNCATION_MARKER
     assert TRUNCATION_MARKER == "...[truncated]"
 
 
@@ -236,9 +240,10 @@ def test_truncation_custom_cap(make: MakeClient) -> None:
     assert value == "y" * (100 - len(TRUNCATION_MARKER)) + TRUNCATION_MARKER
 
 
-def test_truncation_counts_utf16_units(memory: SimpleNamespace) -> None:
+def test_truncation_counts_utf16_units(make: MakeClient) -> None:
     # 40_000 robots are 80_000 UTF-16 units (JS String.length), so both SDKs truncate
     # at the same point even though Python sees only 40_000 code points.
+    memory = make(max_attribute_length=65_536)
     telemetry_dev.start_span("emoji", input="\U0001f916" * 40_000).end()
     value = str(attrs(only_span(memory))["gen_ai.input.messages"])
     assert value == "\U0001f916" * 32_761 + TRUNCATION_MARKER

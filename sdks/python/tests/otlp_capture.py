@@ -36,6 +36,8 @@ class CaptureServer:
     # Seconds that the server waits before it answers a GET request. The server reads it before the
     # request shows in requests, so that a test that sees the request can change it for the next.
     delay: float = 0
+    # Seconds that the server waits before it answers a POST request.
+    post_delay: float = 0
     # The location header of GET replies, for a redirect status.
     location: str | None = None
     # The Retry-After header of GET replies.
@@ -61,6 +63,7 @@ def otlp_capture_server() -> Generator[CaptureServer]:
                     body=body,
                 )
             )
+            time.sleep(capture.post_delay)
             self.send_response(capture.status)
             self.send_header("content-type", "application/x-protobuf")
             self.send_header("content-length", "0")

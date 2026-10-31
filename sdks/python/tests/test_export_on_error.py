@@ -6,9 +6,14 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import pytest
+from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.sdk._logs import ReadableLogRecord
-from opentelemetry.sdk._logs.export import LogRecordExporter, LogRecordExportResult
+from opentelemetry.sdk._logs.export import (
+    InMemoryLogRecordExporter,
+    LogRecordExporter,
+    LogRecordExportResult,
+)
 from opentelemetry.sdk.metrics.export import (
     Gauge,
     Metric,
@@ -20,12 +25,18 @@ from opentelemetry.sdk.metrics.export import (
 )
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
-from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.sdk.util.instrumentation import InstrumentationScope
 from opentelemetry.util.types import AttributeValue
 
 import telemetry_dev
-from telemetry_dev._export import ExportFailures, ReportingLogExporter, ReportingSpanExporter
+from telemetry_dev._export import (
+    ExportFailures,
+    ReportingLogExporter,
+    ReportingSpanExporter,
+    _span_with_attributes,
+)
 from telemetry_dev._metrics import GuardedOTLPMetricExporter
 from telemetry_dev.otel import TelemetrySpanProcessor
 from tests.otlp_capture import otlp_capture_server
@@ -391,3 +402,204 @@ def test_an_outage_that_stops_byo_traces_and_metrics_is_one_report() -> None:
     assert sorted(request.path for request in ingest.requests) == ["/v1/metrics", "/v1/traces"]
     assert len(errors) == 1
     assert "span export failed" in str(errors[0])
+
+
+_MAX_BODY_BYTES = 16 * 1024 * 1024
+
+
+def test_batches_over_the_ingest_limit_are_split_into_requests_that_fit_and_time_out_alone() -> (
+    None
+):
+    errors: list[BaseException] = []
+    with otlp_capture_server() as ingest:
+        # Two requests take longer than one timeout, so a timeout over the whole export fails this.
+        ingest.post_delay = 0.6
+        telemetry_dev.init(
+            api_key="td_live_test",
+            base_url=ingest.url,
+            log_level="error",
+            disable_atexit=True,
+            timeout=1.0,
+            on_error=errors.append,
+        )
+        # Two 9 MB spans: together they exceed the 16 MiB limit, each one fits.
+        for name in ("first", "second"):
+            telemetry_dev.start_span(name, attributes={"payload": "p" * 9_000_000}).end()
+        telemetry_dev.flush()
+        telemetry_dev.shutdown()
+
+        bodies = [request.decompressed() for request in ingest.requests_for("/v1/traces")]
+        assert errors == []
+        assert len(bodies) == 2
+        for body in bodies:
+            assert len(body) <= _MAX_BODY_BYTES
+            assert body.count(b"p" * 9_000_000) == 1
+
+
+@pytest.mark.parametrize("signal", ["span", "log"])
+def test_a_record_over_the_ingest_limit_is_sent_with_its_longest_attribute_cut(
+    signal: str,
+) -> None:
+    errors: list[BaseException] = []
+    attributes = {"first": "a" * 10_000_000, "other": "z" * 9_000_000, "keep": "kept"}
+    with otlp_capture_server() as ingest:
+        telemetry_dev.init(
+            api_key="td_live_test",
+            base_url=ingest.url,
+            export_mode="immediate",
+            log_level="error",
+            disable_atexit=True,
+            on_error=errors.append,
+        )
+        if signal == "span":
+            telemetry_dev.start_span("oversized", attributes=attributes).end()
+        else:
+            telemetry_dev.log("oversized", attributes=attributes)
+        telemetry_dev.shutdown()
+
+        requests = ingest.requests_for("/v1/traces" if signal == "span" else "/v1/logs")
+        assert len(requests) == 1
+        body = requests[0].decompressed()
+        # Only the excess is cut: the request ends up just under the limit, not far below it.
+        assert _MAX_BODY_BYTES - 64 < len(body) <= _MAX_BODY_BYTES
+        assert b"z" * 9_000_000 in body
+        assert b"a...[truncated]" in body
+        assert b"kept" in body
+        # The flag's key followed by its value, an AnyValue with bool_value true.
+        assert b"telemetry.dev.capture.truncated\x12\x02\x10\x01" in body
+        assert any("longest values were truncated" in str(error) for error in errors)
+
+
+def test_a_log_record_whose_message_is_over_the_ingest_limit_is_sent_with_its_message_cut() -> None:
+    errors: list[BaseException] = []
+    with otlp_capture_server() as ingest:
+        telemetry_dev.init(
+            api_key="td_live_test",
+            base_url=ingest.url,
+            export_mode="immediate",
+            log_level="error",
+            disable_atexit=True,
+            on_error=errors.append,
+        )
+        telemetry_dev.log("b" * 17_000_000, attributes={"keep": "kept"})
+        telemetry_dev.shutdown()
+
+        requests = ingest.requests_for("/v1/logs")
+        assert len(requests) == 1
+        body = requests[0].decompressed()
+        assert _MAX_BODY_BYTES - 64 < len(body) <= _MAX_BODY_BYTES
+        assert b"b...[truncated]" in body
+        assert b"kept" in body
+        assert b"telemetry.dev.capture.truncated\x12\x02\x10\x01" in body
+        assert any("longest values were truncated" in str(error) for error in errors)
+
+
+def test_a_span_that_fits_once_its_multi_byte_text_is_cut_is_sent_not_dropped() -> None:
+    finished = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(finished))
+    provider.get_tracer("test").start_span("oversized").end()
+    span = finished.get_finished_spans()[0]
+
+    def with_payload(length: int) -> ReadableSpan:
+        return _span_with_attributes(span, {"payload": ["p" * length], "emoji": "\U0001f916" * 100})
+
+    # The array cannot be cut. Cutting the emoji to the marker removes 386 bytes but only 186
+    # UTF-16 units, so the count of units alone says the span still does not fit.
+    base = encode_spans([with_payload(16_000_000)]).ByteSize()
+    record = with_payload(16_000_000 + _MAX_BODY_BYTES - base + 300)
+    sent: list[bytes] = []
+
+    class Capture(FakeSpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            sent.append(encode_spans(spans).SerializeToString())
+            return SpanExportResult.SUCCESS
+
+    exporter = ReportingSpanExporter(Capture(SpanExportResult.SUCCESS), ExportFailures(None))
+    assert exporter.export([record]) is SpanExportResult.SUCCESS
+    assert len(sent) == 1
+    assert len(sent[0]) <= _MAX_BODY_BYTES
+    assert b"telemetry.dev.capture.truncated\x12\x02\x10\x01" in sent[0]
+    assert "\U0001f916".encode() not in sent[0]
+    provider.shutdown()
+
+
+def test_a_span_over_the_ingest_limit_without_a_string_to_cut_is_dropped() -> None:
+    errors: list[BaseException] = []
+    with otlp_capture_server() as ingest:
+        telemetry_dev.init(
+            api_key="td_live_test",
+            base_url=ingest.url,
+            export_mode="immediate",
+            log_level="error",
+            disable_atexit=True,
+            on_error=errors.append,
+        )
+        telemetry_dev.start_span("oversized", attributes={"payload": ["p" * 17_000_000]}).end()
+        telemetry_dev.shutdown()
+
+        assert ingest.requests_for("/v1/traces") == []
+        assert any("exceeds max export size, dropped" in str(error) for error in errors)
+
+
+def test_spans_past_max_queue_bytes_are_dropped_and_reported_once_until_the_queue_drains() -> None:
+    errors: list[BaseException] = []
+    exporter = InMemorySpanExporter()
+    processor = TelemetrySpanProcessor(
+        exporter,
+        # Nothing exports before force_flush(), so every span waits in the queue.
+        schedule_delay_millis=1_000_000,
+        max_queue_bytes=2_500,
+        metrics=False,
+        on_error=errors.append,
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    def end_spans(count: int) -> None:
+        for _ in range(count):
+            tracer.start_span("tool", attributes={"input": "i" * 1_000}).end()
+
+    # Two spans of 1,000 characters fit in 2,500; the third and later are dropped.
+    end_spans(4)
+    assert ["span export queue is full" in str(error) for error in errors] == [True]
+    processor.force_flush()
+    assert len(exporter.get_finished_spans()) == 2
+
+    # The flush freed the queue, so new spans are admitted and a new drop is reported again.
+    end_spans(3)
+    processor.force_flush()
+    assert len(exporter.get_finished_spans()) == 4
+    assert len(errors) == 2
+
+    # A span larger than max_queue_bytes still enters an empty queue.
+    tracer.start_span("tool", attributes={"input": "i" * 5_000}).end()
+    processor.force_flush()
+    assert len(exporter.get_finished_spans()) == 5
+    assert len(errors) == 2
+    provider.shutdown()
+
+
+def test_batched_logs_past_the_queue_bound_are_dropped_and_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("telemetry_dev._client.DEFAULT_MAX_QUEUE_BYTES", 2_500)
+    errors: list[BaseException] = []
+    logs = InMemoryLogRecordExporter()
+    telemetry_dev.init(
+        api_key="td_live_test",
+        log_level="error",
+        disable_atexit=True,
+        span_exporter=InMemorySpanExporter(),
+        log_exporter=logs,
+        on_error=errors.append,
+    )
+
+    for _ in range(4):
+        telemetry_dev.log("l" * 1_000)
+    telemetry_dev.flush()
+
+    assert len(logs.get_finished_logs()) == 2
+    assert ["log export queue is full" in str(error) for error in errors] == [True]
+    telemetry_dev.shutdown()

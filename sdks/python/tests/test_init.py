@@ -46,7 +46,7 @@ def test_large_max_attribute_length_remains_enabled(make: MakeClient) -> None:
     assert env.client.max_attribute_length == 2**53
 
 
-def test_zero_max_attribute_length_drops_content_but_keeps_raw_attributes(
+def test_zero_max_attribute_length_drops_content_and_leaves_raw_attributes_whole(
     make: MakeClient,
 ) -> None:
     env = make(max_attribute_length=0)
@@ -57,7 +57,7 @@ def test_zero_max_attribute_length_drops_content_but_keeps_raw_attributes(
 
     attributes = dict(env.span_exporter.get_finished_spans()[0].attributes or {})
     assert attributes.get("gen_ai.output.messages", "") == ""
-    assert attributes["gen_ai.request.model"] == "m" * 65_536
+    assert attributes["gen_ai.request.model"] == "m" * 70_000
 
 
 @pytest.mark.parametrize(
@@ -68,11 +68,12 @@ def test_zero_max_attribute_length_drops_content_but_keeps_raw_attributes(
         ("gen_ai.operation.name", "generate_content", 0, "generate_content"),
         ("gen_ai.operation.name", "generate_content", 5, "gener"),
         ("payload", "x" * 100_000, 200_000, "x" * 100_000),
-        ("payload", "x" * 100_000, 0, "x" * 65_536),
+        ("payload", "x" * 100_000, 0, "x" * 100_000),
+        ("payload", "x" * 100_000, None, "x" * 100_000),
     ],
 )
 def test_raw_attributes_follow_the_attribute_backstop_not_the_content_cap(
-    make: MakeClient, key: str, value: Any, max_attribute_length: int, expected: Any
+    make: MakeClient, key: str, value: Any, max_attribute_length: int | None, expected: Any
 ) -> None:
     env = make(max_attribute_length=max_attribute_length)
 
