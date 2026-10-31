@@ -834,42 +834,81 @@ def test_a_fork_in_a_call_that_starts_a_fetch_returns_the_prompt(
 @needs_fork
 @pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="needs signal.setitimer")
 def test_a_fork_in_a_signal_handler_during_the_wait_for_a_fetch_fetches_again_in_the_child(
-    server: CaptureServer, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A child that waits for the fetch of the parent gets no answer in 3 s.
     monkeypatch.setattr(prompts_module, "_FETCH_TIMEOUT_S", 3)
-    server.delay = 1
+    monkeypatch.setattr(prompts_module, "_FORK_CHECK_S", 0.01)
+    parent = os.getpid()
+    names = (f"support/reply-{n}" for n in itertools.count())
+    conditions: list[threading.Condition] = []
+    release = threading.Event()
     pids: list[int] = []
     results: list[str] = []
-    forked_in: list[str | None] = []
+    fetched_in: list[int] = []
+
+    class RecordedEvent(threading.Event):
+        def __init__(self) -> None:
+            super().__init__()
+            # The lock of the event, which a wait takes again when it wakes.
+            conditions.append(vars(self)["_cond"])
+
+    def fetch(url: str, headers: dict[str, str]) -> dict[str, Any]:
+        fetched_in.append(os.getpid())
+        if os.getpid() == parent:
+            # The call forks while it waits for this fetch.
+            signal.setitimer(signal.ITIMER_REAL, 0.01)
+            release.wait()
+        return reply()
 
     def fork_in_the_wait(signum: int, frame: FrameType | None) -> None:
-        server.delay = 0
-        forked_in.append(frame and frame.f_code.co_name)
+        # Lock each lock that a wait on an event takes again, and unlock it only in the parent. The
+        # child gets it locked, as when a thread of the parent held it at the fork: the fetch
+        # thread in set(), or another call at a step of its wait.
+        held = [condition for condition in conditions if condition.acquire(blocking=False)]
+        if len(held) < len(conditions):
+            # This thread holds a lock between two steps of its wait. Fork in a later step.
+            for condition in held:
+                condition.release()
+            signal.setitimer(signal.ITIMER_REAL, 0.01)
+            return
         pids.append(os.fork())
+        if os.getpid() == parent:
+            for condition in held:
+                condition.release()
+            release.set()
 
     def fork() -> int:
-        previous = signal.signal(signal.SIGALRM, fork_in_the_wait)
-        # Between two 0.1 s steps of the wait.
-        signal.setitimer(signal.ITIMER_REAL, 0.35)
-        started = time.monotonic()
         try:
-            version = version_of(server)
-            results.append(f"{version} in under 2 s: {time.monotonic() - started < 2}")
+            prompt = get_prompt(
+                next(names), api_key="td_" + "live_a", base_url="http://prompts.test"
+            )
+            # The fetches of this process: the child has the list of the parent before the fork.
+            results.append(f"{prompt.version} after {fetched_in.count(os.getpid())} fetch")
         except Exception as exc:
             # The child must return the pid to in_fork, and not raise into pytest.
             results.append(repr(exc))
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, previous)
         return pids[0]
 
-    assert in_fork(lambda: results[0], fork) == "12 in under 2 s: True"
-    assert results == ["12 in under 2 s: True"]
-    # The signal came in the wait of threading.Event, not before it.
-    assert forked_in == ["wait"]
-    # The fetch of the parent, and the fetch of the child.
-    assert len(own_requests(server)) == 2
+    monkeypatch.setattr(prompts_module, "_fetch", fetch)
+    # Only the events of the prompt module: Thread.start waits on an event too.
+    monkeypatch.setattr(
+        prompts_module, "threading", SimpleNamespace(**{**vars(threading), "Event": RecordedEvent})
+    )
+    previous = signal.signal(signal.SIGALRM, fork_in_the_wait)
+    try:
+        # The signal can come at any step of the wait.
+        for _ in range(50):
+            conditions.clear()
+            release.clear()
+            pids.clear()
+            results.clear()
+            fetched_in.clear()
+            assert in_fork(lambda: results[0], fork) == "12 after 1 fetch"
+            assert results == ["12 after 1 fetch"]
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 @needs_fork

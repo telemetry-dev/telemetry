@@ -610,8 +610,11 @@ class _Entry:
     checked_at: float = 0.0
     # No fetch before this time: the Retry-After of the last 429 or 503 response.
     retry_at: float = 0.0
-    # Set when the running fetch ends.
-    pending: threading.Event | None = None
+    # One held lock for each call that waits for the running fetch, which releases them when it
+    # ends; None when no fetch runs. Not a threading.Event: its wait takes the lock of the event
+    # again when it wakes, and a fork while another thread of the parent holds that lock, as in
+    # set(), leaves the copy in the child held forever. A call waits only on its own lock.
+    pending: list[threading.Lock] | None = None
     # The process whose thread runs the fetch. A forked process gets the entry, but not the thread.
     pending_pid: int = 0
     # When calls stop waiting for the running fetch.
@@ -698,10 +701,24 @@ def _load(
             entry.pending = None
         # A local, because a fork in this thread, as in a signal handler, can clear entry.pending.
         pending = entry.pending
-        if now >= max(entry.checked_at + ttl, entry.retry_at) and pending is None:
-            pending = entry.pending = threading.Event()
+        start = now >= max(entry.checked_at + ttl, entry.retry_at) and pending is None
+        if start:
+            pending = entry.pending = []
             entry.pending_pid = os.getpid()
             entry.deadline = now + _FETCH_TIMEOUT_S
+        waiter: threading.Lock | None = None
+        if entry.response is None and pending is not None:
+            if now >= entry.deadline and entry.pending_pid == os.getpid():
+                # A fetch past its deadline, as in an address lookup: add no waiter for it. A
+                # forked child goes on to the wait, which fetches again in the child.
+                raise _timeout()
+            # Before the fetch thread starts. After a fork here in this thread, as in a signal
+            # handler, this thread holds only the copy of the parent's cache lock. The fetch thread
+            # of the child takes the child's lock, so it could end before a later add.
+            waiter = threading.Lock()
+            waiter.acquire()
+            pending.append(waiter)
+        if start:
             threading.Thread(
                 target=_refresh, args=(entry, pending, fetch, on_error), daemon=True
             ).start()
@@ -709,8 +726,8 @@ def _load(
             return entry.response
         deadline = entry.deadline
         pending_pid = entry.pending_pid
-    if pending is not None:
-        while not pending.wait(min(_FORK_CHECK_S, deadline - monotonic())):
+    if waiter is not None:
+        while not waiter.acquire(timeout=max(0.0, min(_FORK_CHECK_S, deadline - monotonic()))):
             if os.getpid() != pending_pid:
                 # A fork in a signal handler during the wait. The child has the wait, but not the
                 # thread of the fetch.
@@ -730,7 +747,7 @@ def _load(
 
 def _refresh(
     entry: _Entry,
-    done: threading.Event,
+    waiters: list[threading.Lock],
     fetch: Callable[[], dict[str, Any]],
     on_error: Callable[[BaseException], None] | None,
 ) -> None:
@@ -757,7 +774,9 @@ def _refresh(
         entry.pending = None
     if error is not None and stale is not None:
         report_error(on_error, "fetching the prompt failed; using the last copy", error)
-    done.set()
+    # No call adds to the list once entry.pending is None.
+    for waiter in waiters:
+        waiter.release()
 
 
 class _Deadline:
