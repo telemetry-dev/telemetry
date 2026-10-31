@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/cli",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "The telemetry.dev command line: search traces, sessions, logs, and AI usage from your terminal or an agent's shell.",
   "keywords": [
     "cli",
