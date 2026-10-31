@@ -469,20 +469,55 @@ test("report.mjs gives each matrix leg and working directory its own comment, wh
   expect(changes(again)).toEqual(["PATCH /repos/acme/support/issues/comments/8"]);
 });
 
-test("report.mjs finds its comment on the newest page of a pull request with more than 1,000 comments", async () => {
-  const own = { id: 1006, body: await commentBody(), user: BOT };
-  const others = (from: number, count: number) =>
-    Array.from({ length: count }, (_, index) => ({
-      id: from + index,
-      body: "Looks good",
-      user: { login: "dana", type: "User" as const },
-    }));
-  const github = await fakeGithub({ comments: [...others(1, 1005), own, ...others(1007, 10)] });
+test.each([
+  ["on the newest page", 1005, 10, [1, 2, 3, 4, 5, 11]],
+  ["on an old page", 149, 1000, [1, 2]],
+  ["on the last old page that it reads", 449, 700, [1, 2, 3, 4, 5]],
+])(
+  "report.mjs finds its comment %s of a pull request with more than 1,000 comments",
+  async (_, before, after, pages) => {
+    const own = { id: before + 1, body: await commentBody(), user: BOT };
+    const github = await fakeGithub({
+      comments: [...others(1, before), own, ...others(before + 2, after)],
+    });
 
-  await report({ GITHUB_API_URL: github.url }, [result]);
+    await report({ GITHUB_API_URL: github.url }, [result]);
 
-  expect(changes(github)).toEqual(["PATCH /repos/acme/support/issues/comments/1006"]);
-});
+    expect(listedPages(github)).toEqual(pages);
+    expect(changes(github)).toEqual([`PATCH /repos/acme/support/issues/comments/${before + 1}`]);
+  },
+);
+
+test.each([
+  ["12 pages", 1150, [1, 2, 3, 4, 5, 12, 11, 10, 9, 8]],
+  ["7 pages", 650, [1, 2, 3, 4, 5, 7, 6]],
+])(
+  "report.mjs reads each page once on a pull request of %s without its comment, and adds the comment",
+  async (_, count, pages) => {
+    const github = await fakeGithub({ comments: others(1, count) });
+
+    await report({ GITHUB_API_URL: github.url }, [result]);
+
+    expect(listedPages(github)).toEqual(pages);
+    expect(changes(github)).toEqual(["POST /repos/acme/support/issues/42/comments"]);
+  },
+);
+
+/** Comments by a person, with the ids from `from`. */
+function others(from: number, count: number) {
+  return Array.from({ length: count }, (_, index) => ({
+    id: from + index,
+    body: "Looks good",
+    user: { login: "dana", type: "User" as const },
+  }));
+}
+
+/** The pages of comments that the action read, in order. */
+function listedPages(github: Awaited<ReturnType<typeof fakeGithub>>): number[] {
+  return github.requests
+    .filter((request) => request.method === "GET" && request.url.includes("/comments?"))
+    .map((request) => Number(new URL(request.url, "http://github.test").searchParams.get("page")));
+}
 
 test.each([
   ["a person pasted under the GITHUB_TOKEN", undefined, { login: "mallory", type: "User" }],
