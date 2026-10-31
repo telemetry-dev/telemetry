@@ -69,6 +69,7 @@ beforeEach(async () => {
     errorCodes: true,
     traceUrl: QUIET_TRACE_URL,
     windows: true,
+    agentAndTool: true,
   });
 
   return () => rm(home, { recursive: true, force: true });
@@ -490,6 +491,7 @@ test("a deployment from before --since and the new traces filters fails instead 
     [
       ["traces", "--model", "gpt-5"],
       ["traces", "--until", "1h", "--operation", "chat"],
+      ["traces", "--tool", "refund"],
       ["sessions", "--since", "7d"],
     ].map((args) => run(...args, "--json")),
   );
@@ -506,6 +508,7 @@ test("a deployment from before --since and the new traces filters fails instead 
   expect(failures.map((result) => JSON.parse(result.stderr).error.message)).toEqual([
     "This telemetry.dev deployment doesn't support --model yet and would have ignored it. Run the command without it.",
     "This telemetry.dev deployment doesn't support --until and --operation yet and would have ignored them. Run the command without them.",
+    "This telemetry.dev deployment doesn't support --tool yet and would have ignored it. Run the command without it.",
     "This telemetry.dev deployment doesn't support --since yet and would have ignored it. Run the command without it, or use --range.",
   ]);
 
@@ -515,6 +518,31 @@ test("a deployment from before --since and the new traces filters fails instead 
     expect((await run(...args)).code).toBe(0);
   }
   expect(calls.map((call) => Object.hasOwn(call.args, "until"))).toEqual([false, false, false]);
+});
+
+test("a deployment that refuses --agent and --tool fails with server_unsupported", async () => {
+  await signIn(PROJECTS[0]);
+  serverState.agentAndTool = false;
+
+  const refused = await run("traces", "--model", "gpt-5", "--tool", "refund", "--json");
+  expect(refused).toMatchObject({ code: 1, stdout: "" });
+  expect(JSON.parse(refused.stderr).error).toMatchObject({
+    code: "server_unsupported",
+    message:
+      "This telemetry.dev deployment doesn't support --tool yet. Run the command without it.",
+  });
+
+  // The server names only the first, but it has neither.
+  const both = await run("traces", "--agent", "planner", "--tool", "refund", "--json");
+  expect(JSON.parse(both.stderr).error.message).toBe(
+    "This telemetry.dev deployment doesn't support --agent and --tool yet. Run the command without them.",
+  );
+
+  // Its other errors stay as they are.
+  expect(JSON.parse((await run("traces", "--cursor", "nope", "--json")).stderr).error.code).toBe(
+    "invalid_cursor",
+  );
+  expect((await run("traces", "--model", "gpt-5")).code).toBe(0);
 });
 
 test("--since and --until are checked before any call, and --range can't be combined with them", async () => {
@@ -646,7 +674,7 @@ test("a --since past the project's retention is noted, and the default whole-ret
 test("the next-page command keeps --since and the filters, and runs as pasted", async () => {
   await signIn(PROJECTS[0]);
 
-  const argv = ["traces", "--since", "2h", "--model", "gpt-5", "--errors"];
+  const argv = ["traces", "--since", "2h", "--model", "gpt-5", "--agent", "planner", "--errors"];
   const listed = await run(...argv);
   expect(listed.code).toBe(0);
 
@@ -658,6 +686,7 @@ test("the next-page command keeps --since and the filters, and runs as pasted", 
   expect(argsOf("search_traces")).toMatchObject({
     since: "2h",
     model: "gpt-5",
+    agent: "planner",
     status: "error",
     cursor: traces().next_cursor,
   });

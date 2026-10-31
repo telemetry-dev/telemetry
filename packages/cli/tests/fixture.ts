@@ -439,7 +439,8 @@ const result = (value: unknown) => ({
 class ToolFailure {
   constructor(
     readonly text: string,
-    readonly code: string,
+    /** Without it, the result carries no `_meta`, as an error of the MCP SDK itself. */
+    readonly code: string | undefined,
     readonly retryable = false,
   ) {}
 }
@@ -543,7 +544,7 @@ const server = () => {
       return {
         isError: true,
         content: [{ type: "text" as const, text: value.text }],
-        ...(serverState.errorCodes
+        ...(serverState.errorCodes && value.code !== undefined
           ? { _meta: { "dev.telemetry/error": { code: value.code, retryable: value.retryable } } }
           : {}),
       };
@@ -567,6 +568,16 @@ const server = () => {
     }
 
     if (!serverState.windows) return traces();
+
+    const excess = ["agent", "tool"].filter((name) => !serverState.agentAndTool && name in args);
+
+    // telemetry.dev's MCP SDK refuses an argument it doesn't know, with this text and no code.
+    if (excess.length > 0) {
+      return new ToolFailure(
+        `Input validation error: Invalid arguments for tool search_traces: ${excess[0]}: Expected no excess property`,
+        undefined,
+      );
+    }
 
     const window = resolveWindow(args, null);
 
@@ -671,6 +682,8 @@ export const serverState = {
    * those arguments and answers without them.
    */
   windows: true,
+  /** search_traces takes agent and tool; false acts as a server with windows from before them. */
+  agentAndTool: true,
 };
 
 /**
