@@ -305,7 +305,9 @@ class Client:
                 atexit.unregister(self.shutdown)
             except BaseException:
                 pass
-        if not after_export((self, "shutdown"), lambda: self._shut_down_providers(timeout_s)):
+        if not after_export(
+            (self, "shutdown"), lambda: self._shut_down_providers(timeout_s), shutdown=True
+        ):
             self._shut_down_providers(timeout_s)
 
     def _shut_down_providers(self, timeout_s: float) -> None:

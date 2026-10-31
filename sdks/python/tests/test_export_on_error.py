@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 # pyright: reportPrivateUsage=false
+import atexit
+import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import pytest
+from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.sdk._logs import ReadableLogRecord
@@ -29,6 +35,7 @@ from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.sdk.util.instrumentation import InstrumentationScope
+from opentelemetry.util._once import Once
 from opentelemetry.util.types import AttributeValue
 
 import telemetry_dev
@@ -37,6 +44,8 @@ from telemetry_dev._export import (
     ReportingLogExporter,
     ReportingSpanExporter,
     _span_with_attributes,
+    after_export,
+    exporting,
 )
 from telemetry_dev._metrics import GuardedOTLPMetricExporter
 from telemetry_dev.otel import TelemetrySpanProcessor
@@ -437,9 +446,9 @@ def test_batches_over_the_ingest_limit_are_split_into_requests_that_fit_and_time
             assert body.count(b"p" * 9_000_000) == 1
 
 
-@pytest.mark.parametrize("signal", ["span", "log"])
+@pytest.mark.parametrize("kind", ["span", "log"])
 def test_a_record_over_the_ingest_limit_is_sent_with_its_longest_attribute_cut(
-    signal: str,
+    kind: str,
 ) -> None:
     errors: list[BaseException] = []
     attributes = {"first": "a" * 10_000_000, "other": "z" * 9_000_000, "keep": "kept"}
@@ -452,13 +461,13 @@ def test_a_record_over_the_ingest_limit_is_sent_with_its_longest_attribute_cut(
             disable_atexit=True,
             on_error=errors.append,
         )
-        if signal == "span":
+        if kind == "span":
             telemetry_dev.start_span("oversized", attributes=attributes).end()
         else:
             telemetry_dev.log("oversized", attributes=attributes)
         telemetry_dev.shutdown()
 
-        requests = ingest.requests_for("/v1/traces" if signal == "span" else "/v1/logs")
+        requests = ingest.requests_for("/v1/traces" if kind == "span" else "/v1/logs")
         assert len(requests) == 1
         body = requests[0].decompressed()
         # Only the excess is cut: the request ends up just under the limit, not far below it.
@@ -615,22 +624,24 @@ def _wait_until(condition: Callable[[], bool], seconds: float = 10) -> bool:
     return False
 
 
-@pytest.mark.parametrize("signal", ["span", "log", "metric"])
+@pytest.mark.parametrize("kind", ["span", "log", "metric"])
 def test_an_on_error_that_flushes_during_an_export_does_not_hang_and_flushes_after_it(
-    signal: str,
+    kind: str,
 ) -> None:
     reports: list[BaseException] = []
 
     def on_error(error: BaseException) -> None:
         # The SDK calls this inside the export, while the batch processor or the metric reader
         # holds its export lock. The span gives the metric reader new data to export, as other
-        # threads can at any time.
+        # threads can at any time. Its trace export fails too, so that a trace export that reaches
+        # the ingest does not end the series of failed exports before the deferred flush.
         reports.append(error)
+        ingest.path_status["/v1/traces"] = 400
         telemetry_dev.start_span("chat", type="generation", model="m", provider="p").end()
         telemetry_dev.flush(timeout_s=2)
 
     with otlp_capture_server() as ingest:
-        if signal == "metric":
+        if kind == "metric":
             ingest.path_status["/v1/metrics"] = 400
         else:
             ingest.status = 400
@@ -642,11 +653,11 @@ def test_an_on_error_that_flushes_during_an_export_does_not_hang_and_flushes_aft
             timeout=1.0,
             on_error=on_error,
         )
-        if signal == "log":
+        if kind == "log":
             telemetry_dev.log("failed export")
         # A chat span records metrics, which only a flush sends before the 60 s interval.
         telemetry_dev.start_span("chat", type="generation", model="m", provider="p").end()
-        if signal != "metric":
+        if kind != "metric":
             # The batch processor exports on its own, and the flush that on_error asks for runs
             # once that failed export ends.
             assert _wait_until(lambda: len(ingest.requests_for("/v1/metrics")) == 1)
@@ -658,19 +669,34 @@ def test_an_on_error_that_flushes_during_an_export_does_not_hang_and_flushes_aft
 
         threading.Thread(target=flush, daemon=True).start()
         assert flushed.wait(10)
+        if kind == "metric":
+            # The flush that on_error asked for ran: it sends the metrics of the span that
+            # on_error ended, which only a flush sends before the 60 s interval.
+            assert _wait_until(lambda: len(ingest.requests_for("/v1/metrics")) == 2)
         assert len(reports) == 1
         telemetry_dev.shutdown()
 
 
-def test_an_on_error_that_shuts_down_during_an_export_ends_the_client_without_hanging() -> None:
+@pytest.mark.parametrize("kind", ["span", "log", "metric"])
+def test_an_on_error_that_shuts_down_during_an_export_ends_the_client_without_hanging(
+    kind: str,
+) -> None:
     reports: list[BaseException] = []
 
     def on_error(error: BaseException) -> None:
         reports.append(error)
+        if kind == "metric":
+            # New metric data, which only the shutdown sends. Its trace export fails too, so
+            # that it continues the series of failed exports.
+            ingest.path_status["/v1/traces"] = 400
+            telemetry_dev.start_span("chat", type="generation", model="m", provider="p").end()
         telemetry_dev.shutdown(timeout_s=2)
 
     with otlp_capture_server() as ingest:
-        ingest.status = 400
+        # The exporters do not retry a 400. The other signals reach the ingest.
+        ingest.path_status[
+            {"span": "/v1/traces", "log": "/v1/logs", "metric": "/v1/metrics"}[kind]
+        ] = 400
         client = telemetry_dev.init(
             api_key="td_live_test",
             base_url=ingest.url,
@@ -679,39 +705,251 @@ def test_an_on_error_that_shuts_down_during_an_export_ends_the_client_without_ha
             timeout=1.0,
             on_error=on_error,
         )
-        telemetry_dev.start_span("failed export").end()
+        telemetry_dev.log("queued log")
+        # A chat span records metrics, which only a flush or the shutdown sends before the 60 s
+        # interval.
+        telemetry_dev.start_span("chat", type="generation", model="m", provider="p").end()
+        if kind == "metric":
+            # The flush makes the metric export. It runs on another thread, so that a flush that
+            # waits for itself does not stop the test.
+            threading.Thread(
+                target=telemetry_dev.flush, kwargs={"timeout_s": 3}, daemon=True
+            ).start()
         assert _wait_until(lambda: len(reports) == 1)
         assert telemetry_dev.get_client() is None
+        # The deferred shutdown runs once the export ends. It sends the queued logs and the
+        # metrics, and in the metric row also the metrics of the span that on_error ended.
+        metric_requests = 2 if kind == "metric" else 1
+        assert _wait_until(lambda: len(ingest.requests_for("/v1/metrics")) == metric_requests)
+        assert len(ingest.requests_for("/v1/logs")) == 1
         processor = client.processor
         assert processor is not None
-        # The deferred teardown shuts the span processor down once the export ends, and a
-        # processor that is shut down does not flush.
+        # A processor that is shut down does not flush.
         assert _wait_until(lambda: processor.force_flush(100) is False)
+        assert len(reports) == 1
 
 
-def test_an_on_error_that_flushes_a_byo_processor_during_an_export_does_not_hang() -> None:
-    reports: list[BaseException] = []
+_EXIT_AFTER_ON_ERROR_SHUTS_DOWN = """
+import sys
+import threading
+
+import telemetry_dev
+
+reported = threading.Event()
+
+
+def on_error(error):
+    telemetry_dev.shutdown(timeout_s=5)
+    reported.set()
+
+
+telemetry_dev.init(
+    api_key="td_test", base_url=sys.argv[1], log_level="silent", timeout=2.0, on_error=on_error
+)
+telemetry_dev.log("queued log")
+# More spans than one batch of 64, so that the batch processor exports at once.
+for _ in range(100):
+    telemetry_dev.start_span("chat", type="generation", model="m", provider="p").end()
+assert reported.wait(10)
+# The main thread returns while the deferred shutdown runs.
+"""
+
+
+def test_a_process_that_exits_after_on_error_shuts_down_sends_the_queued_telemetry_first() -> None:
     with otlp_capture_server() as ingest:
-        ingest.status = 400
-        provider = TracerProvider()
-
-        def on_error(error: BaseException) -> None:
-            reports.append(error)
-            provider.force_flush(2_000)
-
-        provider.add_span_processor(
-            TelemetrySpanProcessor(
-                api_key="td_live_test", base_url=ingest.url, metrics=False, on_error=on_error
-            )
+        ingest.path_status["/v1/traces"] = 400
+        # Each request takes this long, so the deferred shutdown still runs when the main thread
+        # of the process returns.
+        ingest.post_delay = 0.3
+        result = subprocess.run(
+            [sys.executable, "-c", _EXIT_AFTER_ON_ERROR_SHUTS_DOWN, ingest.url],
+            capture_output=True,
+            timeout=60,
+            check=False,
         )
-        provider.get_tracer("test").start_span("failed export").end()
+        assert result.returncode == 0, result.stderr.decode()
+        paths = {request.path for request in ingest.requests}
+    assert paths == {"/v1/traces", "/v1/logs", "/v1/metrics"}
+
+
+def test_a_shutdown_from_on_error_runs_at_exit_when_its_thread_cannot_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reports: list[BaseException] = []
+    at_exit: list[Callable[[], object]] = []
+    start = threading.Thread.start
+
+    def start_or_fail(self: threading.Thread) -> None:
+        if self.name == "telemetry-dev-after-export":
+            raise RuntimeError("can't start new thread")
+        start(self)
+
+    def on_error(error: BaseException) -> None:
+        reports.append(error)
+        telemetry_dev.shutdown(timeout_s=2)
+
+    with otlp_capture_server() as ingest:
+        ingest.path_status["/v1/traces"] = 400
+        telemetry_dev.init(
+            api_key="td_test",
+            base_url=ingest.url,
+            log_level="silent",
+            disable_atexit=True,
+            timeout=1.0,
+            on_error=on_error,
+        )
+        monkeypatch.setattr(threading.Thread, "start", start_or_fail)
+        monkeypatch.setattr(atexit, "register", at_exit.append)
+        telemetry_dev.start_span("chat", type="generation", model="m", provider="p").end()
+        assert _wait_until(lambda: len(at_exit) == 1)
+        assert telemetry_dev.get_client() is None
+        # Only the shutdown sends the metrics, and it waits for the exit.
+        assert ingest.requests_for("/v1/metrics") == []
+        at_exit[0]()
+        assert len(ingest.requests_for("/v1/metrics")) == 1
+        assert len(reports) == 1
+
+
+@pytest.mark.parametrize(("shutdown", "daemon"), [(True, False), (False, True)])
+def test_only_a_deferred_shutdown_holds_the_process_open(shutdown: bool, daemon: bool) -> None:
+    # A flush can wait for a whole queue in an outage, so the process exit must not wait for it;
+    # the shutdown at exit sends what is left.
+    ran_on: list[bool] = []
+    done = threading.Event()
+
+    def export() -> None:
+        with exporting():
+            after_export(
+                object(),
+                lambda: (ran_on.append(threading.current_thread().daemon), done.set()),
+                shutdown=shutdown,
+            )
+
+    # Export threads of OpenTelemetry are daemons, and a new thread inherits that.
+    exporter = threading.Thread(target=export, daemon=True)
+    exporter.start()
+    exporter.join(10)
+
+    assert done.wait(10)
+    assert ran_on == [daemon]
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_forked_process_runs_the_work_that_its_parent_has_pending() -> None:
+    key = object()
+    release = threading.Event()
+    with exporting():
+        assert after_export(key, lambda: release.wait(10))
+    ran = threading.Event()
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            # The child has the key of the parent, but not its thread.
+            with exporting():
+                after_export(key, ran.set)
+            code = 0 if ran.wait(5) else 2
+        finally:
+            # The child must not return into pytest.
+            os._exit(code)
+    release.set()
+    # A fork hook that deadlocks the child fails the test instead of hanging the suite.
+    deadline = time.monotonic() + 10
+    while (waited := os.waitpid(pid, os.WNOHANG)) == (0, 0):
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pytest.fail("The forked process did not end in 10 s")
+        time.sleep(0.01)
+    assert os.waitstatus_to_exitcode(waited[1]) == 0
+
+
+@pytest.mark.parametrize(
+    ("owner", "call"),
+    [("byo", "flush"), ("byo", "shutdown"), ("global", "flush"), ("global", "shutdown")],
+)
+def test_an_on_error_that_flushes_or_shuts_down_a_tracer_provider_during_an_export_does_not_hang(
+    owner: str, call: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reports: list[BaseException] = []
+    raised: list[BaseException] = []
+    byo_provider = TracerProvider(shutdown_on_exit=False)
+
+    def end_chat_span() -> None:
+        if owner == "global":
+            telemetry_dev.start_span("chat", type="generation", model="m", provider="p").end()
+        else:
+            span = byo_provider.get_tracer("user-app").start_span("chat")
+            span.set_attribute("gen_ai.operation.name", "chat")
+            span.end()
+
+    def on_error(error: BaseException) -> None:
+        reports.append(error)
+        # The span gives the deferred call new data to send. Its trace export fails too, so that
+        # it continues the series of failed exports.
+        ingest.path_status["/v1/traces"] = 400
+        end_chat_span()
+        try:
+            provider = trace.get_tracer_provider() if owner == "global" else byo_provider
+            assert isinstance(provider, TracerProvider)
+            if call == "flush":
+                provider.force_flush(2_000)
+            else:
+                provider.shutdown()
+        except BaseException as exc:
+            raised.append(exc)
+
+    with otlp_capture_server() as ingest:
+        if owner == "byo":
+            # The meter provider of the processor waits for the metric reader, which holds its
+            # lock during a metric export, so only the guard of the processor itself can defer
+            # the call.
+            ingest.path_status["/v1/metrics"] = 400
+        else:
+            ingest.status = 400
+        stamping = None
+        if owner == "global":
+            monkeypatch.setattr(trace, "_TRACER_PROVIDER", None)
+            monkeypatch.setattr(trace, "_TRACER_PROVIDER_SET_ONCE", Once())
+            stamping = telemetry_dev.init(
+                api_key="td_test",
+                base_url=ingest.url,
+                register_global=True,
+                log_level="silent",
+                disable_atexit=True,
+                timeout=1.0,
+                on_error=on_error,
+            ).processor
+        else:
+            byo_provider.add_span_processor(
+                TelemetrySpanProcessor(
+                    api_key="td_test",
+                    base_url=ingest.url,
+                    metrics=True,
+                    on_error=on_error,
+                )
+            )
+        provider = trace.get_tracer_provider() if owner == "global" else byo_provider
+        assert isinstance(provider, TracerProvider)
+        end_chat_span()
         flushed = threading.Event()
 
         def flush() -> None:
+            # In the byo rows, this flush makes the metric export.
             provider.force_flush(3_000)
             flushed.set()
 
         threading.Thread(target=flush, daemon=True).start()
         assert flushed.wait(10)
+        assert len(reports) == 1
+        assert raised == []
+        if call == "shutdown":
+            # The deferred shutdown ran once the export ended.
+            if stamping is not None:
+                assert _wait_until(lambda: stamping.force_flush(100) is False)
+            else:
+                # It sends the metrics of the span that on_error ended.
+                assert _wait_until(lambda: len(ingest.requests_for("/v1/metrics")) == 2)
         assert len(reports) == 1
         provider.shutdown()
