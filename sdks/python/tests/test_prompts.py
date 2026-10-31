@@ -11,6 +11,7 @@ import json
 import os
 import pickle
 import re
+import secrets
 import signal
 import socket
 import sys
@@ -21,6 +22,7 @@ import urllib.error
 import urllib.request
 import weakref
 from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,7 +50,7 @@ from telemetry_dev import (
 from telemetry_dev._serialize import utf16_length
 
 from .conftest import MakeClient
-from .otlp_capture import CaptureServer, otlp_capture_server
+from .otlp_capture import CapturedRequest, CaptureServer, otlp_capture_server
 
 # Python 3.12+ gives a warning for fork() in a process with threads, and the capture server has one.
 pytestmark = pytest.mark.filterwarnings(
@@ -83,9 +85,28 @@ def api_error(status: int, code: str, message: str) -> tuple[int, object]:
     return status, {"error": {"code": code, "message": message}}
 
 
+@contextmanager
+def prompt_server() -> Generator[CaptureServer]:
+    """A capture server whose URL has a random path. Another local process can send requests to its
+    port; ``own_requests`` leaves them out."""
+    with otlp_capture_server() as capture:
+        capture.url += f"/{secrets.token_hex(8)}"
+        yield capture
+
+
+def own_requests(server: CaptureServer) -> list[CapturedRequest]:
+    """The requests to the URL of ``server``, with the paths that the SDK asked for."""
+    prefix = urlsplit(server.url).path
+    return [
+        dataclasses.replace(request, path=request.path.removeprefix(prefix))
+        for request in server.requests
+        if request.path.startswith(f"{prefix}/")
+    ]
+
+
 @pytest.fixture
 def server() -> Generator[CaptureServer]:
-    with otlp_capture_server() as capture:
+    with prompt_server() as capture:
         capture.replies = [(200, reply())]
         yield capture
 
@@ -207,7 +228,7 @@ def test_get_prompt_sends_query_with_key_and_sdk_header(
 ) -> None:
     get_prompt("support/reply", api_key="td_live_a", base_url=f"{server.url}/", **options)
 
-    [request] = server.requests
+    [request] = own_requests(server)
     assert urlsplit(request.path).path == "/v1/prompts"
     assert query_of(request.path) == {"name": "support/reply", **query}
     assert request.headers["authorization"] == "Bearer td_live_a"
@@ -220,14 +241,14 @@ def test_get_prompt_reads_the_initialized_client_then_the_environment(
 ) -> None:
     make(api_key="td_live_client", base_url=server.url)
     assert get_prompt("support/reply").version == 12
-    assert server.requests[0].headers["authorization"] == "Bearer td_live_client"
+    assert own_requests(server)[0].headers["authorization"] == "Bearer td_live_client"
 
     telemetry_dev.shutdown()
     telemetry_dev.init(api_key="td_live_disabled", enabled=False, disable_atexit=True)
     monkeypatch.setenv("TELEMETRY_DEV_API_KEY", "td_live_env")
     monkeypatch.setenv("TELEMETRY_DEV_BASE_URL", server.url)
     get_prompt("support/reply", label="staging")
-    assert server.requests[1].headers["authorization"] == "Bearer td_live_env"
+    assert own_requests(server)[1].headers["authorization"] == "Bearer td_live_env"
 
 
 def test_get_prompt_reads_the_host_that_telemetry_goes_to(server: CaptureServer) -> None:
@@ -240,7 +261,7 @@ def test_get_prompt_reads_the_host_that_telemetry_goes_to(server: CaptureServer)
 
     get_prompt("support/reply")
 
-    assert [urlsplit(request.path).path for request in server.requests] == [
+    assert [urlsplit(request.path).path for request in own_requests(server)] == [
         "/v1/traces",
         "/v1/prompts",
     ]
@@ -281,19 +302,19 @@ def test_get_prompt_keeps_a_prompt_for_the_ttl_then_refreshes_it_in_the_backgrou
     assert version() == 12
     clock[0] += 59
     assert version() == 12
-    assert len(server.requests) == 1
+    assert len(own_requests(server)) == 1
 
     # After the TTL, calls get the copy at once while one refresh runs.
     server.delay = 0.5
     clock[0] += 1
     assert [version() for _ in range(3)] == [12, 12, 12]
     wait_for(lambda: version() == 13)
-    assert len(server.requests) == 2
+    assert len(own_requests(server)) == 2
 
     # A different key does not share the copy.
     server.delay = 0
     get_prompt("support/reply", api_key="td_live_b", base_url=server.url)
-    assert len(server.requests) == 3
+    assert len(own_requests(server)) == 3
 
 
 def test_concurrent_calls_share_one_fetch(server: CaptureServer) -> None:
@@ -311,7 +332,7 @@ def test_concurrent_calls_share_one_fetch(server: CaptureServer) -> None:
     for thread in threads:
         thread.join()
 
-    assert len(server.requests) == 1
+    assert len(own_requests(server)) == 1
     assert versions == [12] * 5
 
 
@@ -335,7 +356,7 @@ def test_a_failed_refresh_returns_the_last_copy_and_reports_the_error(
 
     # The stale copy counts as fresh for another TTL, so calls do not each start a fetch.
     get_prompt("support/reply")
-    assert len(server.requests) == 2
+    assert len(own_requests(server)) == 2
 
     clock[0] += 60
     assert get_prompt("support/reply").version == 12
@@ -370,15 +391,15 @@ def test_with_no_copy_a_failed_fetch_returns_the_fallback_and_so_do_calls_for_10
 
     clock[0] += 9
     assert fallback_prompt().is_fallback
-    assert len(server.requests) == 1
+    assert len(own_requests(server)) == 1
 
     clock[0] += 1
     assert fallback_prompt().is_fallback
-    assert len(server.requests) == 2
+    assert len(own_requests(server)) == 2
 
     # A TTL under 10 seconds bounds the wait too.
     fallback_prompt(cache_ttl_seconds=0)
-    assert len(server.requests) == 3
+    assert len(own_requests(server)) == 3
 
 
 @pytest.mark.parametrize(
@@ -418,11 +439,11 @@ def test_with_no_copy_get_prompt_does_not_fetch_before_the_retry_after(
     # The HTTP date counts from when the server answered, a moment before this.
     clock[0] += wait - 2
     assert fallback_prompt().is_fallback
-    assert len(server.requests) == 1
+    assert len(own_requests(server)) == 1
 
     clock[0] += 2
     fallback_prompt()
-    assert len(server.requests) == 2
+    assert len(own_requests(server)) == 2
 
 
 def test_a_refresh_that_gets_a_retry_after_keeps_the_copy_until_then(
@@ -447,7 +468,7 @@ def test_a_refresh_that_gets_a_retry_after_keeps_the_copy_until_then(
             for entry in prompts_module._cache.values()  # pyright: ignore[reportPrivateUsage]
         )
     )
-    assert len(server.requests) == 2
+    assert len(own_requests(server)) == 2
 
     # The TTL ends after 60 seconds, but the server asked for 300.
     clock[0] += 299
@@ -458,12 +479,12 @@ def test_a_refresh_that_gets_a_retry_after_keeps_the_copy_until_then(
             for entry in prompts_module._cache.values()  # pyright: ignore[reportPrivateUsage]
         )
     )
-    assert len(server.requests) == 2
+    assert len(own_requests(server)) == 2
 
     clock[0] += 1
     version()
     wait_for(lambda: version() == 13)
-    assert len(server.requests) == 3
+    assert len(own_requests(server)) == 3
 
 
 def test_with_no_copy_and_no_fallback_get_prompt_raises_a_prompt_error(
@@ -512,7 +533,7 @@ def test_a_reply_without_a_label_is_an_invalid_response(server: CaptureServer) -
 
 
 def test_a_redirect_fails_and_does_not_send_the_key(server: CaptureServer) -> None:
-    with otlp_capture_server() as other:
+    with prompt_server() as other:
         other.replies = [(200, reply())]
         server.replies = [(302, {})]
         server.location = f"{other.url}/v1/prompts?name=support%2Freply&label=production"
@@ -521,7 +542,7 @@ def test_a_redirect_fails_and_does_not_send_the_key(server: CaptureServer) -> No
             get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
 
         assert (raised.value.code, raised.value.status) == ("http_302", 302)
-        assert other.requests == []
+        assert own_requests(other) == []
 
 
 @pytest.mark.parametrize("slow", ["reply", "address lookup"])
@@ -637,7 +658,7 @@ def test_a_forked_process_fetches_the_prompt_that_the_parent_was_fetching(
     versions: list[int | None] = []
     parent = threading.Thread(target=lambda: versions.append(version_of(server)))
     parent.start()
-    wait_for(lambda: len(server.requests) == 1)
+    wait_for(lambda: len(own_requests(server)) == 1)
     server.delay = 0
     parent_pid = os.getpid()
 
@@ -651,7 +672,7 @@ def test_a_forked_process_fetches_the_prompt_that_the_parent_was_fetching(
     parent.join()
     assert versions == [12]
     # The fetch of the parent, and the fetch of the child.
-    assert len(server.requests) == 2
+    assert len(own_requests(server)) == 2
 
 
 def test_a_call_does_not_wait_for_a_fetch_that_another_process_started(
@@ -660,7 +681,7 @@ def test_a_call_does_not_wait_for_a_fetch_that_another_process_started(
     server.delay = 1
     first = threading.Thread(target=version_of, args=(server,))
     first.start()
-    wait_for(lambda: len(server.requests) == 1)
+    wait_for(lambda: len(own_requests(server)) == 1)
     server.delay = 0
     # A fork that runs no fork hooks, as a fork in C code, copies the fetch of the parent but not
     # the thread that runs it. Here this process is the child: the fetch gets the id of its parent.
@@ -668,8 +689,36 @@ def test_a_call_does_not_wait_for_a_fetch_that_another_process_started(
     entry.pending_pid = os.getppid()
 
     assert version_of(server) == 12
-    assert len(server.requests) == 2
+    assert len(own_requests(server)) == 2
     first.join()
+
+
+def test_a_call_does_not_wait_for_a_cache_lock_that_another_process_held(
+    server: CaptureServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    held, done = threading.Event(), threading.Event()
+    released_at: list[float] = []
+
+    def hold() -> None:
+        with prompts_module._cache_lock():  # pyright: ignore[reportPrivateUsage]
+            held.set()
+            done.wait(5)
+            released_at.append(time.monotonic())
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    held.wait()
+    # A fork that runs no fork hooks, as a fork in C code, copies the lock while a thread of the
+    # parent holds it. Here this process is the child: it gets a new process ID.
+    pid = os.getpid()
+    monkeypatch.setattr(os, "getpid", lambda: pid + 1)
+    try:
+        assert version_of(server) == 12
+        returned_at = time.monotonic()
+    finally:
+        done.set()
+        holder.join()
+    assert returned_at < released_at[0]
 
 
 @needs_fork
@@ -681,7 +730,7 @@ def test_a_forked_process_refreshes_the_copy_that_the_parent_was_refreshing(
     server.replies = [(200, reply(version=13))]
     server.delay = 1
     assert version_of(server) == 12
-    wait_for(lambda: len(server.requests) == 2)
+    wait_for(lambda: len(own_requests(server)) == 2)
     server.delay = 0
 
     def child() -> str:
@@ -703,7 +752,7 @@ def test_a_fork_waits_for_a_thread_that_holds_the_cache_lock(server: CaptureServ
 
     def hold() -> None:
         try:
-            with prompts_module._cache_lock:  # pyright: ignore[reportPrivateUsage]
+            with prompts_module._cache_lock():  # pyright: ignore[reportPrivateUsage]
                 held.set()
                 time.sleep(0.2)
                 released_at.append(time.monotonic())
@@ -734,7 +783,7 @@ def test_a_fork_in_the_thread_that_holds_the_cache_lock_returns(
     monkeypatch.setattr(prompts_module, "_FETCH_TIMEOUT_S", 3)
 
     def fork_in_the_lock() -> int:
-        with prompts_module._cache_lock:  # pyright: ignore[reportPrivateUsage]
+        with prompts_module._cache_lock():  # pyright: ignore[reportPrivateUsage]
             return os.fork()
 
     def fork_and_fetch() -> str:
@@ -783,6 +832,47 @@ def test_a_fork_in_a_call_that_starts_a_fetch_returns_the_prompt(
 
 
 @needs_fork
+@pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="needs signal.setitimer")
+def test_a_fork_in_a_signal_handler_during_the_wait_for_a_fetch_fetches_again_in_the_child(
+    server: CaptureServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A child that waits for the fetch of the parent gets no answer in 3 s.
+    monkeypatch.setattr(prompts_module, "_FETCH_TIMEOUT_S", 3)
+    server.delay = 1
+    pids: list[int] = []
+    results: list[str] = []
+    forked_in: list[str | None] = []
+
+    def fork_in_the_wait(signum: int, frame: FrameType | None) -> None:
+        server.delay = 0
+        forked_in.append(frame and frame.f_code.co_name)
+        pids.append(os.fork())
+
+    def fork() -> int:
+        previous = signal.signal(signal.SIGALRM, fork_in_the_wait)
+        # Between two 0.1 s steps of the wait.
+        signal.setitimer(signal.ITIMER_REAL, 0.35)
+        started = time.monotonic()
+        try:
+            version = version_of(server)
+            results.append(f"{version} in under 2 s: {time.monotonic() - started < 2}")
+        except Exception as exc:
+            # The child must return the pid to in_fork, and not raise into pytest.
+            results.append(repr(exc))
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+        return pids[0]
+
+    assert in_fork(lambda: results[0], fork) == "12 in under 2 s: True"
+    assert results == ["12 in under 2 s: True"]
+    # The signal came in the wait of threading.Event, not before it.
+    assert forked_in == ["wait"]
+    # The fetch of the parent, and the fetch of the child.
+    assert len(own_requests(server)) == 2
+
+
+@needs_fork
 def test_a_fork_after_a_reload_of_the_prompt_module_returns(
     server: CaptureServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -803,14 +893,12 @@ def test_a_fork_after_a_reload_of_the_prompt_module_returns(
 @pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="needs signal.setitimer")
 @pytest.mark.parametrize("before_hook", ["stopped by a signal", "not run"])
 def test_the_fork_hooks_handle_a_lock_that_the_before_hook_did_not_get(
-    server: CaptureServer, monkeypatch: pytest.MonkeyPatch, before_hook: str
+    server: CaptureServer, before_hook: str
 ) -> None:
     class Interrupted(Exception):
         pass
 
-    lock = prompts_module._cache_lock  # pyright: ignore[reportPrivateUsage]
-    # The child hook replaces the lock. monkeypatch puts it back.
-    monkeypatch.setattr(prompts_module, "_cache_lock", lock)
+    lock = prompts_module._cache_lock()  # pyright: ignore[reportPrivateUsage]
     held, done = threading.Event(), threading.Event()
     errors: list[BaseException] = []
 
@@ -856,7 +944,7 @@ def test_the_fork_hooks_handle_a_lock_that_the_before_hook_did_not_get(
         else:
             # uWSGI with py-call-osafterfork forks in C and runs only the child hook.
             prompts_module._reset_in_child()  # pyright: ignore[reportPrivateUsage]
-            child_lock = prompts_module._cache_lock  # pyright: ignore[reportPrivateUsage]
+            child_lock = prompts_module._cache_lock()  # pyright: ignore[reportPrivateUsage]
             assert child_lock.acquire(blocking=False)
             child_lock.release()
     finally:
@@ -1985,7 +2073,7 @@ async def test_get_prompt_async_fetches_in_a_worker_thread(server: CaptureServer
     ticker.cancel()
 
     assert prompt.version == 12
-    assert query_of(server.requests[0].path)["label"] == "production"
+    assert query_of(own_requests(server)[0].path)["label"] == "production"
     # The event loop ran while the fetch waited for the slow reply. A fetch on the loop's thread
     # would block it, and the ticker would not run until the fetch ended.
     assert ticks >= 5
