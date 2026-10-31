@@ -289,6 +289,28 @@ printf '{"name":"@telemetry-dev/other","version":"0.1.1"}\n' > "$tmp/archive/pac
 tar -czf "$tmp/wrong-name.tgz" -C "$tmp/archive" package
 expect_failure "Packed name @telemetry-dev/other does not match release name @telemetry-dev/mcp" \
   bash -c "cd '$repo' && '$artifact_script' packages/mcp '$tmp/wrong-name.tgz'"
+printf '{"packages/mcp":"0.1.1"}\n' > "$repo/.release-please-manifest.json"
+jq -n '{
+  name: "@telemetry-dev/mcp", version: "0.1.1", bin: "dist/cli.mjs",
+  exports: {".": {types: "./dist/index.d.mts", import: "./dist/index.mjs"}, "./package.json": "./package.json"}
+}' > "$tmp/archive/package/package.json"
+for missing in none dist/index.d.mts dist/cli.mjs; do
+  rm -rf "$tmp/archive/package/dist"
+  mkdir "$tmp/archive/package/dist"
+  for file in dist/index.mjs dist/index.d.mts dist/cli.mjs; do
+    # A file whose name starts with a missing target does not count as the target.
+    printf '{}\n' > "$tmp/archive/package/$file.map"
+    [[ "$file" == "$missing" ]] || printf 'export {};\n' > "$tmp/archive/package/$file"
+  done
+  tar -czf "$tmp/exports.tgz" -C "$tmp/archive" package
+  if [[ "$missing" == none ]]; then
+    (cd "$repo" && "$artifact_script" packages/mcp "$tmp/exports.tgz")
+  else
+    expect_failure "$missing, a target of its exports or bin" \
+      bash -c "cd '$repo' && '$artifact_script' packages/mcp '$tmp/exports.tgz'"
+  fi
+done
+rm -rf "$tmp/archive/package/dist"
 
 mkdir -p "$tmp/publish/npm"
 printf 'mcp.tgz\n' > "$tmp/publish/npm/publish-order.txt"

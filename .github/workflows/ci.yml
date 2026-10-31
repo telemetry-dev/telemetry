@@ -33,6 +33,19 @@ jobs:
       - run: pnpm run check
       - run: pnpm run test
       - run: pnpm run build
+      - name: Check the npm tarballs
+        run: |
+          output=$(mktemp -d)
+          # As in the release, only packages with a release version.
+          packages=$(jq -r --slurpfile manifest .release-please-manifest.json '
+            .packages | to_entries[]
+            | select(.value["release-type"] == "node" and $manifest[0][.key] != null) | .key
+          ' release-please-config.json)
+          [[ -n "$packages" ]]
+          while IFS= read -r package; do
+            metadata=$(pnpm --dir "$package" pack --pack-destination "$output" --json)
+            .github/scripts/release-artifact.sh "$package" "$(jq -r '.filename' <<< "$metadata")"
+          done <<< "$packages"
 
   python:
     runs-on: ubuntu-latest
