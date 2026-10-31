@@ -10,6 +10,7 @@ import itertools
 import json
 import os
 import pickle
+import re
 import signal
 import socket
 import sys
@@ -44,6 +45,7 @@ from telemetry_dev import (
     start_span,
     with_prompt,
 )
+from telemetry_dev._serialize import utf16_length
 
 from .conftest import MakeClient
 from .otlp_capture import CaptureServer, otlp_capture_server
@@ -1303,6 +1305,17 @@ def test_a_message_that_a_placeholder_brings_from_an_older_compile_does_not_win(
     assert prompt_attributes_for(summarized)["td.prompt.name"] == "summary"
 
 
+def test_prompt_attributes_for_cuts_variables_past_the_attribute_size_limit(
+    make: MakeClient,
+) -> None:
+    make(max_attribute_length=60)
+    compiled = chat_prompt(*DESK_MESSAGES).compile(team="billing", order="#" * 100)
+
+    assert prompt_attributes_for(compiled)["td.prompt.variables"] == (
+        '{"team":"billing","order":"' + "#" * 17 + '...[truncated]"}'
+    )
+
+
 def test_prompt_attributes_for_looks_at_the_first_and_the_last_1000_messages(
     make: MakeClient,
 ) -> None:
@@ -1839,6 +1852,100 @@ def test_a_compile_keeps_its_variables_for_5_minutes_after_it_or_after_the_last_
         "td.prompt.version": 12,
         "td.prompt.label": "production",
     }
+
+
+def test_variables_past_the_attribute_size_limit_keep_every_key(
+    server: CaptureServer, make: MakeClient
+) -> None:
+    memory = make(max_attribute_length=200)
+    prompt = get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+    history = [{"role": "user", "content": 'a "quoted" turn'}] * 20
+    prompt.compile(
+        customer="Ada", history=history, question="Where is order 42?", note="\U0001f600" * 60
+    )
+
+    with with_prompt(prompt):
+        start_span("chat", type="generation").end()
+
+    [span] = memory.span_exporter.get_finished_spans()
+    attribute = dict(span.attributes or {}).get("td.prompt.variables")
+    assert isinstance(attribute, str)
+    variables: dict[str, str] = json.loads(attribute)
+    assert utf16_length(attribute) <= 200
+    assert list(variables) == ["customer", "history", "question", "note"]
+    assert variables["customer"] == "Ada"
+    assert variables["question"] == "Where is order 42?"
+    assert re.fullmatch(r'\[\{"role":"user".*\.\.\.\[truncated\]', variables["history"])
+    # The cut keeps no half of a surrogate pair.
+    assert re.fullmatch(r"(\U0001f600)*(\.\.\.\[truncated\])?", variables["note"])
+
+
+def test_a_value_with_no_room_for_its_marker_keeps_the_marker(
+    server: CaptureServer, make: MakeClient
+) -> None:
+    def variables_of(max_attribute_length: int, variables: dict[str, str]) -> object:
+        memory = make(max_attribute_length=max_attribute_length)
+        prompt = get_prompt("support/reply", api_key="td_live_a", base_url=server.url)
+        prompt.compile(**variables)
+        with with_prompt(prompt):
+            start_span("chat", type="generation").end()
+        [span] = memory.span_exporter.get_finished_spans()
+        telemetry_dev.shutdown()
+        return dict(span.attributes or {}).get("td.prompt.variables")
+
+    # Control characters escape to 6 units each, so the cut text is the marker alone.
+    assert variables_of(28, {"a": "\u0001" * 50}) == '{"a":"...[truncated]"}'
+
+    # A share of 12 units holds no marker, so the JSON is cut as a whole.
+    three = {"a": "x" * 50, "b": "y" * 50, "c": "z" * 50}
+    assert (
+        variables_of(60, three) == json.dumps(three, separators=(",", ":"))[:46] + "...[truncated]"
+    )
+
+    # A short text of escapes gets a share of the marker's length, so it becomes the marker.
+    assert variables_of(22, {"a": "\n" * 8}) == '{"a":"...[truncated]"}'
+
+
+def test_a_value_with_lone_surrogates_is_cut_by_utf16_units_and_the_span_keeps_it(
+    server: CaptureServer, make: MakeClient
+) -> None:
+    def variables_of(value: str) -> object:
+        memory = make(max_attribute_length=50)
+        prompt = get_prompt("support/reply", api_key="[REDACTED:api-key]", base_url=server.url)
+        prompt.compile(a=value)
+        with with_prompt(prompt):
+            start_span("chat", type="generation").end()
+        [span] = memory.span_exporter.get_finished_spans()
+        telemetry_dev.shutdown()
+        return dict(span.attributes or {}).get("td.prompt.variables")
+
+    assert variables_of("\ud800" * 100) == '{"a":"...[truncated]"}'
+    # A lone surrogate counts as one unit, and its JSON escape as 6.
+    assert variables_of("\udc00" + "x" * 100) == '{"a":"\\udc00' + "x" * 22 + '...[truncated]"}'
+    # A high surrogate right before the marker goes.
+    assert variables_of("x" * 27 + "\ud800" + "y" * 100) == '{"a":"' + "x" * 27 + '...[truncated]"}'
+
+
+def test_a_failure_to_fit_the_variables_drops_them_and_keeps_the_span(
+    server: CaptureServer, make: MakeClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    errors: list[BaseException] = []
+    memory = make(max_attribute_length=50, on_error=errors.append)
+
+    def broken(text: str, max_len: int) -> str:
+        raise ValueError("cannot fit")
+
+    monkeypatch.setattr(prompts_module, "fit_object_values", broken)
+    prompt = get_prompt("support/reply", api_key="[REDACTED:api-key]", base_url=server.url)
+    prompt.compile(a="x" * 100)
+    with with_prompt(prompt):
+        start_span("chat", type="generation").end()
+
+    [span] = memory.span_exporter.get_finished_spans()
+    attributes = dict(span.attributes or {})
+    assert attributes["td.prompt.name"] == "support/reply"
+    assert "td.prompt.variables" not in attributes
+    assert [str(error) for error in errors] == ["cannot fit"]
 
 
 def test_a_fallback_prompt_records_its_name_and_label_but_no_version(

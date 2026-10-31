@@ -195,6 +195,78 @@ def serialize_content(
         return None
 
 
+def fit_object_values(text: str, max_len: int) -> str:
+    """Cap the JSON of an object at ``max_len`` UTF-16 units and keep it an object with every key.
+
+    The values share the room: a short value stays whole, and each long value gets the same share
+    and becomes a text that ends with the marker. A text whose escapes pass its share becomes the
+    marker alone. A value that is not text becomes the cut text of its JSON. JSON that is no
+    object, whose keys alone pass the cap, or whose values get a share under the marker, is cut
+    as a whole. The TypeScript SDK cuts the same way.
+    """
+    if utf16_length(text) <= max_len:
+        return text
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return _cut_text(text, max_len)
+    if not isinstance(parsed, dict):
+        return _cut_text(text, max_len)
+    values = cast("dict[str, Any]", parsed)
+    skeleton = utf16_length(json_dumps(dict.fromkeys(values, "")))
+
+    def extra(value: Any) -> int:
+        return utf16_length(json_dumps(value)) - 2
+
+    sizes = {key: extra(value) for key, value in values.items()}
+    room = max_len - skeleton
+    if room < 0:
+        return _cut_text(text, max_len)
+    fitted = dict(values)
+    by_size = sorted(values, key=sizes.__getitem__)
+    marker = len(TRUNCATION_MARKER)
+    for index, key in enumerate(by_size):
+        share = room // (len(by_size) - index)
+        if sizes[key] <= share:
+            room -= sizes[key]
+            continue
+        # No marker fits the share of this value, so the JSON is cut as a whole.
+        if share < marker:
+            return _cut_text(text, max_len)
+        value = values[key]
+        whole = value if isinstance(value, str) else json_dumps(value)
+        cut = _cut_text(whole, share)
+        keep = share
+        # Escapes make the JSON of a text longer than the text.
+        while extra(cut) > share and keep > marker:
+            keep = max(keep - (extra(cut) - share), marker)
+            cut = _cut_text(whole, keep)
+        # A share of the marker's length leaves no room to cut an escaped text further.
+        if extra(cut) > share:
+            cut = TRUNCATION_MARKER
+        fitted[key] = cut
+        room -= extra(cut)
+    result = json_dumps(fitted)
+    return result if utf16_length(result) <= max_len else _cut_text(text, max_len)
+
+
+def _cut_text(text: str, max_len: int) -> str:
+    """``truncate`` for a text that can hold lone surrogates, as ``json.loads`` gives them back.
+
+    Each surrogate counts as one UTF-16 unit, and a high surrogate right before the marker goes,
+    as the TypeScript SDK cuts. The JSON of the result escapes any lone surrogate that stays.
+    """
+    encoded = text.encode("utf-16-le", "surrogatepass")
+    if len(encoded) <= max_len * 2:
+        return text
+    if max_len < len(TRUNCATION_MARKER):
+        return TRUNCATION_MARKER[: max(max_len, 0)]
+    head = encoded[: (max_len - len(TRUNCATION_MARKER)) * 2].decode("utf-16-le", "surrogatepass")
+    if head and "\ud800" <= head[-1] <= "\udbff":
+        head = head[:-1]
+    return head + TRUNCATION_MARKER
+
+
 def coerce_attr_value(
     value: Any,
     *,
