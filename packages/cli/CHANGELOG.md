@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.6...cli-v0.1.7) (2026-10-31)
+
+
+### Performance Improvements
+
+* **cli:** shorten deep failure paths without measuring each drop ([#147](https://github.com/telemetry-dev/telemetry/issues/147)) ([ee260e5](https://github.com/telemetry-dev/telemetry/commit/ee260e5f9741964ea63813538799fb819bed87cf))
+
 ## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.5...cli-v0.1.6) (2026-10-31)
 
 

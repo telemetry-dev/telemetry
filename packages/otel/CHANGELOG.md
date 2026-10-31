@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/telemetry-dev/telemetry/compare/otel-v0.2.0...otel-v0.2.1) (2026-10-31)
+
+
+### Bug Fixes
+
+* **sdk:** send each captured value whole ([#148](https://github.com/telemetry-dev/telemetry/issues/148)) ([b9e689a](https://github.com/telemetry-dev/telemetry/commit/b9e689a438aecc72436495d4d5d75b9ac847f90e))
+
 ## [0.2.0](https://github.com/telemetry-dev/telemetry/compare/otel-v0.1.7...otel-v0.2.0) (2026-10-29)
 
 

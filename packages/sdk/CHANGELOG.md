@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.3](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.2.2...sdk-v0.2.3) (2026-10-31)
+
+
+### Bug Fixes
+
+* **sdk:** fail the job for each failed experiment and give each matrix leg its own comment ([#154](https://github.com/telemetry-dev/telemetry/issues/154)) ([8ef8563](https://github.com/telemetry-dev/telemetry/commit/8ef8563a0554a11382107d9d78b83c8f8c24d847))
+* **sdk:** find the comment of the action on the old pages of a long pull request ([#157](https://github.com/telemetry-dev/telemetry/issues/157)) ([4791ba4](https://github.com/telemetry-dev/telemetry/commit/4791ba4e0779e8dcf826a43718e29a5937586095))
+* **sdk:** keep every prompt variable when their JSON is too long ([#142](https://github.com/telemetry-dev/telemetry/issues/142)) ([ca0b86c](https://github.com/telemetry-dev/telemetry/commit/ca0b86c8592807071c7c97942a2b28f7e0a6ae8e))
+* **sdk:** name failed runs in the experiment result and suggest spanId for feedback ([#163](https://github.com/telemetry-dev/telemetry/issues/163)) ([3046a72](https://github.com/telemetry-dev/telemetry/commit/3046a72db1a27461388f9c24e1ad269897c5cada))
+* **sdk:** send each captured value whole ([#148](https://github.com/telemetry-dev/telemetry/issues/148)) ([b9e689a](https://github.com/telemetry-dev/telemetry/commit/b9e689a438aecc72436495d4d5d75b9ac847f90e))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/otel bumped to 0.2.1
+
 ## [0.2.2](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.2.1...sdk-v0.2.2) (2026-10-30)
 
 
