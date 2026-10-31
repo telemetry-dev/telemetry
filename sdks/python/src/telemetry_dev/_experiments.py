@@ -14,6 +14,7 @@ import urllib.parse
 from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from decimal import Decimal
 from time import perf_counter
 from typing import Any, Literal, TypeAlias, TypeGuard, cast
 
@@ -897,7 +898,9 @@ def _finish(api: Api, run: _Run, created: _Created) -> ExperimentResult:
     flush()
     _complete(api, created)
     result, body = _wait_for_result(api, created.id)
-    write_result(os.environ, body, api.on_error)
+    # The action skips the check of a result with the CI mode off, and counts the items from runs.
+    line = {**cast("dict[str, Any]", body), "ci": run.in_ci, "runsPerItem": run.runs_per_item}
+    write_result(os.environ, line, api.on_error)
     print(_describe(result), flush=True)
     if run.in_ci:
         _check_result(result)
@@ -999,8 +1002,9 @@ def _format(kind: str | None, value: float | None) -> str:
         return "no score"
     if kind in _RATE_KINDS:
         return f"{_js_round(value * 100)}%"
-    rounded = _js_round(value * 100) / 100
-    return str(int(rounded)) if rounded.is_integer() else repr(rounded)
+    # toFixed(1) of JavaScript: the exact value, its sign apart, with a half rounded up.
+    tenths = math.floor(Decimal(abs(value)) * 10 + Decimal("0.5"))
+    return f"{'-' if value < 0 else ''}{tenths // 10}.{tenths % 10}"
 
 
 def _js_round(value: float) -> int:

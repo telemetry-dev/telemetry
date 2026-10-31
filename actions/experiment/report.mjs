@@ -1,6 +1,7 @@
 // Writes the job summary of the experiment action, and the comment with the result on the pull
 // request. runExperiment and run_experiment add one line of JSON to the results file for each
-// experiment: the body of GET /v1/experiments/{id}.
+// experiment: the body of GET /v1/experiments/{id}, with `ci`, false when the CI mode was off, and
+// `runsPerItem`. Lines from SDKs before those fields have neither.
 import { createHash } from "node:crypto";
 import { appendFileSync, readFileSync } from "node:fs";
 
@@ -121,6 +122,13 @@ function matrixLeg(json) {
 }
 
 function failure(experiment) {
+  // A script that runs an experiment with the CI mode off asks for its result, not its check.
+  // Version 1.0.0 failed the job only for the exit code of the script, thus a line of an SDK from
+  // before the ci field does not fail it either.
+  return experiment.ci === true ? checkFailure(experiment) : [];
+}
+
+function checkFailure(experiment) {
   if (experiment.status !== "completed")
     return [
       `The experiment ${experiment.name} did not complete. Its status is ${experiment.status}.`,
@@ -158,10 +166,19 @@ function render(experiments, code) {
     const total = Number(experiment.itemsTotal) || 0;
     const failed = Number(experiment.itemsFailed) || 0;
     const completed = Math.max((Number(experiment.itemsDone) || 0) - failed, 0);
+    const runsPerItem = Number(experiment.runsPerItem);
+    const items =
+      Number.isInteger(runsPerItem) && runsPerItem > 1
+        ? ` ${Math.round(total / runsPerItem)} items, ${runsPerItem} runs each:`
+        : "";
 
     lines.push(
-      `**${name}**: ${outcome(experiment)}. ${completed} of ${total} runs completed${failed > 0 ? `, ${failed} failed` : ""}.`,
+      `**${name}**: ${outcome(experiment)}.${items} ${completed} of ${total} runs completed${failed > 0 ? `, ${failed} failed` : ""}.`,
     );
+
+    if (experiment.ci === false && checkFailure(experiment).length > 0) {
+      lines.push("", "The CI mode of this experiment was off, thus it does not fail the job.");
+    }
 
     if (typeof experiment.error === "string" && experiment.error !== "") {
       lines.push("", `> ${text(experiment.error)}`);
