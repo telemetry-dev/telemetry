@@ -1,9 +1,18 @@
-export { jsonAttr, omitUndefined, SCOPE_NAME, SCOPE_VERSION } from "./attrs.ts";
+export {
+  jsonAttr,
+  omitUndefined,
+  SCOPE_NAME,
+  SCOPE_VERSION,
+  TRUNCATION_MARKER,
+  truncate,
+} from "./attrs.ts";
 
 export {
   type BatchOptions,
+  batchExportTimeoutMillis,
   DEFAULT_BASE_URL,
   DEFAULT_BATCH,
+  resolveBatch,
   type ExportMode,
   type LogLevel,
   resolveEnv,
@@ -48,6 +57,8 @@ export {
 } from "./otel.ts";
 
 export { StampingSpanProcessor, type StampingProcessorOptions } from "./processor.ts";
+
+export { ExportQueueBudget } from "./queue.ts";
 
 export {
   sessionIdOf,

@@ -13,6 +13,7 @@ from opentelemetry.sdk.trace.export import (
 
 from ._config import report_error
 from ._context import propagated_attributes
+from ._export import DEFAULT_MAX_QUEUE_BYTES, ExportQueueBudget
 from ._metrics import MetricsRecorder
 
 ExportMode = Literal["batched", "immediate"]
@@ -29,6 +30,7 @@ class StampingSpanProcessor(SpanProcessor):
         max_export_batch_size: int = 64,
         schedule_delay_millis: float = 1000,
         max_queue_size: int = 2048,
+        max_queue_bytes: int = DEFAULT_MAX_QUEUE_BYTES,
         export_timeout_millis: float = 30000,
         span_filter: Callable[[ReadableSpan], bool] | None = None,
         metrics_recorder: MetricsRecorder | None = None,
@@ -37,11 +39,13 @@ class StampingSpanProcessor(SpanProcessor):
         self._span_filter = span_filter
         self._metrics_recorder = metrics_recorder
         self._on_error = on_error
+        self._budget: ExportQueueBudget | None = None
         if export_mode == "immediate":
             self._inner: SpanProcessor = SimpleSpanProcessor(span_exporter)
         else:
+            self._budget = ExportQueueBudget(max_queue_size, max_queue_bytes, "span", on_error)
             self._inner = BatchSpanProcessor(
-                span_exporter,
+                self._budget.releasing(span_exporter),
                 max_queue_size=max_queue_size,
                 schedule_delay_millis=schedule_delay_millis,
                 max_export_batch_size=max_export_batch_size,
@@ -68,6 +72,10 @@ class StampingSpanProcessor(SpanProcessor):
         # Metrics are recorded only for exported spans (after the filter), matching the TS SDK.
         if self._metrics_recorder is not None:
             self._metrics_recorder.record_span(span)
+        # The batch processor drops unsampled spans itself, so the budget does not count them.
+        sampled = span.context is not None and span.context.trace_flags.sampled
+        if self._budget is not None and sampled and not self._budget.admit(span):
+            return
         self._inner.on_end(span)
 
     def shutdown(self) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
@@ -12,6 +13,7 @@ import rfc8785
 from ._config import report_error
 
 TRUNCATION_MARKER = "...[truncated]"
+# Deprecated: the old default of max_attribute_length. Values are now sent whole by default.
 DEFAULT_MAX_ATTRIBUTE_LENGTH = 65536
 _MAX_SAFE_INTEGER = 2**53 - 1
 _MAX_ARRAY_INDEX = 2**32 - 2
@@ -270,7 +272,7 @@ def _cut_text(text: str, max_len: int) -> str:
 def coerce_attr_value(
     value: Any,
     *,
-    max_len: int = DEFAULT_MAX_ATTRIBUTE_LENGTH,
+    max_len: int = sys.maxsize,
     key: str | None = None,
     on_error: Callable[[BaseException], None] | None = None,
 ) -> AttributeValue | None:

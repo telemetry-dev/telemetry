@@ -198,7 +198,7 @@ def main() -> int:
             start_span("private-step", input="should-not-appear", capture_input=False).end(
                 error=ValueError("PRIVATE_EXCEPTION")
             )
-            # C16: oversized content gets truncated at the shared UTF-16 cap with the marker.
+            # C16: content past the old 65536-unit default cap is sent whole.
             start_span("big-payload", input="x" * 10_000 + "\U0001f916" * 30_000).end()
             # C15: client-side cost override.
             start_span(
@@ -299,7 +299,7 @@ def main() -> int:
                     input=messages,
                     capture_input=False,
                 ).end()
-            # C26b: variables past the attribute cap keep every key; the long value is cut.
+            # C26b: prompt variables past the old 65536-unit default cap are sent whole.
             prompt.compile(customer="Ada", history="\U0001f916" * 40_000)
             with with_prompt(prompt):
                 start_span(

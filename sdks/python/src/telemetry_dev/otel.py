@@ -22,7 +22,7 @@ from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
 from ._config import SDK_VERSION, logger, report_error, resolve_config
-from ._export import ExportFailures, ReportingSpanExporter
+from ._export import DEFAULT_MAX_QUEUE_BYTES, ExportFailures, ReportingSpanExporter
 from ._metrics import GuardedOTLPMetricExporter, MetricsRecorder, sdk_meter_provider
 from ._processor import ExportMode, StampingSpanProcessor
 from ._semconv import SCOPE_NAME
@@ -45,20 +45,16 @@ class _NoOpSpanExporter(SpanExporter):
         return True
 
 
-def create_telemetry_span_exporter(
-    *,
-    api_key: str | None = None,
-    base_url: str | None = None,
-    timeout: float = _EXPORTER_TIMEOUT_S,
-) -> SpanExporter:
-    """Build a telemetry.dev OTLP span exporter, or a no-op exporter without an API key."""
+def _otlp_span_exporter(
+    api_key: str | None, base_url: str | None, timeout: float
+) -> OTLPSpanExporter | None:
     config = resolve_config(api_key=api_key, base_url=base_url)
     if config.api_key is None:
         logger.debug(
             "telemetry-dev: no API key (api_key option or TELEMETRY_DEV_API_KEY); "
             "span exporter is a no-op"
         )
-        return _NoOpSpanExporter()
+        return None
     return OTLPSpanExporter(
         endpoint=f"{config.base_url}/v1/traces",
         headers={
@@ -68,6 +64,23 @@ def create_telemetry_span_exporter(
         compression=Compression.Gzip,
         timeout=timeout,
     )
+
+
+def create_telemetry_span_exporter(
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    timeout: float = _EXPORTER_TIMEOUT_S,
+) -> SpanExporter:
+    """Build a telemetry.dev OTLP span exporter, or a no-op exporter without an API key.
+
+    Each request is at most 16 MiB, the ingest's limit; a larger batch is sent in several
+    requests, and a span over the limit has its longest string attributes cut.
+    """
+    exporter = _otlp_span_exporter(api_key, base_url, timeout)
+    if exporter is None:
+        return _NoOpSpanExporter()
+    return ReportingSpanExporter(exporter, ExportFailures(None))
 
 
 class TelemetrySpanProcessor(SpanProcessor):
@@ -87,6 +100,7 @@ class TelemetrySpanProcessor(SpanProcessor):
         max_export_batch_size: int = 64,
         schedule_delay_millis: float = 1000,
         max_queue_size: int = 2048,
+        max_queue_bytes: int = DEFAULT_MAX_QUEUE_BYTES,
         export_timeout_millis: float = 30000,
         span_filter: Callable[[ReadableSpan], bool] | None = None,
         metrics: bool = True,
@@ -109,13 +123,10 @@ class TelemetrySpanProcessor(SpanProcessor):
         failures = ExportFailures(on_error)
 
         if span_exporter is None:
-            span_exporter = create_telemetry_span_exporter(
-                api_key=config.api_key,
-                base_url=config.base_url,
-            )
-            if isinstance(span_exporter, _NoOpSpanExporter):
+            exporter = _otlp_span_exporter(config.api_key, config.base_url, _EXPORTER_TIMEOUT_S)
+            if exporter is None:
                 return
-            span_exporter = ReportingSpanExporter(span_exporter, failures)
+            span_exporter = ReportingSpanExporter(exporter, failures, on_error)
 
         if metrics_recorder is None and metrics and config.api_key is not None:
             resource = Resource.create(
@@ -153,6 +164,7 @@ class TelemetrySpanProcessor(SpanProcessor):
             max_export_batch_size=max_export_batch_size,
             schedule_delay_millis=schedule_delay_millis,
             max_queue_size=max_queue_size,
+            max_queue_bytes=max_queue_bytes,
             export_timeout_millis=export_timeout_millis,
             span_filter=span_filter,
             metrics_recorder=metrics_recorder,

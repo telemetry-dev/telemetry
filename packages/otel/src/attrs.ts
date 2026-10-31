@@ -6,6 +6,19 @@ import type { Attributes } from "@opentelemetry/api";
 export const SCOPE_NAME = "@telemetry-dev/sdk";
 export const SCOPE_VERSION = "0.0.0";
 
+// Byte-identical with the Python SDK so truncated payloads are self-describing across languages.
+export const TRUNCATION_MARKER = "...[truncated]";
+
+/** Cuts `value` to `maxLength` UTF-16 units, the marker included. */
+export function truncate(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+
+  const limit = Math.max(maxLength, 0);
+  const marker = TRUNCATION_MARKER.slice(0, limit);
+
+  return value.slice(0, limit - marker.length) + marker;
+}
+
 export function omitUndefined(attributes: Attributes): Attributes {
   const out: Attributes = {};
 

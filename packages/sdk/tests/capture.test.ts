@@ -398,17 +398,14 @@ describe("capture integration", () => {
     span.end();
   });
 
-  test("preserves truncation markers at default and custom span limits", async () => {
+  test("sends content whole by default and marks the cut at a custom cap", async () => {
     const defaults = setup();
     startSpan("big", { input: "x".repeat(70_000) }).end();
     await flush();
 
-    const defaultValue = String(
-      defaults.spans.getFinishedSpans()[0]!.attributes["gen_ai.input.messages"],
+    expect(defaults.spans.getFinishedSpans()[0]!.attributes["gen_ai.input.messages"]).toBe(
+      "x".repeat(70_000),
     );
-
-    expect(defaultValue.length).toBe(65_536);
-    expect(defaultValue.endsWith(TRUNCATION_MARKER)).toBe(true);
 
     await shutdown();
 
@@ -425,7 +422,7 @@ describe("capture integration", () => {
   });
 
   test("counts non-BMP content in UTF-16 code units", async () => {
-    const { spans } = setup();
+    const { spans } = setup({ maxAttributeLength: 65_536 });
     startSpan("emoji", { input: "🤖".repeat(40_000) }).end();
     await flush();
 
