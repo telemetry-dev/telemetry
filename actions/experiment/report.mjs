@@ -6,8 +6,8 @@ import { appendFileSync, readFileSync } from "node:fs";
 
 const RATE_KINDS = new Set(["pass_fail", "up_down"]);
 /**
- * Pages of 100 comments that the action reads to find its comment from an earlier push: the first
- * page, then the newest pages.
+ * Pages of 100 comments that the action reads to find its comment from an earlier push: the oldest
+ * half, then the newest half.
  */
 const MAX_COMMENT_PAGES = 10;
 /** The longest comment body that GitHub takes, in characters. */
@@ -279,13 +279,19 @@ async function comment(report) {
   const first = await list(1);
   let existing = find(first);
 
-  // The list starts with the oldest comments. On a long pull request the comment can be past the
-  // pages that the action reads, and then the comment that it adds is on the newest page.
-  for (
-    let page = lastPage(first.link), read = 1;
-    existing === undefined && page > 1 && read < MAX_COMMENT_PAGES;
-    page--, read++
-  ) {
+  // The list starts with the oldest comments, and a comment stays on its page. The comment of the
+  // first push is on an old page. On a long pull request it can be past the oldest pages, and then
+  // the comment that the action adds is on a new page.
+  const half = MAX_COMMENT_PAGES / 2;
+  const last = lastPage(first.link);
+  const pages = [];
+
+  for (let page = 2; page <= Math.min(half, last); page++) pages.push(page);
+  for (let page = last; page > Math.max(half, last - half); page--) pages.push(page);
+
+  for (const page of pages) {
+    if (existing !== undefined) break;
+
     existing = find(await list(page));
   }
 

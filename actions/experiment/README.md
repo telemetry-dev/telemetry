@@ -5,7 +5,7 @@ This composite action runs your eval script in a GitHub Actions workflow. The sc
 result to the job summary and to a comment on the pull request. The job fails when the check of the
 pass marks of an experiment fails, when an experiment does not complete, or when the script exits
 with an error. A script that catches the error of one experiment and runs the next still fails the
-job.
+job, and so does a failed experiment that runs with `ci: false` (`ci=False` in Python).
 
 ```yaml
 on: pull_request
