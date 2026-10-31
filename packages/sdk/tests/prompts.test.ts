@@ -930,6 +930,16 @@ test("a message that a placeholder brings from an older compile does not win", a
   expect(promptAttributesFor(summarized)?.["td.prompt.name"]).toBe("summary");
 });
 
+test("promptAttributesFor cuts variables past the attribute size limit as withPrompt does", async () => {
+  setup({ maxAttributeLength: 60 });
+  const prompt = await promptOf(DESK_PROMPT);
+  const compiled = prompt.compile({ team: "billing", order: "#".repeat(100) }) as ChatMessage[];
+
+  expect(promptAttributesFor(compiled)?.["td.prompt.variables"]).toBe(
+    `{"team":"billing","order":"${"#".repeat(17)}...[truncated]"}`,
+  );
+});
+
 test("promptAttributesFor looks at the first and the last 1000 messages", async () => {
   setup();
   const prompt = await promptOf(DESK_PROMPT);
@@ -1464,6 +1474,100 @@ test("promptAttributesFor reports an error and gives undefined", async () => {
 
   expect(promptAttributesFor(trap)).toBeUndefined();
   expect(errors.map((error) => error.message)).toEqual(["trap"]);
+});
+
+test("variables past the attribute size limit keep every key and cut the longest values", async () => {
+  const { spans } = setup({ maxAttributeLength: 200 });
+  const { fetch } = fakeFetch(reply());
+  const prompt = await getPrompt("support/reply", {
+    apiKey: "td_live_a",
+    baseUrl: newBaseUrl(),
+    fetch,
+  });
+
+  const history = Array.from({ length: 20 }, () => ({ role: "user", content: 'a "quoted" turn' }));
+
+  prompt.compile({
+    customer: "Ada",
+    history,
+    question: "Where is order 42?",
+    note: "😀".repeat(60),
+  });
+  withPrompt(prompt, () => startSpan("chat", { type: "generation" }).end());
+  await flush();
+
+  const json = spans.getFinishedSpans()[0]!.attributes["td.prompt.variables"] as string;
+  const variables = JSON.parse(json) as Record<string, string>;
+
+  expect(json.length).toBeLessThanOrEqual(200);
+  expect(Object.keys(variables)).toEqual(["customer", "history", "question", "note"]);
+  expect(variables).toMatchObject({ customer: "Ada", question: "Where is order 42?" });
+  expect(variables.history).toMatch(/^\[\{"role":"user".*\.\.\.\[truncated\]$/);
+  // The cut keeps no half of a surrogate pair.
+  expect(variables.note).toMatch(/^(😀)*(\.\.\.\[truncated\])?$/);
+});
+
+test("a value with no room for its marker keeps the marker, or the JSON is cut as a whole", async () => {
+  const variablesOf = async (maxAttributeLength: number, variables: Record<string, string>) => {
+    const { spans } = setup({ maxAttributeLength });
+    const { fetch } = fakeFetch(reply());
+    const prompt = await getPrompt("support/reply", {
+      apiKey: "td_live_a",
+      baseUrl: newBaseUrl(),
+      fetch,
+    });
+
+    prompt.compile(variables);
+    withPrompt(prompt, () => startSpan("chat", { type: "generation" }).end());
+    await flush();
+    const json = spans.getFinishedSpans()[0]!.attributes["td.prompt.variables"];
+
+    await shutdown();
+
+    return json;
+  };
+
+  // Control characters escape to 6 units each, so the cut text is the marker alone.
+  expect(await variablesOf(28, { a: "\u0001".repeat(50) })).toBe('{"a":"...[truncated]"}');
+
+  // A share of 12 units holds no marker.
+  const three = { a: "x".repeat(50), b: "y".repeat(50), c: "z".repeat(50) };
+
+  expect(await variablesOf(60, three)).toBe(`${JSON.stringify(three).slice(0, 46)}...[truncated]`);
+
+  // A short text of escapes gets a share of the marker's length, so it becomes the marker.
+  expect(await variablesOf(22, { a: "\n".repeat(8) })).toBe('{"a":"...[truncated]"}');
+});
+
+test("a value with lone surrogates is cut by UTF-16 units, and the span keeps it as JSON", async () => {
+  const variablesOf = async (variables: Record<string, string>) => {
+    const { spans } = setup({ maxAttributeLength: 50 });
+    const { fetch } = fakeFetch(reply());
+    const prompt = await getPrompt("support/reply", {
+      apiKey: "td_live_a",
+      baseUrl: newBaseUrl(),
+      fetch,
+    });
+
+    prompt.compile(variables);
+    withPrompt(prompt, () => startSpan("chat", { type: "generation" }).end());
+    await flush();
+    const [span] = spans.getFinishedSpans();
+
+    await shutdown();
+
+    return span!.attributes["td.prompt.variables"];
+  };
+
+  expect(await variablesOf({ a: "\ud800".repeat(100) })).toBe('{"a":"...[truncated]"}');
+  // A lone surrogate counts as one unit, and its JSON escape as 6.
+  expect(await variablesOf({ a: `\udc00${"x".repeat(100)}` })).toBe(
+    `{"a":"\\udc00${"x".repeat(22)}...[truncated]"}`,
+  );
+  // A high surrogate right before the marker goes.
+  expect(await variablesOf({ a: `${"x".repeat(27)}\ud800${"y".repeat(100)}` })).toBe(
+    `{"a":"${"x".repeat(27)}...[truncated]"}`,
+  );
 });
 
 test("a fallback prompt records its name and label but no version", async () => {

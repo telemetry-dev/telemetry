@@ -16,7 +16,7 @@ import {
 
 import { isRecord, resolveApi, retryAfterMs } from "./api.ts";
 import type { FieldCaptureConfig } from "./attrs.ts";
-import { prepareCaptureValue } from "./capture.ts";
+import { fitObjectValues, prepareCaptureValue } from "./capture.ts";
 import { currentClient } from "./client.ts";
 
 /** A message of a chat prompt. A placeholder stands for a list of messages that the app passes. */
@@ -416,7 +416,7 @@ function attributesOf(
     "td.prompt.label": prompt.label ?? undefined,
     "td.prompt.variables":
       variables !== undefined && capture?.captureInput
-        ? prepareCaptureValue("td.prompt.variables", variables, capture)
+        ? variablesAttribute(variables, capture)
         : undefined,
   });
 }
@@ -443,6 +443,29 @@ function tagOf(message: unknown): CompileTag | undefined {
   return typeof message === "object" && message !== null
     ? (message as { [COMPILED_BY]?: CompileTag })[COMPILED_BY]
     : undefined;
+}
+
+/**
+ * The masked variables as JSON. Past the attribute size limit the longest values are cut, so the
+ * attribute stays an object with every variable when the keys and the markers fit, and the trace
+ * still shows the short ones.
+ */
+function variablesAttribute(variables: object, capture: FieldCaptureConfig) {
+  const json = prepareCaptureValue("td.prompt.variables", variables, {
+    ...capture,
+    maxAttributeLength: Number.POSITIVE_INFINITY,
+  });
+
+  if (json === undefined) return undefined;
+
+  // A failure of the cut drops the variables, never the span.
+  try {
+    return fitObjectValues(json, capture.maxAttributeLength);
+  } catch (error) {
+    reportError(capture.onError, error);
+
+    return undefined;
+  }
 }
 
 function checkOptions(name: string, options: GetPromptOptions, type: string): void {

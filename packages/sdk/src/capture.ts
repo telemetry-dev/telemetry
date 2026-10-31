@@ -259,6 +259,79 @@ export function truncate(value: string, maxLength: number): string {
   return value.slice(0, limit - marker.length) + marker;
 }
 
+/**
+ * Caps the JSON of an object at `maxLength` and keeps it an object with every key. The values
+ * share the room: a short value stays whole, and each long value gets the same share and becomes
+ * a text that ends with the marker. A text whose escapes pass its share becomes the marker
+ * alone. A value that is not text becomes the cut text of its JSON. JSON that is no object, whose
+ * keys alone pass the cap, or whose values get a share under the marker, is cut as a whole.
+ */
+export function fitObjectValues(json: string, maxLength: number): string {
+  if (json.length <= maxLength) return json;
+
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return cutText(json, maxLength);
+  }
+
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return cutText(json, maxLength);
+  }
+
+  const object = parsed as Record<string, unknown>;
+  const keys = Object.keys(object);
+  // The JSON with each value an empty text, and what each value adds to it.
+  const skeleton = JSON.stringify(Object.fromEntries(keys.map((key) => [key, ""]))).length;
+  const extra = (value: unknown) => JSON.stringify(value).length - 2;
+  const sizes = new Map(keys.map((key) => [key, extra(object[key])]));
+  let room = maxLength - skeleton;
+
+  if (room < 0) return cutText(json, maxLength);
+
+  const fitted: Record<string, unknown> = { ...object };
+  const bySize = [...keys].sort((a, b) => sizes.get(a)! - sizes.get(b)!);
+
+  for (const [index, key] of bySize.entries()) {
+    const share = Math.floor(room / (bySize.length - index));
+    const size = sizes.get(key)!;
+
+    if (size <= share) {
+      room -= size;
+      continue;
+    }
+
+    // No marker fits the share of this value, so the JSON is cut as a whole.
+    if (share < TRUNCATION_MARKER.length) return cutText(json, maxLength);
+
+    const value = object[key];
+    const text = typeof value === "string" ? value : JSON.stringify(value);
+    let cut = cutText(text, share);
+
+    // Escapes make the JSON of a text longer than the text.
+    for (let keep = share; extra(cut) > share && keep > TRUNCATION_MARKER.length; ) {
+      keep = Math.max(keep - (extra(cut) - share), TRUNCATION_MARKER.length);
+      cut = cutText(text, keep);
+    }
+
+    // A share of the marker's length leaves no room to cut an escaped text further.
+    if (extra(cut) > share) cut = TRUNCATION_MARKER;
+
+    fitted[key] = cut;
+    room -= extra(cut);
+  }
+
+  const result = JSON.stringify(fitted);
+
+  return result.length <= maxLength ? result : cutText(json, maxLength);
+}
+
+/** `truncate`, without half of a surrogate pair before the marker, as the Python SDK cuts. */
+const cutText = (text: string, maxLength: number) =>
+  truncate(text, maxLength).replace(/[\uD800-\uDBFF](?=\.\.\.\[truncated\]$)/, "");
+
 /** The single content funnel: mask → JSON stringify → truncate. */
 export function prepareCaptureValue(
   key: string,

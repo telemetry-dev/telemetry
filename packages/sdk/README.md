@@ -171,7 +171,10 @@ const pinned = await getPrompt("support/reply", { version: 13 });
 `td.prompt.name`, `td.prompt.version`, and `td.prompt.label` (only for a prompt fetched by label).
 When input capture is on, `td.prompt.variables` holds the JSON of the variables of the last
 `compile()` of that prompt object before `withPrompt` starts, or of the last `compile()` inside
-`fn`, after `mask` and truncation. If tasks that run at the same time share one prompt object, call
+`fn`, after `mask`. Past `maxAttributeLength` the longest values are cut one by one, each to a text
+that ends with `...[truncated]`, when the keys and a marker for each cut value fit; the JSON then
+keeps every variable. Otherwise the whole attribute is cut, so it can lose variables and stop being
+valid JSON. If tasks that run at the same time share one prompt object, call
 `compile()` in `withPrompt`, or call getPrompt in each task. getPrompt returns a new object from
 the cache. If you do not, a task can record the variables of a different task. Tasks that run at the
 same time inside one `withPrompt` share its variables, so call `withPrompt` in each task that
@@ -278,7 +281,8 @@ const result = await runExperiment({
   429, thus a lost response or a 503 cannot make a second experiment. When the run stops after it
   made the experiment, runExperiment sends the completion before it rejects: telemetry.dev then
   ends the experiment with the item runs that it got, or fails it when it got none.
-- The key needs the `datasets:read` and `experiments:write` scopes. runExperiment uses the same
+- The key needs Run experiments in its Access on the API keys page (the `datasets:read` and
+  `experiments:write` scopes). runExperiment uses the same
   API key, base URL, and `fetch` as getPrompt, or its own `apiKey`, `baseUrl`, and `fetch`
   options. With `environment: "experiment"`, the key of the telemetry client must be for all
   environments or for `experiment`: a key for another environment cannot send the traces of the
@@ -329,8 +333,12 @@ await score({ name: "user_feedback", traceId: reply.traceId, value: 0, comment: 
   `undefined` after it reports a `ScoreError` through `onError`. It checks the score before it
   sends it (`invalid_score`). The trace id of a span from a client that is not initialized is all
   zeros, and score reports it as `invalid_score`.
-- score makes one request, with no retry, and waits 10 seconds at most. The key needs the
-  `scores:write` scope. A browser must not hold the key, so call score from your server.
+- The rates of the dashboard count one `user_feedback` vote for each trace, span, or session: a
+  later `user_feedback` score on the same trace and span (or on the same session, for feedback with
+  no trace) replaces the earlier one. The SDK sends feedback with no author, so all the feedback that
+  the SDK sends on one trace, or on one span of it, counts as one vote: the newest.
+- score makes one request, with no retry, and waits 10 seconds at most. The key needs Run
+  experiments in its Access on the API keys page (the `scores:write` scope). A browser must not hold the key, so call score from your server.
 
 ## API
 
