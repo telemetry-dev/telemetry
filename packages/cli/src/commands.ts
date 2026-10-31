@@ -321,6 +321,11 @@ const requireSupport = (
 ) => {
   if (flags.length === 0 || Object.hasOwn(result, key)) return;
 
+  throw unsupported(flags, alternative);
+};
+
+/** `ignored` says the server would have answered without the flags; one that refused them didn't. */
+const unsupported = (flags: readonly string[], alternative?: string, ignored = true) => {
   const named = flags.map((flag) => `--${flag}`);
   const list =
     named.length === 1
@@ -328,10 +333,30 @@ const requireSupport = (
       : `${named.slice(0, -1).join(", ")}${named.length > 2 ? "," : ""} and ${named.at(-1)}`;
   const them = named.length === 1 ? "it" : "them";
 
-  throw new CliError(
-    `This telemetry.dev deployment doesn't support ${list} yet and would have ignored ${them}. Run the command without ${them}${alternative ? `, or ${alternative}` : ""}.`,
+  return new CliError(
+    `This telemetry.dev deployment doesn't support ${list} yet${ignored ? ` and would have ignored ${them}` : ""}. Run the command without ${them}${alternative ? `, or ${alternative}` : ""}.`,
     { code: "server_unsupported" },
   );
+};
+
+// Added to search_traces together, after windows.
+const AGENT_AND_TOOL: readonly string[] = ["agent", "tool"];
+
+/**
+ * A server that refuses arguments it doesn't know answers with its MCP SDK's own text and no
+ * error code, such as "…: agent: Expected no excess property", naming only the first. When it
+ * names agent or tool, it has neither, so each of them that was sent is refused.
+ */
+const refusedArguments = (error: unknown, sent: readonly string[]) => {
+  if (!(error instanceof CliError) || error.code !== "tool_error") return [];
+
+  const named = [...error.message.matchAll(/(\w+): Expected no excess property/g)].map(
+    (match) => match[1],
+  );
+
+  return named.some((name) => name !== undefined && AGENT_AND_TOOL.includes(name))
+    ? sent.filter((name) => AGENT_AND_TOOL.includes(name))
+    : [];
 };
 
 /** The window a list covers, in this machine's zone, such as "from Oct 30 09:00:00 to …". */
@@ -726,9 +751,17 @@ export async function useCommand(context: Context) {
   });
 }
 
-// Added with windows: a server from before them would ignore these, so the result must
-// have a window.
-const TRACE_FILTERS = ["framework", "service", "model", "provider", "operation"] as const;
+// A server from before windows would ignore these, so the result must have a window. A server
+// with windows but without agent and tool refuses those two (refusedArguments).
+const TRACE_FILTERS = [
+  "framework",
+  "service",
+  "model",
+  "provider",
+  "operation",
+  "agent",
+  "tool",
+] as const;
 
 export async function tracesCommand(context: Context) {
   const window = timeWindow(context);
@@ -737,27 +770,32 @@ export async function tracesCommand(context: Context) {
   await withApi(async (api) => {
     const project = await resolveProject(api, context);
 
-    const page = await api.call<TracePage>(
-      "search_traces",
-      {
-        project_id: project.id,
-        name_contains: string(context, "name"),
-        status: context.values.errors ? "error" : undefined,
-        environment: string(context, "env"),
-        session_id: string(context, "session"),
-        user_id: string(context, "user"),
-        ...filters,
-        ...window.args,
-        limit: limit(context),
-        cursor: string(context, "cursor"),
-      },
-      "Searching traces",
-    );
+    const sentFilters = TRACE_FILTERS.filter((name) => filters[name] !== undefined);
 
-    requireSupport(page, "window", [
-      ...window.flags,
-      ...TRACE_FILTERS.filter((name) => filters[name] !== undefined),
-    ]);
+    const page = await api
+      .call<TracePage>(
+        "search_traces",
+        {
+          project_id: project.id,
+          name_contains: string(context, "name"),
+          status: context.values.errors ? "error" : undefined,
+          environment: string(context, "env"),
+          session_id: string(context, "session"),
+          user_id: string(context, "user"),
+          ...filters,
+          ...window.args,
+          limit: limit(context),
+          cursor: string(context, "cursor"),
+        },
+        "Searching traces",
+      )
+      .catch((error: unknown) => {
+        const refused = refusedArguments(error, sentFilters);
+
+        throw refused.length > 0 ? unsupported(refused, undefined, false) : error;
+      });
+
+    requireSupport(page, "window", [...window.flags, ...sentFilters]);
 
     if (json(context)) return printJson(page);
 

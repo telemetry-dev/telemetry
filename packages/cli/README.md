@@ -91,7 +91,7 @@ A duration has up to five digits. The CLI sends a date or a time without a zone 
 
 `--range` on `sessions` and `logs` still picks one of the usual windows, and it can't be combined with `--since` or `--until`.
 
-`traces` also takes `--framework` and `--service`, which match the trace, and `--model`, `--provider`, and `--operation`, which match traces with a span that started in the window.
+`traces` also takes `--framework` and `--service`, which match the trace, and `--model`, `--provider`, `--operation`, `--agent`, and `--tool`, which match traces with a span that started in the window. `--tool` matches tool calls by the tool name telemetry.dev records, or by the span name when there is none.
 
 ## Scripts and agents
 
@@ -105,7 +105,7 @@ The results of `traces`, `sessions`, and `logs` include the window that telemetr
 
 `logs` results also have `next_cursor`, which is `null` on the last page, and `range_days` is `null` when the command used `--since` or `--until`.
 
-An older telemetry.dev deployment may ignore `--since`, `--until`, the `traces` filters, and `logs --cursor` and return unfiltered results, or the first page of logs again. So when the CLI sends one of them and the result has no `window`, or no `next_cursor` for `logs --cursor`, the command fails with `server_unsupported` and prints no results. A deployment that refuses arguments it doesn't know fails with `tool_error` instead.
+An older telemetry.dev deployment may ignore `--since`, `--until`, the `traces` filters, and `logs --cursor` and return unfiltered results, or the first page of logs again. So when the CLI sends one of them and the result has no `window`, or no `next_cursor` for `logs --cursor`, the command fails with `server_unsupported` and prints no results. A deployment that refuses `--agent` or `--tool` because it doesn't know them also fails with `server_unsupported`; one that refuses another argument fails with `tool_error`.
 
 `telemetry trace` and `telemetry payload` read every page of a trace or a captured text, up to a limit: 2,000 spans for a trace, and 1,000,000 characters for each payload field. Their JSON output has `complete: false` when the limit cut it short, and human output says so on stderr.
 
