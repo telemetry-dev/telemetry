@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/telemetry-dev/telemetry/compare/python-google-genai-v0.2.2...python-google-genai-v0.2.3) (2026-10-31)
+
+
+### Documentation
+
+* **sdk:** correct the READMEs that no longer match the SDKs ([#164](https://github.com/telemetry-dev/telemetry/issues/164)) ([acb45f5](https://github.com/telemetry-dev/telemetry/commit/acb45f501bf60dd5ecefaff6a8f5769bf0cd51fa))
+
 ## [0.2.2](https://github.com/telemetry-dev/telemetry/compare/python-google-genai-v0.2.1...python-google-genai-v0.2.2) (2026-10-30)
 
 
