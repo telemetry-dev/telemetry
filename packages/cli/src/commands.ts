@@ -1165,17 +1165,30 @@ const failureLine = (span: Span, byId: ReadonlyMap<string, Span>, width: number)
   const room = width - 2;
   const errorWidth = displayWidth(error);
   const reserve = Math.min(errorWidth, ERROR_ROOM);
-  const pathWidth = (kept: readonly string[]) => displayWidth([...kept, leaf].join(PATH));
-  let kept = ancestors;
-
   // The root stays, so the path still says which agent or request it was under.
-  for (
-    let dropped = 1;
-    dropped < ancestors.length && pathWidth(kept) + 2 + reserve > room;
-    dropped += 1
-  ) {
-    kept = [ancestors[0]!, "…", ...ancestors.slice(dropped + 1)];
+  const shortened = (dropped: number) =>
+    dropped === 0 ? ancestors : [ancestors[0]!, "…", ...ancestors.slice(dropped + 1)];
+  const fits = (dropped: number) =>
+    displayWidth([...shortened(dropped), leaf].join(PATH)) + 2 + reserve <= room;
+  let dropped = 0;
+
+  // The fewest ancestors to drop, or all but the root when none fits. The first drop puts
+  // "…" where an ancestor was, which can widen the path, so it is checked on its own; each
+  // later drop removes a label and a separator, so a binary search finds the rest:
+  // measuring each count in turn costs the depth squared on a deep trace.
+  if (ancestors.length > 1 && !fits(0)) {
+    let low = 1;
+    dropped = ancestors.length - 1;
+
+    while (low < dropped) {
+      const middle = (low + dropped) >> 1;
+
+      if (fits(middle)) dropped = middle;
+      else low = middle + 1;
+    }
   }
+
+  const kept = shortened(dropped);
 
   // When even the shortened path is too wide, the ancestors are cut, not the failed span.
   const ancestry = kept.join(PATH);
