@@ -6,9 +6,10 @@ set -uo pipefail
 script=${INPUT_SCRIPT:-}
 command=${INPUT_COMMAND:-}
 
+# An error of the action before the script runs. The output error tells it from an exit of the script.
 fail() {
   echo "::error title=telemetry.dev experiment::$1"
-  echo "exit-code=2" >>"$GITHUB_OUTPUT"
+  printf 'error=%s\nexit-code=2\n' "$1" >>"$GITHUB_OUTPUT"
   exit 0
 }
 

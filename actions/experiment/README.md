@@ -3,7 +3,9 @@
 This composite action runs your eval script in a GitHub Actions workflow. The script calls
 `runExperiment` (`@telemetry-dev/sdk`) or `run_experiment` (`telemetry-dev`). The action writes the
 result to the job summary and to a comment on the pull request. The job fails when the check of the
-pass marks fails, when the experiment does not complete, or when the script exits with an error.
+pass marks of an experiment fails, when an experiment does not complete, or when the script exits
+with an error. A script that catches the error of one experiment and runs the next still fails the
+job.
 
 ```yaml
 on: pull_request
@@ -68,7 +70,7 @@ changes of each release.
 | `api-key`           | A telemetry.dev API key with the `datasets:read` and `experiments:write` scopes, for all environments or for `experiment`. Default: the `TELEMETRY_DEV_API_KEY` variable of the job.                                                                                                                                  |
 | `base-url`          | The telemetry.dev API. Default: `https://api.telemetry.dev`.                                                                                                                                                                                                                                                          |
 | `working-directory` | The directory that the script or the command runs in. Default: `.`.                                                                                                                                                                                                                                                   |
-| `comment`           | Set to `false` to write the job summary only.                                                                                                                                                                                                                                                                         |
+| `comment`           | `true` or `false`. Set to `false` to write the job summary only. Another value gets a warning and counts as `true`. Default: `true`.                                                                                                                                                                                  |
 | `github-token`      | The token that writes the comment. Default: `github.token`, which needs the `pull-requests: write` permission.                                                                                                                                                                                                        |
 
 The action sets `TELEMETRY_DEV_ENVIRONMENT` to `experiment` when the job does not set it, so the
@@ -95,15 +97,27 @@ project do not apply to them.
 
 ## The comment
 
-The action adds one comment to the pull request for each workflow, job, and `dataset`, `script`, or
-`command`. A later push changes that comment. The action changes only a comment that its token
-wrote: with a copy of the comment by someone else, it adds a new comment. When the token cannot
-write comments, the action logs a warning, and the job summary still has the result.
+The action adds one comment to the pull request for each workflow, job, matrix leg,
+`working-directory`, and `dataset`, `script`, or `command`. The comment of a matrix leg shows the
+values of its matrix. A matrix of a job that calls a reusable workflow is not in the `matrix` of
+the jobs of that workflow, thus those legs share one comment. A later push changes that comment,
+and the comment names the commit of its result and links the workflow run. After a rename of the
+workflow, the job, the dataset, or the script, the action adds a new comment, and the old one keeps
+the result of its older commit. In version 1.0.0, the legs of a matrix and the working directories
+shared one comment. Thus after an update from 1.0.0 they add new comments, and you can delete the
+old one.
+
+The action changes only a comment that its token wrote: with a copy of the comment by someone else,
+it adds a new comment. The token of a GitHub App cannot read its own login, thus with an app token
+the action changes a copy of the comment by any app. When the token cannot write comments, the
+action logs a warning with the reason, and the job summary still has the result. A result too long
+for a comment is cut, and the job summary has all of it.
 
 A pull request from a fork gets no secrets, thus no API key, and the action stops with the error
 "Set the api-key input or the TELEMETRY_DEV_API_KEY variable." The `if` of the example above skips
 the job for those pull requests.
 
-The comment and the summary show the name of each experiment, its status, the count of the items
-that ran, and the value, the change from the baseline, and the pass mark of each score. The SDK
+The comment and the summary show the name of each experiment, its status, the count of the runs
+that completed, and the value, the change from the baseline, and the pass mark of each score. With
+`runsPerItem` above 1, each item runs more than one time, and each run counts. The SDK
 writes the result for the action to a file in `RUNNER_TEMP` with mode `0600`.
