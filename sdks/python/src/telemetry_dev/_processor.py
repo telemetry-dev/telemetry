@@ -13,7 +13,7 @@ from opentelemetry.sdk.trace.export import (
 
 from ._config import report_error
 from ._context import propagated_attributes
-from ._export import DEFAULT_MAX_QUEUE_BYTES, ExportQueueBudget
+from ._export import DEFAULT_MAX_QUEUE_BYTES, ExportQueueBudget, after_export
 from ._metrics import MetricsRecorder
 
 ExportMode = Literal["batched", "immediate"]
@@ -79,7 +79,10 @@ class StampingSpanProcessor(SpanProcessor):
         self._inner.on_end(span)
 
     def shutdown(self) -> None:
-        self._inner.shutdown()
+        if not after_export((self, "shutdown"), self._inner.shutdown):
+            self._inner.shutdown()
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
+        if after_export((self, "flush"), lambda: self._inner.force_flush(timeout_millis)):
+            return False
         return self._inner.force_flush(timeout_millis)

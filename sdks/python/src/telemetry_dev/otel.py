@@ -22,7 +22,12 @@ from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
 from ._config import SDK_VERSION, logger, report_error, resolve_config
-from ._export import DEFAULT_MAX_QUEUE_BYTES, ExportFailures, ReportingSpanExporter
+from ._export import (
+    DEFAULT_MAX_QUEUE_BYTES,
+    ExportFailures,
+    ReportingSpanExporter,
+    after_export,
+)
 from ._metrics import GuardedOTLPMetricExporter, MetricsRecorder, sdk_meter_provider
 from ._processor import ExportMode, StampingSpanProcessor
 from ._semconv import SCOPE_NAME
@@ -180,6 +185,8 @@ class TelemetrySpanProcessor(SpanProcessor):
             self._inner.on_end(span)
 
     def shutdown(self) -> None:
+        if after_export((self, "shutdown"), self.shutdown):
+            return
         if self._inner is not None:
             try:
                 self._inner.shutdown()
@@ -192,6 +199,8 @@ class TelemetrySpanProcessor(SpanProcessor):
                 report_error(self._on_error, "metric provider shutdown failed", exc)
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
+        if after_export((self, "flush"), lambda: self.force_flush(timeout_millis)):
+            return False
         ok = True
         if self._inner is not None:
             try:

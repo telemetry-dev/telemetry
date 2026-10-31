@@ -31,6 +31,8 @@ class CaptureServer:
     requests: list[CapturedRequest]
     # The HTTP status of each response. To make an ingest outage, set an error status such as 503.
     status: int = 200
+    # The HTTP status of POST responses to one path, in place of status.
+    path_status: dict[str, int] = field(default_factory=lambda: {})
     # The (status, JSON body) replies to GET requests, in order; the last one repeats.
     replies: list[tuple[int, object]] = field(default_factory=lambda: [])
     # Seconds that the server waits before it answers a GET request. The server reads it before the
@@ -64,7 +66,7 @@ def otlp_capture_server() -> Generator[CaptureServer]:
                 )
             )
             time.sleep(capture.post_delay)
-            self.send_response(capture.status)
+            self.send_response(capture.path_status.get(captured[-1].path, capture.status))
             self.send_header("content-type", "application/x-protobuf")
             self.send_header("content-length", "0")
             self.end_headers()

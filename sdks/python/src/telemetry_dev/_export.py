@@ -4,7 +4,8 @@ import copy
 import os
 import threading
 import weakref
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any, TypeVar, cast
 
 from opentelemetry.exporter.otlp.proto.common._log_encoder import encode_logs
@@ -13,7 +14,7 @@ from opentelemetry.sdk._logs.export import LogRecordExporter, LogRecordExportRes
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
-from ._config import report_error
+from ._config import logger, report_error
 from ._serialize import TRUNCATION_MARKER, truncate, utf16_length
 
 # The ingest rejects a body over 16 MiB after gzip decoding, so this limit applies to the
@@ -266,6 +267,56 @@ class _ReleasingExporter:
         self._exporter.shutdown()
 
 
+_export_state = threading.local()
+
+
+@contextmanager
+def exporting() -> Generator[None]:
+    """Marks the current thread as inside an export of this SDK while the block runs."""
+    _export_state.depth = getattr(_export_state, "depth", 0) + 1
+    try:
+        yield
+    finally:
+        _export_state.depth -= 1
+
+
+_pending_lock = threading.Lock()
+_pending: set[object] = set()
+
+
+def after_export(key: object, work: Callable[[], object]) -> bool:
+    """Runs work on a new thread when this thread is inside an export of this SDK.
+
+    The batch processors and the metric reader hold a lock while they export, and flush and
+    shutdown wait for that lock. An on_error callback runs inside the export, so a flush or
+    shutdown it calls would wait for its own thread forever. On the new thread, the work waits
+    until the export ends. A work item with the same key that has not finished yet takes the
+    place of this one, so a burst of reports starts one thread. The thread is not a daemon, so
+    the process exits only after the work. Returns whether this thread must skip the work.
+    """
+    if not getattr(_export_state, "depth", 0):
+        return False
+    with _pending_lock:
+        if key in _pending:
+            return True
+        _pending.add(key)
+
+    def run() -> None:
+        try:
+            work()
+        finally:
+            with _pending_lock:
+                _pending.discard(key)
+
+    try:
+        threading.Thread(target=run, name="telemetry-dev-after-export").start()
+    except BaseException:
+        with _pending_lock:
+            _pending.discard(key)
+        logger.warning("telemetry-dev: could not start a thread for a flush or shutdown")
+    return True
+
+
 class ExportFailures:
     """Reports the first failed export of a series to on_error and the SDK logger.
 
@@ -311,28 +362,29 @@ class ReportingSpanExporter(SpanExporter):
         self._on_error = on_error
 
     def export(self, spans: Any) -> SpanExportResult:
-        try:
-            result = _send_within_limit(
-                list(spans),
-                size=lambda batch: encode_spans(batch).ByteSize(),
-                fit=_fit_span,
-                send=self._inner.export,
-                success=SpanExportResult.SUCCESS,
-                failure=SpanExportResult.FAILURE,
-                label="span",
-                on_error=self._on_error,
-            )
-        except BaseException as exc:
-            self._failures.report("span export failed", exc)
-            return SpanExportResult.FAILURE
-        if result is SpanExportResult.FAILURE:
-            self._failures.report(
-                "span export failed",
-                RuntimeError("OTLP span export failed (check the API key and ingest URL)"),
-            )
-        else:
-            self._failures.clear()
-        return result
+        with exporting():
+            try:
+                result = _send_within_limit(
+                    list(spans),
+                    size=lambda batch: encode_spans(batch).ByteSize(),
+                    fit=_fit_span,
+                    send=self._inner.export,
+                    success=SpanExportResult.SUCCESS,
+                    failure=SpanExportResult.FAILURE,
+                    label="span",
+                    on_error=self._on_error,
+                )
+            except BaseException as exc:
+                self._failures.report("span export failed", exc)
+                return SpanExportResult.FAILURE
+            if result is SpanExportResult.FAILURE:
+                self._failures.report(
+                    "span export failed",
+                    RuntimeError("OTLP span export failed (check the API key and ingest URL)"),
+                )
+            else:
+                self._failures.clear()
+            return result
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         return self._inner.force_flush(timeout_millis)
@@ -355,28 +407,29 @@ class ReportingLogExporter(LogRecordExporter):
         self._on_error = on_error
 
     def export(self, batch: Any) -> LogRecordExportResult:
-        try:
-            result = _send_within_limit(
-                list(batch),
-                size=lambda records: encode_logs(records).ByteSize(),
-                fit=_fit_log,
-                send=self._inner.export,
-                success=LogRecordExportResult.SUCCESS,
-                failure=LogRecordExportResult.FAILURE,
-                label="log",
-                on_error=self._on_error,
-            )
-        except BaseException as exc:
-            self._failures.report("log export failed", exc)
-            return LogRecordExportResult.FAILURE
-        if result is LogRecordExportResult.FAILURE:
-            self._failures.report(
-                "log export failed",
-                RuntimeError("OTLP log export failed (check the API key and ingest URL)"),
-            )
-        else:
-            self._failures.clear()
-        return result
+        with exporting():
+            try:
+                result = _send_within_limit(
+                    list(batch),
+                    size=lambda records: encode_logs(records).ByteSize(),
+                    fit=_fit_log,
+                    send=self._inner.export,
+                    success=LogRecordExportResult.SUCCESS,
+                    failure=LogRecordExportResult.FAILURE,
+                    label="log",
+                    on_error=self._on_error,
+                )
+            except BaseException as exc:
+                self._failures.report("log export failed", exc)
+                return LogRecordExportResult.FAILURE
+            if result is LogRecordExportResult.FAILURE:
+                self._failures.report(
+                    "log export failed",
+                    RuntimeError("OTLP log export failed (check the API key and ingest URL)"),
+                )
+            else:
+                self._failures.clear()
+            return result
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         inner_flush = getattr(self._inner, "force_flush", None)
