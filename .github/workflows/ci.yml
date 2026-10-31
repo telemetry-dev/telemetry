@@ -41,7 +41,10 @@ jobs:
             .packages | to_entries[]
             | select(.value["release-type"] == "node" and $manifest[0][.key] != null) | .key
           ' release-please-config.json)
-          [[ -n "$packages" ]]
+          if [[ -z "$packages" ]]; then
+            echo "No npm package in release-please-config.json has a release version" >&2
+            exit 1
+          fi
           while IFS= read -r package; do
             metadata=$(pnpm --dir "$package" pack --pack-destination "$output" --json)
             .github/scripts/release-artifact.sh "$package" "$(jq -r '.filename' <<< "$metadata")"
