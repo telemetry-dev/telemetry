@@ -2,7 +2,8 @@ from __future__ import annotations
 
 # pyright: reportPrivateUsage=false
 import threading
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import pytest
@@ -603,3 +604,114 @@ def test_batched_logs_past_the_queue_bound_are_dropped_and_reported(
     assert len(logs.get_finished_logs()) == 2
     assert ["log export queue is full" in str(error) for error in errors] == [True]
     telemetry_dev.shutdown()
+
+
+def _wait_until(condition: Callable[[], bool], seconds: float = 10) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+@pytest.mark.parametrize("signal", ["span", "log", "metric"])
+def test_an_on_error_that_flushes_during_an_export_does_not_hang_and_flushes_after_it(
+    signal: str,
+) -> None:
+    reports: list[BaseException] = []
+
+    def on_error(error: BaseException) -> None:
+        # The SDK calls this inside the export, while the batch processor or the metric reader
+        # holds its export lock. The span gives the metric reader new data to export, as other
+        # threads can at any time.
+        reports.append(error)
+        telemetry_dev.start_span("chat", type="generation", model="m", provider="p").end()
+        telemetry_dev.flush(timeout_s=2)
+
+    with otlp_capture_server() as ingest:
+        if signal == "metric":
+            ingest.path_status["/v1/metrics"] = 400
+        else:
+            ingest.status = 400
+        telemetry_dev.init(
+            api_key="td_live_test",
+            base_url=ingest.url,
+            log_level="silent",
+            disable_atexit=True,
+            timeout=1.0,
+            on_error=on_error,
+        )
+        if signal == "log":
+            telemetry_dev.log("failed export")
+        # A chat span records metrics, which only a flush sends before the 60 s interval.
+        telemetry_dev.start_span("chat", type="generation", model="m", provider="p").end()
+        if signal != "metric":
+            # The batch processor exports on its own, and the flush that on_error asks for runs
+            # once that failed export ends.
+            assert _wait_until(lambda: len(ingest.requests_for("/v1/metrics")) == 1)
+        flushed = threading.Event()
+
+        def flush() -> None:
+            telemetry_dev.flush(timeout_s=3)
+            flushed.set()
+
+        threading.Thread(target=flush, daemon=True).start()
+        assert flushed.wait(10)
+        assert len(reports) == 1
+        telemetry_dev.shutdown()
+
+
+def test_an_on_error_that_shuts_down_during_an_export_ends_the_client_without_hanging() -> None:
+    reports: list[BaseException] = []
+
+    def on_error(error: BaseException) -> None:
+        reports.append(error)
+        telemetry_dev.shutdown(timeout_s=2)
+
+    with otlp_capture_server() as ingest:
+        ingest.status = 400
+        client = telemetry_dev.init(
+            api_key="td_live_test",
+            base_url=ingest.url,
+            log_level="silent",
+            disable_atexit=True,
+            timeout=1.0,
+            on_error=on_error,
+        )
+        telemetry_dev.start_span("failed export").end()
+        assert _wait_until(lambda: len(reports) == 1)
+        assert telemetry_dev.get_client() is None
+        processor = client.processor
+        assert processor is not None
+        # The deferred teardown shuts the span processor down once the export ends, and a
+        # processor that is shut down does not flush.
+        assert _wait_until(lambda: processor.force_flush(100) is False)
+
+
+def test_an_on_error_that_flushes_a_byo_processor_during_an_export_does_not_hang() -> None:
+    reports: list[BaseException] = []
+    with otlp_capture_server() as ingest:
+        ingest.status = 400
+        provider = TracerProvider()
+
+        def on_error(error: BaseException) -> None:
+            reports.append(error)
+            provider.force_flush(2_000)
+
+        provider.add_span_processor(
+            TelemetrySpanProcessor(
+                api_key="td_live_test", base_url=ingest.url, metrics=False, on_error=on_error
+            )
+        )
+        provider.get_tracer("test").start_span("failed export").end()
+        flushed = threading.Event()
+
+        def flush() -> None:
+            provider.force_flush(3_000)
+            flushed.set()
+
+        threading.Thread(target=flush, daemon=True).start()
+        assert flushed.wait(10)
+        assert len(reports) == 1
+        provider.shutdown()

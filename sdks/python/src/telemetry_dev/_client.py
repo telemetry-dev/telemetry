@@ -48,6 +48,7 @@ from ._export import (
     ExportQueueBudget,
     ReportingLogExporter,
     ReportingSpanExporter,
+    after_export,
 )
 from ._metrics import (
     GuardedOTLPMetricExporter,
@@ -278,6 +279,8 @@ class Client:
     def flush(self, timeout_s: float = 10.0) -> None:
         if not self.enabled or self._shutdown:
             return
+        if after_export((self, "flush"), lambda: self.flush(timeout_s)):
+            return
         timeout_millis = int(timeout_s * 1000)
         try:
             if self._tracer_provider is not None:
@@ -291,14 +294,21 @@ class Client:
 
     def shutdown(self, timeout_s: float = 10.0) -> None:
         global _client
-        if self._shutdown:
-            return
-        self._shutdown = True
+        with _lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+            if _client is self:
+                _client = None
         if self._atexit_registered:
             try:
                 atexit.unregister(self.shutdown)
             except BaseException:
                 pass
+        if not after_export((self, "shutdown"), lambda: self._shut_down_providers(timeout_s)):
+            self._shut_down_providers(timeout_s)
+
+    def _shut_down_providers(self, timeout_s: float) -> None:
         timeout_millis = int(timeout_s * 1000)
         try:
             if self._tracer_provider is not None:
@@ -309,9 +319,6 @@ class Client:
                 self._meter_provider.shutdown(timeout_millis=timeout_millis)
         except BaseException as exc:
             self.report("shutdown failed", exc)
-        with _lock:
-            if _client is self:
-                _client = None
 
 
 def init(
