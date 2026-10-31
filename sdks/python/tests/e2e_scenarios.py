@@ -299,6 +299,12 @@ def main() -> int:
                     input=messages,
                     capture_input=False,
                 ).end()
+            # C26b: variables past the attribute cap keep every key; the long value is cut.
+            prompt.compile(customer="Ada", history="\U0001f916" * 40_000)
+            with with_prompt(prompt):
+                start_span(
+                    "prompted-big", type="generation", model="gpt-4o", provider="openai"
+                ).end()
 
         # C13: continue the trace from a serialized W3C traceparent.
         start_span("background-job", parent=agent_traceparent).end()

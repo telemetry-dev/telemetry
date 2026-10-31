@@ -10,6 +10,7 @@ import os
 import random
 import re
 import socket
+import sys
 import threading
 import urllib.error
 import urllib.parse
@@ -37,7 +38,7 @@ from ._semconv import (
     ATTR_PROMPT_VERSION,
     ATTR_SESSION_ID,
 )
-from ._serialize import AttributeValue, json_dumps
+from ._serialize import AttributeValue, fit_object_values, json_dumps, serialize_content
 
 _FETCH_TIMEOUT_S = 10.0
 # How long a failed fetch with no copy answers calls, so that they do not each fetch again.
@@ -355,9 +356,25 @@ def _attributes_of(
     if prompt.label is not None:
         attrs[ATTR_PROMPT_LABEL] = prompt.label
     if variables is not None and capture is not None:
-        serialized = capture.serialize(variables, ATTR_PROMPT_VARIABLES)
+        # Past the attribute size limit the longest values are cut, so the attribute stays an
+        # object with every variable when the keys and the markers fit, and the trace still
+        # shows the short ones.
+        serialized = serialize_content(
+            variables,
+            key=ATTR_PROMPT_VARIABLES,
+            mask=capture.mask,
+            max_len=sys.maxsize,
+            on_error=capture.on_error,
+        )
         if serialized is not None:
-            attrs[ATTR_PROMPT_VARIABLES] = serialized
+            # A failure of the cut drops the variables, never the span.
+            try:
+                attrs[ATTR_PROMPT_VARIABLES] = fit_object_values(
+                    serialized, capture.max_attribute_length
+                )
+            except Exception as exc:
+                message = "failed to fit td.prompt.variables; content dropped"
+                report_error(capture.on_error, message, exc)
     return attrs
 
 

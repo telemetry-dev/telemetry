@@ -251,7 +251,10 @@ pinned = telemetry_dev.get_prompt("support/reply", version=13)
 `td.prompt.name`, `td.prompt.version`, and `td.prompt.label` (only for a prompt fetched by label).
 When input capture is on, `td.prompt.variables` holds the JSON of the variables of the last
 `compile()` of that prompt object before `with_prompt` starts, or of the last `compile()` inside
-it, after `mask` and truncation. If threads or tasks that run at the same time share one prompt
+it, after `mask`. Past `max_attribute_length` the longest values are cut one by one, each to a text
+that ends with `...[truncated]`, when the keys and a marker for each cut value fit; the JSON then
+keeps every variable. Otherwise the whole attribute is cut, so it can lose variables and stop being
+valid JSON. If threads or tasks that run at the same time share one prompt
 object, call `compile()` in `with_prompt`, or call `get_prompt` in each thread or task.
 `get_prompt` returns a new object from the cache. If you do not, a thread can record the variables
 of a different thread. Inside one `with_prompt`, an asyncio task records the last `compile()` that
@@ -371,7 +374,8 @@ result = telemetry_dev.run_experiment(
   made the experiment, also after Ctrl-C or a cancellation, `run_experiment` sends the completion
   before it raises: telemetry.dev then ends the experiment with the item runs that it got, or fails
   it when it got none.
-- The key needs the `datasets:read` and `experiments:write` scopes. `run_experiment` uses the same
+- The key needs Run experiments in its Access on the API keys page (the `datasets:read` and
+  `experiments:write` scopes). `run_experiment` uses the same
   API key and base URL as `get_prompt`, or its own `api_key` and `base_url`. With
   `environment="experiment"`, the key of the telemetry client must be for all environments or for
   `experiment`: a key for another environment cannot send the traces of the items, and the items
@@ -421,8 +425,12 @@ telemetry_dev.score(name="user_feedback", trace_id=trace_id, value=0, comment="W
   after it sends a `ScoreError` to `on_error`. It checks the score before it sends it
   (`invalid_score`). The trace id of a span from a client that is not enabled is all zeros, and
   `score` reports it as `invalid_score`.
+- The rates of the dashboard count one `user_feedback` vote for each trace, span, or session: a
+  later `user_feedback` score on the same trace and span (or on the same session, for feedback with
+  no trace) replaces the earlier one. The SDK sends feedback with no author, so all the feedback that
+  the SDK sends on one trace, or on one span of it, counts as one vote: the newest.
 - `score` makes one request, with no retry. `score_async` runs it in a worker thread. The key
-  needs the `scores:write` scope.
+  needs Run experiments in its Access on the API keys page (the `scores:write` scope).
 
 ## Auto-metrics
 
