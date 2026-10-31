@@ -709,6 +709,47 @@ def test_in_ci_mode_a_failed_check_raises_with_the_result(monkeypatch: pytest.Mo
     )
 
 
+def test_in_ci_mode_a_check_that_failed_items_failed_names_their_count(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("CI", "true")
+    failed_items = result(
+        checkStatus="failed",
+        itemsTotal=6,
+        itemsDone=6,
+        itemsFailed=5,
+        scores=[
+            {
+                "name": "correctness",
+                "kind": "pass_fail",
+                "value": 1,
+                "passCount": 1,
+                "failCount": 0,
+                "baselineValue": None,
+                "delta": None,
+                "minScore": 0.9,
+                "passed": True,
+                "itemsFailed": 5,
+            }
+        ],
+    )
+    with fake_api(results=[failed_items]) as api:
+        with pytest.raises(ExperimentError) as caught:
+            experiment(api, min_scores={"correctness": 0.9})
+
+    assert caught.value.code == "check_failed"
+    assert str(caught.value) == (
+        f"The check of support-golden-v3 failed: 5 of 6 items failed. {EXPERIMENT_URL}"
+    )
+    assert caught.value.result is not None
+    assert caught.value.result.scores[0].items_failed == 5
+    assert capsys.readouterr().out.endswith(
+        f"Experiment support-golden-v3 completed. The check failed. {EXPERIMENT_URL}\n"
+        "  5 of 6 items failed.\n"
+        "  correctness: 100% (pass mark 90%)\n"
+    )
+
+
 @pytest.mark.parametrize(
     ("options", "ci"),
     [({}, None), ({"ci": False}, "true")],

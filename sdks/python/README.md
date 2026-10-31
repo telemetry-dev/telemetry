@@ -374,9 +374,12 @@ result = telemetry_dev.run_experiment(
 - `run_experiment` sends the outputs in batches of 100 items at most, and then waits up to 30
   minutes for the server evaluators. Then it prints the scores and returns an `ExperimentResult`:
   `status`, `check_status`, item counts, `scores` with the value, the baseline value, the change,
-  and the pass mark of each score, and the `url` of the experiment page.
+  the pass mark, and the failed runs (`items_failed`) of each score, and the `url` of the
+  experiment page.
 - `min_scores` sets a pass mark for each score name: the lowest pass rate (0 to 1) of a pass/fail
-  score, or the lowest mean of a number score. A score under its mark fails the check.
+  score, or the lowest mean of a number score. A score under its mark fails the check. A run whose
+  task raises has no score, so the value of a score leaves it out, and with pass marks a failed
+  run fails the check.
 - A failed request raises `ExperimentError` whose `code` tells why, for example
   `dataset_not_found`, `dataset_empty`, `evaluator_not_found`, `insufficient_scope`,
   `missing_api_key`, or `timeout`. A read of the dataset or the result, a post of outputs, and the
@@ -422,13 +425,16 @@ user on a reply:
 ```python
 import telemetry_dev
 
-# When the app replies, keep the trace id of the reply with the message:
+# When the app replies, keep the trace id and the span id of the reply with the message:
 with telemetry_dev.start_span("reply") as span:
     text = reply_to_customer(message)
-    trace_id = f"{span.span.get_span_context().trace_id:032x}"
+    context = span.span.get_span_context()
+    trace_id, span_id = f"{context.trace_id:032x}", f"{context.span_id:016x}"
 
 # Later, when the user clicks thumbs down:
-telemetry_dev.score(name="user_feedback", trace_id=trace_id, value=0, comment="Wrong amount")
+telemetry_dev.score(
+    name="user_feedback", trace_id=trace_id, span_id=span_id, value=0, comment="Wrong amount"
+)
 ```
 
 - Give `trace_id`, `session_id`, or the two, and a `span_id` of the trace for a score on one span.
@@ -438,10 +444,14 @@ telemetry_dev.score(name="user_feedback", trace_id=trace_id, value=0, comment="W
   after it sends a `ScoreError` to `on_error`. It checks the score before it sends it
   (`invalid_score`). The trace id of a span from a client that is not enabled is all zeros, and
   `score` reports it as `invalid_score`.
-- The rates of the dashboard count one `user_feedback` vote for each trace, span, or session: a
-  later `user_feedback` score on the same trace and span (or on the same session, for feedback with
-  no trace) replaces the earlier one. The SDK sends feedback with no author, so all the feedback that
-  the SDK sends on one trace, or on one span of it, counts as one vote: the newest.
+- Give the `span_id` of the reply for feedback on one reply. The SDK puts all the turns of a session
+  in one trace, so feedback with only a `trace_id` counts for the turn that started last before the
+  feedback came, which can be a later turn than the reply.
+- The rates of the dashboard count one `user_feedback` vote for each span, turn, or session: a
+  later `user_feedback` score on the same span (on the same turn, for feedback with only a trace,
+  or on the same session, for feedback with no trace) replaces the earlier one. The SDK sends
+  feedback with no author, so all the feedback that the SDK sends on one span or one turn counts as
+  one vote: the newest.
 - `score` makes one request, with no retry. `score_async` runs it in a worker thread. The key
   needs Run experiments in its Access on the API keys page (the `scores:write` scope).
 
