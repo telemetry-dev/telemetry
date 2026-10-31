@@ -54,7 +54,7 @@ A sign-in covers one workspace. To read another workspace, run `telemetry login`
 telemetry projects                       # list projects
 telemetry use support-bot                # set the default project
 telemetry traces --errors                # recent failed traces
-telemetry trace 4bf92f3577b34da6a3ce929d0e0e4736  # spans, logs, and a dashboard link
+telemetry trace 4bf92f3577b34da6a3ce929d0e0e4736  # failures, repeated calls, spans, logs, and a dashboard link
 telemetry sessions --range 7d --errors   # conversations with a failed trace
 telemetry logs --level error
 telemetry usage --range 30d --by user
@@ -62,6 +62,8 @@ telemetry payload <trace-id> <span-id> --field output
 ```
 
 Run `telemetry <command> --help` to see each command's options and examples.
+
+In human output, `telemetry trace` shows a summary above the span tree. It lists up to 5 of the failed spans where failures began, with their path. It also lists up to 5 of the operations that ran more than once, with their wall time, which counts overlapping calls once. When they list results, `traces` and `sessions` end with a likely next command on stderr. `trace` ends with the `payload` command that reads the full error, when a span where a failure began has an error message and the sign-in can read payloads.
 
 A command reads its project from `--project <name|id>`. Without that option, it uses `TELEMETRY_DEV_PROJECT`, then the default that you set with `telemetry use`. If the workspace has only one project, the command uses it.
 
