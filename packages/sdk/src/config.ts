@@ -3,7 +3,7 @@ import type { ReadableSpan, Sampler } from "@opentelemetry/sdk-trace-base";
 import {
   type BatchOptions,
   DEFAULT_BASE_URL,
-  DEFAULT_BATCH,
+  resolveBatch,
   type ExportMode,
   resolveEnv,
   type SdkLogLevel,
@@ -44,7 +44,7 @@ export interface TelemetryOptions {
   captureOutput?: boolean;
   /** Redaction hook run on captured content before stringify/truncate. */
   mask?: MaskFn;
-  /** Non-negative safe-integer truncation cap for content attributes; Infinity disables truncation. The cap also applies, with the marker, to string metadata and log attributes; any other string attribute is cut at the cap without a marker, except that a cap of 0 leaves those at 65536. init() reports invalid values through onError and returns a disabled client. Default 65536. */
+  /** Non-negative safe-integer truncation cap for content attributes, in UTF-16 units with the marker included; Infinity disables truncation. The cap also applies, with the marker, to string metadata and log attributes; any other string attribute is cut at the cap without a marker, except that a cap of 0 leaves those whole. init() reports invalid values through onError and returns a disabled client. Default Infinity: values are sent whole. */
   maxAttributeLength?: number;
   batch?: BatchOptions;
   /** Export filter. Default when registerGlobal: only spans from this SDK's instrumentation scope. */
@@ -95,6 +95,7 @@ export interface ResolvedConfig {
   sdkName: string;
 }
 
+/** @deprecated The old default of maxAttributeLength. Values are now sent whole by default. */
 export const DEFAULT_MAX_ATTRIBUTE_LENGTH = 65536;
 
 export function resolveConfig(options: TelemetryOptions = {}): ResolvedConfig {
@@ -109,7 +110,7 @@ export function resolveConfig(options: TelemetryOptions = {}): ResolvedConfig {
   }
 
   const maxAttributeLength =
-    options.maxAttributeLength == null ? DEFAULT_MAX_ATTRIBUTE_LENGTH : options.maxAttributeLength;
+    options.maxAttributeLength == null ? Number.POSITIVE_INFINITY : options.maxAttributeLength;
 
   if (
     maxAttributeLength !== Number.POSITIVE_INFINITY &&
@@ -137,7 +138,7 @@ export function resolveConfig(options: TelemetryOptions = {}): ResolvedConfig {
     captureOutput: options.captureOutput ?? true,
     mask: options.mask,
     maxAttributeLength,
-    batch: { ...DEFAULT_BATCH, ...options.batch },
+    batch: resolveBatch(options.batch),
     spanFilter: options.spanFilter,
     sessionRootOf: options.sessionRootOf,
     resourceAttributes: options.resourceAttributes,

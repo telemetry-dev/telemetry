@@ -64,15 +64,15 @@ test.each([-1, 1.5, Number.NaN, Number.NEGATIVE_INFINITY])(
   },
 );
 
-test("null maxAttributeLength uses the default for untyped callers", async () => {
+test("null maxAttributeLength sends values whole for untyped callers", async () => {
   const untypedOptions: TelemetryOptions = JSON.parse('{"maxAttributeLength":null}');
   const { client, spans } = setup(untypedOptions);
 
   expect(client.enabled).toBe(true);
   startSpan("default-limit", { output: "x".repeat(70_000) }).end();
   await flush();
-  expect(String(spans.getFinishedSpans()[0]?.attributes["gen_ai.output.messages"])).toHaveLength(
-    65_536,
+  expect(spans.getFinishedSpans()[0]?.attributes["gen_ai.output.messages"]).toBe(
+    "x".repeat(70_000),
   );
 });
 
@@ -87,7 +87,7 @@ test("maxAttributeLength Infinity preserves unlimited capture", async () => {
   );
 });
 
-test("maxAttributeLength 0 drops content without disabling the raw attribute backstop", async () => {
+test("maxAttributeLength 0 drops content and leaves raw attributes whole", async () => {
   const warned = vi.spyOn(diag, "warn");
   const { client, spans } = setup({ maxAttributeLength: 0 });
 
@@ -96,7 +96,7 @@ test("maxAttributeLength 0 drops content without disabling the raw attribute bac
   await flush();
   const attributes = spans.getFinishedSpans()[0]?.attributes ?? {};
   expect(attributes["gen_ai.output.messages"] ?? "").toBe("");
-  expect(attributes["gen_ai.request.model"]).toBe("m".repeat(65_536));
+  expect(attributes["gen_ai.request.model"]).toBe("m".repeat(70_000));
   expect(warned).not.toHaveBeenCalled();
 });
 
@@ -397,6 +397,49 @@ test("an ingest outage reaches onError once until an export gets through again",
   } finally {
     vi.useRealTimers();
   }
+});
+
+test("batched spans and logs past maxQueueBytes are dropped and reported once until the queue drains", async () => {
+  const errors: Error[] = [];
+
+  const { spans, logs } = setup({
+    exportMode: "batched",
+    // Nothing exports before flush(), so every record waits in the queue.
+    batch: { scheduledDelayMillis: 1_000_000, maxQueueBytes: 2_500 },
+    onError: (error) => errors.push(error),
+  });
+
+  const emit = (count: number) => {
+    for (let i = 0; i < count; i += 1) {
+      startSpan("tool", { type: "tool", input: "i".repeat(1_000) }).end();
+      log("l".repeat(1_000));
+    }
+  };
+
+  // Two records of about 1,000 characters fit in 2,500; the third and later are dropped.
+  emit(4);
+  expect(errors.map((error) => error.message)).toEqual([
+    expect.stringContaining("span export queue is full"),
+    expect.stringContaining("log export queue is full"),
+  ]);
+  await flush();
+  expect(spans.getFinishedSpans()).toHaveLength(2);
+  expect(logs.getFinishedLogRecords()).toHaveLength(2);
+
+  // The flush freed the queue, so new records are admitted and a new drop is reported again.
+  emit(3);
+  await flush();
+  expect(spans.getFinishedSpans()).toHaveLength(4);
+  expect(logs.getFinishedLogRecords()).toHaveLength(4);
+  expect(errors).toHaveLength(4);
+
+  // A record larger than maxQueueBytes still enters an empty queue.
+  startSpan("tool", { type: "tool", input: "i".repeat(5_000) }).end();
+  log("l".repeat(5_000));
+  await flush();
+  expect(spans.getFinishedSpans()).toHaveLength(5);
+  expect(logs.getFinishedLogRecords()).toHaveLength(5);
+  expect(errors).toHaveLength(4);
 });
 
 test("captureMasked reports whether the active client has a mask", () => {

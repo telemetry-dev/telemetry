@@ -1,9 +1,8 @@
-import { jsonAttr, reportError } from "@telemetry-dev/otel";
+import { jsonAttr, reportError, TRUNCATION_MARKER, truncate } from "@telemetry-dev/otel";
 
 import type { MaskFn } from "./config.ts";
 
-// Byte-identical with the Python SDK so truncated payloads are self-describing across languages.
-export const TRUNCATION_MARKER = "...[truncated]";
+export { TRUNCATION_MARKER, truncate } from "@telemetry-dev/otel";
 
 export interface CaptureConfig {
   mask?: MaskFn;
@@ -248,15 +247,6 @@ export function boundedCapture(
   const { value, truncated } = boundedCaptureDetails(input, options);
 
   return { value, truncated };
-}
-
-export function truncate(value: string, maxLength: number): string {
-  if (value.length <= maxLength) return value;
-
-  const limit = Math.max(maxLength, 0);
-  const marker = TRUNCATION_MARKER.slice(0, limit);
-
-  return value.slice(0, limit - marker.length) + marker;
 }
 
 /**

@@ -72,15 +72,28 @@ same service and stays supported: if a firewall allows only it, set `TELEMETRY_D
 
 Other `init()` options: `enabled` (kill switch), `registerGlobal`, `exportMode: "batched" |
 "immediate"`, `captureInput` / `captureOutput`, `mask(value, { key })` redaction hook,
-`maxAttributeLength` (a non-negative safe integer or `Infinity`; default 65536; `null` and
-`undefined` select the default, while other invalid values disable telemetry and are reported
-through `onError`; truncated values use `...[truncated]`, or its prefix when the cap is shorter than
-the marker; the cap also applies, with the marker, to string metadata and log attributes, and any
-other string attribute is cut at the cap without a marker, except that a cap of `0` leaves those at
-65536), `batch`
-(`maxExportBatchSize` 64, `scheduledDelayMillis` 1000, `maxQueueSize` 2048,
-`exportTimeoutMillis` 30000), `spanFilter`, `resourceAttributes`, `logLevel` (SDK diagnostics,
+`maxAttributeLength` (a non-negative safe integer or `Infinity`; default `Infinity`, which sends
+each value whole; `null` and `undefined` select the default, while other invalid values disable
+telemetry and are reported through `onError`; truncated values use `...[truncated]`, or its prefix
+when the cap is shorter than the marker; the cap also applies, with the marker, to string metadata
+and log attributes, and any other string attribute is cut at the cap without a marker, except that a
+cap of `0` leaves those whole), `batch`
+(`maxExportBatchSize` 64, `scheduledDelayMillis` 1000, `maxQueueSize` 2048, `maxQueueBytes`
+67108864, and `exportTimeoutMillis` 30000, the timeout of each export request), `spanFilter`, `resourceAttributes`, `logLevel` (SDK diagnostics,
 default `"warn"`), `fetch`, `waitUntil`, `onError`.
+
+Each export request is at most 16 MiB, the ingest's limit, so a larger batch is sent in several
+requests. A span or log record that is larger than 16 MiB by itself is still sent: its longest
+string values (attributes, or a log record's message) are cut to fit and end with `...[truncated]`,
+the record gets `telemetry.dev.capture.truncated = true`, and `onError` receives a report. A record
+that still does not fit, because its events or array attributes hold the excess, is dropped and
+reported.
+
+In `"batched"` mode, the spans and the log records that wait for export are each bounded to
+`maxQueueSize` records (2048 for logs) and `maxQueueBytes` of string values, each UTF-16 unit
+counted as one byte. A record that arrives when its queue is full is dropped, and the first drop
+of a series is reported to `onError`. A single record larger than `maxQueueBytes` is still queued
+when its queue is empty.
 
 Core SDK error recording keeps failure status, error type, and an exception event. It includes
 `exception.message` and `exception.stacktrace` only when both effective `captureInput` and

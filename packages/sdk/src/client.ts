@@ -6,6 +6,7 @@ import {
   BatchLogRecordProcessor,
   LoggerProvider,
   type LogRecordExporter,
+  type LogRecordProcessor,
   SimpleLogRecordProcessor,
 } from "@opentelemetry/sdk-logs";
 import type { PushMetricExporter } from "@opentelemetry/sdk-metrics";
@@ -19,6 +20,7 @@ import {
   als,
   AlsContextManager,
   BATCHED_METRIC_INTERVAL_MS,
+  batchExportTimeoutMillis,
   createExportFailures,
   createLogExporter,
   createMetricExporter,
@@ -26,6 +28,7 @@ import {
   createTraceExporter,
   diag,
   DORMANT_INTERVAL_MS,
+  ExportQueueBudget,
   otlpHeaders,
   reportError,
   SCOPE_NAME,
@@ -37,12 +40,7 @@ import {
   type Transport,
 } from "@telemetry-dev/otel";
 
-import {
-  DEFAULT_MAX_ATTRIBUTE_LENGTH,
-  type ResolvedConfig,
-  resolveConfig,
-  type TelemetryOptions,
-} from "./config.ts";
+import { type ResolvedConfig, resolveConfig, type TelemetryOptions } from "./config.ts";
 
 /** Test seam: inject in-memory exporters instead of the OTLP fetch transport. */
 export interface ClientOverrides {
@@ -128,6 +126,40 @@ export function init(options?: TelemetryOptions, overrides?: ClientOverrides): T
   }
 }
 
+// The defaults of BatchLogRecordProcessor, set here because the budget must use the same count.
+const LOG_MAX_QUEUE_SIZE = 2048;
+const LOG_MAX_EXPORT_BATCH_SIZE = 512;
+
+function boundedLogProcessor(
+  exporter: LogRecordExporter,
+  exporterTimesEachRequest: boolean,
+  config: ResolvedConfig,
+): LogRecordProcessor {
+  const budget = new ExportQueueBudget(
+    LOG_MAX_QUEUE_SIZE,
+    config.batch.maxQueueBytes,
+    "log",
+    config.onError,
+  );
+
+  const batch = new BatchLogRecordProcessor({
+    exporter: budget.releasing(exporter),
+    maxQueueSize: LOG_MAX_QUEUE_SIZE,
+    maxExportBatchSize: LOG_MAX_EXPORT_BATCH_SIZE,
+    exportTimeoutMillis: exporterTimesEachRequest
+      ? batchExportTimeoutMillis(config.batch.exportTimeoutMillis, LOG_MAX_EXPORT_BATCH_SIZE)
+      : config.batch.exportTimeoutMillis,
+  });
+
+  return {
+    onEmit: (record) => {
+      if (budget.admit(record)) batch.onEmit(record);
+    },
+    forceFlush: () => batch.forceFlush(),
+    shutdown: () => batch.shutdown(),
+  };
+}
+
 function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): TelemetryClient {
   const config = resolveConfig(options);
 
@@ -160,7 +192,12 @@ function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): Tel
   // A failed flush repeats the failure of its export, so the flush and the exporters share one
   // failure state.
   const failures = createExportFailures(config.onError);
-  const transport: Transport = { fetchImpl: config.fetchImpl, onError: config.onError, failures };
+  const transport: Transport = {
+    fetchImpl: config.fetchImpl,
+    onError: config.onError,
+    exportTimeoutMillis: config.batch.exportTimeoutMillis,
+    failures,
+  };
   const headers = config.apiKey ? otlpHeaders(config.apiKey, config.sdkName) : undefined;
 
   const spanExporter =
@@ -195,10 +232,11 @@ function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): Tel
     spanFilter,
     recordMetrics: metrics ? (span) => metrics.record(span) : undefined,
     onError: config.onError,
+    exporterTimesEachRequest: !overrides?.spanExporter,
   });
 
   // A zero cap only drops content; OpenTelemetry rejects it as a provider limit.
-  const backstopLength = config.maxAttributeLength || DEFAULT_MAX_ATTRIBUTE_LENGTH;
+  const backstopLength = config.maxAttributeLength || Number.POSITIVE_INFINITY;
 
   const provider = new BasicTracerProvider({
     resource,
@@ -249,7 +287,7 @@ function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): Tel
       const logProcessor =
         config.exportMode === "immediate"
           ? new SimpleLogRecordProcessor({ exporter: logExporter })
-          : new BatchLogRecordProcessor({ exporter: logExporter });
+          : boundedLogProcessor(logExporter, !overrides?.logRecordExporter, config);
 
       const loggerProvider = new LoggerProvider({
         resource,
