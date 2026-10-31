@@ -275,7 +275,8 @@ expect_failure "Retry commit changes package.json outside packageManager" \
   run_source workflow_dispatch refs/heads/main "$package_change_sha"
 
 mkdir -p "$tmp/archive/package"
-printf '{"name":"@telemetry-dev/mcp","version":"0.1.1"}\n' > "$tmp/archive/package/package.json"
+printf '{"name":"@telemetry-dev/mcp","version":"0.1.1","exports":{"./package.json":"./package.json"}}\n' \
+  > "$tmp/archive/package/package.json"
 tar -czf "$tmp/mcp.tgz" -C "$tmp/archive" package
 printf '{"packages/mcp":"0.1.1"}\n' > "$repo/.release-please-manifest.json"
 (
@@ -291,7 +292,7 @@ expect_failure "Packed name @telemetry-dev/other does not match release name @te
   bash -c "cd '$repo' && '$artifact_script' packages/mcp '$tmp/wrong-name.tgz'"
 printf '{"packages/mcp":"0.1.1"}\n' > "$repo/.release-please-manifest.json"
 jq -n '{
-  name: "@telemetry-dev/mcp", version: "0.1.1", bin: "dist/cli.mjs",
+  name: "@telemetry-dev/mcp", version: "0.1.1", bin: {mcp: "dist/cli.mjs"},
   exports: {".": {types: "./dist/index.d.mts", import: "./dist/index.mjs"}, "./package.json": "./package.json"}
 }' > "$tmp/archive/package/package.json"
 for missing in none dist/index.d.mts dist/cli.mjs; do
@@ -310,6 +311,23 @@ for missing in none dist/index.d.mts dist/cli.mjs; do
       bash -c "cd '$repo' && '$artifact_script' packages/mcp '$tmp/exports.tgz'"
   fi
 done
+# A string bin is the other form of bin.
+jq '.bin = "dist/cli.mjs"' "$tmp/archive/package/package.json" > "$tmp/bin.json"
+mv "$tmp/bin.json" "$tmp/archive/package/package.json"
+tar -czf "$tmp/exports.tgz" -C "$tmp/archive" package
+expect_failure "dist/cli.mjs, a target of its exports or bin" \
+  bash -c "cd '$repo' && '$artifact_script' packages/mcp '$tmp/exports.tgz'"
+# A pattern target names no file, so the check cannot match it.
+printf 'export {};\n' > "$tmp/archive/package/dist/cli.mjs"
+jq '.exports["./*"] = "./dist/*.mjs"' "$tmp/archive/package/package.json" > "$tmp/pattern.json"
+mv "$tmp/pattern.json" "$tmp/archive/package/package.json"
+tar -czf "$tmp/exports.tgz" -C "$tmp/archive" package
+expect_failure "Packed @telemetry-dev/mcp has the pattern target ./dist/*.mjs" \
+  bash -c "cd '$repo' && '$artifact_script' packages/mcp '$tmp/exports.tgz'"
+jq -n '{name: "@telemetry-dev/mcp", version: "0.1.1"}' > "$tmp/archive/package/package.json"
+tar -czf "$tmp/exports.tgz" -C "$tmp/archive" package
+expect_failure "Packed @telemetry-dev/mcp has no target in its exports or bin" \
+  bash -c "cd '$repo' && '$artifact_script' packages/mcp '$tmp/exports.tgz'"
 rm -rf "$tmp/archive/package/dist"
 
 mkdir -p "$tmp/publish/npm"

@@ -66,11 +66,19 @@ if [[ "$release_type" == node ]]; then
   # pnpm pack writes publishConfig.exports into exports. A missing target fails only on import.
   packed_files=$(tar -tf "$artifact")
   targets=$(jq -r '.exports, .bin | .. | strings' <<< "$metadata")
+  if [[ -z "$targets" ]]; then
+    echo "Packed $packed_name has no target in its exports or bin" >&2
+    exit 1
+  fi
   while IFS= read -r target; do
-    [[ -n "$target" ]] || continue
+    if [[ "$target" == *"*"* ]]; then
+      echo "Packed $packed_name has the pattern target $target, which this check cannot match" >&2
+      exit 1
+    fi
     if ! grep -Fxq "package/${target#./}" <<< "$packed_files"; then
       echo "Packed $packed_name has no $target, a target of its exports or bin" >&2
       exit 1
     fi
   done <<< "$targets"
+  echo "$packed_name: targets in exports and bin: $(wc -l <<< "$targets" | tr -d ' '), all in the tarball"
 fi
