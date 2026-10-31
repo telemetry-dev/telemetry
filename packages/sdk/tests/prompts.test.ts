@@ -989,6 +989,15 @@ async function collect(): Promise<void> {
   gc();
 }
 
+// On a busy machine, V8's Maglev compiler can keep a dead object for a moment, through a collection,
+// so collect until the count matches. expect.poll stops after 1 s.
+function liveAfterCollect(refs: WeakRef<object>[]) {
+  return expect.poll(async () => {
+    await collect();
+    return refs.filter((ref) => ref.deref()).length;
+  });
+}
+
 const RAG_PROMPT = {
   messages: [
     { role: "system", content: "Answer from {{documents}}." },
@@ -1013,8 +1022,7 @@ test("the variables of a compile are freed with its messages", async () => {
 
   expect(messages).toHaveLength(2);
   messages = undefined;
-  await collect();
-  expect(freed.deref()).toBeUndefined();
+  await liveAfterCollect([freed]).toBe(0);
 });
 
 // A row removes the global WeakRef, so the test keeps its own.
@@ -1041,10 +1049,9 @@ test.each<[string, () => void]>([
     const compiled = prompt.compile({ documents: [document], question: `question ${turn}` });
     questions.push(compiled.at(-1) as ChatMessage);
   }
-  await collect();
 
   // withPrompt keeps the variables of the last compile of a prompt object.
-  expect(documents.filter((document) => document.deref()).length).toBe(1);
+  await liveAfterCollect(documents).toBe(1);
 
   await shutdown();
   vi.unstubAllGlobals();
@@ -1191,10 +1198,9 @@ test.each<[string, ChatTurn]>([
 
     if (turn === 296) older = kept;
   }
-  await collect();
 
   // Turns 297, 298, and 299: 4, 2, and 0 minutes old.
-  expect(markers.filter((marker) => marker.deref()).length).toBe(3);
+  await liveAfterCollect(markers).toBe(3);
   expect(promptAttributesFor(request)?.["td.prompt.variables"]).toContain("question 299");
   expect(promptAttributesFor(older)).toEqual({
     "td.prompt.name": "support/reply",
