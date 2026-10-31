@@ -29,7 +29,7 @@ inputs:
     required: false
     default: "."
   comment:
-    description: Set to false to write the job summary only, with no comment on the pull request.
+    description: true or false. Set to false to write the job summary only, with no comment on the pull request. Another value gets a warning and counts as true.
     required: false
     default: "true"
   github-token:
@@ -69,14 +69,21 @@ runs:
         INPUT_DATASET: ${{ inputs.dataset }}
         INPUT_SCRIPT: ${{ inputs.script }}
         INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
         INPUT_COMMENT: ${{ inputs.comment }}
+        ACTION_ERROR: ${{ steps.run.outputs.error }}
+        MATRIX: ${{ toJSON(matrix) }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
+        DEFAULT_GITHUB_TOKEN: ${{ inputs.github-token == github.token }}
       run: node "$GITHUB_ACTION_PATH/report.mjs"
 
     - if: always() && steps.run.outputs.exit-code != '0'
       shell: bash
       env:
         EXIT_CODE: ${{ steps.run.outputs.exit-code }}
+        ACTION_ERROR: ${{ steps.run.outputs.error }}
       run: |
-        echo "::error title=telemetry.dev experiment::The experiment script exited with code ${EXIT_CODE:-unknown}."
+        if [ -z "$ACTION_ERROR" ]; then
+          echo "::error title=telemetry.dev experiment::The experiment script exited with code ${EXIT_CODE:-unknown}."
+        fi
         exit "${EXIT_CODE:-1}"
