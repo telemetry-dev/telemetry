@@ -1,4 +1,12 @@
-import { type Attributes, ROOT_CONTEXT, SpanKind, SpanStatusCode } from "@opentelemetry/api";
+import {
+  type Attributes,
+  type Context,
+  context,
+  ROOT_CONTEXT,
+  SpanKind,
+  SpanStatusCode,
+  trace,
+} from "@opentelemetry/api";
 import {
   AlwaysOffSampler,
   AlwaysOnSampler,
@@ -8,7 +16,8 @@ import {
   SamplingDecision,
   TraceIdRatioBasedSampler,
 } from "@opentelemetry/sdk-trace-base";
-import { sessionSpanContext } from "@telemetry-dev/otel";
+import { AlsContextManager, sessionSpanContext } from "@telemetry-dev/otel";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { expect, test, vi } from "vitest";
 
 import { telemetryDev } from "../src/index.ts";
@@ -4011,4 +4020,152 @@ test("overlapping evaluations stay isolated and errors clean up their call state
   expect(new Set(spanBatches[0]!.map(traceId)).size).toBe(1);
   expect(new Set(spanBatches[1]!.map(traceId)).size).toBe(1);
   expect(traceId(spanBatches[0]![0]!)).not.toBe(traceId(spanBatches[1]![0]!));
+});
+
+test("executeTool runs the tool inside its span and the tool end finishes that span", async () => {
+  context.setGlobalContextManager(new AlsContextManager(new AsyncLocalStorage<Context>()));
+
+  try {
+    const { spanBatches, overrides } = makeCapture();
+    const integ = telemetryDev(baseOptions, overrides);
+    const callId = "call-execute-tool";
+    const toolCall = { toolCallId: "t-exec", toolName: "lookup", input: { q: "x" } };
+    let activeSpanId: string | undefined;
+
+    integ.onStart?.({
+      callId,
+      operationId: "ai.generateText",
+      provider: "openai",
+      modelId: "gpt-4o",
+      messages: [{ role: "user", content: "go" }],
+    });
+    integ.onStepStart?.({ callId, stepNumber: 0 });
+    integ.onToolExecutionStart?.({ callId, toolCall });
+
+    const result = await integ.executeTool?.({
+      callId,
+      toolCallId: "t-exec",
+      execute: async () => {
+        activeSpanId = trace.getActiveSpan()?.spanContext().spanId;
+
+        return "tool output";
+      },
+    });
+
+    integ.onToolExecutionEnd?.({
+      callId,
+      toolCall,
+      toolExecutionMs: 5,
+      toolOutput: { type: "tool-result", output: { ok: true } },
+    });
+    integ.onStepEnd?.({
+      callId,
+      stepNumber: 0,
+      model,
+      text: "",
+      finishReason: "tool-calls",
+      response: { id: "r-exec", modelId: "gpt-4o" },
+      usage: { inputTokens: 3, outputTokens: 1 },
+    });
+    await integ.onEnd?.({
+      callId,
+      text: "done",
+      finishReason: "stop",
+      usage: { inputTokens: 3, outputTokens: 1 },
+    });
+
+    expect(result).toBe("tool output");
+    const spans = spanBatches[0]!;
+    const step = byOperation(spans, "chat").find((s) => s.kind === SpanKind.CLIENT)!;
+    const tools = byOperation(spans, "execute_tool");
+    expect(tools).toHaveLength(1);
+    expect(spanId(tools[0]!)).toBe(activeSpanId);
+    expect(tools[0]!.parentSpanContext?.spanId).toBe(spanId(step));
+    expect(tools[0]!.attributes["gen_ai.tool.name"]).toBe("lookup");
+  } finally {
+    context.disable();
+  }
+});
+
+test("a step that ends without onStepStart gets a span that starts with the trace", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-no-step-start";
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+    messages: [{ role: "user", content: "hi" }],
+  });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model,
+    text: "hello",
+    finishReason: "stop",
+    response: { id: "r-no-start", modelId: "gpt-4o" },
+    usage: { inputTokens: 2, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "hello",
+    finishReason: "stop",
+    usage: { inputTokens: 2, outputTokens: 1 },
+  });
+
+  const spans = spanBatches[0]!;
+  const root = spans.find((s) => s.kind === SpanKind.INTERNAL)!;
+  const steps = spans.filter((s) => s.kind === SpanKind.CLIENT);
+  expect(steps).toHaveLength(1);
+  expect(steps[0]!.parentSpanContext?.spanId).toBe(spanId(root));
+  expect(steps[0]!.startTime).toEqual(root.startTime);
+  expect(steps[0]!.attributes["gen_ai.usage.input_tokens"]).toBe(2);
+});
+
+test("ai@7 relabels the gateway provider to Vercel AI Gateway on every span", async () => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-gateway";
+  const gatewayModel = { provider: "gateway", modelId: "openai/gpt-4o" } as const;
+  const toolCall = { toolCallId: "t-gateway", toolName: "lookup", input: {} };
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "gateway",
+    modelId: "openai/gpt-4o",
+    messages: [{ role: "user", content: "hi" }],
+  });
+  integ.onStepStart?.({ callId, stepNumber: 0, provider: "gateway", modelId: "openai/gpt-4o" });
+  integ.onToolExecutionStart?.({ callId, toolCall });
+  integ.onToolExecutionEnd?.({
+    callId,
+    toolCall,
+    toolExecutionMs: 5,
+    toolOutput: { type: "tool-result", output: {} },
+  });
+  integ.onStepEnd?.({
+    callId,
+    stepNumber: 0,
+    model: gatewayModel,
+    text: "hello",
+    finishReason: "stop",
+    response: { id: "r-gateway", modelId: "openai/gpt-4o" },
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  await integ.onEnd?.({
+    callId,
+    text: "hello",
+    finishReason: "stop",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+
+  const withProvider = spanBatches[0]!.filter((s) => "gen_ai.provider.name" in s.attributes);
+  expect(withProvider.length).toBeGreaterThanOrEqual(2);
+
+  for (const s of withProvider) {
+    expect(s.attributes["gen_ai.provider.name"]).toBe("Vercel AI Gateway");
+  }
 });

@@ -10,7 +10,10 @@ import {
   TraceIdRatioBasedSampler,
 } from "@opentelemetry/sdk-trace-base";
 import { sessionSpanContext } from "@telemetry-dev/otel";
+import { generateText, tool } from "ai-v6";
+import { MockLanguageModelV3 } from "ai-v6/test";
 import { expect, test, vi } from "vitest";
+import { z } from "zod";
 
 import { telemetryDev } from "../src/v6.ts";
 
@@ -1015,4 +1018,99 @@ test("v6 exports session spans only when the configured sampler selects them", a
     expect(spanBatches.flat().map(traceId)).toEqual(expected);
     expect(errors).toEqual([]);
   }
+});
+
+// The other ai@6 tests send hand-built events; this one runs generateText through the real ai@6
+// dispatcher, so a change in the events it sends or the hooks it calls shows up here.
+test("a real ai@6 generateText run with a tool call records the root, both steps, and the tool", async () => {
+  const { spanBatches, metrics, overrides } = makeCapture();
+  let calls = 0;
+
+  const mockModel = new MockLanguageModelV3({
+    provider: "openai",
+    modelId: "gpt-4o",
+    doGenerate: async () => {
+      calls += 1;
+
+      const usage = {
+        inputTokens: { total: 4, noCache: 4, cacheRead: undefined, cacheWrite: undefined },
+        outputTokens: { total: 2, text: 2, reasoning: undefined },
+      };
+
+      return calls === 1
+        ? {
+            content: [
+              {
+                type: "tool-call" as const,
+                toolCallId: "call-1",
+                toolName: "lookup",
+                input: JSON.stringify({ q: "otel" }),
+              },
+            ],
+            finishReason: { unified: "tool-calls" as const, raw: "tool_calls" },
+            usage,
+            warnings: [],
+          }
+        : {
+            content: [{ type: "text" as const, text: "found it" }],
+            finishReason: { unified: "stop" as const, raw: "stop" },
+            usage,
+            warnings: [],
+          };
+    },
+  });
+
+  const result = await generateText({
+    model: mockModel,
+    prompt: "find otel",
+    tools: {
+      lookup: tool({
+        inputSchema: z.object({ q: z.string() }),
+        execute: async ({ q }) => ({ hits: [q] }),
+      }),
+    },
+    stopWhen: () => calls >= 2,
+    experimental_telemetry: {
+      isEnabled: true,
+      integrations: [
+        telemetryDev(
+          { apiKey: "td_live_test", environment: "test", serviceName: "svc" },
+          overrides,
+        ),
+      ],
+    },
+  });
+
+  expect(result.text).toBe("found it");
+  await vi.waitFor(() => expect(spanBatches).toHaveLength(1));
+
+  const spans = spanBatches[0]!;
+  const root = spans.find(
+    (s) => s.kind === SpanKind.INTERNAL && s.attributes["gen_ai.operation.name"] !== "execute_tool",
+  )!;
+  const steps = spans.filter((s) => s.kind === SpanKind.CLIENT);
+  const tools = spans.filter((s) => s.attributes["gen_ai.operation.name"] === "execute_tool");
+
+  expect(steps).toHaveLength(2);
+  expect(tools).toHaveLength(1);
+  expect(tools[0]!.attributes["gen_ai.tool.name"]).toBe("lookup");
+  expect(tools[0]!.parentSpanContext?.spanId).toBe(spanId(steps[0]!));
+
+  for (const step of steps) {
+    expect(step.parentSpanContext?.spanId).toBe(spanId(root));
+    expect(step.attributes["gen_ai.usage.input_tokens"]).toBe(4);
+  }
+
+  expect(steps.map((s) => s.attributes["gen_ai.response.finish_reasons"])).toEqual([
+    ["tool-calls"],
+    ["stop"],
+  ]);
+
+  // A duration per step and per tool, as with hand-built events.
+  const durations = metrics.filter((m) => m.metric === "duration");
+  expect(durations.map((m) => String(m.attributes["gen_ai.operation.name"])).sort()).toEqual([
+    "chat",
+    "chat",
+    "execute_tool",
+  ]);
 });
