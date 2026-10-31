@@ -71,7 +71,7 @@ changes of each release.
 | `base-url`          | The telemetry.dev API. Default: `https://api.telemetry.dev`.                                                                                                                                                                                                                                                          |
 | `working-directory` | The directory that the script or the command runs in. Default: `.`.                                                                                                                                                                                                                                                   |
 | `comment`           | `true` or `false`. Set to `false` to write the job summary only. Another value gets a warning and counts as `true`. Default: `true`.                                                                                                                                                                                  |
-| `github-token`      | The token that writes the comment. Default: `github.token`, which needs the `pull-requests: write` permission.                                                                                                                                                                                                        |
+| `github-token`      | The token that writes the comment. Default: `github.token`, which needs the `pull-requests: write` permission. When it is empty on a pull request, the action writes no comment and logs a warning.                                                                                                                   |
 
 The action sets `TELEMETRY_DEV_ENVIRONMENT` to `experiment` when the job does not set it, so the
 traces of the items stay out of your production pages. Thus the key must be for all environments
@@ -113,11 +113,16 @@ the action changes a copy of the comment by any app. When the token cannot write
 action logs a warning with the reason, and the job summary still has the result. A result too long
 for a comment is cut, and the job summary has all of it.
 
+The action looks for its comment on the 5 oldest and the 5 newest pages of the comments of the
+pull request, 100 comments to a page. On a pull request with more than 1,000 comments, a comment
+on a page between them is not found, and the action adds a new one.
+
 A pull request from a fork gets no secrets, thus no API key, and the action stops with the error
 "Set the api-key input or the TELEMETRY_DEV_API_KEY variable." The `if` of the example above skips
 the job for those pull requests.
 
 The comment and the summary show the name of each experiment, its status, the count of the runs
-that completed, and the value, the change from the baseline, and the pass mark of each score. With
-`runsPerItem` above 1, each item runs more than one time, and each run counts. The SDK
-writes the result for the action to a file in `RUNNER_TEMP` with mode `0600`.
+that completed and, when runs failed, of the runs that failed, and the value, the change from the
+baseline, and the pass mark of each score. With `runsPerItem` above 1, each item runs more than one
+time, and each run counts. The SDK writes the result for the action to a file in `RUNNER_TEMP`
+with mode `0600`.

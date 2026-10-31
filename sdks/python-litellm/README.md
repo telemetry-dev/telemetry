@@ -130,7 +130,7 @@ Aggregate usage keys are `input_tokens`, `output_tokens`, `total_tokens`, `cache
 
 On a LiteLLM or Router call made outside the LiteLLM proxy, each key of the call's `litellm_metadata` argument, or of `metadata` when `litellm_metadata` is absent or empty, is exported as `td.metadata.<key>`, except the keys listed below. That includes keys LiteLLM's Router adds to the argument, such as `model_group`, `deployment`, `model_info` and `api_base`. Rerank spans also add `result_count` and `search_units`.
 
-Strings, numbers, booleans and non-empty sequences of only strings, only booleans or only numbers are exported as they are; other values, including empty sequences, are JSON-encoded. Each string, including each string in a sequence, and each JSON value is truncated to `max_attribute_length`. Metadata values are not passed to the `mask` callback, and metadata is exported whatever `capture_input` and `capture_output` are set to.
+Strings, numbers, booleans and non-empty sequences of only strings, only booleans or only numbers are exported as they are; other values, including empty sequences, are JSON-encoded. When `max_attribute_length` is set, each string, including each string in a sequence, and each JSON value is truncated to it; by default they are exported whole, or cut at 65,536 characters with `telemetry-dev` 0.3.2 or earlier. Metadata values are not passed to the `mask` callback, and metadata is exported whatever `capture_input` and `capture_output` are set to.
 
 These top-level keys are always dropped:
 

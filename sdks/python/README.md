@@ -103,10 +103,6 @@ metric readers, so supplying `metric_reader=` disables this histogram. Duration,
 time-to-first-chunk metrics remain available; the first accepted streamed span with two or more
 recorded chunks reports this limitation once through `on_error` and the SDK logger.
 
-Provider integrations feature-detect `record_output_chunk`. Older core SDKs without that method
-continue delivering streams and tracing normally, but do not emit chunk-interval metrics. Upgrade
-the core SDK with provider integrations to enable the new metric.
-
 ### Span types
 
 `type=` maps to `gen_ai.operation.name`:
@@ -233,13 +229,13 @@ pinned = telemetry_dev.get_prompt("support/reply", version=13)
   call returns it at once and fetches a new copy in a background thread. Only a call with no copy
   waits for a fetch, for 10 seconds at most, also when the network stops. Calls for the same
   prompt share one fetch. `get_prompt_async` runs the same function in a worker thread.
-- A process that `os.fork()` makes keeps the copies of its parent. This includes a process of
-  `multiprocessing` with the `fork` start method. A call that starts in the child does not wait
-  for a fetch of the parent. If the call must fetch, it starts a new fetch.
-- If a signal handler forks while a call waits for a fetch, that call continues in the child. No
-  thread of the child completes that fetch. Thus the call waits until 10 seconds after the start
-  of the fetch. Then the call returns the `fallback`, or raises `PromptError` with the code
-  `timeout`.
+- A forked process keeps the copies of its parent: a process that `os.fork()` makes, one that
+  `multiprocessing` makes with the `fork` start method, or one that C code forks without running
+  fork hooks. A call that starts in the child does not wait for a fetch of the parent, or for a
+  lock that a thread of the parent held. If the call must fetch, it starts a new fetch.
+- If a signal handler forks while a call waits for a fetch, that call continues in the child,
+  where no thread completes that fetch. Thus the call looks at the cache again, and starts a new
+  fetch if it must, which it waits for up to 10 seconds more.
 - If a fetch fails, `get_prompt` returns the last copy that it fetched and reports the error
   through `on_error`. With no copy, it returns the `fallback` (`version` is `None` and
   `is_fallback` is `True`). With no fallback, it raises `PromptError` whose `code` tells why, for
@@ -501,6 +497,10 @@ from telemetry_dev.otel import create_telemetry_span_exporter
 span_exporter = create_telemetry_span_exporter()
 your_tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter))
 ```
+
+`create_telemetry_span_exporter` takes `api_key`, `base_url`, and `timeout`, in seconds (default
+`10.0`). The timeout covers each export request with its retries, also each request of a batch
+that is split.
 
 `TelemetrySpanProcessor` remains available from the package root for compatibility:
 
