@@ -868,6 +868,28 @@ test("a real chat() run opens one iteration span per model call", async () => {
   expect(metrics.filter((m) => m.metric === "duration")).toHaveLength(1);
 });
 
+// Supported engines call onConfig after onStart only before a model call, so no engine run reaches
+// the phase guard; this calls it directly.
+test.each(["init", "afterModel", "modelStream", "beforeTools", "afterTools"] as const)(
+  "onConfig for phase %s after onStart opens no iteration span",
+  async (phase) => {
+    const { spanBatches, overrides } = makeCapture();
+    const mw = middleware(overrides);
+    const ctx = makeCtx();
+
+    await mw.onStart?.(ctx);
+    await mw.onConfig?.(ctx, chatConfig());
+    Object.assign(ctx, { phase });
+    await mw.onConfig?.(ctx, chatConfig());
+    await mw.onUsage?.(ctx, { promptTokens: 10, completionTokens: 5, totalTokens: 15 } as never);
+    await mw.onFinish?.(ctx, { finishReason: "stop", duration: 50, content: "done" } as never);
+
+    const iterations = spanBatches[0]!.filter((s) => s.kind === SpanKind.CLIENT);
+    expect(iterations).toHaveLength(1);
+    expect(iterations[0]!.attributes["gen_ai.usage.input_tokens"]).toBe(10);
+  },
+);
+
 test("structured output finalization records a separate iteration span", async () => {
   const { spanBatches, metrics, overrides } = makeCapture();
   const mw = middleware(overrides);
