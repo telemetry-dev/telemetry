@@ -797,6 +797,52 @@ test("in CI mode a failed check rejects with the result", async () => {
   expect(error.result?.scores[1]?.kind).toBeNull();
 });
 
+test("in CI mode a check that failed items failed names their count, in the log too", async () => {
+  vi.stubEnv("CI", "true");
+
+  const api = fakeApi({
+    results: [
+      result({
+        checkStatus: "failed",
+        itemsTotal: 6,
+        itemsDone: 6,
+        itemsFailed: 5,
+        scores: [
+          {
+            name: "correctness",
+            kind: "pass_fail",
+            value: 1,
+            passCount: 1,
+            failCount: 0,
+            baselineValue: null,
+            delta: null,
+            minScore: 0.9,
+            passed: true,
+            itemsFailed: 5,
+          },
+        ],
+      }),
+    ],
+  });
+
+  const error = (await experiment(api, { minScores: { correctness: 0.9 } }).catch(
+    (caught: unknown) => caught,
+  )) as ExperimentError;
+
+  expect(error.code).toBe("check_failed");
+  expect(error.message).toBe(
+    `The check of support-golden-v3 failed: 5 of 6 items failed. ${URL_OF_EXPERIMENT}`,
+  );
+  expect(error.result?.scores[0]?.itemsFailed).toBe(5);
+  expect(vi.mocked(console.log).mock.calls.at(-1)?.[0]).toBe(
+    [
+      `Experiment support-golden-v3 completed. The check failed. ${URL_OF_EXPERIMENT}`,
+      "  5 of 6 items failed.",
+      "  correctness: 100% (pass mark 90%)",
+    ].join("\n"),
+  );
+});
+
 test.each([
   ["CI is off", {}, undefined],
   ["ci: false wins over CI", { ci: false }, "true"],
@@ -825,6 +871,7 @@ test("a result score that leaves out its null fields reads them as null", async 
       delta: null,
       minScore: null,
       passed: null,
+      itemsFailed: null,
     },
   ]);
 });

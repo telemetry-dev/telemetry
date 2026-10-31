@@ -103,6 +103,11 @@ export interface ExperimentScore {
   readonly minScore: number | null;
   /** Null when the score has no pass mark. */
   readonly passed: boolean | null;
+  /**
+   * The runs that failed. They have no score, so `value` leaves them out, and the check fails.
+   * Null from a server that does not send it.
+   */
+  readonly itemsFailed: number | null;
 }
 
 export interface ExperimentResult {
@@ -809,12 +814,19 @@ function checkResult(result: ExperimentResult): void {
         `${score.name} is ${formatScore(score.kind, score.value)}, under the pass mark ${formatScore(score.kind, score.minScore)}`,
     );
 
+  if (result.itemsFailed > 0) failed.unshift(itemsFailedText(result));
+
   throw new ExperimentError(
     "check_failed",
     `The check of ${result.name} failed${failed.length > 0 ? `: ${failed.join("; ")}` : ""}. ${result.url}`,
     undefined,
     { result },
   );
+}
+
+/** "5 of 6 items failed": a failed item has no score, so it fails the check. */
+function itemsFailedText(result: ExperimentResult): string {
+  return `${result.itemsFailed} of ${result.itemsDone} items failed`;
 }
 
 function describe(result: ExperimentResult): string {
@@ -827,6 +839,7 @@ function describe(result: ExperimentResult): string {
 
   return [
     `Experiment ${result.name} ${outcome}. ${result.url}`,
+    ...(result.itemsFailed > 0 ? [`  ${itemsFailedText(result)}.`] : []),
     ...result.scores.map(
       (score) =>
         `  ${score.name}: ${formatScore(score.kind, score.value)}` +
@@ -954,8 +967,15 @@ function parseScore(raw: unknown): ExperimentScore | undefined {
     delta: raw.delta ?? null,
     minScore: raw.minScore ?? null,
     passed: raw.passed ?? null,
+    itemsFailed: raw.itemsFailed ?? null,
   };
-  const numbers = [score.value, score.baselineValue, score.delta, score.minScore];
+  const numbers = [
+    score.value,
+    score.baselineValue,
+    score.delta,
+    score.minScore,
+    score.itemsFailed,
+  ];
 
   if (
     typeof score.name !== "string" ||

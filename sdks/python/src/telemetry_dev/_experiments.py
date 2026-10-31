@@ -98,7 +98,9 @@ class ExperimentScore:
     up/down score, or the mean of a number score. ``kind`` is None before the score has values.
     ``baseline_value`` is the value in the experiment that this one compares with, by default the
     dataset baseline. ``delta`` is whole points of a pass rate, or the change of a mean to one
-    decimal. ``passed`` is None when the score has no pass mark."""
+    decimal. ``passed`` is None when the score has no pass mark. ``items_failed`` is the count of
+    runs that failed: they have no score, so ``value`` leaves them out, and the check fails. It is
+    None from a server that does not send it."""
 
     name: str
     kind: str | None
@@ -109,6 +111,7 @@ class ExperimentScore:
     delta: float | None
     min_score: float | None
     passed: bool | None
+    items_failed: int | None = None
 
 
 @dataclass(frozen=True)
@@ -956,12 +959,19 @@ def _check_result(result: ExperimentResult) -> None:
         for score in result.scores
         if score.passed is False
     ]
+    if result.items_failed > 0:
+        failed.insert(0, _items_failed_text(result))
     detail = f": {'; '.join(failed)}" if failed else ""
     raise ExperimentError(
         "check_failed",
         f"The check of {result.name} failed{detail}. {result.url}",
         result=result,
     )
+
+
+def _items_failed_text(result: ExperimentResult) -> str:
+    """As "5 of 6 items failed": a failed item has no score, so it fails the check."""
+    return f"{result.items_failed} of {result.items_done} items failed"
 
 
 def _describe(result: ExperimentResult) -> str:
@@ -972,6 +982,8 @@ def _describe(result: ExperimentResult) -> str:
     else:
         outcome = f"completed. The check {result.check_status}"
     lines = [f"Experiment {result.name} {outcome}. {result.url}"]
+    if result.items_failed > 0:
+        lines.append(f"  {_items_failed_text(result)}.")
     for score in result.scores:
         mark = (
             ""
@@ -1110,7 +1122,9 @@ def _parse_score(raw: object) -> ExperimentScore | None:
     score = cast("dict[str, Any]", raw)
     name, kind, passed = score.get("name"), score.get("kind"), score.get("passed")
     pass_count, fail_count = score.get("passCount"), score.get("failCount")
-    nullable = [score.get(key) for key in ("value", "baselineValue", "delta", "minScore")]
+    nullable = [
+        score.get(key) for key in ("value", "baselineValue", "delta", "minScore", "itemsFailed")
+    ]
     if (
         not isinstance(name, str)
         or not (kind is None or isinstance(kind, str))
@@ -1120,7 +1134,7 @@ def _parse_score(raw: object) -> ExperimentScore | None:
         or not (passed is None or isinstance(passed, bool))
     ):
         return None
-    value, baseline_value, delta, min_score = nullable
+    value, baseline_value, delta, min_score, items_failed = nullable
     return ExperimentScore(
         name=name,
         kind=kind,
@@ -1131,6 +1145,7 @@ def _parse_score(raw: object) -> ExperimentScore | None:
         delta=delta,
         min_score=min_score,
         passed=passed,
+        items_failed=None if items_failed is None else int(cast("float", items_failed)),
     )
 
 
