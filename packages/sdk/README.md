@@ -321,8 +321,8 @@ the result on the pull request. It gives runExperiment the `dataset` input in
 `TELEMETRY_DEV_EXPERIMENT_DATASET`, which must agree with the `dataset` of the script, and the
 `min-scores` input in `TELEMETRY_DEV_EXPERIMENT_MIN_SCORES`, which wins over `minScores` for the
 same name. Use the action as `telemetry-dev/telemetry/actions/experiment@experiment-action-v1`, a
-tag that moves to each 1.x release of the action. In the action, a failed experiment fails the job
-also with `ci: false`.
+tag that moves to each 1.x release of the action. In the action, a failed experiment with `ci: false`
+shows its result but does not fail the job.
 
 ## Scores
 

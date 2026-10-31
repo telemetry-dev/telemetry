@@ -709,7 +709,7 @@ def test_in_ci_mode_a_failed_check_raises_with_the_result(monkeypatch: pytest.Mo
     )
 
 
-def test_in_ci_mode_a_check_that_failed_items_failed_names_their_count(
+def test_in_ci_mode_a_check_that_failed_items_failed_names_their_count_and_a_mean_with_one_decimal(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("CI", "true")
@@ -730,7 +730,46 @@ def test_in_ci_mode_a_check_that_failed_items_failed_names_their_count(
                 "minScore": 0.9,
                 "passed": True,
                 "itemsFailed": 5,
-            }
+            },
+            {
+                # toFixed(1) of the exact value, as in the comment of the action:
+                # the float 4.35 is just under 4.35.
+                "name": "helpfulness",
+                "kind": "number",
+                "value": 4.35,
+                "passCount": 0,
+                "failCount": 0,
+                "baselineValue": None,
+                "delta": None,
+                "minScore": 4.5,
+                "passed": False,
+                "itemsFailed": 5,
+            },
+            {
+                # An exact tie rounds away from zero, where f"{value:.1f}" rounds it to even.
+                "name": "tone",
+                "kind": "number",
+                "value": 4.25,
+                "passCount": 0,
+                "failCount": 0,
+                "baselineValue": None,
+                "delta": None,
+                "minScore": None,
+                "passed": None,
+                "itemsFailed": 5,
+            },
+            {
+                "name": "length",
+                "kind": "number",
+                "value": 12,
+                "passCount": 0,
+                "failCount": 0,
+                "baselineValue": None,
+                "delta": None,
+                "minScore": 10,
+                "passed": True,
+                "itemsFailed": 5,
+            },
         ],
     )
     with fake_api(results=[failed_items]) as api:
@@ -739,7 +778,8 @@ def test_in_ci_mode_a_check_that_failed_items_failed_names_their_count(
 
     assert caught.value.code == "check_failed"
     assert str(caught.value) == (
-        f"The check of support-golden-v3 failed: 5 of 6 items failed. {EXPERIMENT_URL}"
+        "The check of support-golden-v3 failed: 5 of 6 items failed; helpfulness is 4.3, "
+        f"under the pass mark 4.5. {EXPERIMENT_URL}"
     )
     assert caught.value.result is not None
     assert caught.value.result.scores[0].items_failed == 5
@@ -747,6 +787,9 @@ def test_in_ci_mode_a_check_that_failed_items_failed_names_their_count(
         f"Experiment support-golden-v3 completed. The check failed. {EXPERIMENT_URL}\n"
         "  5 of 6 items failed.\n"
         "  correctness: 100% (pass mark 90%)\n"
+        "  helpfulness: 4.3 (pass mark 4.5)\n"
+        "  tone: 4.3\n"
+        "  length: 12.0 (pass mark 10.0)\n"
     )
 
 
@@ -854,8 +897,18 @@ def test_in_github_actions_it_records_the_pull_request_its_head_commit_and_the_r
         "prUrl": "https://github.com/acme/support/pull/42",
         "runUrl": "https://github.com/acme/support/actions/runs/991",
     }
-    lines = results.read_text().splitlines()
-    assert [json.loads(line) for line in lines] == [result()]
+    # A second experiment of the script, with the CI mode off: the action does not fail the job
+    # for it, and counts its items from runsPerItem.
+    experiment(api, ci=False, runs_per_item=2)
+
+    # The same line as the TypeScript SDK writes: the body, then ci and runsPerItem.
+    assert results.read_text() == "".join(
+        json.dumps(line, ensure_ascii=False, separators=(",", ":")) + "\n"
+        for line in [
+            {**result(), "ci": True, "runsPerItem": 1},
+            {**result(), "ci": False, "runsPerItem": 2},
+        ]
+    )
     assert results.stat().st_mode & 0o777 == 0o600
 
 

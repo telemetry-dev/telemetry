@@ -293,7 +293,12 @@ export async function runExperiment(options: RunExperimentOptions): Promise<Expe
   await complete(api, created.id);
 
   const { result, body } = await waitForResult(api, created.id);
-  writeResult(env, body, api.onError);
+  // The action skips the check of a result with the CI mode off, and counts the items from runs.
+  writeResult(
+    env,
+    { ...(body as Record<string, unknown>), ci: run.inCi, runsPerItem: run.runsPerItem },
+    api.onError,
+  );
   console.log(describe(result));
 
   if (run.inCi) checkResult(result);
@@ -848,12 +853,11 @@ function describe(result: ExperimentResult): string {
   ].join("\n");
 }
 
+/** A rate as a whole percent, and a mean with one decimal, as the action and the page show them. */
 function formatScore(kind: string | null, value: number | null): string {
   if (value === null) return "no score";
 
-  return kind !== null && RATE_KINDS.has(kind)
-    ? `${Math.round(value * 100)}%`
-    : String(Math.round(value * 100) / 100);
+  return kind !== null && RATE_KINDS.has(kind) ? `${Math.round(value * 100)}%` : value.toFixed(1);
 }
 
 function parseCreated(body: unknown): Created {

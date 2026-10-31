@@ -797,7 +797,7 @@ test("in CI mode a failed check rejects with the result", async () => {
   expect(error.result?.scores[1]?.kind).toBeNull();
 });
 
-test("in CI mode a check that failed items failed names their count, in the log too", async () => {
+test("in CI mode a check that failed items failed names their count, and a mean with one decimal, in the log too", async () => {
   vi.stubEnv("CI", "true");
 
   const api = fakeApi({
@@ -820,6 +820,44 @@ test("in CI mode a check that failed items failed names their count, in the log 
             passed: true,
             itemsFailed: 5,
           },
+          {
+            // toFixed(1) of the exact value, as in the comment of the action: the float 4.35 is just under 4.35.
+            name: "helpfulness",
+            kind: "number",
+            value: 4.35,
+            passCount: 0,
+            failCount: 0,
+            baselineValue: null,
+            delta: null,
+            minScore: 4.5,
+            passed: false,
+            itemsFailed: 5,
+          },
+          {
+            // An exact tie rounds away from zero.
+            name: "tone",
+            kind: "number",
+            value: 4.25,
+            passCount: 0,
+            failCount: 0,
+            baselineValue: null,
+            delta: null,
+            minScore: null,
+            passed: null,
+            itemsFailed: 5,
+          },
+          {
+            name: "length",
+            kind: "number",
+            value: 12,
+            passCount: 0,
+            failCount: 0,
+            baselineValue: null,
+            delta: null,
+            minScore: 10,
+            passed: true,
+            itemsFailed: 5,
+          },
         ],
       }),
     ],
@@ -831,7 +869,7 @@ test("in CI mode a check that failed items failed names their count, in the log 
 
   expect(error.code).toBe("check_failed");
   expect(error.message).toBe(
-    `The check of support-golden-v3 failed: 5 of 6 items failed. ${URL_OF_EXPERIMENT}`,
+    `The check of support-golden-v3 failed: 5 of 6 items failed; helpfulness is 4.3, under the pass mark 4.5. ${URL_OF_EXPERIMENT}`,
   );
   expect(error.result?.scores[0]?.itemsFailed).toBe(5);
   expect(vi.mocked(console.log).mock.calls.at(-1)?.[0]).toBe(
@@ -839,6 +877,9 @@ test("in CI mode a check that failed items failed names their count, in the log 
       `Experiment support-golden-v3 completed. The check failed. ${URL_OF_EXPERIMENT}`,
       "  5 of 6 items failed.",
       "  correctness: 100% (pass mark 90%)",
+      "  helpfulness: 4.3 (pass mark 4.5)",
+      "  tone: 4.3",
+      "  length: 12.0 (pass mark 10.0)",
     ].join("\n"),
   );
 });
@@ -938,7 +979,15 @@ test("in GitHub Actions the experiment records the pull request, its head commit
       runUrl: "https://github.com/acme/support/actions/runs/991",
     },
   });
-  expect(readFileSync(results, "utf8")).toBe(`${JSON.stringify(result())}\n`);
+
+  // A second experiment of the script, with the CI mode off: the action does not fail the job for
+  // it, and counts its items from runsPerItem.
+  await experiment(fakeApi(), { ci: false, runsPerItem: 2 });
+
+  expect(readFileSync(results, "utf8")).toBe(
+    `${JSON.stringify({ ...result(), ci: true, runsPerItem: 1 })}\n` +
+      `${JSON.stringify({ ...result(), ci: false, runsPerItem: 2 })}\n`,
+  );
 });
 
 test("a pull request title is cut to 256 UTF-16 units without half of an emoji", async () => {
