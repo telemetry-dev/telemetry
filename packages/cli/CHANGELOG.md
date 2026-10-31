@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.5...cli-v0.1.6) (2026-10-31)
+
+
+### Features
+
+* **cli:** filter traces by agent and tool ([#143](https://github.com/telemetry-dev/telemetry/issues/143)) ([8651565](https://github.com/telemetry-dev/telemetry/commit/8651565c68c520405d917614e0aa673566e68426))
+
 ## [0.1.5](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.4...cli-v0.1.5) (2026-10-30)
 
 
