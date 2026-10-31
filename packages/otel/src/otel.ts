@@ -11,7 +11,7 @@ import type {
 import {
   type BatchOptions,
   DEFAULT_BASE_URL,
-  DEFAULT_BATCH,
+  resolveBatch,
   type ExportMode,
   resolveEnv,
 } from "./config.ts";
@@ -119,10 +119,11 @@ export class TelemetrySpanProcessor implements SpanProcessor {
     this.inner = new StampingSpanProcessor({
       exporter,
       exportMode,
-      batch: { ...DEFAULT_BATCH, ...options.batch },
+      batch: resolveBatch(options.batch),
       spanFilter: options.spanFilter,
       recordMetrics: metrics ? (span) => metrics.record(span) : undefined,
       onError: options.onError,
+      exporterTimesEachRequest: !options.spanExporter,
     });
   }
 

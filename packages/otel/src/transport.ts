@@ -12,6 +12,7 @@ import {
 } from "@opentelemetry/sdk-metrics";
 import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
 
+import { TRUNCATION_MARKER, truncate } from "./attrs.ts";
 import { DEFAULT_BATCH } from "./config.ts";
 import { reportError } from "./debug.ts";
 
@@ -334,17 +335,8 @@ const createExportLifecycle = (transport: Transport) => {
     }
   };
 
-  const exportBatch = (
-    send: (signal: AbortSignal) => Promise<boolean>,
-    resultCallback: (result: ExportResult) => void,
-  ) => {
-    if (shutDown) {
-      const error = new Error("telemetry.dev exporter is shut down");
-      callback(resultCallback, { code: ExportResultCode.FAILED, error });
-
-      return;
-    }
-
+  /** Runs one request with its own timeout, so a batch split into several requests gets one each. */
+  const timed = <T>(run: (signal: AbortSignal) => Promise<T>): Promise<T> => {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
 
@@ -355,8 +347,23 @@ const createExportLifecycle = (transport: Transport) => {
       }, timeoutMillis);
     });
 
+    return Promise.race([run(controller.signal), timeout]).finally(() => clearTimeout(timer));
+  };
+
+  const exportBatch = (
+    send: () => Promise<boolean>,
+    resultCallback: (result: ExportResult) => void,
+  ) => {
+    if (shutDown) {
+      const error = new Error("telemetry.dev exporter is shut down");
+      callback(resultCallback, { code: ExportResultCode.FAILED, error });
+
+      return;
+    }
+
     let tracked: Promise<void>;
-    tracked = Promise.race([Promise.resolve().then(() => send(controller.signal)), timeout])
+    tracked = Promise.resolve()
+      .then(send)
       .then(
         (delivered) => {
           if (delivered) failures.clear();
@@ -369,7 +376,6 @@ const createExportLifecycle = (transport: Transport) => {
         },
       )
       .finally(() => {
-        clearTimeout(timer);
         inFlight.delete(tracked);
       });
     inFlight.add(tracked);
@@ -383,47 +389,134 @@ const createExportLifecycle = (transport: Transport) => {
     return forceFlush();
   };
 
-  return { exportBatch, forceFlush, shutdown };
+  return { exportBatch, timed, forceFlush, shutdown };
 };
 
-// Stay under the ingest's 4 MiB raw body limit with headroom; oversized batches are halved.
-const MAX_BODY_BYTES = 3_500_000;
+// The ingest rejects a body over 16 MiB after gzip decoding, so this limit applies to the
+// serialized request. Keep it equal to DECOMPRESSED_BODY_LIMIT in the ingest.
+const MAX_BODY_BYTES = 16 * 1024 * 1024;
+
+const CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated";
 
 interface Serializer<T> {
   serializeRequest(items: T[]): Uint8Array | undefined;
 }
 
+type ExportRecord = {
+  readonly attributes: Readonly<Record<string, unknown>>;
+  readonly body?: unknown;
+};
+
+/**
+ * Cuts the longest string values of a record that alone serializes over the body limit, and
+ * marks the record with the truncation flag. The values are the attributes and, for a log
+ * record, its body. Returns undefined when no string value is left to cut.
+ */
+function fitRecord<T extends ExportRecord>(
+  record: T,
+  serializer: Serializer<T>,
+): Uint8Array | undefined {
+  const attributes: Record<string, unknown> = {
+    ...record.attributes,
+    [CAPTURE_TRUNCATED_ATTRIBUTE]: true,
+  };
+
+  let { body } = record;
+
+  for (;;) {
+    // The prototype keeps the record's other fields and methods, such as spanContext().
+    const candidate = Object.create(record, {
+      attributes: { value: attributes },
+      ...(typeof body === "string" && { body: { value: body } }),
+    }) as T;
+
+    const serialized = serializer.serializeRequest([candidate]);
+
+    if (!serialized) return undefined;
+    let excessBytes = serialized.byteLength - MAX_BODY_BYTES;
+
+    if (excessBytes <= 0) return serialized;
+
+    // Cut the excess from the longest values before the next serialization, since each
+    // serialization of a record this large is costly. Each UTF-16 unit takes at least one UTF-8
+    // byte, so removing excessBytes units removes at least the excess. Multi-byte text removes
+    // more, so when no value is left to cut, the next serialization decides.
+    let cutAny = false;
+
+    while (excessBytes > 0) {
+      let longestKey: string | undefined;
+      let longestLength = TRUNCATION_MARKER.length;
+
+      for (const [key, value] of Object.entries(attributes)) {
+        if (typeof value === "string" && value.length > longestLength) {
+          longestKey = key;
+          longestLength = value.length;
+        }
+      }
+
+      const cutBody = typeof body === "string" && body.length > longestLength;
+
+      if (cutBody) longestLength = (body as string).length;
+      else if (longestKey === undefined) break;
+
+      const cut = Math.min(excessBytes, longestLength - TRUNCATION_MARKER.length);
+
+      if (cutBody) body = truncate(body as string, longestLength - cut);
+      else
+        attributes[longestKey!] = truncate(attributes[longestKey!] as string, longestLength - cut);
+      excessBytes -= cut;
+      cutAny = true;
+    }
+
+    if (!cutAny) return undefined;
+  }
+}
+
 /** The sender resolves to true when at least one request reached the ingest. */
-function createOtlpBatchSender<T>(
+function createOtlpBatchSender<T extends ExportRecord>(
   serializer: Serializer<T>,
   target: OtlpTarget,
   transport: Transport,
   label: string,
-): (items: T[], signal: AbortSignal) => Promise<boolean> {
-  const send = async (items: T[], signal: AbortSignal): Promise<boolean> => {
-    const body = serializer.serializeRequest(items);
+  timed: ReturnType<typeof createExportLifecycle>["timed"],
+): (items: T[]) => Promise<boolean> {
+  const send = async (items: T[]): Promise<boolean> => {
+    let body = serializer.serializeRequest(items);
 
     if (!body || body.byteLength === 0) return false;
 
     if (body.byteLength > MAX_BODY_BYTES) {
       if (items.length > 1) {
         const mid = Math.ceil(items.length / 2);
-        const first = await send(items.slice(0, mid), signal);
-        const second = await send(items.slice(mid), signal);
+        const first = await send(items.slice(0, mid));
+        const second = await send(items.slice(mid));
 
         return first || second;
       }
 
-      // A single record beyond the limit can never be accepted; drop it instead of wedging the batch.
+      const fitted = fitRecord(items[0]!, serializer);
+
+      if (fitted === undefined) {
+        // A record the ingest can never accept is dropped instead of wedging the batch.
+        reportError(
+          transport.onError,
+          new Error(`telemetry.dev: ${label} record exceeds max export size, dropped`),
+        );
+
+        return false;
+      }
+
       reportError(
         transport.onError,
-        new Error(`telemetry.dev: ${label} record exceeds max export size, dropped`),
+        new Error(
+          `telemetry.dev: ${label} record exceeds max export size; its longest values were truncated`,
+        ),
       );
-
-      return false;
+      body = fitted;
     }
 
-    await postSerialized(body, target, transport, label, signal);
+    const request = body;
+    await timed((signal) => postSerialized(request, target, transport, label, signal));
 
     return true;
   };
@@ -432,18 +525,18 @@ function createOtlpBatchSender<T>(
 }
 
 export function createTraceExporter(target: OtlpTarget, transport: Transport): SpanExporter {
+  const lifecycle = createExportLifecycle(transport);
   const send = createOtlpBatchSender<ReadableSpan>(
     ProtobufTraceSerializer,
     target,
     transport,
     "trace",
+    lifecycle.timed,
   );
-
-  const lifecycle = createExportLifecycle(transport);
 
   return {
     export(spans, resultCallback) {
-      lifecycle.exportBatch((signal) => send(spans, signal), resultCallback);
+      lifecycle.exportBatch(() => send(spans), resultCallback);
     },
     forceFlush: lifecycle.forceFlush,
     shutdown: lifecycle.shutdown,
@@ -451,18 +544,18 @@ export function createTraceExporter(target: OtlpTarget, transport: Transport): S
 }
 
 export function createLogExporter(target: OtlpTarget, transport: Transport): LogRecordExporter {
+  const lifecycle = createExportLifecycle(transport);
   const send = createOtlpBatchSender<ReadableLogRecord>(
     ProtobufLogsSerializer,
     target,
     transport,
     "log",
+    lifecycle.timed,
   );
-
-  const lifecycle = createExportLifecycle(transport);
 
   return {
     export(logs, resultCallback) {
-      lifecycle.exportBatch((signal) => send(logs, signal), resultCallback);
+      lifecycle.exportBatch(() => send(logs), resultCallback);
     },
     forceFlush: lifecycle.forceFlush,
     shutdown: lifecycle.shutdown,
@@ -474,7 +567,7 @@ export function createMetricExporter(target: OtlpTarget, transport: Transport): 
 
   return {
     export(resourceMetrics: ResourceMetrics, resultCallback) {
-      lifecycle.exportBatch(async (signal) => {
+      lifecycle.exportBatch(async () => {
         const hasData = resourceMetrics.scopeMetrics.some((scope) =>
           scope.metrics.some((metric) => metric.dataPoints.length > 0),
         );
@@ -484,7 +577,9 @@ export function createMetricExporter(target: OtlpTarget, transport: Transport): 
           : undefined;
 
         if (body === undefined || body.byteLength === 0) return false;
-        await postSerialized(body, target, transport, "metric", signal);
+        await lifecycle.timed((signal) =>
+          postSerialized(body, target, transport, "metric", signal),
+        );
 
         return true;
       }, resultCallback);

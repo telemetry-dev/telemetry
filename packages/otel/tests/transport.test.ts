@@ -318,34 +318,181 @@ test.each([
   },
 );
 
-test("oversized batches split into multiple POSTs", async () => {
-  const { calls, fetchImpl } = makeFetch([200]);
+const MAX_BODY_BYTES = 16 * 1024 * 1024;
 
-  const exporter = createTraceExporter(
-    { url: "https://ingest.example/v1/traces", headers: otlpHeaders("td_live_x") },
-    { fetchImpl },
-  );
+const countByte = (body: Uint8Array, char: string) => {
+  const code = char.charCodeAt(0);
+  let count = 0;
 
-  // Two ~2 MB spans: combined serialization exceeds the 3.5 MB guard, each half fits.
-  const code = await exportSpans(exporter, makeSpans(2, 2_000_000));
-  expect(code).toBe(ExportResultCode.SUCCESS);
-  expect(calls).toHaveLength(2);
-});
+  for (const byte of body) if (byte === code) count += 1;
 
-test("a single span beyond the limit is dropped with onError, not wedged", async () => {
-  const errors: unknown[] = [];
-  const { calls, fetchImpl } = makeFetch([200]);
+  return count;
+};
 
-  const exporter = createTraceExporter(
-    { url: "https://ingest.example/v1/traces", headers: otlpHeaders("td_live_x") },
-    { fetchImpl, onError: (e) => errors.push(e) },
-  );
+// Payloads near the 16 MiB limit take seconds to serialize.
+const LARGE_PAYLOAD_TIMEOUT_MS = 30_000;
 
-  const code = await exportSpans(exporter, makeSpans(1, 4_000_000));
-  expect(code).toBe(ExportResultCode.SUCCESS);
-  expect(calls).toHaveLength(0);
-  expect(String(errors[0])).toContain("exceeds max export size");
-});
+test(
+  "oversized batches split into multiple POSTs that each fit the limit and get their own timeout",
+  async () => {
+    const { calls, fetchImpl } = makeFetch([200]);
+    const REQUEST_MS = 600;
+
+    const slowFetch: typeof fetch = (input, init) =>
+      new Promise((resolve) => setTimeout(() => resolve(fetchImpl(input, init)), REQUEST_MS));
+
+    // Two requests take longer than one timeout, so a timeout over the whole export fails this.
+    const exporter = createTraceExporter(
+      { url: "https://ingest.example/v1/traces", headers: otlpHeaders("td_live_x") },
+      { fetchImpl: slowFetch, exportTimeoutMillis: 1_000 },
+    );
+
+    // Two 9 MB spans: together they exceed the 16 MiB limit, each one fits.
+    const code = await exportSpans(exporter, makeSpans(2, 9_000_000));
+    expect(code).toBe(ExportResultCode.SUCCESS);
+    expect(calls).toHaveLength(2);
+
+    for (const call of calls) {
+      const body = await gunzip(call.body);
+      expect(body.byteLength).toBeLessThanOrEqual(MAX_BODY_BYTES);
+      expect(countByte(body, "p")).toBeGreaterThanOrEqual(9_000_000);
+    }
+  },
+  LARGE_PAYLOAD_TIMEOUT_MS,
+);
+
+// The flag's key followed by its value, an AnyValue with bool_value true.
+const TRUNCATED_FLAG = Buffer.from("telemetry.dev.capture.truncated\x12\x02\x10\x01", "latin1");
+
+const oversizedAttributes = {
+  first: "a".repeat(10_000_000),
+  other: "z".repeat(9_000_000),
+  keep: "kept",
+};
+
+test.each([
+  {
+    name: "span",
+    send: (fetchImpl: typeof fetch, onError: (error: Error) => void) => {
+      const [span] = makeSpans(1);
+      const record = Object.create(span!, { attributes: { value: oversizedAttributes } });
+
+      return exportSpans(createTraceExporter(target, { fetchImpl, onError }), [record]);
+    },
+  },
+  {
+    name: "log record",
+    send: (fetchImpl: typeof fetch, onError: (error: Error) => void) =>
+      new Promise<ExportResultCode>((resolve) =>
+        createLogExporter(target, { fetchImpl, onError }).export(
+          [{ ...LOG_RECORD, attributes: oversizedAttributes }],
+          (result) => resolve(result.code),
+        ),
+      ),
+  },
+])(
+  "a $name over the limit is sent with its longest attribute cut and flagged",
+  async ({ send }) => {
+    const errors: Error[] = [];
+    const { calls, fetchImpl } = makeFetch([200]);
+
+    expect(await send(fetchImpl, (error) => errors.push(error))).toBe(ExportResultCode.SUCCESS);
+    expect(calls).toHaveLength(1);
+    const body = await gunzip(calls[0]!.body);
+    const text = new TextDecoder().decode(body);
+
+    // Only the excess is cut: the request ends up just under the limit, not far below it.
+    expect(body.byteLength).toBeLessThanOrEqual(MAX_BODY_BYTES);
+    expect(body.byteLength).toBeGreaterThan(MAX_BODY_BYTES - 64);
+    // The shorter attribute is whole; span and trace ids can add a few more "z" bytes.
+    expect(countByte(body, "z")).toBeGreaterThanOrEqual(9_000_000);
+    expect(text).toContain("a...[truncated]");
+    expect(text).toContain("kept");
+    expect(Buffer.from(body).includes(TRUNCATED_FLAG)).toBe(true);
+    expect(String(errors[0])).toContain("longest values were truncated");
+  },
+  LARGE_PAYLOAD_TIMEOUT_MS,
+);
+
+test(
+  "a log record whose message is over the limit is sent with its message cut and flagged",
+  async () => {
+    const errors: Error[] = [];
+    const { calls, fetchImpl } = makeFetch([200]);
+
+    const code = await new Promise<ExportResultCode>((resolve) =>
+      createLogExporter(target, { fetchImpl, onError: (error) => errors.push(error) }).export(
+        [{ ...LOG_RECORD, body: "b".repeat(17_000_000), attributes: { keep: "kept" } }],
+        (result) => resolve(result.code),
+      ),
+    );
+
+    expect(code).toBe(ExportResultCode.SUCCESS);
+    expect(calls).toHaveLength(1);
+    const body = await gunzip(calls[0]!.body);
+    const text = new TextDecoder().decode(body);
+    expect(body.byteLength).toBeLessThanOrEqual(MAX_BODY_BYTES);
+    expect(body.byteLength).toBeGreaterThan(MAX_BODY_BYTES - 64);
+    expect(text).toContain("b...[truncated]");
+    expect(text).toContain("kept");
+    expect(Buffer.from(body).includes(TRUNCATED_FLAG)).toBe(true);
+    expect(String(errors[0])).toContain("longest values were truncated");
+  },
+  LARGE_PAYLOAD_TIMEOUT_MS,
+);
+
+test(
+  "a span that fits once its multi-byte text is cut is sent, not dropped",
+  async () => {
+    const [span] = makeSpans(1);
+
+    const withPayload = (length: number): ReadableSpan =>
+      Object.create(span!, {
+        attributes: { value: { payload: ["p".repeat(length)], emoji: "🤖".repeat(100) } },
+      });
+
+    // The array cannot be cut. Cutting the emoji to the marker removes 386 bytes but only 186
+    // UTF-16 units, so the count of units alone says the span still does not fit.
+    const base = ProtobufTraceSerializer.serializeRequest([withPayload(16_000_000)])!.byteLength;
+    const record = withPayload(16_000_000 + MAX_BODY_BYTES - base + 300);
+    const { calls, fetchImpl } = makeFetch([200]);
+
+    expect(await exportSpans(createTraceExporter(target, { fetchImpl }), [record])).toBe(
+      ExportResultCode.SUCCESS,
+    );
+    expect(calls).toHaveLength(1);
+    const body = await gunzip(calls[0]!.body);
+    expect(body.byteLength).toBeLessThanOrEqual(MAX_BODY_BYTES);
+    expect(Buffer.from(body).includes(TRUNCATED_FLAG)).toBe(true);
+    expect(new TextDecoder().decode(body)).not.toContain("🤖");
+  },
+  LARGE_PAYLOAD_TIMEOUT_MS,
+);
+
+test(
+  "a span over the limit without a string attribute to cut is dropped with onError",
+  async () => {
+    const errors: unknown[] = [];
+    const { calls, fetchImpl } = makeFetch([200]);
+
+    const exporter = createTraceExporter(
+      { url: "https://ingest.example/v1/traces", headers: otlpHeaders("td_live_x") },
+      { fetchImpl, onError: (e) => errors.push(e) },
+    );
+
+    const [span] = makeSpans(1);
+
+    const record = Object.create(span!, {
+      attributes: { value: { payload: ["p".repeat(17_000_000)] } },
+    });
+
+    const code = await exportSpans(exporter, [record]);
+    expect(code).toBe(ExportResultCode.SUCCESS);
+    expect(calls).toHaveLength(0);
+    expect(String(errors[0])).toContain("exceeds max export size, dropped");
+  },
+  LARGE_PAYLOAD_TIMEOUT_MS,
+);
 
 test("metric exporter skips POSTs when every data point set is empty", async () => {
   const { calls, fetchImpl } = makeFetch([200]);

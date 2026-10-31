@@ -1,4 +1,4 @@
-import type { Attributes, Context } from "@opentelemetry/api";
+import { type Attributes, type Context, TraceFlags } from "@opentelemetry/api";
 import {
   BatchSpanProcessor,
   type ReadableSpan,
@@ -8,9 +8,10 @@ import {
   type SpanProcessor,
 } from "@opentelemetry/sdk-trace-base";
 
-import type { BatchOptions, ExportMode } from "./config.ts";
+import { type BatchOptions, batchExportTimeoutMillis, type ExportMode } from "./config.ts";
 import { activeContext, PROPAGATED_KEY, propagatedFromContext } from "./context.ts";
 import { reportError } from "./debug.ts";
+import { ExportQueueBudget } from "./queue.ts";
 
 export interface StampingProcessorOptions {
   exporter: SpanExporter;
@@ -19,6 +20,8 @@ export interface StampingProcessorOptions {
   spanFilter?: (span: ReadableSpan) => boolean;
   recordMetrics?: (span: ReadableSpan) => void;
   onError?: (error: Error) => void;
+  /** The exporter applies `batch.exportTimeoutMillis` to each request, as the telemetry.dev exporter does. */
+  exporterTimesEachRequest?: boolean;
 }
 
 /**
@@ -27,12 +30,27 @@ export interface StampingProcessorOptions {
  */
 export class StampingSpanProcessor implements SpanProcessor {
   private readonly inner: SpanProcessor;
+  private readonly budget?: ExportQueueBudget;
 
   constructor(private readonly options: StampingProcessorOptions) {
-    this.inner =
-      options.exportMode === "immediate"
-        ? new SimpleSpanProcessor(options.exporter)
-        : new BatchSpanProcessor(options.exporter, options.batch);
+    const { batch } = options;
+
+    if (options.exportMode === "immediate") {
+      this.inner = new SimpleSpanProcessor(options.exporter);
+    } else {
+      this.budget = new ExportQueueBudget(
+        batch.maxQueueSize,
+        batch.maxQueueBytes,
+        "span",
+        options.onError,
+      );
+      this.inner = new BatchSpanProcessor(this.budget.releasing(options.exporter), {
+        ...batch,
+        exportTimeoutMillis: options.exporterTimesEachRequest
+          ? batchExportTimeoutMillis(batch.exportTimeoutMillis, batch.maxExportBatchSize)
+          : batch.exportTimeoutMillis,
+      });
+    }
   }
 
   onStart(span: Span, parentContext: Context): void {
@@ -62,6 +80,11 @@ export class StampingSpanProcessor implements SpanProcessor {
     } catch (error) {
       reportError(this.options.onError, error);
     }
+
+    // The batch processor drops unsampled spans itself, so the budget does not count them.
+    const sampled = (span.spanContext().traceFlags & TraceFlags.SAMPLED) !== 0;
+
+    if (this.budget && sampled && !this.budget.admit(span)) return;
 
     this.inner.onEnd(span);
   }
