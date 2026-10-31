@@ -185,7 +185,7 @@ class TelemetrySpanProcessor(SpanProcessor):
             self._inner.on_end(span)
 
     def shutdown(self) -> None:
-        if after_export((self, "shutdown"), self.shutdown):
+        if after_export((self, "shutdown"), self.shutdown, shutdown=True):
             return
         if self._inner is not None:
             try:
