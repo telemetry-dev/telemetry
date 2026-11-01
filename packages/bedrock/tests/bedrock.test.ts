@@ -7,9 +7,11 @@ import {
   InvokeModelWithResponseStreamCommand,
   type ConverseCommandInput,
 } from "@aws-sdk/client-bedrock-runtime";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import { afterEach, expect, test, vi } from "vitest";
 
-import { type ChatMessage, getPrompt, type MaskFn } from "@telemetry-dev/sdk";
+import { type ChatMessage, getPrompt, MAX_RECORD_BYTES, type MaskFn } from "@telemetry-dev/sdk";
 import * as telemetrySdk from "@telemetry-dev/sdk";
 
 import { instrumentBedrock, uninstrumentBedrock, wrapBedrock } from "../src/index.ts";
@@ -19,6 +21,7 @@ import {
   collect,
   jsonAttr,
   jsonRequestHandler,
+  releaseOtherStream,
   setup,
   streamOf,
   teardown,
@@ -232,6 +235,40 @@ test("ConverseStream accumulates output and ends partial on early break", async 
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
+test("a ConverseStream read through an iterator outlives its collected response", async () => {
+  const spans = setup();
+  setFlagsFromString("--expose-gc");
+  // With --expose-gc set, a new context defines gc().
+  const gc = runInNewContext("gc") as () => void;
+  const client = wrapBedrock(new FakeClient([{ stream: textStream("kept", 2) }]));
+  // Only the iterator stays reachable; the response that made it is collected below.
+  const iterator = await (async () => {
+    const response = (await client.send(
+      new ConverseStreamCommand({ modelId: "anthropic.claude", messages: [] }),
+    )) as { stream: AsyncIterable<unknown> };
+
+    return response.stream[Symbol.asyncIterator]();
+  })();
+
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    gc();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  expect(spans.getFinishedSpans()).toEqual([]);
+  while (!(await iterator.next()).done);
+
+  const [span] = spans.getFinishedSpans();
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    {
+      role: "assistant",
+      parts: [{ type: "text", content: "keptkept" }],
+      finish_reason: "end_turn",
+    },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
+
 function textStream(text: string, repeat = 1) {
   return streamOf([
     { messageStart: { role: "assistant" } },
@@ -302,6 +339,41 @@ test.each([false, true])(
       expect(retained.length).toBeLessThanOrEqual(48 * 1024);
       expect(retained).toBe("x".repeat(retained.length));
     }
+  },
+);
+
+// Each 1 MiB delta costs its JSON, {"text":"..."}, 11 bytes more than its text. Fifteen fit in
+// MAX_RECORD_BYTES, the sixteenth does not, so the cut stream keeps 15 MiB.
+test.each([
+  [64 * 1024, false],
+  [MAX_RECORD_BYTES, true],
+] as const)(
+  "with the default bounds a ConverseStream of %s text bytes is cut: %s",
+  async (length, cut) => {
+    const spans = setup({ batch: {} });
+    releaseOtherStream();
+    const piece = "x".repeat(1024 * 1024);
+
+    const deltas = Array.from({ length: Math.ceil(length / piece.length) }, (_, index) => ({
+      contentBlockDelta: {
+        contentBlockIndex: 0,
+        delta: { text: piece.slice(0, Math.min(piece.length, length - index * piece.length)) },
+      },
+    }));
+
+    await streamedConverse(
+      streamOf([
+        { messageStart: { role: "assistant" } },
+        ...deltas,
+        { messageStop: { stopReason: "end_turn" } },
+      ]),
+    );
+
+    const [span] = spans.getFinishedSpans();
+    const text = jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content as string;
+
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(cut ? true : undefined);
+    expect(text.length).toBe(cut ? MAX_RECORD_BYTES - 1024 * 1024 : length);
   },
 );
 

@@ -2,10 +2,12 @@ import {
   boundedCapture,
   boundedCaptureDetails,
   captureEnabled,
+  MAX_RECORD_BYTES,
   startSpan,
   type SpanFields,
   type SpanHandle,
   type StartSpanOptions,
+  StreamCapture,
 } from "@telemetry-dev/sdk";
 import * as telemetrySdk from "@telemetry-dev/sdk";
 import OpenAI from "openai";
@@ -24,14 +26,23 @@ const ORIGINAL = Symbol("telemetry.dev.openai.original");
 const wrappedClients = new WeakSet<object>();
 const wrappedRealtimeConnections = new WeakSet<object>();
 let realtimeEventSequence = 0;
-const MAX_CAPTURE_LENGTH = 65536;
 const REALTIME_CORRELATION_KEY = "__telemetry_dev_response_id";
 const REALTIME_TRACE_TIMEOUT_MS = 5 * 60_000;
 const REALTIME_MAX_IN_FLIGHT = 100;
-const REALTIME_CAPTURE_MAX_BYTES = 48 * 1024;
+// Output and content indices past this are not kept, and the capture is marked cut.
 const REALTIME_CAPTURE_MAX_ITEMS = 1_000;
-const CHAT_STREAM_CAPTURE_MAX_BYTES = 48 * 1024;
+// More choices, tool calls, or finish reasons than this are not kept, and the capture is marked cut.
 const CHAT_STREAM_CAPTURE_MAX_ITEMS = 1_000;
+// Each streamed finish reason is cut to this many characters, as in the other integrations.
+const FINISH_REASON_MAX_LENGTH = 128;
+// Finish reasons stay outside the stream budget so a terminal one is still exported. Their own
+// budget fits CHAT_STREAM_CAPTURE_MAX_ITEMS records of the largest JSON a cut reason can take.
+const FINISH_REASON_BUDGET_BYTES =
+  CHAT_STREAM_CAPTURE_MAX_ITEMS *
+  boundedCaptureDetails({
+    index: -Number.MAX_VALUE,
+    finish_reason: "\u0000".repeat(FINISH_REASON_MAX_LENGTH),
+  }).bytes;
 
 type JsonValue =
   | string
@@ -111,7 +122,7 @@ function readOwn(
   }
 }
 
-function sanitizeResponsesCapture(value: unknown, maxBytes = CHAT_STREAM_CAPTURE_MAX_BYTES) {
+function sanitizeResponsesCapture(value: unknown, maxBytes = MAX_RECORD_BYTES) {
   return boundedCapture(value, {
     maxBytes,
     skip(key, item, parent, path) {
@@ -297,7 +308,7 @@ function responsesUsage<T>(usage: T): SpanFields["usage"] {
 function responsesResponse<T>(
   response: T,
   captureOutput = captureEnabled("output"),
-  maxBytes = CHAT_STREAM_CAPTURE_MAX_BYTES,
+  maxBytes = MAX_RECORD_BYTES,
 ): SpanFields {
   const r = asRecord(response) ?? {};
   const status = readString(r.status);
@@ -764,13 +775,25 @@ interface ChatMessageFields {
 
 interface ChatCaptureBudget {
   remainingBytes: number;
-  remainingItems: number;
   truncated: boolean;
 }
 
-interface ChatCaptureReservation {
-  bytes: number;
-  items: number;
+/** A ChatCaptureBudget whose bytes are held in the process-wide stream budget. */
+class StreamChatCaptureBudget implements ChatCaptureBudget {
+  readonly capture: StreamCapture;
+  truncated = false;
+
+  constructor(reservedBytes: number) {
+    this.capture = new StreamCapture(reservedBytes);
+  }
+
+  get remainingBytes(): number {
+    return this.capture.limit - this.capture.bytes;
+  }
+
+  set remainingBytes(bytes: number) {
+    this.capture.bytes = this.capture.limit - bytes;
+  }
 }
 
 interface ChatToolCallDelta {
@@ -784,15 +807,14 @@ interface ChatToolCallDelta {
   readFailed: boolean;
 }
 
-function reserveChatStructure(budget: ChatCaptureBudget, bytes: number, items = 0): boolean {
-  if (budget.truncated || budget.remainingBytes < bytes || budget.remainingItems < items) {
+function reserveChatStructure(budget: ChatCaptureBudget, bytes: number): boolean {
+  if (budget.truncated || budget.remainingBytes < bytes) {
     budget.truncated = true;
 
     return false;
   }
 
   budget.remainingBytes -= bytes;
-  budget.remainingItems -= items;
 
   return true;
 }
@@ -802,22 +824,18 @@ function captureChatString(
   budget: ChatCaptureBudget,
   structureBytes: number,
   includeQuotes: boolean,
-  includeItem: boolean,
   recoverable = false,
 ): string | undefined {
   const quoteRefund = includeQuotes ? 0 : 2;
   const availableBytes = budget.remainingBytes - structureBytes + quoteRefund;
 
-  if (budget.truncated || availableBytes < 0 || (includeItem && budget.remainingItems < 1)) {
+  if (budget.truncated || availableBytes < 0) {
     if (!recoverable) budget.truncated = true;
 
     return undefined;
   }
 
-  const capture = boundedCaptureDetails(value, {
-    maxBytes: availableBytes,
-    maxItems: 1,
-  });
+  const capture = boundedCaptureDetails(value, { maxBytes: availableBytes });
 
   const captured = readString(capture.value);
 
@@ -829,8 +847,6 @@ function captureChatString(
 
   budget.remainingBytes -= capture.bytes - quoteRefund + structureBytes;
 
-  if (includeItem) budget.remainingItems -= 1;
-
   return captured;
 }
 
@@ -839,12 +855,9 @@ function releaseCapturedChatString(
   budget: ChatCaptureBudget,
   structureBytes: number,
   includeQuotes: boolean,
-  includeItem: boolean,
 ): void {
   const capture = boundedCaptureDetails(value);
   budget.remainingBytes += capture.bytes - (includeQuotes ? 0 : 2) + structureBytes;
-
-  if (includeItem) budget.remainingItems += 1;
 }
 
 function releaseCapturedChatField(
@@ -856,7 +869,6 @@ function releaseCapturedChatField(
   const retained = boundedCaptureDetails({ [key]: value });
   const empty = boundedCaptureDetails({});
   budget.remainingBytes += retained.bytes - empty.bytes + (hasSibling ? 1 : 0);
-  budget.remainingItems += retained.items - empty.items;
 }
 
 function replaceChatString(
@@ -865,30 +877,19 @@ function replaceChatString(
   budget: ChatCaptureBudget,
 ): string | undefined {
   const held = boundedCaptureDetails(current);
-
-  const capture = boundedCaptureDetails(value, {
-    maxBytes: budget.remainingBytes + held.bytes,
-    maxItems: budget.remainingItems + held.items,
-  });
-
+  const capture = boundedCaptureDetails(value, { maxBytes: budget.remainingBytes + held.bytes });
   const captured = readString(capture.value);
 
   if (capture.truncated || captured === undefined) return undefined;
 
   budget.remainingBytes += held.bytes - capture.bytes;
-  budget.remainingItems += held.items - capture.items;
 
   return captured;
 }
 
 function replaceChatNullWithString(value: string, budget: ChatCaptureBudget): string | undefined {
   const held = boundedCaptureDetails(null);
-
-  const capture = boundedCaptureDetails(value, {
-    maxBytes: budget.remainingBytes + held.bytes,
-    maxItems: budget.remainingItems + held.items,
-  });
-
+  const capture = boundedCaptureDetails(value, { maxBytes: budget.remainingBytes + held.bytes });
   const captured = readString(capture.value);
 
   if (capture.truncated || captured === undefined) {
@@ -898,7 +899,6 @@ function replaceChatNullWithString(value: string, budget: ChatCaptureBudget): st
   }
 
   budget.remainingBytes += held.bytes - capture.bytes;
-  budget.remainingItems += held.items - capture.items;
 
   return captured;
 }
@@ -907,18 +907,15 @@ function replaceFinishReason(
   index: number,
   finishReason: string,
   states: Map<number, string>,
-  reservations: Map<number, ChatCaptureReservation>,
+  reservations: Map<number, number>,
   rejected: Set<number>,
   budget: ChatCaptureBudget,
 ): void {
-  const held = reservations.get(index) ?? { bytes: 0, items: 0 };
+  const held = reservations.get(index) ?? 0;
 
   const capture = boundedCaptureDetails(
     { index, finish_reason: finishReason },
-    {
-      maxBytes: budget.remainingBytes + held.bytes,
-      maxItems: budget.remainingItems + held.items,
-    },
+    { maxBytes: budget.remainingBytes + held },
   );
 
   const captured = asRecord(capture.value);
@@ -926,8 +923,7 @@ function replaceFinishReason(
   const capturedReason = readString(captured?.finish_reason);
 
   if (capture.truncated || capturedIndex === undefined || capturedReason === undefined) {
-    budget.remainingBytes += held.bytes;
-    budget.remainingItems += held.items;
+    budget.remainingBytes += held;
     reservations.delete(index);
     states.delete(index);
 
@@ -937,9 +933,8 @@ function replaceFinishReason(
     return;
   }
 
-  budget.remainingBytes += held.bytes - capture.bytes;
-  budget.remainingItems += held.items - capture.items;
-  reservations.set(capturedIndex, { bytes: capture.bytes, items: capture.items });
+  budget.remainingBytes += held - capture.bytes;
+  reservations.set(capturedIndex, capture.bytes);
   states.set(capturedIndex, capturedReason);
   rejected.delete(capturedIndex);
 }
@@ -990,7 +985,7 @@ function captureToolCallPayload(
   const payload = { ...asRecord(current[payloadKey]) };
 
   if (!hadPayload) {
-    if (!reserveChatStructure(budget, JSON.stringify(payloadKey).length + 4, 1)) return false;
+    if (!reserveChatStructure(budget, JSON.stringify(payloadKey).length + 4)) return false;
     current[payloadKey] = payload;
     changed = true;
   }
@@ -1000,7 +995,7 @@ function captureToolCallPayload(
 
     const capturedName =
       currentName === undefined
-        ? captureChatString(name, budget, JSON.stringify("name").length + 2, true, true, true)
+        ? captureChatString(name, budget, JSON.stringify("name").length + 2, true, true)
         : replaceChatString(currentName, name, budget);
 
     if (capturedName !== undefined) {
@@ -1009,13 +1004,7 @@ function captureToolCallPayload(
       changed = true;
     } else {
       if (currentName !== undefined) {
-        releaseCapturedChatString(
-          currentName,
-          budget,
-          JSON.stringify("name").length + 2,
-          true,
-          true,
-        );
+        releaseCapturedChatString(currentName, budget, JSON.stringify("name").length + 2, true);
         delete payload.name;
         changed = true;
       }
@@ -1031,7 +1020,6 @@ function captureToolCallPayload(
       valueText,
       budget,
       existingValue === undefined ? JSON.stringify(valueKey).length + 2 : 0,
-      existingValue === undefined,
       existingValue === undefined,
     );
 
@@ -1086,9 +1074,6 @@ function captureToolCallDelta(
           (firstToolCall && state.content.length === 0 && state.functionCall === undefined
             ? JSON.stringify("content").length + 6
             : 0),
-        1 +
-          (firstToolCall ? 1 : 0) +
-          (firstToolCall && state.content.length === 0 && state.functionCall === undefined ? 1 : 0),
       )
     ) {
       return;
@@ -1100,7 +1085,7 @@ function captureToolCallDelta(
 
     const capturedId =
       currentId === undefined
-        ? captureChatString(id, budget, JSON.stringify("id").length + 2, true, true, true)
+        ? captureChatString(id, budget, JSON.stringify("id").length + 2, true, true)
         : replaceChatString(currentId, id, budget);
 
     if (capturedId !== undefined) {
@@ -1109,7 +1094,7 @@ function captureToolCallDelta(
       changed = true;
     } else {
       if (currentId !== undefined) {
-        releaseCapturedChatString(currentId, budget, JSON.stringify("id").length + 2, true, true);
+        releaseCapturedChatString(currentId, budget, JSON.stringify("id").length + 2, true);
         delete current.id;
         changed = true;
       }
@@ -1123,7 +1108,7 @@ function captureToolCallDelta(
 
     const capturedType =
       currentType === undefined
-        ? captureChatString(type, budget, JSON.stringify("type").length + 2, true, true, true)
+        ? captureChatString(type, budget, JSON.stringify("type").length + 2, true, true)
         : replaceChatString(currentType, type, budget);
 
     if (capturedType !== undefined) {
@@ -1132,13 +1117,7 @@ function captureToolCallDelta(
       changed = true;
     } else {
       if (currentType !== undefined) {
-        releaseCapturedChatString(
-          currentType,
-          budget,
-          JSON.stringify("type").length + 2,
-          true,
-          true,
-        );
+        releaseCapturedChatString(currentType, budget, JSON.stringify("type").length + 2, true);
         delete current.type;
         changed = true;
       }
@@ -1192,7 +1171,6 @@ function captureFunctionCallDelta(
         JSON.stringify("function_call").length +
           4 +
           (reserveNullContent ? JSON.stringify("content").length + 6 : 0),
-        1 + (reserveNullContent ? 1 : 0),
       )
     )
       return;
@@ -1204,7 +1182,7 @@ function captureFunctionCallDelta(
 
     const capturedName =
       currentName === undefined
-        ? captureChatString(name, budget, JSON.stringify("name").length + 2, true, true, true)
+        ? captureChatString(name, budget, JSON.stringify("name").length + 2, true, true)
         : replaceChatString(currentName, name, budget);
 
     if (capturedName !== undefined) {
@@ -1212,13 +1190,7 @@ function captureFunctionCallDelta(
       state.unresolvedFunctionScalars.delete("name");
     } else {
       if (currentName !== undefined) {
-        releaseCapturedChatString(
-          currentName,
-          budget,
-          JSON.stringify("name").length + 2,
-          true,
-          true,
-        );
+        releaseCapturedChatString(currentName, budget, JSON.stringify("name").length + 2, true);
         delete current.name;
       }
 
@@ -1233,7 +1205,6 @@ function captureFunctionCallDelta(
       argumentsText,
       budget,
       existingArguments === undefined ? JSON.stringify("arguments").length + 2 : 0,
-      existingArguments === undefined,
       existingArguments === undefined,
     );
 
@@ -1340,7 +1311,7 @@ function recordChatChunk<T>(
   chunk: T,
   states: Map<number, ChatChoiceState>,
   finishReasonStates: Map<number, string>,
-  finishReasonReservations: Map<number, ChatCaptureReservation>,
+  finishReasonReservations: Map<number, number>,
   rejectedFinishReasons: Set<number>,
   unterminatedChoices: Set<number>,
   outputBudget: ChatCaptureBudget,
@@ -1406,7 +1377,7 @@ function recordChatChunk<T>(
 
     const finishReason = readString(
       readOwn(choiceRecord, "finish_reason", finishReasonBudget, fieldReadFailed, reportError),
-    );
+    )?.slice(0, FINISH_REASON_MAX_LENGTH);
 
     if (finishReason !== undefined) {
       unterminatedChoices.delete(choiceIndex);
@@ -1449,14 +1420,12 @@ function recordChatChunk<T>(
 
         const initialCapture = boundedCaptureDetails(chatMessage(initialState), {
           maxBytes: outputBudget.remainingBytes,
-          maxItems: outputBudget.remainingItems,
         });
 
         if (initialCapture.truncated || initialCapture.value === undefined) {
           outputBudget.truncated = true;
         } else {
           outputBudget.remainingBytes -= initialCapture.bytes;
-          outputBudget.remainingItems -= initialCapture.items;
           state = initialState;
           states.set(choiceIndex, state);
         }
@@ -1478,7 +1447,6 @@ function recordChatChunk<T>(
             role,
             outputBudget,
             JSON.stringify("role").length + (chatStateHasFieldBesidesRole(state) ? 2 : 1),
-            true,
             true,
             true,
           );
@@ -1510,7 +1478,6 @@ function recordChatChunk<T>(
               outputBudget,
               hasContent ? 0 : JSON.stringify("content").length + 2,
               !hasContent,
-              !hasContent,
             );
 
       if (capturedContent !== undefined) state.content += capturedContent;
@@ -1523,7 +1490,6 @@ function recordChatChunk<T>(
         refusal,
         outputBudget,
         hasRefusal ? 0 : JSON.stringify("refusal").length + 2,
-        !hasRefusal,
         !hasRefusal,
       );
 
@@ -1687,25 +1653,20 @@ function createObservedChatStream(
   const capturePolicy = span.capturePolicy ?? LEGACY_CAPTURE_POLICY;
   const captureOutput = capturePolicy.output;
   const maskOutputWhenIncomplete = capturePolicy.mask;
-  const captureLimit = CHAT_STREAM_CAPTURE_MAX_BYTES;
   const reportError = createSpanErrorReporter(span);
 
   async function* iterator() {
     const states = new Map<number, ChatChoiceState>();
     const finishReasonStates = new Map<number, string>();
-    const finishReasonReservations = new Map<number, ChatCaptureReservation>();
+    const finishReasonReservations = new Map<number, number>();
     const rejectedFinishReasons = new Set<number>();
     const unterminatedChoices = new Set<number>();
 
-    const outputBudget: ChatCaptureBudget = {
-      remainingBytes: Math.max(captureLimit - 2, 0),
-      remainingItems: CHAT_STREAM_CAPTURE_MAX_ITEMS - 1,
-      truncated: captureOutput && captureLimit < 2,
-    };
+    // The output starts as "[]".
+    const outputBudget = new StreamChatCaptureBudget(2);
 
     const finishReasonBudget: ChatCaptureBudget = {
-      remainingBytes: CHAT_STREAM_CAPTURE_MAX_BYTES,
-      remainingItems: CHAT_STREAM_CAPTURE_MAX_ITEMS,
+      remainingBytes: FINISH_REASON_BUDGET_BYTES,
       truncated: false,
     };
 
@@ -1802,7 +1763,12 @@ function createObservedChatStream(
       );
 
       if (terminalError) fields.error = terminalError;
-      end(fields);
+
+      try {
+        end(fields);
+      } finally {
+        outputBudget.capture.release();
+      }
     }
   }
 
@@ -1825,11 +1791,11 @@ function createObservedResponsesStream(
   end: (fields?: SpanFields) => void,
 ): Stream<JsonValue> {
   const capturePolicy = span.capturePolicy ?? LEGACY_CAPTURE_POLICY;
-  const captureLimit = CHAT_STREAM_CAPTURE_MAX_BYTES;
   const maskOutputWhenIncomplete = capturePolicy.mask;
   const reportError = createSpanErrorReporter(span);
 
   async function* iterator() {
+    const retained = new StreamCapture();
     let sawFirst = false;
     let sawTerminalSnapshot = false;
     let partial: SpanFields = {};
@@ -1852,7 +1818,7 @@ function createObservedResponsesStream(
           }
 
           if (response) {
-            const next = responsesResponse(response, capturePolicy.output, captureLimit);
+            const next = responsesResponse(response, capturePolicy.output, retained.limit);
             const truncated = next.attributes?.["telemetry.dev.capture.truncated"] === true;
 
             const fitsWithContent =
@@ -1860,12 +1826,21 @@ function createObservedResponsesStream(
               next.output !== undefined &&
               !(Array.isArray(next.output) && next.output.length === 0);
 
-            if (fitsWithContent) retainedOutput = next.output;
+            if (fitsWithContent) {
+              retainedOutput = next.output;
+              retained.bytes = boundedCaptureDetails(retainedOutput).bytes;
+            }
 
             partial = next;
 
             if (truncated && maskOutputWhenIncomplete) delete partial.output;
             else if (retainedOutput !== undefined) partial.output = retainedOutput;
+
+            // Until a snapshot fits, the stream keeps the cut one, so it holds that one's bytes.
+            if (retainedOutput === undefined) {
+              retained.bytes =
+                partial.output === undefined ? 0 : boundedCaptureDetails(partial.output).bytes;
+            }
           }
 
           const terminalSnapshot =
@@ -1909,7 +1884,12 @@ function createObservedResponsesStream(
       if (!sawTerminalSnapshot) markResponsesCaptureIncomplete(partial, maskOutputWhenIncomplete);
 
       if (terminalError) partial.error = terminalError;
-      end(partial);
+
+      try {
+        end(partial);
+      } finally {
+        retained.release();
+      }
     }
   }
 
@@ -1947,10 +1927,15 @@ function serializedJsonCharacterLength(character: string): number {
 
   if (code <= 0x1f || (character.length === 1 && code >= 0xd800 && code <= 0xdfff)) return 6;
 
-  return character.length;
+  if (code < 0x80) return 1;
+
+  if (code < 0x800) return 2;
+
+  return character.length === 2 ? 4 : 3;
 }
 
-function boundedTranscriptText(value: string, maxContentLength = MAX_CAPTURE_LENGTH - 2) {
+/** Cuts text so that its JSON string, without the quotes, is at most `maxContentLength` UTF-8 bytes. */
+function boundedTranscriptText(value: string, maxContentLength: number) {
   let cutoff = 0;
   let serializedLength = 0;
 
@@ -1978,14 +1963,14 @@ function createObservedMediaStream(
   const capturePolicy = span.capturePolicy ?? LEGACY_CAPTURE_POLICY;
   const captureOutput = capturePolicy.output;
   const maskOutputWhenIncomplete = capturePolicy.mask;
-  const captureLimit = MAX_CAPTURE_LENGTH;
   const reportError = createSpanErrorReporter(span);
 
   async function* iterator() {
     let sawFirst = false;
     let sawTranscriptDelta = false;
     const textChunks: string[] = [];
-    let serializedTextLength = 2;
+    // The text is kept as one JSON string, quotes included.
+    const retained = new StreamCapture(2);
     let deltaCaptureStopped = false;
     let captureTruncated = false;
     let sawTerminal = false;
@@ -2045,19 +2030,21 @@ function createObservedMediaStream(
           ) {
             const capture = boundedTranscriptText(
               incrementalText,
-              Math.max(captureLimit - serializedTextLength, 0),
+              Math.max(retained.limit - retained.bytes, 0),
             );
 
             if (capture.value) textChunks.push(capture.value);
-            serializedTextLength += capture.serializedLength;
+            retained.bytes += capture.serializedLength;
             deltaCaptureStopped = capture.truncated;
             captureTruncated ||= capture.truncated;
           }
 
           if (completeText !== undefined) {
-            const capture = boundedTranscriptText(completeText, Math.max(captureLimit - 2, 0));
+            const capture = boundedTranscriptText(completeText, Math.max(retained.limit - 2, 0));
             terminalText = capture.value;
             captureTruncated = capture.truncated;
+            textChunks.length = 0;
+            retained.bytes = 2 + capture.serializedLength;
           }
 
           if (e.usage) {
@@ -2076,15 +2063,22 @@ function createObservedMediaStream(
     } finally {
       const text = captureOutput ? (terminalText ?? textChunks.join("")) : "";
       const captureIncomplete = captureTruncated || !sawTerminal;
-      end({
-        output:
-          operation === "transcriptions" && text && !(maskOutputWhenIncomplete && captureIncomplete)
-            ? text
-            : undefined,
-        usage,
-        error,
-        attributes: captureIncomplete ? { "telemetry.dev.capture.truncated": true } : undefined,
-      });
+
+      try {
+        end({
+          output:
+            operation === "transcriptions" &&
+            text &&
+            !(maskOutputWhenIncomplete && captureIncomplete)
+              ? text
+              : undefined,
+          usage,
+          error,
+          attributes: captureIncomplete ? { "telemetry.dev.capture.truncated": true } : undefined,
+        });
+      } finally {
+        retained.release();
+      }
     }
   }
 
@@ -2438,7 +2432,7 @@ export interface WrapOpenAIRealtimeOptions {
 interface RealtimeOutputState {
   items: Map<number, JsonRecord>;
   itemBytes: Map<number, number>;
-  bytes: number;
+  capture: StreamCapture;
   truncated: boolean;
   stopped: boolean;
 }
@@ -2485,9 +2479,9 @@ const setRealtimeItem = (state: RealtimeOutputState, index: number, item: JsonRe
   const previousBytes = state.itemBytes.get(index) ?? 0;
   const separatorBytes = state.items.has(index) || state.items.size === 0 ? 0 : 1;
   const itemBytes = jsonByteLength(item);
-  const nextBytes = state.bytes - previousBytes + itemBytes + separatorBytes;
+  const nextBytes = state.capture.bytes - previousBytes + itemBytes + separatorBytes;
 
-  if (nextBytes > REALTIME_CAPTURE_MAX_BYTES) {
+  if (nextBytes > state.capture.limit) {
     stopRealtimeOutputCapture(state);
 
     return false;
@@ -2495,7 +2489,7 @@ const setRealtimeItem = (state: RealtimeOutputState, index: number, item: JsonRe
 
   state.items.set(index, item);
   state.itemBytes.set(index, itemBytes);
-  state.bytes = nextBytes;
+  state.capture.bytes = nextBytes;
 
   return true;
 };
@@ -2533,13 +2527,13 @@ const appendRealtimeText = (
 ) => {
   const overhead = current === undefined ? jsonByteLength({ [key]: "" }) - 1 : 0;
 
-  if (state.bytes + overhead > REALTIME_CAPTURE_MAX_BYTES) {
+  if (state.capture.bytes + overhead > state.capture.limit) {
     stopRealtimeOutputCapture(state);
 
     return current;
   }
 
-  const available = Math.max(0, REALTIME_CAPTURE_MAX_BYTES - state.bytes - overhead);
+  const available = Math.max(0, state.capture.limit - state.capture.bytes - overhead);
   let used = 0;
   let cutoff = 0;
 
@@ -2551,7 +2545,7 @@ const appendRealtimeText = (
     cutoff += character.length;
   }
 
-  state.bytes += overhead + used;
+  state.capture.bytes += overhead + used;
   state.itemBytes.set(index, (state.itemBytes.get(index) ?? 0) + overhead + used);
 
   if (cutoff < value.length) stopRealtimeOutputCapture(state);
@@ -2917,15 +2911,19 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
       !hasAuthoritativeOutput &&
       (partialCapture?.truncated === true || (!responseDone && partialOutput !== undefined));
 
-    trace.end(
-      withholdCutOutput(trace.span, {
-        ...fields,
-        output: hasAuthoritativeOutput ? fields.output : partialOutput,
-        attributes: partialTruncated
-          ? { ...fields?.attributes, "telemetry.dev.capture.truncated": true }
-          : fields?.attributes,
-      }),
-    );
+    try {
+      trace.end(
+        withholdCutOutput(trace.span, {
+          ...fields,
+          output: hasAuthoritativeOutput ? fields.output : partialOutput,
+          attributes: partialTruncated
+            ? { ...fields?.attributes, "telemetry.dev.capture.truncated": true }
+            : fields?.attributes,
+        }),
+      );
+    } finally {
+      trace.output?.capture.release();
+    }
   };
 
   const finishAll = (error: Error) => {
@@ -3150,7 +3148,7 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
         ? {
             items: new Map(),
             itemBytes: new Map(),
-            bytes: 2,
+            capture: new StreamCapture(2),
             truncated: false,
             stopped: false,
           }

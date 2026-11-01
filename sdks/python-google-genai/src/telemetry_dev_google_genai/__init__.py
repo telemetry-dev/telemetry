@@ -14,6 +14,7 @@ import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from functools import wraps
+from io import StringIO
 from typing import Any, TypeVar, cast
 from weakref import WeakKeyDictionary
 
@@ -41,8 +42,7 @@ _AFC_USAGE_STATE: contextvars.ContextVar[dict[str, Any] | None] = contextvars.Co
 )
 _MAX_PENDING_VIDEO_OPERATIONS = 1024
 _MAX_CAPTURE_DEPTH = 32
-# Retention uses fixed bounds; the core applies max_attribute_length after the mask.
-_STREAM_CAPTURE_MAX_BYTES = 48 * 1024
+# The core applies max_attribute_length after the mask. More candidates than this are not kept.
 _STREAM_CAPTURE_MAX_ITEMS = 1000
 # Retained finish reasons stay outside the output budget so a terminal one is still exported,
 # so each is capped instead. Gemini's longest is 25 characters.
@@ -642,7 +642,7 @@ def _record_candidate_metadata(
     index: int,
     attrs: dict[str, Any],
     metadata_content: bool,
-    budget: telemetry_dev.CaptureBudget | None = None,
+    accept: Callable[[str, str], bool] | None = None,
 ) -> None:
     ratings = _field(candidate, "safety_ratings")
     if ratings:
@@ -656,25 +656,36 @@ def _record_candidate_metadata(
                 entries = []
         else:
             entries = []
-        entries.append(
-            {
-                "candidateIndex": index,
-                "ratings": _metadata(ratings, _SAFETY_RATINGS_STRUCTURE, metadata_content),
-            }
-        )
+        entry = {
+            "candidateIndex": index,
+            "ratings": _metadata(ratings, _SAFETY_RATINGS_STRUCTURE, metadata_content),
+        }
+        # A stream repeats a candidate's ratings on later chunks; the latest replaces them.
+        for at, existing_entry in enumerate(entries):
+            if isinstance(existing_entry, dict) and existing_entry.get("candidateIndex") == index:
+                entries[at] = entry
+                break
+        else:
+            entries.append(entry)
         encoded = _json_attr(entries)
-        if encoded is not None and (budget is None or budget.accept(encoded)):
+        if encoded is not None and (
+            accept is None or accept("google_genai.response.safety_ratings", encoded)
+        ):
             attrs["google_genai.response.safety_ratings"] = encoded
     if index == 0:
         grounding = _field(candidate, "grounding_metadata")
         if grounding is not None:
             encoded = _metadata_attr(grounding, _GROUNDING_STRUCTURE, metadata_content)
-            if encoded is not None and (budget is None or budget.accept(encoded)):
+            if encoded is not None and (
+                accept is None or accept("google_genai.response.grounding_metadata", encoded)
+            ):
                 attrs["google_genai.response.grounding_metadata"] = encoded
         url_context = _field(candidate, "url_context_metadata")
         if url_context is not None:
             encoded = _metadata_attr(url_context, _URL_CONTEXT_STRUCTURE, metadata_content)
-            if encoded is not None and (budget is None or budget.accept(encoded)):
+            if encoded is not None and (
+                accept is None or accept("google_genai.response.url_context_metadata", encoded)
+            ):
                 attrs["google_genai.response.url_context_metadata"] = encoded
 
 
@@ -781,6 +792,9 @@ class _CandidateState:
     def __init__(self) -> None:
         self.role = "model"
         self.parts: list[Any] = []
+        # The text of parts[-1] while later deltas extend it: repeated concatenation copies the
+        # whole text for each delta. _candidate_parts writes it back.
+        self.text_fragments: StringIO | None = None
 
 
 class _StreamState:
@@ -795,10 +809,57 @@ class _StreamState:
         self.committed_usage: dict[str, int | float] | None = None
         self.prior_contents: list[dict[str, Any]] = []
         self.afc_history: Any = None
-        self.budget = telemetry_dev.CaptureBudget(
-            _STREAM_CAPTURE_MAX_BYTES, _STREAM_CAPTURE_MAX_ITEMS
-        )
+        self.budget = _stream_budget()
+        # The bytes charged for each value that a chunk replaces whole, by key.
+        self.replaced_bytes: dict[str, int] = {}
         self.output_truncated = False
+
+
+def _reserve_bytes(budget: telemetry_dev.CaptureBudget, total: int) -> bool:
+    # Older cores have no reserve_bytes; there the measure against max_bytes stands.
+    reserve = getattr(budget, "reserve_bytes", None)
+    if callable(reserve):
+        return bool(reserve(total))
+    if total > budget.max_bytes:
+        return False
+    budget.bytes_used = total
+    return True
+
+
+def _accept_replacement(state: _StreamState, key: str, value: Any) -> bool:
+    """Charges ``value`` to the stream in place of the value charged under ``key`` before: each
+    chunk repeats the whole AFC history and metadata, which replace the last ones."""
+    budget = state.budget
+    if budget.truncated:
+        return False
+    measured = telemetry_dev.CaptureBudget()
+    held = state.replaced_bytes.get(key, 0)
+    if not measured.accept(value) or not _reserve_bytes(
+        budget, budget.bytes_used - held + measured.bytes_used
+    ):
+        budget.truncated = True
+        return False
+    state.replaced_bytes[key] = measured.bytes_used
+    return True
+
+
+def _stream_budget() -> telemetry_dev.CaptureBudget:
+    # Older cores have no for_stream and bound each budget at 64 KiB on its own.
+    for_stream = getattr(telemetry_dev.CaptureBudget, "for_stream", None)
+    budget = for_stream() if callable(for_stream) else telemetry_dev.CaptureBudget()
+    return cast(telemetry_dev.CaptureBudget, budget)
+
+
+def _ending_stream(end: Callable[..., None], state: _StreamState) -> Callable[..., None]:
+    def end_stream(**fields: Any) -> None:
+        try:
+            end(**fields)
+        finally:
+            release = getattr(state.budget, "release", None)
+            if callable(release):
+                release()
+
+    return end_stream
 
 
 def _capture_masked(handle: telemetry_dev.SpanHandle) -> bool:
@@ -833,20 +894,30 @@ def _mark_stream_capture(
     return fields
 
 
-def _append_part(parts: list[Any], native: Any) -> None:
-    if not isinstance(native, dict):
-        parts.append(native)
-        return
-    text = native.get("text")
-    if text is not None:
-        thought = native.get("thought", False)
-        if parts:
-            previous = parts[-1]
-            if isinstance(previous, dict) and previous.get("text") is not None:
-                if previous.get("thought", False) == thought:
-                    previous["text"] = f"{previous.get('text', '')}{text}"
-                    return
+def _append_part(state: _CandidateState, native: Any) -> None:
+    parts = state.parts
+    if isinstance(native, dict):
+        text = native.get("text")
+        if text is not None:
+            thought = native.get("thought", False)
+            if parts:
+                previous = parts[-1]
+                if isinstance(previous, dict) and previous.get("text") is not None:
+                    if previous.get("thought", False) == thought:
+                        if state.text_fragments is None:
+                            state.text_fragments = StringIO()
+                            state.text_fragments.write(f"{previous.get('text', '')}")
+                        state.text_fragments.write(f"{text}")
+                        return
+    _candidate_parts(state)
+    state.text_fragments = None
     parts.append(native)
+
+
+def _candidate_parts(state: _CandidateState) -> list[Any]:
+    if state.text_fragments is not None:
+        state.parts[-1]["text"] = state.text_fragments.getvalue()
+    return state.parts
 
 
 def _fold_turn(state: _StreamState) -> None:
@@ -856,7 +927,7 @@ def _fold_turn(state: _StreamState) -> None:
         candidate_state = state.candidates[index]
         if candidate_state.parts:
             state.prior_contents.append(
-                {"role": candidate_state.role, "parts": candidate_state.parts}
+                {"role": candidate_state.role, "parts": _candidate_parts(candidate_state)}
             )
     state.candidates.clear()
     state.finish_reasons.clear()
@@ -898,14 +969,18 @@ def _record_chunk_inner(chunk: Any, state: _StreamState) -> None:
         for part in _sequence_items(_field(content, "parts")):
             native = _native(part)
             if state.budget.accept(native):
-                _append_part(candidate_state.parts, native)
+                _append_part(candidate_state, native)
             else:
                 state.output_truncated = True
         finish = _enum_value(_field(candidate, "finish_reason"))
         if finish is not None:
             state.finish_reasons[candidate_index] = finish[:_FINISH_REASON_MAX_LENGTH]
         _record_candidate_metadata(
-            candidate, candidate_index, state.attrs, state.metadata_content, state.budget
+            candidate,
+            candidate_index,
+            state.attrs,
+            state.metadata_content,
+            lambda key, value: _accept_replacement(state, key, value),
         )
     usage = _generate_usage(_field(chunk, "usage_metadata"), state.attrs)
     if usage:
@@ -920,12 +995,13 @@ def _record_chunk_inner(chunk: Any, state: _StreamState) -> None:
     prompt_ratings = _sequence_items(_field(feedback, "safety_ratings"))
     if prompt_ratings:
         encoded = _metadata_attr(prompt_ratings, _SAFETY_RATINGS_STRUCTURE, state.metadata_content)
-        if encoded is not None and state.budget.accept(encoded):
-            state.attrs["google_genai.response.prompt_safety_ratings"] = encoded
+        key = "google_genai.response.prompt_safety_ratings"
+        if encoded is not None and _accept_replacement(state, key, encoded):
+            state.attrs[key] = encoded
     history = _field(chunk, "automatic_function_calling_history")
     if history:
         native_history = _native(history)
-        if native_history and state.budget.accept(native_history):
+        if native_history and _accept_replacement(state, "afc_history", native_history):
             state.afc_history = native_history
 
 
@@ -948,7 +1024,9 @@ def _stream_fields_inner(state: _StreamState) -> dict[str, Any]:
     for index in sorted(state.candidates):
         candidate_state = state.candidates[index]
         if candidate_state.parts:
-            output.append({"role": candidate_state.role, "parts": candidate_state.parts})
+            output.append(
+                {"role": candidate_state.role, "parts": _candidate_parts(candidate_state)}
+            )
         if index in state.finish_reasons:
             finish_reasons.append(state.finish_reasons[index])
     if state.afc_history:
@@ -1077,9 +1155,9 @@ class _ObservedStream:
     ) -> None:
         self._inner = inner
         self._handle = handle
-        self._end = end
         self._started_at = started_at
         self._state = _StreamState(_capture_metadata_content(handle))
+        self._end = _ending_stream(end, self._state)
         self._saw_first = False
         self._afc_usage_state = afc_usage_state
         self._completed = False
@@ -1170,9 +1248,9 @@ class _ObservedAsyncStream:
     ) -> None:
         self._inner = inner
         self._handle = handle
-        self._end = end
         self._started_at = started_at
         self._state = _StreamState(_capture_metadata_content(handle))
+        self._end = _ending_stream(end, self._state)
         self._saw_first = False
         self._afc_usage_state = afc_usage_state
         self._completed = False
@@ -1549,7 +1627,7 @@ def _media_contents(kwargs: Mapping[str, Any]) -> tuple[Any, bool]:
     client = telemetry_dev.get_client()
     if client is None or not client.capture_input:
         return None, False
-    # Fixed retention bound; the core applies max_attribute_length after the mask.
+    # The core applies max_attribute_length after the mask.
     budget = telemetry_dev.CaptureBudget()
     try:
         result: dict[str, Any] = {}

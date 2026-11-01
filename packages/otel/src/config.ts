@@ -18,6 +18,14 @@ export interface BatchOptions {
    * Default 67108864 (64 MiB).
    */
   maxQueueBytes?: number;
+  /**
+   * Maximum bytes, across the process, that provider integrations keep for the output of
+   * streams that have not ended, counted as UTF-8 bytes of JSON. Output past it is not kept,
+   * and its span carries the truncation flag. While no other stream holds bytes in it, a
+   * stream may grow to 16 MiB even past this bound. The bound is process-wide, so the span
+   * processor started last sets it. Default 67108864 (64 MiB).
+   */
+  maxStreamBytes?: number;
   /** Timeout of each export request in milliseconds. Default 30000. */
   exportTimeoutMillis?: number;
 }
@@ -29,15 +37,27 @@ export const DEFAULT_BATCH: Required<BatchOptions> = {
   scheduledDelayMillis: 1000,
   maxQueueSize: 2048,
   maxQueueBytes: 64 * 1024 * 1024,
+  maxStreamBytes: 64 * 1024 * 1024,
   exportTimeoutMillis: 30000,
 };
 
-/** The batch options with DEFAULT_BATCH for each option that is absent or undefined. */
+/**
+ * The batch options with DEFAULT_BATCH for each option that is absent or undefined. Throws a
+ * RangeError when a byte bound is not a non-negative safe integer or Infinity.
+ */
 export function resolveBatch(batch: BatchOptions = {}): Required<BatchOptions> {
   const resolved = { ...DEFAULT_BATCH };
 
   for (const key of Object.keys(resolved) as (keyof BatchOptions)[]) {
     resolved[key] = batch[key] ?? resolved[key];
+  }
+
+  for (const key of ["maxQueueBytes", "maxStreamBytes"] as const) {
+    const bound = resolved[key];
+
+    if (bound !== Infinity && (!Number.isSafeInteger(bound) || bound < 0)) {
+      throw new RangeError(`batch.${key} must be a non-negative safe integer or Infinity`);
+    }
   }
 
   return resolved;

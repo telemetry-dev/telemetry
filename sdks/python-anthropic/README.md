@@ -73,7 +73,7 @@ The integration maps native Anthropic request and response shapes directly into 
 
 Native Anthropic stream events pass through unmodified. The span records time to first chunk on the first received event, merges usage from `message_start` and `message_delta`, aggregates text, tool-use JSON, and thinking blocks, and ends on stream exhaustion, close, context-manager exit, or error.
 
-Reconstructed output is bounded to 48 KiB and 1,000 items. The configured `max_attribute_length` does not shrink these retention bounds; the core applies it to the exported attribute after the mask runs, with its `...[truncated]` marker, without setting `telemetry.dev.capture.truncated`. A stream that ends without `message_stop`, encounters a mapping failure,
+Reconstructed output is kept up to 16 MiB, and all streams in flight share the `max_stream_bytes` bound of the core (64 MiB by default). These bounds need a `telemetry-dev` core with `max_stream_bytes`; with an older core, each stream keeps up to 64 KiB and 1,024 items. The configured `max_attribute_length` does not shrink these retention bounds; the core applies it to the exported attribute after the mask runs, with its `...[truncated]` marker, without setting `telemetry.dev.capture.truncated`. A stream that ends without `message_stop`, encounters a mapping failure,
 or exceeds a capture bound sets `telemetry.dev.capture.truncated`. With a mask configured,
 incomplete output is omitted because the mask cannot inspect the complete value. When output
 capture is disabled, response IDs and models, finish reasons, usage, timing, and errors may still

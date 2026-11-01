@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
 import threading
 import time
 import types
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
-from functools import wraps
+from functools import partial, wraps
 from io import StringIO
 from typing import Any, Literal, TypeVar, cast
 from urllib.parse import urlsplit
@@ -33,9 +35,12 @@ _installed = False
 _install_lock = threading.Lock()
 _T = TypeVar("_T")
 _OMIT = object()
-_CHAT_STREAM_CAPTURE_MAX_BYTES = 48 * 1024
-_TRANSCRIPT_CAPTURE_MAX_BYTES = 64 * 1024
+# More choices, tool calls, or finish reasons than this are not kept.
 _CHAT_STREAM_CAPTURE_MAX_ITEMS = 1000
+# Each streamed finish reason is cut to this many characters, as in the other integrations.
+_FINISH_REASON_MAX_LENGTH = 128
+_TEXT_CHUNK_CHARS = 4096
+_SURROGATES = re.compile("[\ud800-\udfff]")
 
 
 class _CaptureLimit(Exception):
@@ -65,6 +70,12 @@ def _structure_cost(shape: object) -> tuple[int, int]:
 
 
 _FINISH_REASON_BYTES, _FINISH_REASON_ITEMS = _structure_cost({"finish_reason": "", "index": 0})
+# Finish reasons stay outside the stream budget so a terminal one is still exported. Their own
+# budget fits _CHAT_STREAM_CAPTURE_MAX_ITEMS of the largest records a cut reason can take.
+_FINISH_REASON_BUDGET_BYTES = _CHAT_STREAM_CAPTURE_MAX_ITEMS * (
+    _FINISH_REASON_BYTES
+    + telemetry_dev.CaptureBudget.json_string_bytes("\x00" * _FINISH_REASON_MAX_LENGTH)
+)
 _TOOL_CALLS_FIELD_BYTES = _field_bytes("tool_calls")
 _CONTENT_FIELD_BYTES = _field_bytes("content")
 _FUNCTION_CALL_FIELD_BYTES = _field_bytes("function_call")
@@ -147,6 +158,7 @@ def _bounded_responses_capture(
     *,
     capture_enabled: bool | None = None,
     max_bytes: int | None = None,
+    budget: telemetry_dev.CaptureBudget | None = None,
     report_error: Callable[[BaseException], None] | None = None,
 ) -> tuple[Any | None, bool]:
     client = telemetry_dev.get_client()
@@ -156,11 +168,12 @@ def _bounded_responses_capture(
         capture_enabled = client.capture_input if capture == "input" else client.capture_output
     if not capture_enabled:
         return None, False
-    budget = (
-        telemetry_dev.CaptureBudget(max_bytes=max_bytes)
-        if max_bytes is not None
-        else telemetry_dev.CaptureBudget()
-    )
+    if budget is None:
+        budget = (
+            telemetry_dev.CaptureBudget(max_bytes=max_bytes)
+            if max_bytes is not None
+            else telemetry_dev.CaptureBudget()
+        )
     ancestors: set[int] = set()
 
     def reserve(byte_count: int) -> None:
@@ -169,7 +182,8 @@ def _bounded_responses_capture(
             or budget.items_used >= budget.max_items
         ):
             raise _CaptureLimit
-        budget.bytes_used += byte_count
+        if not _reserve_bytes(budget, budget.bytes_used + byte_count):
+            raise _CaptureLimit
         budget.items_used += 1
 
     def convert(item: Any, parent_type: str | None, depth: int) -> Any:
@@ -313,36 +327,85 @@ def _sent_params(params: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _transcript_capture_budget() -> telemetry_dev.CaptureBudget:
-    return telemetry_dev.CaptureBudget(max_bytes=_TRANSCRIPT_CAPTURE_MAX_BYTES)
+def _stream_budget() -> telemetry_dev.CaptureBudget:
+    # Older cores have no for_stream and bound each budget at 64 KiB on its own.
+    for_stream = getattr(telemetry_dev.CaptureBudget, "for_stream", None)
+    budget = for_stream() if callable(for_stream) else telemetry_dev.CaptureBudget()
+    return cast(telemetry_dev.CaptureBudget, budget)
+
+
+def _release_budget(budget: telemetry_dev.CaptureBudget) -> None:
+    release = getattr(budget, "release", None)
+    if callable(release):
+        release()
+
+
+def _reserve_bytes(budget: telemetry_dev.CaptureBudget, total: int) -> bool:
+    # Older cores have no reserve_bytes; there the caller's check against max_bytes stands.
+    reserve = getattr(budget, "reserve_bytes", None)
+    if callable(reserve):
+        return bool(reserve(total))
+    budget.bytes_used = total
+    return True
+
+
+def _ending_stream(end: Callable[..., None], release: Callable[[], None]) -> Callable[..., None]:
+    def end_stream(**fields: Any) -> None:
+        try:
+            end(**fields)
+        finally:
+            release()
+
+    return end_stream
+
+
+def _character_bytes(character: str) -> int:
+    code = ord(character)
+    if code <= 0x7F:
+        return 1
+    if code <= 0x7FF:
+        return 2
+    if 0xD800 <= code <= 0xDFFF:
+        return 6
+    if code <= 0xFFFF:
+        return 3
+    return 4
+
+
+def _text_bytes(value: str) -> int:
+    """The bytes _character_bytes charges for ``value``: its UTF-8 width, and 6 per surrogate."""
+    return len(value.encode("utf-8", "surrogatepass")) + 3 * len(_SURROGATES.findall(value))
 
 
 def _capture_text(value: str, budget: telemetry_dev.CaptureBudget) -> str:
     if not value or budget.truncated:
         return ""
-    if budget.remaining_bytes <= 0:
+    # Read once: the remaining bytes of a stream budget take a lock.
+    remaining = budget.remaining_bytes
+    if remaining <= 0:
         budget.truncated = True
         return ""
     byte_count = 0
-    retained_characters = 0
-    for index, character in enumerate(value):
-        code = ord(character)
-        if code <= 0x7F:
-            character_bytes = 1
-        elif code <= 0x7FF:
-            character_bytes = 2
-        elif 0xD800 <= code <= 0xDFFF:
-            character_bytes = 6
-        elif code <= 0xFFFF:
-            character_bytes = 3
-        else:
-            character_bytes = 4
-        if byte_count + character_bytes > budget.remaining_bytes:
-            budget.truncated = True
-            break
-        byte_count += character_bytes
-        retained_characters = index + 1
-    budget.bytes_used += byte_count
+    retained_characters = len(value)
+    # Whole chunks are measured at once; only the chunk that does not fit is walked by character.
+    # Every character costs at least one byte, so the scan stops within remaining + one chunk.
+    for start in range(0, len(value), _TEXT_CHUNK_CHARS):
+        chunk = value[start : start + _TEXT_CHUNK_CHARS]
+        chunk_bytes = _text_bytes(chunk)
+        if byte_count + chunk_bytes <= remaining:
+            byte_count += chunk_bytes
+            continue
+        retained_characters = start
+        for character in chunk:
+            character_bytes = _character_bytes(character)
+            if byte_count + character_bytes > remaining:
+                break
+            byte_count += character_bytes
+            retained_characters += 1
+        break
+    if not _reserve_bytes(budget, budget.bytes_used + byte_count):
+        budget.truncated = True
+        return ""
     if retained_characters < len(value):
         budget.truncated = True
         return value[:retained_characters]
@@ -737,10 +800,7 @@ class _ChatToolCallDelta:
 
 
 def _chat_capture_budget(*, reserve_output_list: bool = False) -> telemetry_dev.CaptureBudget:
-    budget = telemetry_dev.CaptureBudget(
-        _CHAT_STREAM_CAPTURE_MAX_BYTES,
-        _CHAT_STREAM_CAPTURE_MAX_ITEMS,
-    )
+    budget = _stream_budget()
     if reserve_output_list:
         budget.accept([])
     return budget
@@ -768,7 +828,11 @@ def _replace_finish_reason(
         reservations.pop(index, None)
         return False
     reservation = (_FINISH_REASON_BYTES + value_bytes, _FINISH_REASON_ITEMS)
-    budget.bytes_used = base_bytes + reservation[0]
+    if not _reserve_bytes(budget, base_bytes + reservation[0]):
+        budget.bytes_used = base_bytes
+        budget.items_used = base_items
+        reservations.pop(index, None)
+        return False
     budget.items_used = base_items + reservation[1]
     reservations[index] = reservation
     return True
@@ -789,7 +853,10 @@ def _reserve_chat_budget(
         if not recoverable:
             budget.truncated = True
         return False
-    budget.bytes_used += byte_count
+    if not _reserve_bytes(budget, budget.bytes_used + byte_count):
+        if not recoverable:
+            budget.truncated = True
+        return False
     budget.items_used += item_count
     return True
 
@@ -837,8 +904,7 @@ def _replace_chat_scalar(
     value_bytes = telemetry_dev.CaptureBudget.json_string_bytes(value, available_bytes)
     if value_bytes > available_bytes:
         return False
-    budget.bytes_used = base_bytes + _BASE_ITEM_BYTES + value_bytes
-    return True
+    return _reserve_bytes(budget, base_bytes + _BASE_ITEM_BYTES + value_bytes)
 
 
 def _release_chat_field(field_name: str, value: str, budget: telemetry_dev.CaptureBudget) -> None:
@@ -1139,6 +1205,7 @@ def _record_chat_chunk(
             )
         )
         if finish_reason is not None:
+            finish_reason = finish_reason[:_FINISH_REASON_MAX_LENGTH]
             if unterminated_choices is not None:
                 unterminated_choices.discard(choice_index)
             if _replace_finish_reason(
@@ -1443,6 +1510,15 @@ def _hook_response_close(inner: Any, finish: Callable[[], None]) -> None:
     response = getattr(inner, "response", None)
     if response is None:
         return
+    # ``finish`` is a method of the stream wrapper, which holds ``response``: held weakly, the hook
+    # adds no reference cycle, so a dropped wrapper and its stream budget are freed at once.
+    finish_method = weakref.WeakMethod(finish)
+
+    def finish_if_alive() -> None:
+        method = finish_method()
+        if method is not None:
+            method()
+
     close = getattr(response, "close", None)
     if callable(close):
 
@@ -1450,7 +1526,7 @@ def _hook_response_close(inner: Any, finish: Callable[[], None]) -> None:
             try:
                 return close(*args, **kwargs)
             finally:
-                finish()
+                finish_if_alive()
 
         response.close = _close_hook
     aclose = getattr(response, "aclose", None)
@@ -1461,7 +1537,7 @@ def _hook_response_close(inner: Any, finish: Callable[[], None]) -> None:
             try:
                 return await aclose_fn(*args, **kwargs)
             finally:
-                finish()
+                finish_if_alive()
 
         response.aclose = _aclose_hook
 
@@ -1516,7 +1592,6 @@ class _InstrumentedStream:
         started_at: float,
     ) -> None:
         self._inner = inner
-        self._end = _end_once(handle)
         self._handle = handle
         self._injected_usage = injected_usage
         self._started_at = started_at
@@ -1536,7 +1611,9 @@ class _InstrumentedStream:
         self._consume: Iterator[Any] | None = None
         self._in_next = False
         self._budget = _chat_capture_budget(reserve_output_list=self._capture_output)
-        self._finish_reason_budget = _chat_capture_budget()
+        # Bound to the budget, not self, so the callback adds no reference cycle.
+        self._end = _ending_stream(_end_once(handle), partial(_release_budget, self._budget))
+        self._finish_reason_budget = telemetry_dev.CaptureBudget(_FINISH_REASON_BUDGET_BYTES)
         _hook_response_close(inner, self._on_response_close)
 
     def _iterate(self) -> Iterator[Any]:
@@ -1679,7 +1756,6 @@ class _InstrumentedAsyncStream:
         started_at: float,
     ) -> None:
         self._inner = inner
-        self._end = _end_once(handle)
         self._handle = handle
         self._injected_usage = injected_usage
         self._started_at = started_at
@@ -1699,7 +1775,9 @@ class _InstrumentedAsyncStream:
         self._consume: AsyncIterator[Any] | None = None
         self._in_next = False
         self._budget = _chat_capture_budget(reserve_output_list=self._capture_output)
-        self._finish_reason_budget = _chat_capture_budget()
+        # Bound to the budget, not self, so the callback adds no reference cycle.
+        self._end = _ending_stream(_end_once(handle), partial(_release_budget, self._budget))
+        self._finish_reason_budget = telemetry_dev.CaptureBudget(_FINISH_REASON_BUDGET_BYTES)
         _hook_response_close(inner, self._on_response_close)
 
     async def _aiterate(self) -> AsyncIterator[Any]:
@@ -1851,7 +1929,12 @@ class _InstrumentedResponsesStream:
     def __init__(self, inner: Any, handle: telemetry_dev.SpanHandle, started_at: float) -> None:
         self._inner = inner
         self._handle = handle
-        self._end = _end_once(handle)
+        self._output_budget = _stream_budget()
+        # Bound to the budget, not self, so the callback adds no reference cycle.
+        self._end_stream = _ending_stream(
+            _end_once(handle), partial(_release_budget, self._output_budget)
+        )
+        self._ended = False
         (
             self._capture_output,
             self._mask_output_when_incomplete,
@@ -1939,7 +2022,15 @@ class _InstrumentedResponsesStream:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
+    def _end(self, **fields: Any) -> None:
+        # The span has ended and the stream budget no longer counts bytes, so later events are
+        # not kept.
+        self._ended = True
+        self._end_stream(**fields)
+
     def _record(self, event: Any, received_at: float) -> None:
+        if self._ended:
+            return
         if _response_event_has_output(event):
             self._handle.record_output_chunk(received_at * 1000)
         if not self._saw_first:
@@ -1957,13 +2048,24 @@ class _InstrumentedResponsesStream:
             output = None
             truncated = False
             if raw_output is not None:
+                # The snapshot replaces the output kept so far.
+                measured = telemetry_dev.CaptureBudget(self._output_budget.max_bytes)
                 output, truncated = _bounded_responses_capture(
                     raw_output,
                     capture_enabled=self._capture_output,
-                    max_bytes=_CHAT_STREAM_CAPTURE_MAX_BYTES,
+                    budget=measured,
                     report_error=self._report_error,
                 )
-                if not truncated and output:
+                # A snapshot that fits replaces the output kept so far. Until one fits, the
+                # stream keeps the cut one, so it holds that one's bytes.
+                keeps = output and (
+                    not truncated
+                    or (self._retained_output is None and not self._mask_output_when_incomplete)
+                )
+                if keeps and not _reserve_bytes(self._output_budget, measured.bytes_used):
+                    # Another stream took the room after this one measured.
+                    output, truncated = None, True
+                elif keeps and not truncated:
                     self._retained_output = output
             self._partial = fields
             if self._retained_output is not None and not (
@@ -1997,7 +2099,12 @@ class _InstrumentedAsyncResponsesStream:
     def __init__(self, inner: Any, handle: telemetry_dev.SpanHandle, started_at: float) -> None:
         self._inner = inner
         self._handle = handle
-        self._end = _end_once(handle)
+        self._output_budget = _stream_budget()
+        # Bound to the budget, not self, so the callback adds no reference cycle.
+        self._end_stream = _ending_stream(
+            _end_once(handle), partial(_release_budget, self._output_budget)
+        )
+        self._ended = False
         (
             self._capture_output,
             self._mask_output_when_incomplete,
@@ -2090,7 +2197,15 @@ class _InstrumentedAsyncResponsesStream:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
+    def _end(self, **fields: Any) -> None:
+        # The span has ended and the stream budget no longer counts bytes, so later events are
+        # not kept.
+        self._ended = True
+        self._end_stream(**fields)
+
     def _record(self, event: Any, received_at: float) -> None:
+        if self._ended:
+            return
         if _response_event_has_output(event):
             self._handle.record_output_chunk(received_at * 1000)
         if not self._saw_first:
@@ -2108,13 +2223,24 @@ class _InstrumentedAsyncResponsesStream:
             output = None
             truncated = False
             if raw_output is not None:
+                # The snapshot replaces the output kept so far.
+                measured = telemetry_dev.CaptureBudget(self._output_budget.max_bytes)
                 output, truncated = _bounded_responses_capture(
                     raw_output,
                     capture_enabled=self._capture_output,
-                    max_bytes=_CHAT_STREAM_CAPTURE_MAX_BYTES,
+                    budget=measured,
                     report_error=self._report_error,
                 )
-                if not truncated and output:
+                # A snapshot that fits replaces the output kept so far. Until one fits, the
+                # stream keeps the cut one, so it holds that one's bytes.
+                keeps = output and (
+                    not truncated
+                    or (self._retained_output is None and not self._mask_output_when_incomplete)
+                )
+                if keeps and not _reserve_bytes(self._output_budget, measured.bytes_used):
+                    # Another stream took the room after this one measured.
+                    output, truncated = None, True
+                elif keeps and not truncated:
                     self._retained_output = output
             self._partial = fields
             if self._retained_output is not None and not (
@@ -2148,6 +2274,7 @@ def _media_stream_event_fields(
     event: Any,
     response_mapper: ResponseMapper,
     capture_output: bool,
+    budget: telemetry_dev.CaptureBudget,
 ) -> dict[str, Any]:
     if response_mapper is not _text_media_response:
         return response_mapper(event)
@@ -2155,7 +2282,9 @@ def _media_stream_event_fields(
     if capture_output and _string(_field(event, "type")) == "transcript.text.done":
         text = _string(_field(event, "text"))
         if text is not None:
-            budget = _transcript_capture_budget()
+            # The terminal text replaces the deltas, within the room the stream has.
+            budget.bytes_used = 0
+            budget.truncated = False
             fields["output"] = _capture_text(text, budget)
             if budget.truncated:
                 fields["attributes"] = {"telemetry.dev.capture.truncated": True}
@@ -2240,14 +2369,16 @@ class _InstrumentedMediaStream:
         self, inner: Any, handle: telemetry_dev.SpanHandle, response_mapper: ResponseMapper
     ) -> None:
         self._inner = inner
-        self._end = _end_once(handle)
         self._fields: dict[str, Any] = {}
         self._response_mapper = response_mapper
         (
             self._capture_output,
             self._mask_output_when_incomplete,
         ) = _chat_span_capture_policy(handle)
-        self._budget = _transcript_capture_budget()
+        self._budget = _stream_budget()
+        # Bound to the budget, not self, so the callback adds no reference cycle.
+        self._end_stream = _ending_stream(_end_once(handle), partial(_release_budget, self._budget))
+        self._ended = False
         self._text_parts: list[str] = []
         self._saw_delta = False
         self._saw_terminal = False
@@ -2304,7 +2435,15 @@ class _InstrumentedMediaStream:
             if failure is not None:
                 self._end(**self._finish_fields(), error=failure)
 
+    def _end(self, **fields: Any) -> None:
+        # The span has ended and the stream budget no longer counts bytes, so later events are
+        # not kept.
+        self._ended = True
+        self._end_stream(**fields)
+
     def _record(self, event: Any) -> None:
+        if self._ended:
+            return
         event_type = _string(_field(event, "type")) or ""
         if event_type in _MEDIA_TERMINAL_EVENTS:
             self._saw_terminal = True
@@ -2312,6 +2451,7 @@ class _InstrumentedMediaStream:
             event,
             self._response_mapper,
             self._capture_output,
+            self._budget,
         )
         if "output" in mapped:
             self._fields = _clean_fields(mapped)
@@ -2357,14 +2497,16 @@ class _InstrumentedAsyncMediaStream:
         self, inner: Any, handle: telemetry_dev.SpanHandle, response_mapper: ResponseMapper
     ) -> None:
         self._inner = inner
-        self._end = _end_once(handle)
         self._fields: dict[str, Any] = {}
         self._response_mapper = response_mapper
         (
             self._capture_output,
             self._mask_output_when_incomplete,
         ) = _chat_span_capture_policy(handle)
-        self._budget = _transcript_capture_budget()
+        self._budget = _stream_budget()
+        # Bound to the budget, not self, so the callback adds no reference cycle.
+        self._end_stream = _ending_stream(_end_once(handle), partial(_release_budget, self._budget))
+        self._ended = False
         self._text_parts: list[str] = []
         self._saw_delta = False
         self._saw_terminal = False
@@ -2428,7 +2570,15 @@ class _InstrumentedAsyncMediaStream:
             if failure is not None:
                 self._end(**self._finish_fields(), error=failure)
 
+    def _end(self, **fields: Any) -> None:
+        # The span has ended and the stream budget no longer counts bytes, so later events are
+        # not kept.
+        self._ended = True
+        self._end_stream(**fields)
+
     def _record(self, event: Any) -> None:
+        if self._ended:
+            return
         event_type = _string(_field(event, "type")) or ""
         if event_type in _MEDIA_TERMINAL_EVENTS:
             self._saw_terminal = True
@@ -2436,6 +2586,7 @@ class _InstrumentedAsyncMediaStream:
             event,
             self._response_mapper,
             self._capture_output,
+            self._budget,
         )
         if "output" in mapped:
             self._fields = _clean_fields(mapped)

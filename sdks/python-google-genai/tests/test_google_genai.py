@@ -13,8 +13,10 @@ from collections.abc import AsyncIterator, Iterator, Sequence
 from types import SimpleNamespace
 from typing import Any, cast
 
+import conftest
 import pytest
 import telemetry_dev
+from conftest import STREAM_LIMIT
 from google import genai
 from google.genai import errors, types
 from opentelemetry.sdk.trace import ReadableSpan
@@ -29,6 +31,9 @@ from telemetry_dev_google_genai import (
 
 USER_CONTENT = [{"role": "user", "parts": [{"text": "Tell me a joke about OpenTelemetry"}]}]
 SYSTEM_INSTRUCTION = {"parts": [{"text": "You must never tell jokes"}]}
+MIB_TEXT = "x" * (1024 * 1024)
+# Large enough that the 16 MiB bound of a media capture is reached after a few hundred.
+REFERENCE_PADDING = "r" * 100_000
 
 
 def redact_media(_value: Any, context: telemetry_dev.MaskContext) -> str:
@@ -300,6 +305,9 @@ class _TraversalGuard(Sequence[Any]):
 
 
 class _LargeReferences(Sequence[Any]):
+    # Each reference costs more than its padding, so one past this many cannot fit the bound.
+    max_reads = telemetry_dev.MAX_RECORD_BYTES // len(REFERENCE_PADDING) + 1
+
     def __init__(self) -> None:
         self.reads = 0
 
@@ -312,9 +320,9 @@ class _LargeReferences(Sequence[Any]):
         if index >= len(self):
             raise IndexError
         self.reads += 1
-        if self.reads > 400:
+        if self.reads > self.max_reads:
             raise AssertionError("reference image traversal exceeded the capture budget")
-        return {"reference_image": {"uri": f"gs://bucket/reference-{index}.png"}}
+        return {"reference_image": {"uri": f"gs://bucket/{REFERENCE_PADDING}-{index}.png"}}
 
 
 @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
@@ -396,7 +404,8 @@ def test_media_capture_bounds_large_and_cyclic_inputs(
 
     a = attrs(only_span(memory))
     assert a["telemetry.dev.capture.truncated"] is True
-    assert references.reads <= 400
+    # Each reference costs its padding plus under 100 bytes, so the 168th does not fit.
+    assert references.reads == references.max_reads
 
 
 def test_media_capture_projects_cyclic_labels(memory: SimpleNamespace) -> None:
@@ -1249,6 +1258,61 @@ def _streamed_text(memory: SimpleNamespace, texts: list[str]) -> tuple[Any, dict
     return stream._state, attrs(only_span(memory))
 
 
+def test_a_history_and_ratings_that_each_chunk_repeats_are_charged_once(
+    memory: SimpleNamespace,
+) -> None:
+    # After the first AFC round, the SDK sets the whole history on each chunk, and each chunk
+    # carries the prompt and candidate ratings again; each replaces the last one. Nine copies of
+    # the 10,000-byte history, or of either 6,000-byte rating list, pass the 48 KiB stream bound.
+    def get_weather(location: str) -> str:
+        """Get the weather."""
+        return "sunny"
+
+    ratings = SAFETY_RATINGS[:1] * 30
+    call = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [{"functionCall": {"name": "get_weather", "args": {"location": "P"}}}],
+                }
+            }
+        ]
+    }
+    answer: list[Any] = [
+        {
+            "candidates": [
+                {
+                    "index": 0,
+                    "content": {"role": "model", "parts": [{"text": f"{index} "}]},
+                    "safetyRatings": ratings,
+                }
+            ],
+            "promptFeedback": {"safetyRatings": ratings},
+        }
+        for index in range(9)
+    ]
+    answer[-1]["candidates"][0]["finishReason"] = "STOP"
+    client, _ = client_with_transport([[call], answer])
+    prompt = "h" * 10_000
+
+    list(
+        wrap_google_genai(client).models.generate_content_stream(
+            model="gemini-2.5-flash",
+            contents=[{"role": "user", "parts": [{"text": prompt}]}],
+            config=types.GenerateContentConfig(tools=[get_weather]),
+        )
+    )
+
+    a = attrs(only_span(memory))
+    assert "telemetry.dev.capture.truncated" not in a
+    assert "get_weather" in str(a["gen_ai.input.messages"])
+    assert "8 " in str(a["gen_ai.output.messages"])
+    assert json.loads(cast(str, a["google_genai.response.safety_ratings"])) == [
+        {"candidateIndex": 0, "ratings": ratings}
+    ]
+
+
 @pytest.mark.parametrize(
     ("max_attribute_length", "redact", "expected"),
     [
@@ -1282,7 +1346,7 @@ def test_configured_cap_applies_after_the_mask_not_to_stream_retention(
 
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize("max_attribute_length", [0, 100, 1024 * 1024])
-def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
+def test_stream_beyond_the_stream_bound_is_flagged_and_withheld_from_a_mask(
     make: Any, masked: bool, max_attribute_length: int
 ) -> None:
     seen: list[str] = []
@@ -1300,7 +1364,8 @@ def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
 
     retained = "".join(part["text"] for part in state.candidates[0].parts)
     assert state.budget.truncated is True
-    assert state.budget.max_bytes == google_genai_instrumentation._STREAM_CAPTURE_MAX_BYTES  # pyright: ignore[reportPrivateUsage]
+    # Cut at the stream bound, within one 100-byte delta of it.
+    assert STREAM_LIMIT - 200 < state.budget.bytes_used <= STREAM_LIMIT
     assert 0 < len(retained) < 1_100 * 100
     assert a["telemetry.dev.capture.truncated"] is True
     if masked:
@@ -1311,6 +1376,27 @@ def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
         assert output[0]["parts"][0]["text"] == retained
     else:
         assert len(str(a.get("gen_ai.output.messages", ""))) <= max_attribute_length
+
+
+@pytest.mark.parametrize(
+    ("length", "cut"), [(64 * 1024, False), (telemetry_dev.MAX_RECORD_BYTES, True)]
+)
+def test_with_the_default_bounds_a_stream_is_cut_only_at_the_record_bound(
+    make: Any, length: int, cut: bool
+) -> None:
+    conftest.other_stream.release()
+    memory = make(max_stream_bytes=64 * 1024 * 1024)
+    texts = [
+        MIB_TEXT[: min(len(MIB_TEXT), length - start)] for start in range(0, length, len(MIB_TEXT))
+    ]
+
+    _state, a = _streamed_text(memory, texts)
+
+    text = json.loads(str(a["gen_ai.output.messages"]))[0]["parts"][0]["text"]
+    assert a.get("telemetry.dev.capture.truncated") is (True if cut else None)
+    # Each part costs its text plus 52 bytes, so the 16th 1 MiB part does not fit and is
+    # rejected whole.
+    assert len(text) == (telemetry_dev.MAX_RECORD_BYTES - len(MIB_TEXT) if cut else length)
 
 
 @pytest.mark.parametrize("extra_indices", [0, 5_000])
@@ -2591,7 +2677,10 @@ def test_stream_state_folds_usage_and_output_across_response_ids() -> None:
     ]
 
 
-def test_stream_state_drops_over_budget_afc_history_but_still_folds_turn() -> None:
+def test_stream_state_drops_over_budget_afc_history_but_still_folds_turn(
+    memory: SimpleNamespace,
+) -> None:
+    # The client sizes the shared stream bound, which leaves this stream STREAM_LIMIT.
     from telemetry_dev_google_genai import _record_chunk, _stream_fields, _StreamState
 
     state = _StreamState()

@@ -79,7 +79,8 @@ when the cap is shorter than the marker; the cap also applies, with the marker, 
 and log attributes, and any other string attribute is cut at the cap without a marker, except that a
 cap of `0` leaves those whole), `batch`
 (`maxExportBatchSize` 64, `scheduledDelayMillis` 1000, `maxQueueSize` 2048, `maxQueueBytes`
-67108864, and `exportTimeoutMillis` 30000, the timeout of each export request), `spanFilter`, `resourceAttributes`, `logLevel` (SDK diagnostics,
+67108864, `maxStreamBytes` 67108864, and `exportTimeoutMillis` 30000, the timeout of each export
+request), `spanFilter`, `resourceAttributes`, `logLevel` (SDK diagnostics,
 default `"warn"`), `fetch`, `waitUntil`, `onError`.
 
 Each export request is at most 16 MiB, the ingest's limit, so a larger batch is sent in several
@@ -94,6 +95,13 @@ In `"batched"` mode, the spans and the log records that wait for export are each
 counted as one byte. A record that arrives when its queue is full is dropped, and the first drop
 of a series is reported to `onError`. A single record larger than `maxQueueBytes` is still queued
 when its queue is empty.
+
+Provider integrations keep at most 16 MiB (`MAX_RECORD_BYTES`) of the output of one stream, and
+of each value that their READMEs list as bounded.
+While a stream runs, the output it keeps counts toward `maxStreamBytes`, shared by all streams in
+the process; while no other stream holds bytes in it, not even the few bytes a started stream holds before any output, a stream may grow to 16 MiB even past it. The
+bound is process-wide, so the span processor started last sets it. Output past either bound is
+not kept, and its span gets `telemetry.dev.capture.truncated = true`.
 
 Core SDK error recording keeps failure status, error type, and an exception event. It includes
 `exception.message` and `exception.stacktrace` only when both effective `captureInput` and
@@ -403,7 +411,10 @@ await score({
 - `captureMasked()` — report whether the active initialized client has a `mask` configured.
   Returns `false` when no client is initialized.
 - `boundedCapture(value, options?)` — copy a JSON-compatible value within bounded work and retained
-  size. Defaults to 48 KiB, depth 32, and 1,000 traversal items. Returns `{ value, truncated }`;
+  size. Defaults to `MAX_RECORD_BYTES` (16 MiB) of JSON, depth 32, and as many visited values as
+  `maxBytes`, which a value made only of JSON values that fits never reaches; holes, `undefined` and
+  function members, and skipped or inherited keys count as visits (`maxItems` sets another). Returns
+  `{ value, truncated }`;
   `value` can be partial or `undefined` when a limit, cycle, getter, or skip rule prevents capture.
 - `flush()` / `shutdown()` — export pending data; required before serverless freeze/exit.
 

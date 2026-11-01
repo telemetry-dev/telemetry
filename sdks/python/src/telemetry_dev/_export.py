@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import copy
+import math
 import os
 import threading
 import weakref
@@ -18,9 +19,11 @@ from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from ._config import logger, report_error
 from ._serialize import TRUNCATION_MARKER, truncate, utf16_length
 
-# The ingest rejects a body over 16 MiB after gzip decoding, so this limit applies to the
-# serialized request. Keep it equal to DECOMPRESSED_BODY_LIMIT in the ingest.
-MAX_BODY_BYTES = 16 * 1024 * 1024
+# The largest OTLP request the exporters send. The ingest rejects a body over 16 MiB after gzip
+# decoding; keep this equal to DECOMPRESSED_BODY_LIMIT in the ingest. A record that alone is
+# larger has its longest values cut at export, so provider integrations keep at most this much
+# of one value or stream.
+MAX_RECORD_BYTES = 16 * 1024 * 1024
 _CAPTURE_TRUNCATED = "telemetry.dev.capture.truncated"
 
 _Record = TypeVar("_Record")
@@ -46,7 +49,7 @@ def _fit_values(
     lengths = {key: utf16_length(value) for key, value in values.items() if isinstance(value, str)}
     while True:
         fitted = {key: value for key, value in values.items() if key is not _BODY}
-        excess_bytes = size(fitted, values[_BODY]) - MAX_BODY_BYTES
+        excess_bytes = size(fitted, values[_BODY]) - MAX_RECORD_BYTES
         if excess_bytes <= 0:
             return fitted, values[_BODY]
         # Cut the excess from the longest values before the next serialization, since each
@@ -123,8 +126,8 @@ def _send_within_limit(
     label: str,
     on_error: Callable[[BaseException], None] | None,
 ) -> _Result:
-    """Send records in requests of at most MAX_BODY_BYTES, like the TypeScript exporter."""
-    if not records or size(records) <= MAX_BODY_BYTES:
+    """Send records in requests of at most MAX_RECORD_BYTES, like the TypeScript exporter."""
+    if not records or size(records) <= MAX_RECORD_BYTES:
         return send(records)
     if len(records) > 1:
         middle = (len(records) + 1) // 2
@@ -154,6 +157,22 @@ def _send_within_limit(
 
 
 DEFAULT_MAX_QUEUE_BYTES = 64 * 1024 * 1024
+
+
+def resolve_byte_bound(name: str, value: object, default: int) -> int:
+    """``value`` as a byte bound, or ``default`` when it is None. ``math.inf`` means no bound,
+    and a float with no fraction, such as ``1e8``, counts as its integer. Raises ValueError for
+    anything else that is not a non-negative integer."""
+    if value is None:
+        return default
+    if isinstance(value, float) and value >= 0:
+        if value == math.inf:
+            return cast(int, value)
+        if value.is_integer():
+            return int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be None, a non-negative integer, or math.inf")
+    return value
 
 
 def _value_size(value: Any) -> int:

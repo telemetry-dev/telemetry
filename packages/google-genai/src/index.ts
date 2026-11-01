@@ -15,6 +15,7 @@ import {
   startSpan,
   type SpanFields,
   type SpanHandle,
+  StreamCapture,
 } from "@telemetry-dev/sdk";
 import * as telemetrySdk from "@telemetry-dev/sdk";
 
@@ -338,7 +339,7 @@ function ownField(value: unknown, key: string): unknown {
     : undefined;
 }
 
-// boundedCapture's default item limit; more candidates than this cannot all be kept.
+// More candidates than this are not kept, and the capture is marked cut.
 const CAPTURE_MAX_ITEMS = 1_000;
 
 // Retained finish reasons stay outside the output budget so a terminal one is still exported,
@@ -352,7 +353,7 @@ function candidateOutput(response: UnknownRecord) {
 
   // Only candidate content is exported as output. Bounding a projection of it, rather than whole
   // candidates, keeps grounding or safety metadata from marking complete content as cut.
-  const projected = all?.slice(0, CAPTURE_MAX_ITEMS + 1).map((candidate) => {
+  const projected = all?.slice(0, CAPTURE_MAX_ITEMS).map((candidate) => {
     try {
       const content = asRecord(ownField(candidate, "content"));
 
@@ -369,7 +370,8 @@ function candidateOutput(response: UnknownRecord) {
   const capture = boundedTelemetryCapture(projected);
 
   // Metadata that does not fit is still a loss for the span-level flag; both passes are bounded.
-  const contentCut = capture.truncated || projectionFailed;
+  const contentCut =
+    capture.truncated || projectionFailed || (all?.length ?? 0) > CAPTURE_MAX_ITEMS;
   const truncated = contentCut || boundedTelemetryCapture(response.candidates).truncated;
 
   const candidates = asArray(capture.value);
@@ -1224,8 +1226,11 @@ class StreamAggregator {
   private automaticFunctionCalling = false;
   private responseId?: string;
   private responseModel?: string;
-  private outputCaptureBytes = 2;
-  private outputCaptureItems = 0;
+  private readonly outputCapture = new StreamCapture(2);
+  // The AFC history the stream builds, which output folds into, holds its bytes apart. The
+  // request it starts from is the caller's, so only the bytes past it count.
+  private readonly afcCapture = new StreamCapture();
+  private afcRequestBytes = 0;
   private outputCaptureEntries = 0;
   private outputCaptureTruncated = false;
   private afcCaptureTruncated = false;
@@ -1246,20 +1251,25 @@ class StreamAggregator {
       .map(([, state]) => ({ role: state.role, parts: state.parts }));
   }
 
-  private reserveOutput(byteCount: number, itemCount: number): boolean {
-    if (
-      this.outputCaptureBytes + byteCount > 48 * 1024 ||
-      this.outputCaptureItems + itemCount > 1_000
-    ) {
+  private reserveOutput(byteCount: number): boolean {
+    // A cut stream keeps no more output, even once other streams return bytes and the limit
+    // rises, so the kept output has no gaps.
+    if (this.outputCaptureTruncated) return false;
+
+    if (this.outputCapture.bytes + byteCount > this.outputCapture.limit) {
       this.outputCaptureTruncated = true;
 
       return false;
     }
 
-    this.outputCaptureBytes += byteCount;
-    this.outputCaptureItems += itemCount;
+    this.outputCapture.bytes += byteCount;
 
     return true;
+  }
+
+  releaseCapture(): void {
+    this.outputCapture.release();
+    this.afcCapture.release();
   }
 
   get outputTruncated(): boolean {
@@ -1272,8 +1282,7 @@ class StreamAggregator {
 
   private resetOutputCapture(): void {
     this.priorOutput = [];
-    this.outputCaptureBytes = 2;
-    this.outputCaptureItems = 0;
+    this.outputCapture.bytes = 2;
     this.outputCaptureEntries = 0;
     this.outputCaptureTruncated = false;
   }
@@ -1298,6 +1307,7 @@ class StreamAggregator {
 
     if (!this.afcHistory) {
       this.afcHistory = [...(asArray(this.requestInput) ?? [])];
+      this.afcRequestBytes = boundedTelemetryCaptureDetails(this.afcHistory).bytes;
 
       if (this.requestInputCut) this.afcInputIncomplete = true;
     }
@@ -1312,9 +1322,9 @@ class StreamAggregator {
     let appended = false;
 
     for (const entry of entries) {
-      const capture = boundedTelemetryCapture([...this.ensureAfcHistory(), entry]);
+      const capture = boundedTelemetryCaptureDetails([...this.ensureAfcHistory(), entry]);
 
-      if (capture.truncated) {
+      if (capture.truncated || !this.holdAfcBytes(capture.bytes)) {
         this.afcCaptureTruncated = true;
         continue;
       }
@@ -1332,8 +1342,26 @@ class StreamAggregator {
     return appended;
   }
 
+  private holdAfcBytes(total: number): boolean {
+    const held = Math.max(total - this.afcRequestBytes, 0);
+
+    if (held > this.afcCapture.limit) return false;
+    this.afcCapture.bytes = held;
+
+    return true;
+  }
+
   private replaceAfcHistory(history: unknown[]): void {
-    const capture = boundedTelemetryCapture(history);
+    this.ensureAfcHistory();
+    const capture = boundedTelemetryCaptureDetails(history);
+
+    if (!this.holdAfcBytes(capture.bytes)) {
+      this.afcCaptureTruncated = true;
+      this.afcInputIncomplete = true;
+
+      return;
+    }
+
     this.afcHistory = asArray(capture.value) ?? [];
     this.afcCaptureTruncated = capture.truncated;
     this.afcInputIncomplete = capture.truncated;
@@ -1342,12 +1370,12 @@ class StreamAggregator {
   private foldTurn(toAfcHistory: boolean): void {
     const output = this.currentOutput(toAfcHistory);
 
-    if (output.length > 0) {
-      if (toAfcHistory) this.appendAfcHistory(...output);
-      else this.priorOutput.push(...output);
-    }
-
-    if (toAfcHistory) this.resetOutputCapture();
+    if (toAfcHistory) {
+      // The turn's output moves into the history, which holds its bytes from here on.
+      this.outputCapture.bytes = 2;
+      if (output.length > 0) this.appendAfcHistory(...output);
+      this.resetOutputCapture();
+    } else if (output.length > 0) this.priorOutput.push(...output);
 
     this.committedUsage = sumUsage(this.committedUsage, this.usage);
     this.candidates.clear();
@@ -1420,7 +1448,7 @@ class StreamAggregator {
         const byteCount =
           (this.outputCaptureEntries > 0 ? 1 : 0) + serializedByteLength({ role, parts: [] });
 
-        const captured = capturesContent && this.reserveOutput(byteCount, 1);
+        const captured = capturesContent && this.reserveOutput(byteCount);
         state = { role, parts: [], captured };
 
         if (captured) this.outputCaptureEntries += 1;
@@ -1436,7 +1464,7 @@ class StreamAggregator {
         if (role && role !== state.role) {
           const byteCount = roleCapture.bytes - serializedByteLength(state.role);
 
-          if (!state.captured || this.reserveOutput(byteCount, 0)) state.role = role;
+          if (!state.captured || this.reserveOutput(byteCount)) state.role = role;
         }
 
         for (const part of asArray(content.parts) ?? []) {
@@ -1458,7 +1486,7 @@ class StreamAggregator {
             ? serializedByteLength(partRecord.text) - 2
             : (state.parts.length > 0 ? 1 : 0) + capture.bytes;
 
-          if (this.reserveOutput(byteCount, 1)) appendPart(state.parts, partRecord);
+          if (this.reserveOutput(byteCount)) appendPart(state.parts, partRecord);
         }
       }
 
@@ -1584,7 +1612,12 @@ function createObservedStream(
     if (masked && aggregator.afcInputTruncated) delete finalFields.input;
 
     if (error !== undefined) finalFields.error = error;
-    end(finalFields);
+
+    try {
+      end(finalFields);
+    } finally {
+      aggregator.releaseCapture();
+    }
   };
 
   return {

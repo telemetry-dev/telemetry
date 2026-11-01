@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
-from functools import wraps
+from functools import partial, wraps
+from io import StringIO
 from typing import Any, TypeVar, cast
 
 import telemetry_dev
@@ -21,10 +23,8 @@ _PROVIDER = "openrouter"
 _WRAPPED_ATTR = "_telemetry_dev_openrouter_wrapped"
 _ORIGINAL_ATTR = "_telemetry_dev_openrouter_original"
 _CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated"
-# Retention uses fixed bounds, the same as the TypeScript integration; the core applies
-# max_attribute_length after the mask.
-_STREAM_CAPTURE_MAX_BYTES = 64 * 1024
-_STREAM_CAPTURE_MAX_ITEMS = 1024
+# The core applies max_attribute_length after the mask. More choices than this are not kept.
+_MAX_STREAM_CHOICES = 1024
 _FINISH_REASON_MAX_LENGTH = 128
 _TERMINAL_RESPONSE_EVENTS = frozenset(
     {"response.completed", "response.failed", "response.incomplete"}
@@ -393,19 +393,33 @@ def _end_once(handle: telemetry_dev.SpanHandle) -> Callable[..., None]:
 class _ChatChoice:
     def __init__(self) -> None:
         self.role: str | None = None
-        self.content = ""
-        self.reasoning = ""
+        # Deltas are written to buffers and joined when output is read: repeated concatenation
+        # copies the whole text for each delta.
+        self.content_fragments = StringIO()
+        self.reasoning_fragments = StringIO()
         self.reasoning_details: list[Any] = []
-        self.refusal = ""
+        self.refusal_fragments = StringIO()
         self.tool_calls: dict[int, dict[str, Any]] = {}
         self.finish_reason: str | None = None
+
+    @property
+    def content(self) -> str:
+        return self.content_fragments.getvalue()
+
+    @property
+    def reasoning(self) -> str:
+        return self.reasoning_fragments.getvalue()
+
+    @property
+    def refusal(self) -> str:
+        return self.refusal_fragments.getvalue()
 
 
 def _choice_state(
     states: dict[int, _ChatChoice], index: int, budget: telemetry_dev.CaptureBudget
 ) -> _ChatChoice | None:
     if index not in states:
-        if len(states) >= budget.max_items:
+        if len(states) >= _MAX_STREAM_CHOICES:
             budget.truncated = True
             return None
         states[index] = _ChatChoice()
@@ -430,7 +444,10 @@ def _merge_tool_call(state: _ChatChoice, delta: Any) -> None:
         if name is not None:
             current_function["name"] = name
         if isinstance(arguments, str):
-            current_function["arguments"] = f"{current_function.get('arguments', '')}{arguments}"
+            fragments = current_function.get("arguments")
+            if not isinstance(fragments, StringIO):
+                fragments = current_function["arguments"] = StringIO()
+            fragments.write(arguments)
         current["function"] = current_function
     state.tool_calls[tool_index] = current
 
@@ -451,15 +468,15 @@ def _record_chat_chunk(
         if isinstance(role, str):
             state.role = role
         if isinstance(content, str) and budget.accept(content):
-            state.content += content
+            state.content_fragments.write(content)
         if isinstance(reasoning, str) and budget.accept(reasoning):
-            state.reasoning += reasoning
+            state.reasoning_fragments.write(reasoning)
         for detail in _sequence_items(_field(delta, "reasoning_details")):
             native_detail = _native(detail)
             if native_detail is not None and budget.accept(native_detail):
                 state.reasoning_details.append(native_detail)
         if isinstance(refusal, str) and budget.accept(refusal):
-            state.refusal += refusal
+            state.refusal_fragments.write(refusal)
         for tool_call in _sequence_items(_field(delta, "tool_calls")):
             if budget.accept(tool_call):
                 _merge_tool_call(state, tool_call)
@@ -528,6 +545,16 @@ def _response_event_has_output(event: Any) -> bool:
     )
 
 
+def _joined_tool_call(call: dict[str, Any]) -> dict[str, Any]:
+    function = call.get("function")
+    if not isinstance(function, dict):
+        return call
+    arguments = cast(dict[str, Any], function).get("arguments")
+    if not isinstance(arguments, StringIO):
+        return call
+    return {**call, "function": {**function, "arguments": arguments.getvalue()}}
+
+
 def _chat_output(states: Mapping[int, _ChatChoice]) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     for _, state in sorted(states.items()):
@@ -543,13 +570,57 @@ def _chat_output(states: Mapping[int, _ChatChoice]) -> list[dict[str, Any]]:
         if state.refusal:
             message["refusal"] = state.refusal
         if state.tool_calls:
-            message["tool_calls"] = [call for _, call in sorted(state.tool_calls.items())]
+            message["tool_calls"] = [
+                _joined_tool_call(call) for _, call in sorted(state.tool_calls.items())
+            ]
         output.append(message)
     return output
 
 
 def _stream_capture_budget() -> telemetry_dev.CaptureBudget:
-    return telemetry_dev.CaptureBudget(_STREAM_CAPTURE_MAX_BYTES, _STREAM_CAPTURE_MAX_ITEMS)
+    # Older cores have no for_stream and bound each budget at 64 KiB on its own.
+    for_stream = getattr(telemetry_dev.CaptureBudget, "for_stream", None)
+    budget = for_stream() if callable(for_stream) else telemetry_dev.CaptureBudget()
+    return cast(telemetry_dev.CaptureBudget, budget)
+
+
+def _release_budget(budget: telemetry_dev.CaptureBudget) -> None:
+    release = getattr(budget, "release", None)
+    if callable(release):
+        release()
+
+
+def _measuring_budget(stream: telemetry_dev.CaptureBudget) -> telemetry_dev.CaptureBudget:
+    """An empty budget that measures a value replacing everything ``stream`` holds, within the
+    bound ``stream`` has now, without holding bytes itself."""
+    return telemetry_dev.CaptureBudget(stream.max_bytes, stream.max_items)
+
+
+def _adopt_budget(
+    stream: telemetry_dev.CaptureBudget, measured: telemetry_dev.CaptureBudget
+) -> bool:
+    """Takes the counts of a budget that measured a replacement into the stream's own budget.
+    Returns False, and takes nothing, when another stream took the room after the measure."""
+    # Older cores have no reserve_bytes; there the measure against max_bytes stands.
+    reserve = getattr(stream, "reserve_bytes", None)
+    if callable(reserve):
+        if not reserve(measured.bytes_used):
+            return False
+    else:
+        stream.bytes_used = measured.bytes_used
+    stream.items_used = measured.items_used
+    stream.truncated = measured.truncated
+    return True
+
+
+def _ending_stream(end: Callable[..., None], release: Callable[[], None]) -> Callable[..., None]:
+    def end_stream(**fields: Any) -> None:
+        try:
+            end(**fields)
+        finally:
+            release()
+
+    return end_stream
 
 
 def _capture_masked(handle: telemetry_dev.SpanHandle) -> bool:
@@ -619,6 +690,15 @@ def _hook_response_close(inner: Any, finish: Callable[[], None]) -> None:
     response = getattr(inner, "response", None)
     if response is None:
         return
+    # ``finish`` is a method of the stream wrapper, which holds ``response``: held weakly, the hook
+    # adds no reference cycle, so a dropped wrapper and its stream budget are freed at once.
+    finish_method = weakref.WeakMethod(finish)
+
+    def finish_if_alive() -> None:
+        method = finish_method()
+        if method is not None:
+            method()
+
     close = getattr(response, "close", None)
     if callable(close):
 
@@ -626,7 +706,7 @@ def _hook_response_close(inner: Any, finish: Callable[[], None]) -> None:
             try:
                 return close(*args, **kwargs)
             finally:
-                finish()
+                finish_if_alive()
 
         response.close = _close_hook
     aclose = getattr(response, "aclose", None)
@@ -637,7 +717,7 @@ def _hook_response_close(inner: Any, finish: Callable[[], None]) -> None:
             try:
                 return await aclose_fn(*args, **kwargs)
             finally:
-                finish()
+                finish_if_alive()
 
         response.aclose = _aclose_hook
 
@@ -665,7 +745,6 @@ async def _close_async_stream(inner: Any) -> None:
 class _InstrumentedStream:
     def __init__(self, inner: Any, handle: telemetry_dev.SpanHandle, started_at: float) -> None:
         self._inner = inner
-        self._end = _end_once(handle)
         self._handle = handle
         self._started_at = started_at
         self._states: dict[int, _ChatChoice] = {}
@@ -677,6 +756,9 @@ class _InstrumentedStream:
         self._completed = False
         self._mask_output_when_incomplete = _capture_masked(handle)
         self._budget = _stream_capture_budget()
+        # Bound to the budget, not self, so the callback adds no reference cycle.
+        self._end_stream = _ending_stream(_end_once(handle), partial(_release_budget, self._budget))
+        self._ended = False
         _hook_response_close(inner, self._on_response_close)
 
     def _iterate(self) -> Iterator[Any]:
@@ -747,7 +829,15 @@ class _InstrumentedStream:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
+    def _end(self, **fields: Any) -> None:
+        # The span has ended and the stream budget no longer counts bytes, so later events are
+        # not kept.
+        self._ended = True
+        self._end_stream(**fields)
+
     def _record(self, chunk: Any, received_at: float) -> bool:
+        if self._ended:
+            return True
         update = _record_chat_chunk(chunk, self._states, self._budget)
         if _chat_chunk_has_output(chunk):
             record_output_chunk = getattr(self._handle, "record_output_chunk", None)
@@ -770,7 +860,6 @@ class _InstrumentedStream:
 class _InstrumentedAsyncStream:
     def __init__(self, inner: Any, handle: telemetry_dev.SpanHandle, started_at: float) -> None:
         self._inner = inner
-        self._end = _end_once(handle)
         self._handle = handle
         self._started_at = started_at
         self._states: dict[int, _ChatChoice] = {}
@@ -782,6 +871,9 @@ class _InstrumentedAsyncStream:
         self._completed = False
         self._mask_output_when_incomplete = _capture_masked(handle)
         self._budget = _stream_capture_budget()
+        # Bound to the budget, not self, so the callback adds no reference cycle.
+        self._end_stream = _ending_stream(_end_once(handle), partial(_release_budget, self._budget))
+        self._ended = False
         _hook_response_close(inner, self._on_response_close)
 
     async def _aiterate(self) -> AsyncIterator[Any]:
@@ -855,7 +947,15 @@ class _InstrumentedAsyncStream:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
+    def _end(self, **fields: Any) -> None:
+        # The span has ended and the stream budget no longer counts bytes, so later events are
+        # not kept.
+        self._ended = True
+        self._end_stream(**fields)
+
     def _record(self, chunk: Any, received_at: float) -> bool:
+        if self._ended:
+            return True
         update = _record_chat_chunk(chunk, self._states, self._budget)
         if _chat_chunk_has_output(chunk):
             record_output_chunk = getattr(self._handle, "record_output_chunk", None)
@@ -873,6 +973,37 @@ class _InstrumentedAsyncStream:
         if update.get("cost_usd") is not None:
             self._cost_usd = update["cost_usd"]
         return _chunk_error(chunk) is None
+
+
+def _write_fragment(target: dict[str, Any], key: str, value: str) -> None:
+    """Appends a delta to ``target[key]`` in a buffer, since repeated concatenation copies the
+    whole text for each delta. _joined_item reads the text back."""
+    fragments = target.get(key)
+    if not isinstance(fragments, StringIO):
+        fragments = StringIO()
+        fragments.write(f"{target.get(key, '')}")
+        target[key] = fragments
+    fragments.write(value)
+
+
+def _joined_value(value: Any) -> Any:
+    return value.getvalue() if isinstance(value, StringIO) else value
+
+
+def _joined_item(item: Any) -> Any:
+    if not isinstance(item, dict):
+        return item
+    joined: dict[str, Any] = {}
+    for key, value in cast(dict[str, Any], item).items():
+        if key in ("content", "summary") and isinstance(value, list):
+            value = [
+                {name: _joined_value(field) for name, field in cast(dict[str, Any], part).items()}
+                if isinstance(part, dict)
+                else part
+                for part in cast(list[Any], value)
+            ]
+        joined[key] = _joined_value(value)
+    return joined
 
 
 class _ResponsesStreamState:
@@ -903,7 +1034,10 @@ class _ResponsesStreamState:
 
     def _output_with_item(self, output_index: int, item: dict[str, Any]) -> list[dict[str, Any]]:
         items = {**self._items, output_index: item}
-        return [*[value for _, value in sorted(items.items())], *self._synthetic_events]
+        return [
+            *[_joined_item(value) for _, value in sorted(items.items())],
+            *self._synthetic_events,
+        ]
 
     @staticmethod
     def _can_accept(budget: telemetry_dev.CaptureBudget, value: Any) -> bool:
@@ -914,13 +1048,18 @@ class _ResponsesStreamState:
         return candidate.accept(value)
 
     def _replace_output(self, output: Any) -> bool:
-        replacement = _stream_capture_budget()
+        replacement = _measuring_budget(self._budget)
         if not replacement.accept(output):
             self._budget.truncated = True
             return False
         replacement.truncated = self._provider_events_truncated
-        self._budget = replacement
+        if not _adopt_budget(self._budget, replacement):
+            self._budget.truncated = True
+            return False
         return True
+
+    def release(self) -> None:
+        _release_budget(self._budget)
 
     def _sync_output(self) -> None:
         self.retained_output = self._output()
@@ -1007,7 +1146,7 @@ class _ResponsesStreamState:
         if event_type in {"response.output_item.added", "response.output_item.done"}:
             raw_item = _field(event, "item")
             replacement = event_type.endswith(".done")
-            preflight = _stream_capture_budget() if replacement else self._budget
+            preflight = _measuring_budget(self._budget) if replacement else self._budget
             if not self._can_accept(preflight, raw_item):
                 self._budget.truncated = True
                 return False
@@ -1025,7 +1164,7 @@ class _ResponsesStreamState:
         if event_type in {"response.content_part.added", "response.content_part.done"}:
             event_part = _field(event, "part")
             replacement = event_type.endswith(".done")
-            preflight = _stream_capture_budget() if replacement else self._budget
+            preflight = _measuring_budget(self._budget) if replacement else self._budget
             if not self._can_accept(preflight, event_part):
                 self._budget.truncated = True
                 return False
@@ -1127,7 +1266,7 @@ class _ResponsesStreamState:
             else:
                 if not self._budget.accept(value):
                     return False
-                item[field] = f"{item.get(field, '')}{value}"
+                _write_fragment(item, field, value)
                 name = _field(event, "name")
                 if name is not None:
                     item["name"] = name
@@ -1138,7 +1277,7 @@ class _ResponsesStreamState:
         }:
             event_part = _field(event, "part")
             replacement = event_type.endswith(".done")
-            preflight = _stream_capture_budget() if replacement else self._budget
+            preflight = _measuring_budget(self._budget) if replacement else self._budget
             if not self._can_accept(preflight, event_part):
                 self._budget.truncated = True
                 return False
@@ -1253,7 +1392,7 @@ class _ResponsesStreamState:
                 self._summary[summary_key] = part
                 self._sync_item(output_index, item)
             else:
-                summary["text"] = f"{summary.get('text', '')}{value}"
+                _write_fragment(summary, "text", value)
             return True
         content_index = self._event_index(event, "content_index", "contentIndex")
         content_key = (output_index, content_index)
@@ -1292,9 +1431,9 @@ class _ResponsesStreamState:
             self._content[content_key] = replacement
             self._sync_item(output_index, item)
         elif refusal:
-            part["refusal"] = f"{part.get('refusal', '')}{value}"
+            _write_fragment(part, "refusal", value)
         else:
-            part["text"] = f"{part.get('text', '')}{value}"
+            _write_fragment(part, "text", value)
         return True
 
     def record(self, event: Any) -> None:
@@ -1302,7 +1441,7 @@ class _ResponsesStreamState:
         response = _field(event, "response")
         if response is not None:
             fields = _responses_response(response, include_error=False, include_output=False)
-            response_budget = _stream_capture_budget()
+            response_budget = _measuring_budget(self._budget)
             raw_output = _field(response, "output")
             if raw_output is not None:
                 if not self._can_accept(response_budget, raw_output):
@@ -1314,7 +1453,11 @@ class _ResponsesStreamState:
                         self._budget.truncated = True
                     else:
                         response_artifact = [*response_items, *self._synthetic_events]
+                        adopted = False
                         if response_budget.accept(response_artifact):
+                            response_budget.truncated = self._provider_events_truncated
+                            adopted = _adopt_budget(self._budget, response_budget)
+                        if adopted:
                             self._items.clear()
                             self._content.clear()
                             self._summary.clear()
@@ -1322,8 +1465,6 @@ class _ResponsesStreamState:
                                 if isinstance(item, dict):
                                     self._hydrate_item(index, cast(dict[str, Any], item))
                             self.retained_output = response_artifact
-                            response_budget.truncated = self._provider_events_truncated
-                            self._budget = response_budget
                         else:
                             self._budget.truncated = True
             self.partial = fields
@@ -1337,6 +1478,9 @@ class _ResponsesStreamState:
 
     def fields(self, mask_output: bool, *, failed: bool = False) -> dict[str, Any]:
         fields = dict(self.partial)
+        output = fields.get("output")
+        if isinstance(output, list):
+            fields["output"] = [_joined_item(item) for item in cast(list[Any], output)]
         if failed or self._budget.truncated or not self.saw_terminal_snapshot:
             _mark_capture_incomplete(fields, mask_output)
         return fields
@@ -1346,10 +1490,12 @@ class _InstrumentedResponsesStream:
     def __init__(self, inner: Any, handle: telemetry_dev.SpanHandle, started_at: float) -> None:
         self._inner = inner
         self._handle = handle
-        self._end = _end_once(handle)
         self._started_at = started_at
         self._saw_first = False
         self._state = _ResponsesStreamState()
+        # Bound to the state, not self, so the callback adds no reference cycle.
+        self._end_stream = _ending_stream(_end_once(handle), self._state.release)
+        self._ended = False
         self._mask_output_when_incomplete = _capture_masked(handle)
         self._consume: Iterator[Any] | None = None
         self._in_next = False
@@ -1417,7 +1563,15 @@ class _InstrumentedResponsesStream:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
+    def _end(self, **fields: Any) -> None:
+        # The span has ended and the stream budget no longer counts bytes, so later events are
+        # not kept.
+        self._ended = True
+        self._end_stream(**fields)
+
     def _record(self, event: Any, received_at: float) -> None:
+        if self._ended:
+            return
         if _response_event_has_output(event):
             record_output_chunk = getattr(self._handle, "record_output_chunk", None)
             if callable(record_output_chunk):
@@ -1444,10 +1598,12 @@ class _InstrumentedAsyncResponsesStream:
     def __init__(self, inner: Any, handle: telemetry_dev.SpanHandle, started_at: float) -> None:
         self._inner = inner
         self._handle = handle
-        self._end = _end_once(handle)
         self._started_at = started_at
         self._saw_first = False
         self._state = _ResponsesStreamState()
+        # Bound to the state, not self, so the callback adds no reference cycle.
+        self._end_stream = _ending_stream(_end_once(handle), self._state.release)
+        self._ended = False
         self._mask_output_when_incomplete = _capture_masked(handle)
         self._consume: AsyncIterator[Any] | None = None
         self._in_next = False
@@ -1518,7 +1674,15 @@ class _InstrumentedAsyncResponsesStream:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
+    def _end(self, **fields: Any) -> None:
+        # The span has ended and the stream budget no longer counts bytes, so later events are
+        # not kept.
+        self._ended = True
+        self._end_stream(**fields)
+
     def _record(self, event: Any, received_at: float) -> None:
+        if self._ended:
+            return
         if _response_event_has_output(event):
             record_output_chunk = getattr(self._handle, "record_output_chunk", None)
             if callable(record_output_chunk):

@@ -31,6 +31,7 @@ from opentelemetry.sdk.trace.export import SpanExporter
 from opentelemetry.sdk.trace.sampling import Sampler
 from opentelemetry.trace import Tracer
 
+from ._capture import DEFAULT_MAX_STREAM_BYTES
 from ._config import (
     SDK_VERSION,
     LogLevelOption,
@@ -49,6 +50,7 @@ from ._export import (
     ReportingLogExporter,
     ReportingSpanExporter,
     after_export,
+    resolve_byte_bound,
 )
 from ._metrics import (
     GuardedOTLPMetricExporter,
@@ -123,6 +125,7 @@ class Client:
         capture_output: bool = True,
         mask: Mask | None = None,
         max_attribute_length: int = sys.maxsize,
+        max_stream_bytes: float | None = DEFAULT_MAX_STREAM_BYTES,
         span_filter: Callable[[ReadableSpan], bool] | None = None,
         sampler: Sampler | None = None,
         on_error: Callable[[BaseException], None] | None = None,
@@ -223,6 +226,7 @@ class Client:
         self.processor = StampingSpanProcessor(
             span_exporter,
             export_mode=export_mode,
+            max_stream_bytes=max_stream_bytes,
             span_filter=span_filter,
             metrics_recorder=metrics_recorder,
             on_error=on_error,
@@ -338,6 +342,7 @@ def init(
     capture_output: bool = True,
     mask: Mask | None = None,
     max_attribute_length: int | None = None,
+    max_stream_bytes: float | None = DEFAULT_MAX_STREAM_BYTES,
     span_filter: Callable[[ReadableSpan], bool] | None = None,
     sampler: Sampler | None = None,
     on_error: Callable[[BaseException], None] | None = None,
@@ -374,6 +379,9 @@ def init(
             or raw_max_attribute_length < 0
         ):
             raise ValueError("max_attribute_length must be None or a non-negative integer")
+        max_stream_bytes = resolve_byte_bound(
+            "max_stream_bytes", max_stream_bytes, DEFAULT_MAX_STREAM_BYTES
+        )
         client = Client(
             config=config,
             enabled=effective_enabled,
@@ -384,6 +392,7 @@ def init(
             capture_output=capture_output,
             mask=mask,
             max_attribute_length=raw_max_attribute_length,
+            max_stream_bytes=max_stream_bytes,
             span_filter=span_filter,
             sampler=sampler,
             on_error=on_error,

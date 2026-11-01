@@ -1,4 +1,9 @@
-import { boundedCapture, captureEnabled, type SpanFields } from "@telemetry-dev/sdk";
+import {
+  boundedCapture,
+  boundedCaptureDetails,
+  captureEnabled,
+  type SpanFields,
+} from "@telemetry-dev/sdk";
 
 import {
   arrayValue,
@@ -120,10 +125,11 @@ export class AgentStreamState implements StreamState {
     if (returnControl) {
       this.sawReturnControl = true;
 
-      // Return control replaces the text output, so it gets its own fresh bound and survives
-      // text that already spent the shared budget; one that alone does not fit is dropped and
-      // the capture is marked incomplete.
-      if (new StreamRetention().accept(returnControl)) {
+      // Return control replaces the text output, so it gets its own record-sized bound and
+      // survives text that already spent the stream budget; it is the decoded event itself,
+      // not a copy, so it is not counted there. One that alone does not fit is dropped and the
+      // capture is marked incomplete.
+      if (!boundedCaptureDetails(returnControl).truncated) {
         this.returnControl = returnControl;
       } else {
         this.returnControl = undefined;

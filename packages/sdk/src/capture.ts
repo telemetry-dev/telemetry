@@ -1,8 +1,14 @@
-import { jsonAttr, reportError, TRUNCATION_MARKER, truncate } from "@telemetry-dev/otel";
+import {
+  jsonAttr,
+  MAX_RECORD_BYTES,
+  reportError,
+  TRUNCATION_MARKER,
+  truncate,
+} from "@telemetry-dev/otel";
 
 import type { MaskFn } from "./config.ts";
 
-export { TRUNCATION_MARKER, truncate } from "@telemetry-dev/otel";
+export { MAX_RECORD_BYTES, StreamCapture, TRUNCATION_MARKER, truncate } from "@telemetry-dev/otel";
 
 export interface CaptureConfig {
   mask?: MaskFn;
@@ -11,8 +17,16 @@ export interface CaptureConfig {
 }
 
 export interface BoundedCaptureOptions {
+  /** UTF-8 bytes of the JSON to keep. Default MAX_RECORD_BYTES (16 MiB). */
   maxBytes?: number;
+  /** Default 32. */
   maxDepth?: number;
+  /**
+   * Values to visit, counting each array, object, and leaf, and each skipped or inherited key,
+   * also those not kept. Default maxBytes: each kept value takes at least one byte, so a value
+   * made only of JSON values whose JSON fits in maxBytes never reaches it; holes and undefined
+   * or function members count.
+   */
   maxItems?: number;
   skip?: (key: string, value: unknown, parent: unknown, path: readonly string[]) => boolean;
 }
@@ -88,13 +102,28 @@ export function boundedCaptureDetails(
   input: unknown,
   options: BoundedCaptureOptions = {},
 ): BoundedCaptureDetails {
-  const maxBytes = captureLimit("maxBytes", options.maxBytes, 48 * 1024);
+  const maxBytes = captureLimit("maxBytes", options.maxBytes, MAX_RECORD_BYTES);
   const maxDepth = captureLimit("maxDepth", options.maxDepth, 32);
-  const maxItems = captureLimit("maxItems", options.maxItems, 1_000);
+  const maxItems = captureLimit("maxItems", options.maxItems, maxBytes);
   const ancestors = new WeakSet<object>();
   let bytes = 0;
   let items = 0;
   let truncated = false;
+  // Characters scanned for strings that then did not fit. Without an item limit, many large
+  // strings that each fail to fit would each be scanned up to the remaining room.
+  let wasted = 0;
+
+  const measure = (text: string): number => {
+    const room = maxBytes - bytes;
+
+    // Each UTF-16 unit takes at least one byte, and the quotes two.
+    if (text.length + 2 > room) return room + 1;
+    const length = jsonStringByteLength(text, room);
+
+    if (length > room) wasted += text.length;
+
+    return length;
+  };
 
   const visit = (
     value: unknown,
@@ -116,9 +145,7 @@ export function boundedCaptureDetails(
       typeof value === "string"
     ) {
       const length =
-        typeof value === "string"
-          ? jsonStringByteLength(value, maxBytes - bytes)
-          : (JSON.stringify(value)?.length ?? 0);
+        typeof value === "string" ? measure(value) : (JSON.stringify(value)?.length ?? 0);
 
       if (bytes + length > maxBytes) {
         truncated = true;
@@ -147,7 +174,7 @@ export function boundedCaptureDetails(
         const result: CapturedValue[] = [];
 
         for (const item of value) {
-          if (items >= maxItems) {
+          if (items >= maxItems || bytes >= maxBytes || wasted > maxBytes) {
             truncated = true;
             break;
           }
@@ -171,7 +198,7 @@ export function boundedCaptureDetails(
       let emitted = false;
 
       for (const key in value) {
-        if (items >= maxItems) {
+        if (items >= maxItems || bytes >= maxBytes || wasted > maxBytes) {
           truncated = true;
           break;
         }
@@ -181,7 +208,7 @@ export function boundedCaptureDetails(
           continue;
         }
 
-        const keyBytes = jsonStringByteLength(key, maxBytes - bytes) + 1 + (emitted ? 1 : 0);
+        const keyBytes = measure(key) + 1 + (emitted ? 1 : 0);
 
         if (bytes + keyBytes > maxBytes) {
           items += 1;

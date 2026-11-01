@@ -105,7 +105,12 @@ events or array attributes hold the excess, is dropped); both cases are reported
 batch has its own; in batched mode, the span queue and the log queue each hold at most 2048 records
 and 64 MiB of string values (each UTF-16 unit, or each Python character, counted as one byte; a
 record into an empty queue is always held); a record over either bound is dropped, and the first
-drop of a series is reported; instrumentation scopes `@telemetry-dev/sdk` and `telemetry_dev` (both
+drop of a series is reported; provider integrations keep at most 16 MiB of the output of one
+stream (`MAX_RECORD_BYTES`), and the output kept by streams that have not ended shares one
+process-wide bound (TypeScript `batch.maxStreamBytes`, Python `max_stream_bytes`, default 64 MiB;
+while no other stream holds bytes in it, not even the few bytes a started stream holds before any output, a stream may grow to 16 MiB even past it); output past
+either bound is not kept, and its span gets `telemetry.dev.capture.truncated = true`;
+instrumentation scopes `@telemetry-dev/sdk` and `telemetry_dev` (both
 classify as framework `otel`).
 
 The SDK allowlists above drop unknown keys in SDK usage objects. Ingest reports

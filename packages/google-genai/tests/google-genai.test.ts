@@ -10,7 +10,15 @@ import {
   type PushMetricExporter,
   type ResourceMetrics,
 } from "@opentelemetry/sdk-metrics";
-import { type ChatMessage, flush, getPrompt, init, shutdown } from "@telemetry-dev/sdk";
+import {
+  type ChatMessage,
+  flush,
+  getPrompt,
+  init,
+  MAX_RECORD_BYTES,
+  shutdown,
+  StreamCapture,
+} from "@telemetry-dev/sdk";
 import * as telemetrySdk from "@telemetry-dev/sdk";
 import {
   FunctionCallingConfigMode,
@@ -21,7 +29,7 @@ import {
   type Part,
   type Tool,
 } from "@google/genai";
-import { afterEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import { wrapGoogleGenAI } from "../src/index.ts";
 
@@ -116,6 +124,20 @@ function createFakeFetch(...responses: Response[]) {
   return { fetch: fetchImpl, requests };
 }
 
+// Most tests reach the stream bound at 48 KiB: another stream holds a byte, and the setup sizes
+// the shared bound to leave a stream these tests start 48 KiB.
+const STREAM_LIMIT = 48 * 1024;
+let otherStream: StreamCapture | undefined;
+
+beforeEach(() => {
+  otherStream = new StreamCapture(1);
+});
+
+// Requests, unary responses, and AFC history are kept up to MAX_RECORD_BYTES of JSON. As a JSON
+// string OVER_RECORD alone is 2 bytes over it; NEAR_RECORD leaves about 5,000 bytes. Built once.
+const OVER_RECORD = "x".repeat(MAX_RECORD_BYTES);
+const NEAR_RECORD = "p".repeat(MAX_RECORD_BYTES - 5_000);
+
 function setupSpans(
   options: {
     captureInput?: boolean;
@@ -123,6 +145,7 @@ function setupSpans(
     mask?: (value: unknown, context: { key: string }) => unknown;
     maxAttributeLength?: number;
     sampler?: Sampler;
+    batch?: { maxStreamBytes?: number };
   } = {},
 ): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
@@ -134,6 +157,7 @@ function setupSpans(
       exportMode: "immediate",
       logLevel: "silent",
       fetch: async () => new Response(null, { status: 200 }),
+      batch: { maxStreamBytes: STREAM_LIMIT + 1 },
       ...options,
     },
     { spanExporter },
@@ -230,6 +254,7 @@ function messagesAttr(span: ReadableSpan, key: "gen_ai.input.messages" | "gen_ai
 }
 
 afterEach(async () => {
+  otherStream?.release();
   vi.unstubAllGlobals();
   await shutdown();
   vi.restoreAllMocks();
@@ -810,7 +835,8 @@ test("streaming automatic function calls keep tool turns out of final output", a
 });
 
 test("streaming AFC input does not consume the resumed output budget", async () => {
-  const spans = setupSpans();
+  // The history and the output share the stream bound, so it leaves room for both.
+  const spans = setupSpans({ batch: { maxStreamBytes: 2 * STREAM_LIMIT } });
   const functionArgument = "x".repeat(47_000);
   const finalText = "y".repeat(3_000);
 
@@ -866,7 +892,9 @@ test("streaming AFC input does not consume the resumed output budget", async () 
 
 test("streaming AFC applies one cumulative input budget", async () => {
   const spans = setupSpans();
-  const requestText = "r".repeat(40_000);
+  // The request and the function call each fit, the call within the stream bound, but together
+  // they pass the input bound.
+  const requestText = NEAR_RECORD;
   const functionArgument = "a".repeat(40_000);
   const finalText = "final";
 
@@ -911,7 +939,11 @@ test("streaming AFC applies one cumulative input budget", async () => {
 
   const span = await exportedSpan(spans);
   const input = String(span.attributes["gen_ai.input.messages"]);
-  expect(new TextEncoder().encode(input).byteLength).toBeLessThanOrEqual(48 * 1024);
+  expect(new TextEncoder().encode(input).byteLength).toBeLessThanOrEqual(MAX_RECORD_BYTES);
+  expect(messagesAttr(span, "gen_ai.input.messages")).toEqual([
+    { role: "user", parts: [{ text: requestText }] },
+    { role: "user", parts: [{ functionResponse: { name: "lookup", response: { ok: true } } }] },
+  ]);
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
   expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
     { role: "model", parts: [{ text: finalText }] },
@@ -999,6 +1031,46 @@ test("streaming output applies its cumulative limit in UTF-8 bytes", async () =>
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
+test.each([
+  [64 * 1024, false],
+  [MAX_RECORD_BYTES, true],
+] as const)("with the default bounds a stream of %s text bytes is cut: %s", async (length, cut) => {
+  otherStream?.release();
+  const spans = setupSpans({ batch: {} });
+  const piece = OVER_RECORD.slice(0, 1024 * 1024);
+
+  const chunks = Array.from({ length: Math.ceil(length / piece.length) }, (_, index) => ({
+    candidates: [
+      {
+        content: {
+          role: "model",
+          parts: [{ text: piece.slice(0, Math.min(piece.length, length - index * piece.length)) }],
+        },
+      },
+    ],
+  }));
+
+  vi.stubGlobal("fetch", createFakeFetch(sseResponse(chunks)).fetch);
+  const stream = await clientWith().models.generateContentStream({
+    model: "gemini",
+    contents: "go",
+  });
+
+  for await (const _chunk of stream) {
+  }
+
+  const span = await exportedSpan(spans);
+  const output = messagesAttr(span, "gen_ai.output.messages") as Array<{
+    parts: Array<{ text: string }>;
+  }>;
+
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(cut ? true : undefined);
+  // The capture holds 2 bytes of [] and 27 of {"role":"model","parts":[]}, then 11 bytes of
+  // {"text":""} with the text. A 1 MiB chunk that would pass MAX_RECORD_BYTES is rejected whole,
+  // so 15 of the 16 are kept.
+  expect(output[0]!.parts[0]!.text.length).toBe(cut ? MAX_RECORD_BYTES - 1024 * 1024 : length);
+});
+
 test("streaming capture ignores unretained candidate metadata", async () => {
   const spans = setupSpans();
 
@@ -1031,7 +1103,7 @@ test("streaming capture ignores unretained candidate metadata", async () => {
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
 });
 
-test("streaming capture resumes after rejecting an oversized output delta", async () => {
+test("streaming capture keeps no output after it rejects a delta, also when the limit rises", async () => {
   const spans = setupSpans();
   const retained = "a".repeat(40_000);
 
@@ -1042,9 +1114,14 @@ test("streaming capture resumes after rejecting an oversized output delta", asyn
         yield {
           candidates: [{ content: { role: "model", parts: [{ text: "b".repeat(10_000) }] } }],
         };
+        // The other stream returns its byte, so the limit rises to MAX_RECORD_BYTES.
+        otherStream?.release();
         yield {
           candidates: [
-            { content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" },
+            {
+              content: { role: "model", parts: [{ text: "c".repeat(10_000) }] },
+              finishReason: "STOP",
+            },
           ],
         };
       },
@@ -1060,9 +1137,106 @@ test("streaming capture resumes after rejecting an oversized output delta", asyn
 
   const span = await exportedSpan(spans);
   expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
-    { role: "model", parts: [{ text: `${retained}ok` }] },
+    { role: "model", parts: [{ text: retained }] },
   ]);
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+// A probe that holds nothing sees the room that streams in flight leave. The stream must give
+// its bytes back however it ends.
+test.each(["ending its span throws", "the provider stream fails", "the caller stops early"])(
+  "a stream returns its bytes to the stream bound when %s",
+  async (ending) => {
+    const spans = setupSpans();
+
+    if (ending === "ending its span throws") {
+      const startSpan = telemetrySdk.startSpan;
+      vi.spyOn(telemetrySdk, "startSpan").mockImplementation((...args) => {
+        const span = startSpan(...args);
+        const end = span.end.bind(span);
+        vi.spyOn(span, "end").mockImplementation((fields) => {
+          end(fields);
+          throw new Error("span processor failed");
+        });
+
+        return span;
+      });
+    }
+
+    const client = wrapGoogleGenAI({
+      models: {
+        async *generateContentStream(_params: unknown) {
+          yield { candidates: [{ content: { role: "model", parts: [{ text: "first" }] } }] };
+
+          if (ending === "the provider stream fails") throw new Error("stream failed");
+          yield {
+            candidates: [
+              { content: { role: "model", parts: [{ text: " second" }] }, finishReason: "STOP" },
+            ],
+          };
+        },
+      },
+    });
+
+    const stream = await Promise.resolve(
+      client.models.generateContentStream({ model: "gemini", contents: "go" }),
+    );
+    let roomWhileOpen: number | undefined;
+
+    const consumed = (async () => {
+      for await (const _chunk of stream) {
+        roomWhileOpen ??= new StreamCapture().limit;
+
+        if (ending === "the caller stops early") break;
+      }
+    })();
+
+    if (ending === "the caller stops early") await consumed;
+    else
+      await expect(consumed).rejects.toThrow(
+        ending === "ending its span throws" ? "span processor failed" : "stream failed",
+      );
+
+    expect(roomWhileOpen).toBeLessThan(STREAM_LIMIT);
+    expect(new StreamCapture().limit).toBe(STREAM_LIMIT);
+
+    if (ending === "ending its span throws") {
+      expect(messagesAttr(await exportedSpan(spans), "gen_ai.output.messages")).toEqual([
+        { role: "model", parts: [{ text: "first second" }] },
+      ]);
+    }
+  },
+);
+
+test("streamed AFC history holds its bytes in the stream bound until the stream ends", async () => {
+  setupSpans();
+  const history = "h".repeat(20_000);
+
+  const client = wrapGoogleGenAI({
+    models: {
+      async *generateContentStream(_params: unknown) {
+        yield {
+          candidates: [{ content: { role: "model", parts: [{ text: "first" }] } }],
+          automaticFunctionCallingHistory: [{ role: "user", parts: [{ text: history }] }],
+        };
+        yield {
+          candidates: [
+            { content: { role: "model", parts: [{ text: " second" }] }, finishReason: "STOP" },
+          ],
+        };
+      },
+    },
+  });
+
+  const stream = await Promise.resolve(
+    client.models.generateContentStream({ model: "gemini", contents: "go" }),
+  );
+  let roomWhileOpen: number | undefined;
+
+  for await (const _chunk of stream) roomWhileOpen ??= new StreamCapture().limit;
+
+  expect(roomWhileOpen).toBeLessThan(STREAM_LIMIT - history.length);
+  expect(new StreamCapture().limit).toBe(STREAM_LIMIT);
 });
 
 test("streaming records terminal metadata when the terminal candidate is truncated", async () => {
@@ -1141,7 +1315,8 @@ test("streaming AFC capture accepts fitting entries after a rejected turn", asyn
     },
   });
 
-  const prompt = "p".repeat(40_000);
+  // The function call turn does not fit next to the prompt; the function response does.
+  const prompt = NEAR_RECORD;
 
   const stream = await Promise.resolve(
     client.models.generateContentStream({ model: "gemini", contents: prompt }),
@@ -1174,7 +1349,7 @@ test("unary AFC replacement reports terminal input truncation", async () => {
 
   const response = {
     candidates: [{ content: { role: "model", parts: [{ text: "done" }] } }],
-    automaticFunctionCallingHistory: [{ role: "user", parts: [{ text: "x".repeat(60_000) }] }],
+    automaticFunctionCallingHistory: [{ role: "user", parts: [{ text: OVER_RECORD }] }],
   };
 
   const client = wrapGoogleGenAI({
@@ -1185,7 +1360,7 @@ test("unary AFC replacement reports terminal input truncation", async () => {
 
   const span = await exportedSpan(spans);
   const input = String(span.attributes["gen_ai.input.messages"]);
-  expect(new TextEncoder().encode(input).byteLength).toBeLessThanOrEqual(48 * 1024);
+  expect(new TextEncoder().encode(input).byteLength).toBeLessThanOrEqual(MAX_RECORD_BYTES);
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
@@ -2208,7 +2383,7 @@ test("masked streaming AFC flags a cut function response and keeps it from the m
                   {
                     functionResponse: {
                       name: "lookup",
-                      response: { body: `fr-start${"y".repeat(60_000)}` },
+                      response: { body: `fr-start${OVER_RECORD}` },
                     },
                   },
                 ],
@@ -2268,7 +2443,7 @@ test("masked streaming AFC keeps a complete model turn when a later cut function
                       name: "lookup",
                       // The bound drops body and keeps keep, but the cut response then no longer
                       // fits next to the model turn and is left out of the history whole.
-                      response: { body: "x".repeat(60_000), keep: "k".repeat(30_000) },
+                      response: { body: OVER_RECORD, keep: NEAR_RECORD },
                     },
                   },
                 ],
@@ -3150,7 +3325,7 @@ test.each(["get", "getVideosOperation"] as const)(
   },
 );
 
-test("capture traversal is bounded, cycle-aware, binary-safe, and preserves provider outcomes", async () => {
+test("capture traversal stops at the depth limit and at cycles, strips binary data, keeps every part, and preserves provider outcomes", async () => {
   const spans = setupSpans();
   const shared = { text: "shared" };
 
@@ -3187,15 +3362,29 @@ test("capture traversal is bounded, cycle-aware, binary-safe, and preserves prov
   expect(client.models.generateContent({ model: "gemini", contents })).toBe(response);
   expect(generateContent).toHaveBeenCalledOnce();
   const span = await exportedSpan(spans);
+  // contents is at depth 0, so the 31 objects of the chain above depth 32 are kept, the last
+  // empty; the reference back to contents is a cycle and is left out.
+  let chain: CaptureFixture = {};
+
+  for (let depth = 31; depth > 1; depth -= 1) chain = { next: chain };
+
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
   expect(String(span.attributes["gen_ai.input.messages"])).not.toContain("SECRET_BINARY");
-  expect(String(span.attributes["gen_ai.input.messages"])).toContain('"shared"');
-  expect(String(span.attributes["gen_ai.output.messages"])).toContain('"shared"');
-  expect(String(span.attributes["gen_ai.input.messages"]).length).toBeLessThan(65_536);
-  expect(String(span.attributes["gen_ai.output.messages"]).length).toBeLessThan(65_536);
+  // Every one of the 2,000 parts is kept: there is no item limit.
+  expect(messagesAttr(span, "gen_ai.input.messages")).toEqual([
+    {
+      role: "user",
+      parts: contents.parts,
+      inlineData: { mimeType: "image/png" },
+      next: chain,
+    },
+  ]);
+  expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "model", parts: contents.parts },
+  ]);
 });
 
-const CUT_CAPTURE_SECRET = `SECRET${"x".repeat(60_000)}`;
+const CUT_CAPTURE_SECRET = `SECRET${OVER_RECORD}`;
 
 function maskSpy() {
   const keys: string[] = [];
@@ -3454,7 +3643,7 @@ test("generateContent keeps complete text when only candidate metadata is cut", 
       {
         content: { role: "model", parts: [{ text: "complete answer" }] },
         finishReason: "STOP",
-        groundingMetadata: { searchEntryPoint: { renderedContent: "g".repeat(60_000) } },
+        groundingMetadata: { searchEntryPoint: { renderedContent: OVER_RECORD } },
       },
     ],
   };
@@ -3475,19 +3664,25 @@ test.each([
   {
     name: "content filling the byte bound before trailing metadata",
     candidate: {
-      content: { role: "model", parts: [{ text: "x".repeat(49_100) }] },
+      // The projection [{"content":{"role":"model","parts":[{"text":…}]}}] is 52 bytes plus the
+      // text, so it fills the bound exactly; the whole candidate, with its finish reason, is cut.
+      content: { role: "model", parts: [{ text: OVER_RECORD.slice(0, MAX_RECORD_BYTES - 52) }] },
       finishReason: "STOP",
     },
+    truncated: true,
   },
   {
-    name: "content filling the item bound before trailing metadata",
+    // 1,000 values in the projection and more with the metadata, the old item bound: no item
+    // limit cuts them now.
+    name: "497 parts and their trailing metadata whole, without the truncation flag,",
     candidate: {
       content: { role: "model", parts: Array.from({ length: 497 }, () => ({ text: "x" })) },
       finishReason: "STOP",
       index: 0,
     },
+    truncated: undefined,
   },
-])("generateContent keeps $name for a mask", async ({ candidate }) => {
+])("generateContent keeps $name for a mask", async ({ candidate, truncated }) => {
   const spy = maskSpy();
   const spans = setupSpans({ mask: spy.mask });
 
@@ -3500,6 +3695,7 @@ test.each([
   const span = await exportedSpan(spans);
   expect(spy.keys).toContain("gen_ai.output.messages");
   expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([candidate.content]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(truncated);
 });
 
 test.each([true, false])(

@@ -103,7 +103,7 @@ Tool definitions (`gen_ai.tool.definitions`, including tool descriptions and par
 
 Gemini streams already include cumulative `usage_metadata` on chunks, so no request injection is needed. Stream spans record time-to-first-chunk, aggregate text parts (merging consecutive text with the same `thought` flag), last-seen usage/finish reasons, and end once when the stream completes, errors, or is closed.
 
-Stream reconstruction retains up to 48 KiB and 1,000 items, shared with streamed safety, grounding, and URL-context metadata. Media request inputs are retained up to 64 KiB and 1,024 items. The configured `max_attribute_length` does not shrink these retention bounds; the core applies it to the exported attribute after the mask runs. A stream that is cut at its bound, closed early, or fails sets `telemetry.dev.capture.truncated`. With a mask configured, incomplete reconstructed output is omitted because the mask cannot inspect the complete value.
+Stream reconstruction, shared with streamed safety, grounding, and URL-context metadata, is kept up to 16 MiB, and all streams in flight share the `max_stream_bytes` bound of the core (64 MiB by default). These bounds need a `telemetry-dev` core with `max_stream_bytes`; with an older core, each stream keeps up to 64 KiB and 1,024 items. Media request inputs are retained up to 16 MiB. The configured `max_attribute_length` does not shrink these retention bounds; the core applies it to the exported attribute after the mask runs. A stream that is cut at its bound, closed early, or fails sets `telemetry.dev.capture.truncated`. With a mask configured, incomplete reconstructed output is omitted because the mask cannot inspect the complete value.
 
 ## Automatic function calling (AFC)
 

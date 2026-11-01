@@ -9,15 +9,21 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import boto3
+import conftest
 import pytest
 import telemetry_dev
 from botocore.client import BaseClient
 from botocore.exceptions import ClientError, EventStreamError
 from botocore.response import StreamingBody
 from botocore.stub import Stubber
+from conftest import STREAM_LIMIT
 
 import telemetry_dev_bedrock._streams as bedrock_streams
 from telemetry_dev_bedrock import instrument_bedrock, uninstrument_bedrock, wrap_bedrock
+
+# A JSON string of this many characters alone passes the bound of a non-stream capture.
+OVER_RECORD = "x" * telemetry_dev.MAX_RECORD_BYTES
+MIB_TEXT = "x" * (1024 * 1024)
 
 
 def _client(service: str) -> BaseClient:
@@ -388,9 +394,10 @@ def test_rerank_bounds_large_inputs_and_outputs_without_changing_request(
         "type": "INLINE",
         "inlineDocumentSource": {
             "type": "TEXT",
-            "textDocument": {"text": "x" * 1_000},
+            "textDocument": {"text": "x" * 10_000},
         },
     }
+    # 2,000 sources of 10,000 bytes pass the 16 MiB bound of a non-stream capture.
     sources = [shared_source] * 2_000
     request = {
         "queries": [{"type": "TEXT", "textQuery": {"text": "best"}}],
@@ -402,9 +409,9 @@ def test_rerank_bounds_large_inputs_and_outputs_without_changing_request(
             },
         },
     }
+    document = {"text": "x" * 10_000}
     results = [
-        {"index": index, "relevanceScore": 0.5, "document": {"text": "x" * 1_000}}
-        for index in range(2_000)
+        {"index": index, "relevanceScore": 0.5, "document": document} for index in range(2_000)
     ]
     calls = _stub_api_call(client, [{"results": results}], monkeypatch)
     wrap_bedrock(client)
@@ -522,7 +529,7 @@ def test_converse_stream_bounds_retained_state_without_dropping_events(
     assert delivered == events
     assert budget.truncated is True
     assert budget.bytes_used <= budget.max_bytes
-    assert len(state.blocks[0]["text"]) < 64 * 1024
+    assert len(state.blocks[0]["text"]) < STREAM_LIMIT
     span = memory.span_exporter.get_finished_spans()[0]
     assert span.attributes["gen_ai.usage.input_tokens"] == 7
     assert span.attributes["gen_ai.usage.output_tokens"] == 11
@@ -595,7 +602,7 @@ def test_configured_cap_applies_after_the_mask_not_to_stream_retention(
 
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize("max_attribute_length", [0, 100, 1024 * 1024])
-def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
+def test_stream_beyond_the_stream_bound_is_flagged_and_withheld_from_a_mask(
     make: Any, monkeypatch: pytest.MonkeyPatch, masked: bool, max_attribute_length: int
 ) -> None:
     seen: list[Any] = []
@@ -614,7 +621,8 @@ def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
     )
 
     assert state.budget.truncated is True
-    assert state.budget.max_bytes == bedrock_streams._STREAM_CAPTURE_MAX_BYTES  # pyright: ignore[reportPrivateUsage]
+    # Cut at the stream bound, within one 100-byte delta of it.
+    assert STREAM_LIMIT - 200 < state.budget.bytes_used <= STREAM_LIMIT
     retained = state.blocks[0]["text"]
     assert 0 < len(retained) < 1_100 * 100
     assert span.attributes["telemetry.dev.capture.truncated"] is True
@@ -626,6 +634,32 @@ def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
         assert output[0]["parts"][0]["content"] == retained
     else:
         assert len(str(span.attributes.get("gen_ai.output.messages", ""))) <= max_attribute_length
+
+
+@pytest.mark.parametrize(
+    ("length", "cut"), [(64 * 1024, False), (telemetry_dev.MAX_RECORD_BYTES, True)]
+)
+def test_with_the_default_bounds_a_converse_stream_is_cut_only_at_the_record_bound(
+    make: Any, monkeypatch: pytest.MonkeyPatch, length: int, cut: bool
+) -> None:
+    conftest.other_stream.release()
+    memory = make(max_stream_bytes=64 * 1024 * 1024)
+    deltas = [
+        MIB_TEXT[: min(len(MIB_TEXT), length - start)] for start in range(0, length, len(MIB_TEXT))
+    ]
+    events = [
+        {"messageStart": {"role": "assistant"}},
+        *[{"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": d}}} for d in deltas],
+        {"messageStop": {"stopReason": "end_turn"}},
+    ]
+
+    _state, span = _streamed_converse(memory, monkeypatch, events)
+
+    text = _json_attr(span, "gen_ai.output.messages")[0]["parts"][0]["content"]
+    assert span.attributes.get("telemetry.dev.capture.truncated") is (True if cut else None)
+    # Each delta costs its text plus 52 bytes, so the 16th 1 MiB delta does not fit and is
+    # rejected whole.
+    assert len(text) == (telemetry_dev.MAX_RECORD_BYTES - len(MIB_TEXT) if cut else length)
 
 
 def test_masked_converse_stream_closed_early_withholds_partial_output(
@@ -1436,11 +1470,15 @@ def test_invoke_model_streaming_body_offers_readinto_only_when_botocore_does(
 @pytest.mark.skipif(
     not hasattr(StreamingBody, "readinto"), reason="botocore added readinto in 1.39"
 )
+@pytest.mark.parametrize("extra", [0, 1])
 def test_invoke_model_streaming_body_bounds_capture_and_preserves_readinto(
-    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, extra: int
 ) -> None:
     client = _client("bedrock-runtime")
-    raw = _body({"completion": "x" * 100_000})
+    # The body takes the stream bound: one of STREAM_LIMIT bytes is kept, one more byte is not.
+    padding = STREAM_LIMIT + extra - len(_body({"completion": ""}))
+    raw = _body({"completion": "x" * padding})
+    assert len(raw) == STREAM_LIMIT + extra
     source = StreamingBody(io.BytesIO(raw), len(raw))
     _stub_api_call(
         client,
@@ -1464,10 +1502,15 @@ def test_invoke_model_streaming_body_bounds_capture_and_preserves_readinto(
 
     budget = cast(Any, body)._budget
     assert bytes(delivered) == raw
-    assert budget.truncated is True
-    assert budget.bytes_used <= budget.max_bytes
+    assert budget.bytes_used == STREAM_LIMIT
     spans = memory.span_exporter.get_finished_spans()
     assert len(spans) == 1
+    if not extra:
+        assert budget.truncated is False
+        assert "telemetry.dev.capture.truncated" not in spans[0].attributes
+        assert "gen_ai.output.messages" in spans[0].attributes
+        return
+    assert budget.truncated is True
     assert spans[0].attributes["telemetry.dev.capture.truncated"] is True
     assert "gen_ai.output.messages" not in spans[0].attributes
 
@@ -1803,9 +1846,18 @@ def test_agent_stream_keeps_return_control_after_budget_exhaustion(
     assert span.attributes["telemetry.dev.capture.truncated"] is True
 
 
-@pytest.mark.parametrize("shape", ["bytes", "items"])
-def test_masked_agent_stream_drops_return_control_beyond_its_bound(
-    make: Any, monkeypatch: pytest.MonkeyPatch, shape: str
+# Return control has the 16 MiB bound of a non-stream capture and no item limit.
+@pytest.mark.parametrize(
+    ("inputs", "kept"),
+    [
+        ([{"apiInvocationInput": {"actionGroup": OVER_RECORD}}], False),
+        ([{"apiInvocationInput": {"actionGroup": "x" * (STREAM_LIMIT + 1)}}], True),
+        ([{"function": "f"} for _ in range(1_500)], True),
+    ],
+    ids=["over-record-bytes", "over-stream-bytes", "many-items"],
+)
+def test_masked_agent_stream_drops_return_control_only_beyond_the_record_bound(
+    make: Any, monkeypatch: pytest.MonkeyPatch, inputs: list[Any], kept: bool
 ) -> None:
     seen: list[str] = []
 
@@ -1814,11 +1866,6 @@ def test_masked_agent_stream_drops_return_control_beyond_its_bound(
         return value
 
     memory = make(mask=mask)
-    inputs: list[Any] = (
-        [{"apiInvocationInput": {"actionGroup": "x" * 60_000}}]
-        if shape == "bytes"
-        else [{"function": "f"} for _ in range(1_500)]
-    )
     return_control = {"invocationId": "inv-oversized", "invocationInputs": inputs}
     events = [{"chunk": {"bytes": b"Short answer"}}, {"returnControl": return_control}]
     client = _client("bedrock-agent-runtime")
@@ -1833,10 +1880,15 @@ def test_masked_agent_stream_drops_return_control_beyond_its_bound(
     instrumented_stream = response["completion"]
     assert list(instrumented_stream) == events
 
-    assert cast(Any, instrumented_stream)._state.return_control is None
     span = memory.span_exporter.get_finished_spans()[0]
-    assert span.attributes["telemetry.dev.capture.truncated"] is True
     assert span.attributes["td.metadata.return_control"] == "true"
+    if kept:
+        assert cast(Any, instrumented_stream)._state.return_control == return_control
+        assert "telemetry.dev.capture.truncated" not in span.attributes
+        assert _json_attr(span, "gen_ai.output.messages") == {"returnControl": return_control}
+        return
+    assert cast(Any, instrumented_stream)._state.return_control is None
+    assert span.attributes["telemetry.dev.capture.truncated"] is True
     assert "gen_ai.output.messages" not in span.attributes
     assert not any("inv-oversized" in value or "Short answer" in value for value in seen)
 
@@ -2085,7 +2137,7 @@ def test_agent_trace_content_follows_the_capture_flags(
     keeps_output: bool,
 ) -> None:
     memory = make(**options)
-    # Withheld content past the fixed bound must not spend it.
+    # Withheld content past the stream bound must not spend it.
     prompt = "PROMPT_TEXT" if keeps_input else f"PROMPT_TEXT {'p' * 60_000}"
     events = _agent_trace_events(prompt)
     orchestration, pre, post, routing, custom, guardrail, failure = (

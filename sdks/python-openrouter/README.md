@@ -111,9 +111,12 @@ still execute and return their normal SDK values without exporting telemetry.
 ## Limitations
 
 - Unconsumed streams end their spans only when the stream is exhausted, errors, or is closed.
-- Streaming output is retained up to 64 KiB and 1,024 items; terminal metadata and usage can still
-  be recorded after the bound is reached. The configured `max_attribute_length` does not shrink this
-  retention bound; the core applies it to the exported attribute after the mask runs.
+- Streaming output is kept up to 16 MiB, and all streams in flight share the `max_stream_bytes`
+  bound of the core (64 MiB by default); terminal metadata and usage can still be recorded after
+  the bound is reached. The configured `max_attribute_length` does not shrink this
+  retention bound; the core applies it to the exported attribute after the mask runs. These bounds
+  need a `telemetry-dev` core with `max_stream_bytes`; with an older core, each stream keeps up to
+  64 KiB and 1,024 items.
 - A chat stream that is cut at the bound, closed early, or fails, and a Responses stream that is cut
   at the bound, ends without a terminal response, or ends with an `error` event set
   `telemetry.dev.capture.truncated = true`. With a mask configured, the incomplete reconstructed

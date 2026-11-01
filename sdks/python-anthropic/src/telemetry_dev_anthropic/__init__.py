@@ -8,6 +8,7 @@ import time
 import types
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
 from functools import wraps
+from io import StringIO
 from typing import Any, Final, TypeVar, cast
 
 import anthropic
@@ -484,29 +485,73 @@ def _end_once(handle: telemetry_dev.SpanHandle) -> Callable[..., None]:
     return end
 
 
+def _stream_budget() -> telemetry_dev.CaptureBudget:
+    # Older cores have no for_stream and bound each budget at 64 KiB on its own.
+    for_stream = getattr(telemetry_dev.CaptureBudget, "for_stream", None)
+    budget = for_stream() if callable(for_stream) else telemetry_dev.CaptureBudget()
+    return cast(telemetry_dev.CaptureBudget, budget)
+
+
+def _reserve_bytes(budget: telemetry_dev.CaptureBudget, total: int) -> bool:
+    # Older cores have no reserve_bytes; there the caller's check against max_bytes stands.
+    reserve = getattr(budget, "reserve_bytes", None)
+    if callable(reserve):
+        return bool(reserve(total))
+    budget.bytes_used = total
+    return True
+
+
+def _release_budget(budget: telemetry_dev.CaptureBudget) -> None:
+    release = getattr(budget, "release", None)
+    if callable(release):
+        release()
+
+
 class _StreamState:
     def __init__(self, capture_output: bool = True) -> None:
         self.capture_output = capture_output
         self.message_stopped = False
-        self.blocks: dict[int, dict[str, Any]] = {}
-        self.tool_json: dict[int, str] = {}
+        self._blocks: dict[int, dict[str, Any]] = {}
+        self._tool_json: dict[int, str] = {}
+        # Appended deltas wait here and are joined when the blocks are next read: adding each
+        # delta to the string copies all the text before it, which is quadratic in a long
+        # stream. Only the appending path reads _blocks and _tool_json directly.
+        self._appended_text: dict[tuple[int, str], StringIO] = {}
+        self._appended_json: dict[int, StringIO] = {}
         self.usage: dict[str, int | float] | None = None
         self.one_hour_cache_creation_tokens: int | float | None = None
         self.iterations: _IterationsUsage | None = None
         self.finish_reason: str | None = None
         self.response_model: str | None = None
         self.metadata_truncated = False
-        self.budget = telemetry_dev.CaptureBudget(
-            _STREAM_CAPTURE_MAX_BYTES, _STREAM_CAPTURE_MAX_ITEMS
-        )
+        self.budget = _stream_budget()
         self.block_reservations: dict[int, tuple[int, int]] = {}
         self.unresolved_replacements: set[int] = set()
         self.unresolved_encrypted_content: set[int] = set()
         self.envelope_charged = False
         self.settled_tool_blocks: set[int] = set()
 
+    @property
+    def blocks(self) -> dict[int, dict[str, Any]]:
+        self._join_appended()
+        return self._blocks
 
-_STREAM_CAPTURE_MAX_BYTES = 48 * 1024
+    @property
+    def tool_json(self) -> dict[int, str]:
+        self._join_appended()
+        return self._tool_json
+
+    def _join_appended(self) -> None:
+        for (index, key), parts in self._appended_text.items():
+            block = self._blocks[index]
+            block[key] = block[key] + parts.getvalue()
+        self._appended_text.clear()
+        for index, parts in self._appended_json.items():
+            self._tool_json[index] = self._tool_json[index] + parts.getvalue()
+        self._appended_json.clear()
+
+
+# The usage iterations a stream keeps.
 _STREAM_CAPTURE_MAX_ITEMS = 1000
 _STREAM_CAPTURE_MAX_DEPTH = 32
 _MAX_UNRESOLVED_REPLACEMENTS = _STREAM_CAPTURE_MAX_ITEMS
@@ -547,14 +592,40 @@ def _reserve_appended_text(index: int, value: Any, state: _StreamState) -> bool:
     if size > budget.remaining_bytes:
         budget.truncated = True
         return False
-    budget.bytes_used += size
+    if not _reserve_bytes(budget, budget.bytes_used + size):
+        budget.truncated = True
+        return False
     held_bytes, held_items = state.block_reservations.get(index, (0, 0))
     state.block_reservations[index] = (held_bytes + size, held_items)
     return True
 
 
-def _bounded_native(value: Any) -> Any:
-    remaining_items = [_STREAM_CAPTURE_MAX_ITEMS]
+# An appended delta is charged only its text bytes, which may be none: the delta, its type
+# and text fields are not charged.
+_APPENDED_DELTA_ITEMS: Final = 5
+
+
+def _event_items_bound(
+    index: int, state: _StreamState, *, replacing: bool = False, uncharged_items: int = 0
+) -> int:
+    """The items an event value for block ``index`` may have and still fit in the stream.
+
+    That is the bytes the stream may still keep, plus the bytes a replacement gives back,
+    plus the items an appended delta keeps uncharged: every other item the copy keeps is
+    charged at least a byte, 16 by CaptureBudget.accept and one in compact JSON. The copy
+    also reads two items for each None field it drops; the SDK's appended deltas have none,
+    and elsewhere each kept item's 16 bytes leave room for seven.
+    """
+    room = max(0, state.budget.remaining_bytes)
+    if replacing:
+        room += state.block_reservations.get(index, (0, 0))[0]
+    return room + uncharged_items
+
+
+def _bounded_native(value: Any, max_items: int) -> Any:
+    """Copy an event value, or _OMIT once it passes max_items items or the depth bound, so a
+    value whose len() under-reports or that never ends is read only that far."""
+    remaining_items = [max_items]
     try:
         return _bounded_stream_native(value, remaining_items, 0, set())
     except _StreamCaptureLimit:
@@ -713,27 +784,49 @@ def _stream_output(state: _StreamState) -> list[dict[str, Any]] | None:
     ]
 
 
+def _json_cost(value: Any) -> tuple[int, int] | None:
+    """Compact JSON bytes and items of a retained value, or None if it does not serialize.
+
+    The final bounded check and the settled tool input charge both measure with this, so
+    they agree on whether a settled tool block fits. Items count as CaptureBudget counts
+    them: each value, and each object key.
+    """
+    try:
+        size = len(json_dumps(value).encode())
+    except (TypeError, ValueError, RecursionError):
+        return None
+    # json_dumps rejects cycles, so the walk ends. It writes other values as one string.
+    items = 0
+    pending: list[Any] = [value]
+    while pending:
+        item = pending.pop()
+        items += 1
+        if isinstance(item, dict):
+            mapping = cast(dict[Any, Any], item)
+            items += len(mapping)
+            pending.extend(mapping.values())
+        elif isinstance(item, list | tuple):
+            pending.extend(cast(Sequence[Any], item))
+    return size, items
+
+
 def _bounded_stream_output(
     blocks: list[dict[str, Any]], max_bytes: int, max_items: int
 ) -> tuple[list[dict[str, Any]] | None, bool]:
-    def encoded_size(value: Any) -> int:
-        return len(json_dumps(value).encode())
-
-    envelope: list[dict[str, Any]] = [{"role": "assistant", "content": []}]
-    item_budget = telemetry_dev.CaptureBudget(max_items=max_items)
     kept: list[dict[str, Any]] = []
-    try:
-        size = encoded_size(envelope)
-        if not item_budget.accept(envelope):
-            return None, True
-        for block in blocks:
-            block_size = encoded_size(block) + (_BLOCK_SEPARATOR_BYTES if kept else 0)
-            if size + block_size > max_bytes or not item_budget.accept(block):
-                break
-            size += block_size
-            kept.append(block)
-    except (TypeError, ValueError, RecursionError):
+    size, items = _ENVELOPE_BYTES, _ENVELOPE_ITEMS
+    if items > max_items:
         return None, True
+    for block in blocks:
+        cost = _json_cost(block)
+        if cost is None:
+            return None, True
+        block_size = cost[0] + (_BLOCK_SEPARATOR_BYTES if kept else 0)
+        if size + block_size > max_bytes or items + cost[1] > max_items:
+            break
+        size += block_size
+        items += cost[1]
+        kept.append(block)
     truncated = len(kept) < len(blocks)
     return ([{"role": "assistant", "content": kept}] if kept else None), truncated
 
@@ -784,17 +877,36 @@ def _stream_partial(
     return fields
 
 
-def _append_string(target: dict[str, Any], key: str, value: Any) -> None:
+# The appending helpers write the buffers of _StreamState directly: its blocks and tool_json
+# properties join the buffers, which on every delta would copy all the text before it.
+def _append_string(
+    index: int, target: dict[str, Any], key: str, value: Any, state: _StreamState
+) -> None:
     text = _string(value)
     if text is None:
         return
-    target[key] = f"{_string(target.get(key)) or ''}{text}"
+    parts = state._appended_text.get((index, key))  # pyright: ignore[reportPrivateUsage]
+    if parts is None:
+        target[key] = _string(target.get(key)) or ""
+        parts = state._appended_text[(index, key)] = StringIO()  # pyright: ignore[reportPrivateUsage]
+    parts.write(text)
+
+
+def _append_tool_json(index: int, value: Any, state: _StreamState) -> None:
+    parts = state._appended_json.get(index)  # pyright: ignore[reportPrivateUsage]
+    if parts is None:
+        state._tool_json.setdefault(index, "")  # pyright: ignore[reportPrivateUsage]
+        parts = state._appended_json[index] = StringIO()  # pyright: ignore[reportPrivateUsage]
+    parts.write(_string(value) or "")
 
 
 def _append_item(target: dict[str, Any], key: str, value: Any) -> None:
     if value is None:
         return
     existing = target.get(key)
+    if isinstance(existing, list):
+        cast(list[Any], existing).append(_native(value))
+        return
     items: list[Any] = (
         list(cast(Sequence[Any], existing))
         if isinstance(existing, Sequence) and not isinstance(existing, str)
@@ -811,7 +923,10 @@ def _record_content_block_start(event: Any, state: _StreamState) -> None:
     block_index = index if isinstance(index, int) else len(state.blocks)
     raw_content_block = _field(event, "content_block")
     raw_block_type = _string(_field(raw_content_block, "type"))
-    content_block = _bounded_native(raw_content_block)
+    content_block = _bounded_native(
+        raw_content_block,
+        _event_items_bound(block_index, state, replacing=raw_block_type == "compaction"),
+    )
     if content_block is _OMIT:
         if raw_block_type == "compaction":
             _reject_replacement(block_index, state, recover_unseen=True)
@@ -872,12 +987,14 @@ def _default_block(delta_type: str | None) -> dict[str, Any]:
 
 
 def _block_for_delta(index: int, delta_type: str | None, state: _StreamState) -> dict[str, Any]:
-    if index in state.blocks:
-        return state.blocks[index]
-    state.blocks[index] = _default_block(delta_type)
+    # Called for appended deltas, so it must not join the appended text.
+    blocks = state._blocks  # pyright: ignore[reportPrivateUsage]
+    if index in blocks:
+        return blocks[index]
+    blocks[index] = _default_block(delta_type)
     if delta_type == "input_json_delta":
-        state.tool_json[index] = ""
-    return state.blocks[index]
+        state._tool_json[index] = ""  # pyright: ignore[reportPrivateUsage]
+    return blocks[index]
 
 
 _REPLACEMENT_DELTAS = frozenset({"compaction_delta", "signature_delta"})
@@ -939,7 +1056,9 @@ def _reserve_replacement(
             return False
         measured_bytes = candidate.bytes_used - base_bytes
         measured_items = candidate.items_used - base_items
-    budget.bytes_used = base_bytes + measured_bytes
+    if not _reserve_bytes(budget, base_bytes + measured_bytes):
+        _reject_replacement(index, state, recover_unseen=recover_unseen)
+        return False
     budget.items_used = base_items + measured_items
     state.block_reservations[index] = (measured_bytes, measured_items)
     state.unresolved_replacements.discard(index)
@@ -1007,8 +1126,7 @@ def _drop_stale_signature(index: int, state: _StreamState) -> None:
         candidate.items_used = base_items
         if candidate.accept(retained):
             measured = (candidate.bytes_used - base_bytes, candidate.items_used - base_items)
-    if measured is not None:
-        state.budget.bytes_used = base_bytes + measured[0]
+    if measured is not None and _reserve_bytes(state.budget, base_bytes + measured[0]):
         state.budget.items_used = base_items + measured[1]
         state.block_reservations[index] = measured
     state.blocks[index] = stripped
@@ -1030,7 +1148,17 @@ def _record_content_block_delta(event: Any, state: _StreamState) -> None:
     raw_delta = _field(event, "delta")
     raw_delta_type = _string(_field(raw_delta, "type"))
     replacing = raw_delta_type in _REPLACEMENT_DELTAS
-    delta = _bounded_native(raw_delta)
+    delta = _bounded_native(
+        raw_delta,
+        _event_items_bound(
+            block_index,
+            state,
+            replacing=replacing,
+            uncharged_items=_APPENDED_DELTA_ITEMS
+            if raw_delta_type in _APPENDED_DELTA_FIELDS
+            else 0,
+        ),
+    )
     if delta is _OMIT:
         if replacing:
             _drop_rejected_replacement(
@@ -1073,7 +1201,7 @@ def _record_content_block_delta(event: Any, state: _StreamState) -> None:
         return
     appended_field = _APPENDED_DELTA_FIELDS.get(delta_type or "")
     if appended_field is not None:
-        if block_index not in state.blocks and not _reserve(
+        if block_index not in state._blocks and not _reserve(  # pyright: ignore[reportPrivateUsage]
             block_index, _default_block(delta_type), state
         ):
             return
@@ -1083,15 +1211,13 @@ def _record_content_block_delta(event: Any, state: _StreamState) -> None:
         return
     block = _block_for_delta(block_index, delta_type, state)
     if delta_type == "input_json_delta":
-        state.tool_json[block_index] = (
-            f"{state.tool_json.get(block_index, '')}{_string(_field(delta, 'partial_json')) or ''}"
-        )
+        _append_tool_json(block_index, _field(delta, "partial_json"), state)
     elif delta_type == "text_delta":
-        _append_string(block, "text", _field(delta, "text"))
+        _append_string(block_index, block, "text", _field(delta, "text"), state)
     elif delta_type == "citations_delta":
         _append_item(block, "citations", _field(delta, "citation"))
     elif delta_type == "thinking_delta":
-        _append_string(block, "thinking", _field(delta, "thinking"))
+        _append_string(block_index, block, "thinking", _field(delta, "thinking"), state)
 
 
 def _fallback_serving_model(usage: Any, state: _StreamState) -> str | None:
@@ -1156,30 +1282,22 @@ _STREAM_OUTPUT_ENVELOPE: Final[list[dict[str, Any]]] = [{"role": "assistant", "c
 _BLOCK_SEPARATOR_BYTES: Final = 1
 
 
-def _envelope_cost() -> tuple[int, int]:
-    measured = telemetry_dev.CaptureBudget()
-    measured.accept(_STREAM_OUTPUT_ENVELOPE)
-    envelope_bytes = len(json_dumps(_STREAM_OUTPUT_ENVELOPE).encode())
-    return envelope_bytes, measured.items_used
-
-
-_ENVELOPE_BYTES, _ENVELOPE_ITEMS = _envelope_cost()
+_ENVELOPE_COST = _json_cost(_STREAM_OUTPUT_ENVELOPE)
+assert _ENVELOPE_COST is not None
+_ENVELOPE_BYTES, _ENVELOPE_ITEMS = _ENVELOPE_COST
 
 
 def _settled_cost(
     index: int, block: Mapping[str, Any], state: _StreamState
 ) -> tuple[int, int] | None:
     """Bytes and items the final bounded check counts for a block, or None if it cannot."""
-    try:
-        size = len(json_dumps(block).encode())
-    except (TypeError, ValueError, RecursionError):
+    cost = _json_cost(block)
+    if cost is None:
         return None
+    size, items = cost
     if any(other < index for other in state.blocks):
         size += _BLOCK_SEPARATOR_BYTES
-    measured = telemetry_dev.CaptureBudget(state.budget.max_bytes, state.budget.max_items)
-    if not measured.accept(block):
-        return None
-    return size, measured.items_used
+    return size, items
 
 
 def _settled_replacement_cost(
@@ -1225,7 +1343,9 @@ def _settle_tool_input(index: int, state: _StreamState) -> None:
     if base_bytes + size > budget.max_bytes or base_items + items > budget.max_items:
         budget.truncated = True
         return
-    budget.bytes_used = base_bytes + size
+    if not _reserve_bytes(budget, base_bytes + size):
+        budget.truncated = True
+        return
     budget.items_used = base_items + items
     state.envelope_charged = True
     state.block_reservations[index] = (size, items)
@@ -1307,12 +1427,16 @@ class _InstrumentedStream:
         )
 
     def finish(self, error: BaseException | None = None) -> None:
-        fields = _stream_partial(
-            self._state, mask_output_when_incomplete=self._mask_output_when_incomplete
-        )
-        if error is not None:
-            fields["error"] = error
-        self._end(**fields)
+        # The output is read before the release, which fixes the stream's bound.
+        try:
+            fields = _stream_partial(
+                self._state, mask_output_when_incomplete=self._mask_output_when_incomplete
+            )
+            if error is not None:
+                fields["error"] = error
+            self._end(**fields)
+        finally:
+            _release_budget(self._state.budget)
 
     def _iterate(self) -> Iterator[Any]:
         try:
@@ -1394,12 +1518,16 @@ class _InstrumentedAsyncStream:
         )
 
     def finish(self, error: BaseException | None = None) -> None:
-        fields = _stream_partial(
-            self._state, mask_output_when_incomplete=self._mask_output_when_incomplete
-        )
-        if error is not None:
-            fields["error"] = error
-        self._end(**fields)
+        # The output is read before the release, which fixes the stream's bound.
+        try:
+            fields = _stream_partial(
+                self._state, mask_output_when_incomplete=self._mask_output_when_incomplete
+            )
+            if error is not None:
+                fields["error"] = error
+            self._end(**fields)
+        finally:
+            _release_budget(self._state.budget)
 
     async def _aiterate(self) -> AsyncIterator[Any]:
         try:

@@ -5,6 +5,7 @@ import {
   type SpanHandle,
   type SpanType,
   type StartSpanOptions,
+  StreamCapture,
 } from "@telemetry-dev/sdk";
 import * as telemetrySdk from "@telemetry-dev/sdk";
 
@@ -360,13 +361,12 @@ export function parseJson<T>(value: T): JsonValue {
   }
 }
 
-// Retention uses fixed bounds; the core applies maxAttributeLength after the mask.
-const STREAM_CAPTURE_MAX_BYTES = 48 * 1024;
+// The usage iterations a stream keeps; the core applies maxAttributeLength after the mask.
 export const STREAM_CAPTURE_MAX_ITEMS = 1_000;
 const CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated";
 
 // Older cores enforce captureOutput and masking when the span ends but expose no policy, so
-// withhold incomplete output from their mask. Retention uses the fixed stream bounds either way;
+// withhold incomplete output from their mask. Retention uses the stream bounds either way;
 // maxAttributeLength is only here to satisfy the policy type.
 const LEGACY_CAPTURE_POLICY: NonNullable<SpanHandle["capturePolicy"]> = {
   output: true,
@@ -374,18 +374,19 @@ const LEGACY_CAPTURE_POLICY: NonNullable<SpanHandle["capturePolicy"]> = {
   maxAttributeLength: 65_536,
 };
 
-/** Tracks the fixed byte and item bound before a stream state retains a value. */
+/**
+ * A stream state's share of the shared stream bound. After the first value that does not fit,
+ * it accepts nothing more, so the kept output is a prefix of the stream.
+ */
 export class StreamRetention {
-  private bytes = 0;
-  private items = 0;
+  private readonly capture = new StreamCapture();
   truncated = false;
 
   accept<T>(value: T): boolean {
     if (this.truncated) return false;
 
     const measured = boundedCaptureDetails(value, {
-      maxBytes: STREAM_CAPTURE_MAX_BYTES - this.bytes,
-      maxItems: STREAM_CAPTURE_MAX_ITEMS - this.items,
+      maxBytes: this.capture.limit - this.capture.bytes,
     });
 
     if (measured.truncated) {
@@ -394,10 +395,13 @@ export class StreamRetention {
       return false;
     }
 
-    this.bytes += measured.bytes;
-    this.items += measured.items;
+    this.capture.bytes += measured.bytes;
 
     return true;
+  }
+
+  release(): void {
+    this.capture.release();
   }
 }
 
@@ -442,12 +446,19 @@ export function wrapAsyncIterable<T>(
   let ended = false;
   let first = false;
   const unregisterToken = {};
+  const wrapperToken = {};
 
   const endOnce = (fields?: SpanFields) => {
     if (ended) return;
     ended = true;
     STREAM_FINALIZER?.unregister(unregisterToken);
-    endSpan(span, mergeFields(baseFields, fields));
+    STREAM_FINALIZER?.unregister(wrapperToken);
+
+    try {
+      endSpan(span, mergeFields(baseFields, fields));
+    } finally {
+      state.retention.release();
+    }
   };
 
   const generator = async function* () {
@@ -480,7 +491,12 @@ export function wrapAsyncIterable<T>(
       );
       throw error;
     } finally {
-      if (!ended) endOnce(finishStream(state, span, !completed));
+      try {
+        if (!ended) endOnce(finishStream(state, span, !completed));
+      } finally {
+        // Also when finishing the stream state throws before the span could end.
+        state.retention.release();
+      }
     }
   };
 
@@ -493,14 +509,16 @@ export function wrapAsyncIterable<T>(
   }
 
   const finishAbandoned = () => endOnce(safe(() => finishStream(state, span, true)));
+  // A caller may keep only the iterator, so once one exists the wrapper is not watched.
   wrapped[Symbol.asyncIterator] = () => {
     const iterator = generator();
+    STREAM_FINALIZER?.unregister(wrapperToken);
     STREAM_FINALIZER?.register(iterator, finishAbandoned, unregisterToken);
 
     return iterator;
   };
 
-  STREAM_FINALIZER?.register(wrapped, finishAbandoned, unregisterToken);
+  STREAM_FINALIZER?.register(wrapped, finishAbandoned, wrapperToken);
 
   return wrapped as T;
 }

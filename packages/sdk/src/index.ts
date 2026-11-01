@@ -32,6 +32,8 @@ export {
   type BoundedCaptureDetails,
   type BoundedCaptureOptions,
   type BoundedCaptureResult,
+  MAX_RECORD_BYTES,
+  StreamCapture,
 } from "./capture.ts";
 
 export {

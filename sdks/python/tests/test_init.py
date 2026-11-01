@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 from typing import Any
 
@@ -37,6 +38,50 @@ def test_invalid_max_attribute_length_fails_open_through_on_error(
 
     assert client.enabled is False
     assert isinstance(errors[0], ValueError)
+
+
+@pytest.mark.parametrize("max_stream_bytes", [-1, 2.5, float("nan"), True, "64"])
+def test_invalid_max_stream_bytes_fails_open_through_on_error(max_stream_bytes: Any) -> None:
+    errors: list[BaseException] = []
+
+    client = telemetry_dev.init(
+        api_key="[REDACTED:api-key]",
+        max_stream_bytes=max_stream_bytes,
+        on_error=errors.append,
+        log_level="silent",
+        disable_atexit=True,
+    )
+
+    assert client.enabled is False
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert "max_stream_bytes" in str(errors[0])
+
+
+def test_none_max_stream_bytes_selects_the_default(
+    make: MakeClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from telemetry_dev._capture import DEFAULT_MAX_STREAM_BYTES, stream_budget
+
+    monkeypatch.setattr(stream_budget, "max_bytes", 1)
+    env = make(max_stream_bytes=None)
+
+    assert env.client.enabled is True
+    assert stream_budget.max_bytes == DEFAULT_MAX_STREAM_BYTES
+
+
+@pytest.mark.parametrize(("value", "bound"), [(math.inf, math.inf), (1e8, 100_000_000)])
+def test_max_stream_bytes_takes_infinity_and_whole_floats(
+    make: MakeClient, monkeypatch: pytest.MonkeyPatch, value: float, bound: float
+) -> None:
+    from telemetry_dev._capture import stream_budget
+
+    # The bound is process-wide; monkeypatch puts it back for the tests after this one.
+    monkeypatch.setattr(stream_budget, "max_bytes", stream_budget.max_bytes)
+    env = make(max_stream_bytes=value)
+
+    assert env.client.enabled is True
+    assert stream_budget.max_bytes == bound
 
 
 def test_large_max_attribute_length_remains_enabled(make: MakeClient) -> None:
