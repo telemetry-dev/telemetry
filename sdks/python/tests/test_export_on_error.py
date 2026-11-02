@@ -3,6 +3,7 @@ from __future__ import annotations
 # pyright: reportPrivateUsage=false
 import atexit
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from typing import Any
 
 import pytest
 from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.common._log_encoder import encode_logs
 from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.sdk._logs import ReadableLogRecord
@@ -34,6 +36,7 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.sdk.trace.sampling import Decision, Sampler, SamplingResult
 from opentelemetry.sdk.util.instrumentation import InstrumentationScope
 from opentelemetry.util._once import Once
 from opentelemetry.util.types import AttributeValue
@@ -43,6 +46,8 @@ from telemetry_dev._export import (
     ExportFailures,
     ReportingLogExporter,
     ReportingSpanExporter,
+    _log_bound,
+    _span_bound,
     _span_with_attributes,
     after_export,
     exporting,
@@ -534,22 +539,224 @@ def test_a_span_that_fits_once_its_multi_byte_text_is_cut_is_sent_not_dropped() 
     provider.shutdown()
 
 
-def test_a_span_over_the_ingest_limit_without_a_string_to_cut_is_dropped() -> None:
+def _random_value(rng: random.Random, depth: int = 0) -> Any:
+    alphabet = 'a"\\\n\x01é東\U0001f916'
+    kind = rng.randrange(7 if depth < 3 else 4)
+    if kind == 0:
+        return "".join(rng.choice(alphabet) for _ in range(rng.randrange(40)))
+    if kind == 1:
+        return rng.choice([True, False, -(2**63), 2**63 - 1, 0])
+    if kind == 2:
+        return rng.choice([0.0, -1.5e308, float("nan")])
+    if kind == 3:
+        return rng.randbytes(rng.randrange(20))
+    if kind == 4:
+        return [_random_value(rng, depth + 1) for _ in range(rng.randrange(4))]
+    return {f"k{index}東": _random_value(rng, depth + 1) for index in range(rng.randrange(4))}
+
+
+def test_the_size_bound_of_a_record_is_at_least_its_encoded_size() -> None:
+    rng = random.Random(149)
+    finished = InMemorySpanExporter()
+    provider = TracerProvider(resource=Resource({"service.name": "東" * 50, "n": 1}))
+    provider.add_span_processor(SimpleSpanProcessor(finished))
+    tracer = provider.get_tracer("scope東", "1.0")
+    # In each of these records, one part holds 5,000 four-byte characters, whose bound has little
+    # room to spare, so a bound that leaves that part out is below the encoded size.
+    robots = "\U0001f916" * 5_000
+    tracer.start_span("value", attributes={"robots": robots}).end()
+    tracer.start_span("ascii", attributes={"ascii": "a" * 20_000}).end()
+    tracer.start_span("ascii key", attributes={"a" * 20_000: 1}).end()
+    tracer.start_span("key", attributes={robots: 1}).end()
+    tracer.start_span("array", attributes={"robots": [robots, "b"]}).end()
+    event = tracer.start_span("event")
+    event.add_event("e", {"x": robots})
+    event.end()
+    tracer.start_span(
+        "link", links=[trace.Link(trace.SpanContext(1, 1, False), {"l": robots})]
+    ).end()
+    resource_provider = TracerProvider(resource=Resource({"robots": robots}))
+    resource_provider.add_span_processor(SimpleSpanProcessor(finished))
+    resource_provider.get_tracer("resource").start_span("resource").end()
+    resource_provider.get_tracer("scope", attributes={"robots": robots}).start_span("scope").end()
+    for index in range(200):
+        attributes = {f"a{key}": _random_value(rng, 2) for key in range(rng.randrange(5))}
+        link_context = trace.SpanContext(index + 1, index + 1, False)
+        span = tracer.start_span(
+            "\U0001f916" * rng.randrange(20),
+            attributes={
+                key: value
+                for key, value in attributes.items()
+                if not isinstance(value, bytes | dict)
+            },
+            links=[trace.Link(link_context, {"l": "東" * rng.randrange(10)})],
+        )
+        span.add_event("e" + "東" * rng.randrange(10), {"x": "\U0001f916" * rng.randrange(10)})
+        span.set_status(trace.Status(trace.StatusCode.ERROR, "東" * rng.randrange(10)))
+        span.end()
+    logs = InMemoryLogRecordExporter()
+    client = telemetry_dev.init(
+        api_key="[REDACTED:api-key]",
+        log_level="silent",
+        disable_atexit=True,
+        log_exporter=logs,
+        export_mode="immediate",
+    )
+    for _ in range(200):
+        telemetry_dev.log(
+            "東" * rng.randrange(10),
+            attributes={"body": "\U0001f916" * rng.randrange(10)},
+        )
+        assert client._logger_provider is not None
+        client._logger_provider.get_logger("raw").emit(
+            body=_random_value(rng), severity_text="東" * rng.randrange(5)
+        )
+    telemetry_dev.log("long", attributes={"robots": robots})
+    assert client._logger_provider is not None
+    raw = client._logger_provider.get_logger("raw")
+    for body in (robots, "a" * 20_000, b"\xff" * 20_000, {"map": {robots: [robots]}}):
+        raw.emit(body=body)
+    telemetry_dev.shutdown()
+    # The first client's shutdown stopped its exporter.
+    resource_logs = InMemoryLogRecordExporter()
+    telemetry_dev.init(
+        api_key="td_live_test",
+        log_level="silent",
+        disable_atexit=True,
+        log_exporter=resource_logs,
+        export_mode="immediate",
+        service_name=robots,
+    )
+    telemetry_dev.log("resource")
+    telemetry_dev.shutdown()
+
+    spans = finished.get_finished_spans()
+    records = [*logs.get_finished_logs(), *resource_logs.get_finished_logs()]
+    assert len(spans) == 209 and len(records) == 406
+    for span in spans:
+        bound = _span_bound(span)
+        assert bound is not None and bound >= encode_spans([span]).ByteSize()
+    for record in records:
+        bound = _log_bound(record)
+        assert bound is not None and bound >= encode_logs([record]).ByteSize()
+    provider.shutdown()
+
+
+def test_a_batch_that_surely_fits_is_sent_without_encoding_it_to_measure_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    measured: list[int] = []
+
+    def counting(records: Any) -> Any:
+        measured.append(len(records))
+        return encode_spans(records)
+
+    monkeypatch.setattr(telemetry_dev._export, "encode_spans", counting)
+    finished = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(finished))
+    for name in ("small", "large"):
+        provider.get_tracer("test").start_span(name, attributes={"payload": "é" * 5_000_000}).end()
+    small, large = finished.get_finished_spans()
+    small = _span_with_attributes(small, {"payload": "small"})
+    inner = FakeSpanExporter(SpanExportResult.SUCCESS)
+    exporter = ReportingSpanExporter(inner, ExportFailures(None))
+
+    assert exporter.export([small] * 64) is SpanExportResult.SUCCESS
+    # 5 MB of ASCII text is 5 MB as a bound, so two such spans are sent without measuring.
+    ascii_span = _span_with_attributes(small, {"payload": "p" * 5_000_000})
+    assert exporter.export([ascii_span, ascii_span]) is SpanExportResult.SUCCESS
+    assert measured == []
+    # A bound over the limit measures the batch: 10 MB of "é" is 20 MB as a bound.
+    assert exporter.export([small, large]) is SpanExportResult.SUCCESS
+    assert measured == [2]
+    assert inner.export_calls == 3
+    # A span the bound cannot read is measured instead of failing its batch.
+    unreadable = ReadableSpan("unreadable", trace.SpanContext(1, 1, False), status=None)  # pyright: ignore[reportArgumentType]
+    assert exporter.export([unreadable]) is SpanExportResult.SUCCESS
+    assert measured == [2, 1]
+    provider.shutdown()
+
+
+@pytest.mark.parametrize("kind", ["span", "log"])
+def test_a_split_batch_stops_at_its_first_failed_request(kind: str) -> None:
     errors: list[BaseException] = []
     with otlp_capture_server() as ingest:
+        ingest.status = 400
         telemetry_dev.init(
-            api_key="td_live_test",
+            api_key="[REDACTED:api-key]",
             base_url=ingest.url,
-            export_mode="immediate",
-            log_level="error",
+            log_level="silent",
             disable_atexit=True,
             on_error=errors.append,
         )
-        telemetry_dev.start_span("oversized", attributes={"payload": ["p" * 17_000_000]}).end()
+        # Two 9 MB records: together they exceed the 16 MiB limit, so the batch splits in two.
+        for name in ("first", "second"):
+            if kind == "span":
+                telemetry_dev.start_span(name, attributes={"payload": "p" * 9_000_000}).end()
+            else:
+                telemetry_dev.log(name, attributes={"payload": "p" * 9_000_000})
+        telemetry_dev.flush()
         telemetry_dev.shutdown()
 
-        assert ingest.requests_for("/v1/traces") == []
+        assert len(ingest.requests_for("/v1/traces" if kind == "span" else "/v1/logs")) == 1
+        assert len([error for error in errors if f"{kind} export failed" in str(error)]) == 1
+
+
+@pytest.mark.parametrize("kind", ["span", "log"])
+def test_a_batch_whose_only_record_is_dropped_does_not_end_a_failure_series(kind: str) -> None:
+    errors: list[BaseException] = []
+    with otlp_capture_server() as ingest:
+        ingest.status = 400
+        telemetry_dev.init(
+            api_key="[REDACTED:api-key]",
+            base_url=ingest.url,
+            export_mode="immediate",
+            log_level="silent",
+            disable_atexit=True,
+            on_error=errors.append,
+        )
+
+        def record(name: str, attributes: dict[str, Any] | None = None) -> None:
+            if kind == "span":
+                telemetry_dev.start_span(name, attributes=attributes).end()
+            else:
+                telemetry_dev.log(name, attributes=attributes)
+
+        record("fails")
+        # Nothing in it can be cut, so it is dropped without a request.
+        record("dropped", {"payload": ["p" * 17_000_000]})
+        record("fails again")
+        telemetry_dev.shutdown()
+
+        assert len(ingest.requests_for("/v1/traces" if kind == "span" else "/v1/logs")) == 2
         assert any("exceeds max export size, dropped" in str(error) for error in errors)
+        assert len([error for error in errors if f"{kind} export failed" in str(error)]) == 1
+
+    # The processors ignore an export's result, so check that the drop alone does not fail.
+    spans = InMemorySpanExporter()
+    logs = InMemoryLogRecordExporter()
+    telemetry_dev.init(
+        api_key="td_live_test",
+        export_mode="immediate",
+        log_level="silent",
+        disable_atexit=True,
+        span_exporter=spans,
+        log_exporter=logs,
+    )
+    record("dropped", {"payload": ["p" * 17_000_000]})
+    telemetry_dev.shutdown()
+    assert len(spans.get_finished_spans() if kind == "span" else logs.get_finished_logs()) == 1
+    if kind == "span":
+        span_inner = FakeSpanExporter(SpanExportResult.SUCCESS)
+        span_exporter = ReportingSpanExporter(span_inner, ExportFailures(None))
+        assert span_exporter.export(spans.get_finished_spans()) is SpanExportResult.SUCCESS
+        assert span_inner.export_calls == 0
+    else:
+        log_inner = FakeLogExporter(LogRecordExportResult.SUCCESS)
+        log_exporter = ReportingLogExporter(log_inner, ExportFailures(None))
+        assert log_exporter.export(logs.get_finished_logs()) is LogRecordExportResult.SUCCESS
+        assert log_inner.export_calls == 0
 
 
 def test_spans_past_max_queue_bytes_are_dropped_and_reported_once_until_the_queue_drains() -> None:
@@ -588,6 +795,124 @@ def test_spans_past_max_queue_bytes_are_dropped_and_reported_once_until_the_queu
     processor.force_flush()
     assert len(exporter.get_finished_spans()) == 5
     assert len(errors) == 2
+    provider.shutdown()
+
+
+class _SampleByName(Sampler):
+    def should_sample(
+        self, parent_context: Any, trace_id: int, name: str, *args: Any, **kwargs: Any
+    ) -> SamplingResult:
+        return SamplingResult(
+            Decision.RECORD_AND_SAMPLE if name == "sampled" else Decision.RECORD_ONLY
+        )
+
+    def get_description(self) -> str:
+        return "sample by name"
+
+
+def test_spans_recorded_without_sampling_take_no_room_in_the_export_queue() -> None:
+    errors: list[BaseException] = []
+    exporter = InMemorySpanExporter()
+    processor = TelemetrySpanProcessor(
+        exporter,
+        schedule_delay_millis=1_000_000,
+        max_queue_size=2,
+        max_export_batch_size=2,
+        metrics=False,
+        on_error=errors.append,
+    )
+    provider = TracerProvider(sampler=_SampleByName())
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    # The batch processor drops these itself, so a budget that counted them would never free them.
+    for _ in range(3):
+        tracer.start_span("recorded").end()
+    tracer.start_span("sampled").end()
+    processor.force_flush()
+
+    assert [span.name for span in exporter.get_finished_spans()] == ["sampled"]
+    assert errors == []
+    provider.shutdown()
+
+
+class _BlockingSpanExporter(InMemorySpanExporter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.exporting = threading.Event()
+        self.release = threading.Event()
+
+    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        self.exporting.set()
+        self.release.wait(10)
+        return super().export(spans)
+
+
+def test_spans_past_max_queue_size_are_dropped_and_reported_without_evicting_queued_spans() -> None:
+    errors: list[BaseException] = []
+    exporter = _BlockingSpanExporter()
+    processor = TelemetrySpanProcessor(
+        exporter,
+        max_queue_size=2,
+        max_export_batch_size=1,
+        metrics=False,
+        on_error=errors.append,
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+
+    tracer.start_span("0").end()
+    # Span 0 is out of the queue and its export waits, so spans 1 and 2 fill the queue.
+    assert exporter.exporting.wait(10)
+    for name in ("1", "2", "3"):
+        tracer.start_span(name).end()
+    assert ["span export queue is full" in str(error) for error in errors] == [True]
+    exporter.release.set()
+    processor.force_flush()
+
+    # The batch processor's own queue would keep span 3 and evict span 1.
+    assert [span.name for span in exporter.get_finished_spans()] == ["0", "1", "2"]
+    provider.shutdown()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_forked_child_starts_with_an_empty_export_queue() -> None:
+    errors: list[BaseException] = []
+    exporter = InMemorySpanExporter()
+    processor = TelemetrySpanProcessor(
+        exporter,
+        schedule_delay_millis=1_000_000,
+        max_queue_bytes=1_000,
+        metrics=False,
+        on_error=errors.append,
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("test")
+    # The parent's queue is full by size when it forks.
+    tracer.start_span("parent", attributes={"input": "i" * 1_000}).end()
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            # The child's batch processor drops the parent's queue, so the queue has room again.
+            tracer.start_span("child", attributes={"input": "i" * 1_000}).end()
+            processor.force_flush()
+            names = [span.name for span in exporter.get_finished_spans()]
+            code = 0 if names == ["child"] and errors == [] else 2
+        finally:
+            # The child must not return into pytest.
+            os._exit(code)
+    deadline = time.monotonic() + 10
+    while (waited := os.waitpid(pid, os.WNOHANG)) == (0, 0):
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pytest.fail("The forked process did not end in 10 s")
+        time.sleep(0.01)
+    assert os.waitstatus_to_exitcode(waited[1]) == 0
     provider.shutdown()
 
 

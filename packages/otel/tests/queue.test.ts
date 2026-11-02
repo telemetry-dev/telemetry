@@ -1,7 +1,13 @@
 import { runInNewContext } from "node:vm";
 import { setFlagsFromString } from "node:v8";
 
-import { BasicTracerProvider, InMemorySpanExporter } from "@opentelemetry/sdk-trace-base";
+import { ExportResultCode } from "@opentelemetry/core";
+import {
+  BasicTracerProvider,
+  InMemorySpanExporter,
+  SamplingDecision,
+  type SpanExporter,
+} from "@opentelemetry/sdk-trace-base";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import { DEFAULT_BATCH } from "../src/config.ts";
@@ -140,4 +146,79 @@ test("a span processor sizes the bound, with the default for an absent or invali
   expect(streamCaptureBudget.maxBytes).toBe(6_000);
   expect(errors).toHaveLength(2);
   expect(errors.every((error) => error instanceof RangeError)).toBe(true);
+});
+
+function batchedProvider(
+  exporter: SpanExporter,
+  maxExportBatchSize: number,
+  onError: (error: Error) => void,
+) {
+  return new BasicTracerProvider({
+    sampler: {
+      shouldSample: (_context, _traceId, name) => ({
+        decision:
+          name === "sampled" ? SamplingDecision.RECORD_AND_SAMPLED : SamplingDecision.RECORD,
+      }),
+      toString: () => "sample by name",
+    },
+    spanProcessors: [
+      new StampingSpanProcessor({
+        exporter,
+        exportMode: "batched",
+        batch: {
+          maxExportBatchSize,
+          scheduledDelayMillis: 1_000_000,
+          maxQueueSize: 2,
+          exportTimeoutMillis: 30000,
+        },
+        onError,
+      }),
+    ],
+  });
+}
+
+test("spans recorded without sampling take no room in the export queue", async () => {
+  const errors: Error[] = [];
+  const exporter = new InMemorySpanExporter();
+  const provider = batchedProvider(exporter, 2, (error) => errors.push(error));
+  const tracer = provider.getTracer("queue");
+
+  // The batch processor drops these itself, so a budget that counted them would never release them.
+  for (let i = 0; i < 3; i += 1) tracer.startSpan("recorded").end();
+  tracer.startSpan("sampled").end();
+  await provider.forceFlush();
+
+  expect(exporter.getFinishedSpans().map((span) => span.name)).toEqual(["sampled"]);
+  expect(errors).toEqual([]);
+  await provider.shutdown();
+});
+
+test("spans past maxQueueSize are dropped and reported", async () => {
+  const errors: Error[] = [];
+  const exported: string[] = [];
+  const waiting: (() => void)[] = [];
+  const exporter: SpanExporter = {
+    export: (spans, done) => {
+      exported.push(...spans.map((span) => span.name));
+      waiting.push(() => done({ code: ExportResultCode.SUCCESS }));
+    },
+    shutdown: async () => {},
+  };
+  const provider = batchedProvider(exporter, 1, (error) => errors.push(error));
+  const tracer = provider.getTracer("queue");
+
+  tracer.startSpan("sampled").end();
+  // The first span is out of the queue and its export waits, so the next two fill the queue.
+  expect(exported).toHaveLength(1);
+  for (let i = 0; i < 3; i += 1) tracer.startSpan("sampled").end();
+  expect(errors.map((error) => error.message)).toEqual([
+    expect.stringContaining("span export queue is full"),
+  ]);
+
+  while (waiting.length > 0) {
+    waiting.shift()!();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  expect(exported).toHaveLength(3);
+  await provider.shutdown();
 });

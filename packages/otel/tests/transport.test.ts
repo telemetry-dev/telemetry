@@ -470,26 +470,37 @@ test(
 );
 
 test(
-  "a span over the limit without a string attribute to cut is dropped with onError",
+  "a split batch stops at its first failed request",
+  async () => {
+    const { calls, fetchImpl } = makeFetch([400]);
+    const exporter = createTraceExporter(target, { fetchImpl });
+
+    // Two 9 MB spans: together they exceed the 16 MiB limit, so the batch splits in two.
+    expect(await exportSpans(exporter, makeSpans(2, 9_000_000))).toBe(ExportResultCode.FAILED);
+    expect(calls).toHaveLength(1);
+  },
+  LARGE_PAYLOAD_TIMEOUT_MS,
+);
+
+test(
+  "a span over the limit without a string to cut is dropped with onError and does not end a failure series",
   async () => {
     const errors: unknown[] = [];
-    const { calls, fetchImpl } = makeFetch([200]);
-
-    const exporter = createTraceExporter(
-      { url: "https://ingest.example/v1/traces", headers: otlpHeaders("td_live_x") },
-      { fetchImpl, onError: (e) => errors.push(e) },
-    );
-
+    const { calls, fetchImpl } = makeFetch([400]);
+    const exporter = createTraceExporter(target, { fetchImpl, onError: (e) => errors.push(e) });
     const [span] = makeSpans(1);
-
-    const record = Object.create(span!, {
+    // Nothing in it can be cut, so it is dropped without a request.
+    const dropped = Object.create(span!, {
       attributes: { value: { payload: ["p".repeat(17_000_000)] } },
     });
 
-    const code = await exportSpans(exporter, [record]);
-    expect(code).toBe(ExportResultCode.SUCCESS);
-    expect(calls).toHaveLength(0);
-    expect(String(errors[0])).toContain("exceeds max export size, dropped");
+    expect(await exportSpans(exporter, makeSpans(1))).toBe(ExportResultCode.FAILED);
+    expect(await exportSpans(exporter, [dropped])).toBe(ExportResultCode.SUCCESS);
+    expect(await exportSpans(exporter, makeSpans(1))).toBe(ExportResultCode.FAILED);
+    expect(calls).toHaveLength(2);
+    // The first failure and the drop; the second failure continues the series.
+    expect(errors).toHaveLength(2);
+    expect(String(errors[1])).toContain("exceeds max export size, dropped");
   },
   LARGE_PAYLOAD_TIMEOUT_MS,
 );

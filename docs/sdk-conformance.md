@@ -96,11 +96,13 @@ used `https://ingest.telemetry.dev`, another hostname for the same service) /
 `OTEL_SERVICE_NAME` (default `unknown_service`); no default truncation cap, so each captured value
 is sent whole; a configured cap counts UTF-16 units **including** the `...[truncated]` marker
 (custom caps shorter than the marker retain its prefix); export requests of at most 16 MiB, the
-ingest's decompressed body limit: a larger batch is split, and a span or log record that is larger
-by itself has its longest string values (attributes, or a log record's message) cut with the marker
-and gets `telemetry.dev.capture.truncated = true` (a record that still does not fit, because its
-events or array attributes hold the excess, is dropped); both cases are reported to `onError` /
-`on_error`; TypeScript batch defaults 64/1000ms/2048/30000ms; the export timeout (TypeScript
+ingest's decompressed body limit: a larger batch is split, its requests stop at the first that
+fails, and the batch fails; a span or log record that is larger by itself has its longest string
+values (attributes, or a log record's message) cut with the marker and gets
+`telemetry.dev.capture.truncated = true` (a record that still does not fit, because its events or
+array attributes hold the excess, is dropped, and a batch of only dropped records neither fails nor
+ends a series of failed exports); both cases are reported to `onError` / `on_error`; TypeScript
+batch defaults 64/1000ms/2048/30000ms; the export timeout (TypeScript
 `exportTimeoutMillis`, Python `timeout`) applies to each export request, so each request of a split
 batch has its own; in batched mode, the span queue and the log queue each hold at most 2048 records
 and 64 MiB of string values (each UTF-16 unit, or each Python character, counted as one byte; a
