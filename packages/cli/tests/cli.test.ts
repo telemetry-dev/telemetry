@@ -179,6 +179,15 @@ test("payload --field prints the whole text across pages", async () => {
   expect(calls.filter((call) => call.tool === "get_span_payload").length).toBeGreaterThan(1);
 });
 
+test("payload counts what it read of a long text in characters, not UTF-16 code units", async () => {
+  await signIn(PROJECTS[0]);
+
+  const result = await run("payload", "4bf92f3577b34da6a3ce929d0e0e4736", "f6", "--field", "error");
+  expect(result.code).toBe(0);
+  expect(result.stdout).toBe("🙂".repeat(2_000));
+  expect(result.stderr).toContain("The CLI read the first 2,000 of 2,100 characters.");
+});
+
 test("trace leads with where the run failed and which calls repeated, counting parallel calls once", async () => {
   await signIn(PROJECTS[0]);
 

@@ -1640,6 +1640,9 @@ export async function usageCommand(context: Context) {
 const MAX_PAYLOAD_PAGES = 50;
 const FIELDS = { input: "input", output: "output", error: "error" } as const;
 
+/** Characters as `get_span_payload` counts them: code points, not UTF-16 code units. */
+const characterCount = (text: string) => Array.from(text).length;
+
 type Payload = Omit<PayloadPage, "offset" | "next_offset"> & {
   /** False when the CLI stopped reading before the end of the stored text. */
   readonly complete: boolean;
@@ -1666,7 +1669,7 @@ const readPayload = async (
 
   return {
     field,
-    total_characters: page?.total_characters ?? text.length,
+    total_characters: page?.total_characters ?? characterCount(text),
     stored_text_truncated: page?.stored_text_truncated ?? false,
     complete: offset === null,
     text,
@@ -1675,7 +1678,7 @@ const readPayload = async (
 
 const payloadWarning = (payload: Payload) =>
   !payload.complete
-    ? `The CLI read the first ${formatInteger(payload.text.length)} of ${formatInteger(payload.total_characters)} characters.`
+    ? `The CLI read the first ${formatInteger(characterCount(payload.text))} of ${formatInteger(payload.total_characters)} characters.`
     : payload.stored_text_truncated
       ? "telemetry.dev stored only the start of this text."
       : undefined;
