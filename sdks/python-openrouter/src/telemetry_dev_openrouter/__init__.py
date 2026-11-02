@@ -407,15 +407,86 @@ def _end_once(handle: telemetry_dev.SpanHandle) -> Callable[..., None]:
     return end
 
 
+# On Python 3.10 and 3.11, StringIO keeps up to 100,000 written strings in a list before it
+# joins them, about 60 bytes each that the stream bound does not charge: 15 bytes a character
+# for 4-character deltas. Deltas are joined 256 at a time, so that those waiting hold under
+# about 22 KB, onto a string that is written once it has 4,096 characters, so that what is
+# written costs about 1.5% more than its text. Python 3.12 dropped the list.
+_DELTA_BATCH = 256
+_WRITE_CHARS = 4096
+
+
+class _DeltaBuffer:
+    # A write takes several steps, unlike one StringIO call, so without the lock a read on
+    # another thread, such as one that closes the stream, could copy a batch twice or drop it.
+    # A fork copies the lock held if another thread was writing, and that thread does not run
+    # in the child to release it. Every fork, also one that runs no at-fork hooks, changes the
+    # process ID, so a child takes a new lock. The check is inline because it runs per delta.
+    # A signal handler runs on the thread it interrupts, so one that reads the stream, such as
+    # one that closes it, can read inside a write. So the lock is reentrant, and each step takes
+    # the deltas and the tail out of the buffer before it joins or writes them, so that a read
+    # inside the step does not write them as well; that read returns a prefix, which can leave
+    # out the deltas being joined. A handler that writes inside a step is not supported. An
+    # exception inside a step, such as KeyboardInterrupt from a handler, puts back the text the
+    # step took unless the StringIO has it, so that a later read still has every delta.
+    __slots__ = ("_buffer", "_lock", "_pending", "_pid", "_tail")
+
+    def __init__(self) -> None:
+        self._buffer = StringIO()
+        self._lock = threading.RLock()
+        self._pid = os.getpid()
+        self._pending: list[str] = []
+        self._tail = ""
+
+    def write(self, text: str) -> None:
+        pid = os.getpid()
+        if self._pid != pid:
+            self._lock = threading.RLock()
+            self._pid = pid
+        with self._lock:
+            self._pending.append(text)
+            if len(self._pending) >= _DELTA_BATCH:
+                self._join(_WRITE_CHARS)
+
+    def getvalue(self) -> str:
+        pid = os.getpid()
+        if self._pid != pid:
+            self._lock = threading.RLock()
+            self._pid = pid
+        with self._lock:
+            self._join(1)
+            return self._buffer.getvalue()
+
+    def _join(self, write_at: int) -> None:
+        if not self._pending and len(self._tail) < write_at:
+            return
+        written = self._buffer.tell()
+        pending: list[str] = []
+        tail = ""
+        try:
+            pending, self._pending = self._pending, []
+            tail, self._tail = self._tail, ""
+            joined = "".join([tail, *pending])
+            if len(joined) >= write_at:
+                self._buffer.write(joined)
+            else:
+                self._tail = joined
+        except BaseException:
+            if self._buffer.tell() == written:
+                self._pending[:0] = pending
+                self._tail = tail + self._tail
+            raise
+
+
 class _ChatChoice:
     def __init__(self) -> None:
         self.role: str | None = None
         # Deltas are written to buffers and joined when output is read: repeated concatenation
         # copies the whole text for each delta.
-        self.content_fragments = StringIO()
-        self.reasoning_fragments = StringIO()
+        self.content_fragments = _DeltaBuffer()
+        self.reasoning_fragments = _DeltaBuffer()
         self.reasoning_details: list[Any] = []
-        self.refusal_fragments = StringIO()
+        self.refusal_fragments = _DeltaBuffer()
         self.tool_calls: dict[int, dict[str, Any]] = {}
         self.finish_reason: str | None = None
 
@@ -462,8 +533,8 @@ def _merge_tool_call(state: _ChatChoice, delta: Any) -> None:
             current_function["name"] = name
         if isinstance(arguments, str):
             fragments = current_function.get("arguments")
-            if not isinstance(fragments, StringIO):
-                fragments = current_function["arguments"] = StringIO()
+            if not isinstance(fragments, _DeltaBuffer):
+                fragments = current_function["arguments"] = _DeltaBuffer()
             fragments.write(arguments)
         current["function"] = current_function
     state.tool_calls[tool_index] = current
@@ -567,7 +638,7 @@ def _joined_tool_call(call: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(function, dict):
         return call
     arguments = cast(dict[str, Any], function).get("arguments")
-    if not isinstance(arguments, StringIO):
+    if not isinstance(arguments, _DeltaBuffer):
         return call
     return {**call, "function": {**function, "arguments": arguments.getvalue()}}
 
@@ -996,15 +1067,15 @@ def _write_fragment(target: dict[str, Any], key: str, value: str) -> None:
     """Appends a delta to ``target[key]`` in a buffer, since repeated concatenation copies the
     whole text for each delta. _joined_item reads the text back."""
     fragments = target.get(key)
-    if not isinstance(fragments, StringIO):
-        fragments = StringIO()
+    if not isinstance(fragments, _DeltaBuffer):
+        fragments = _DeltaBuffer()
         fragments.write(f"{target.get(key, '')}")
         target[key] = fragments
     fragments.write(value)
 
 
 def _joined_value(value: Any) -> Any:
-    return value.getvalue() if isinstance(value, StringIO) else value
+    return value.getvalue() if isinstance(value, _DeltaBuffer) else value
 
 
 def _joined_item(item: Any) -> Any:

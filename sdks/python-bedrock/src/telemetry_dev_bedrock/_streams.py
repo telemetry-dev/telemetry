@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -30,6 +32,77 @@ def release_budget(budget: telemetry_dev.CaptureBudget) -> None:
     release = getattr(budget, "release", None)
     if callable(release):
         release()
+
+
+# On Python 3.10 and 3.11, StringIO keeps up to 100,000 written strings in a list before it
+# joins them, about 60 bytes each that the stream bound does not charge: 15 bytes a character
+# for 4-character deltas. Deltas are joined 256 at a time, so that those waiting hold under
+# about 22 KB, onto a string that is written once it has 4,096 characters, so that what is
+# written costs about 1.5% more than its text. Python 3.12 dropped the list.
+_DELTA_BATCH = 256
+_WRITE_CHARS = 4096
+
+
+class _DeltaBuffer:
+    # A write takes several steps, unlike one StringIO call, so without the lock a read on
+    # another thread, such as one that closes the stream, could copy a batch twice or drop it.
+    # A fork copies the lock held if another thread was writing, and that thread does not run
+    # in the child to release it. Every fork, also one that runs no at-fork hooks, changes the
+    # process ID, so a child takes a new lock. The check is inline because it runs per delta.
+    # A signal handler runs on the thread it interrupts, so one that reads the stream, such as
+    # one that closes it, can read inside a write. So the lock is reentrant, and each step takes
+    # the deltas and the tail out of the buffer before it joins or writes them, so that a read
+    # inside the step does not write them as well; that read returns a prefix, which can leave
+    # out the deltas being joined. A handler that writes inside a step is not supported. An
+    # exception inside a step, such as KeyboardInterrupt from a handler, puts back the text the
+    # step took unless the StringIO has it, so that a later read still has every delta.
+    __slots__ = ("_buffer", "_lock", "_pending", "_pid", "_tail")
+
+    def __init__(self) -> None:
+        self._buffer = StringIO()
+        self._lock = threading.RLock()
+        self._pid = os.getpid()
+        self._pending: list[str] = []
+        self._tail = ""
+
+    def write(self, text: str) -> None:
+        pid = os.getpid()
+        if self._pid != pid:
+            self._lock = threading.RLock()
+            self._pid = pid
+        with self._lock:
+            self._pending.append(text)
+            if len(self._pending) >= _DELTA_BATCH:
+                self._join(_WRITE_CHARS)
+
+    def getvalue(self) -> str:
+        pid = os.getpid()
+        if self._pid != pid:
+            self._lock = threading.RLock()
+            self._pid = pid
+        with self._lock:
+            self._join(1)
+            return self._buffer.getvalue()
+
+    def _join(self, write_at: int) -> None:
+        if not self._pending and len(self._tail) < write_at:
+            return
+        written = self._buffer.tell()
+        pending: list[str] = []
+        tail = ""
+        try:
+            pending, self._pending = self._pending, []
+            tail, self._tail = self._tail, ""
+            joined = "".join([tail, *pending])
+            if len(joined) >= write_at:
+                self._buffer.write(joined)
+            else:
+                self._tail = joined
+        except BaseException:
+            if self._buffer.tell() == written:
+                self._pending[:0] = pending
+                self._tail = tail + self._tail
+            raise
 
 
 def capture_masked(handle: Any) -> bool:
@@ -109,7 +182,7 @@ class ConverseStreamState(StreamState):
         self._blocks: dict[int, dict[str, Any]] = {}
         # Appended text waits here and is joined when the blocks are read: adding each delta
         # to the string copies all the text before it, which is quadratic in a long stream.
-        self._appended: dict[tuple[int, str], StringIO] = {}
+        self._appended: dict[tuple[int, str], _DeltaBuffer] = {}
         self.stop_reason: str | None = None
         self.usage: dict[str, int] | None = None
         self.metadata: dict[str, Any] = {}
@@ -127,7 +200,7 @@ class ConverseStreamState(StreamState):
         parts = self._appended.get((index, key))
         if parts is None:
             block.setdefault(key, "")
-            parts = self._appended[(index, key)] = StringIO()
+            parts = self._appended[(index, key)] = _DeltaBuffer()
         parts.write(text)
 
     def feed(self, event: Any) -> None:
@@ -454,7 +527,7 @@ class AgentStreamState(StreamState):
     def __init__(self, *, capture_trace: bool = False) -> None:
         self.budget = stream_capture_budget()
         self.capture_trace = capture_trace
-        self.text_fragments = StringIO()
+        self.text_fragments = _DeltaBuffer()
         # Trace metadata shares the budget but does not make the text incomplete.
         self.text_rejected = False
         self.usage: dict[str, int] = {}
@@ -587,7 +660,7 @@ class AgentStreamState(StreamState):
 class RagStreamState(StreamState):
     def __init__(self) -> None:
         self.budget = stream_capture_budget()
-        self.text_fragments = StringIO()
+        self.text_fragments = _DeltaBuffer()
         self.citation_count = 0
         self.guardrail_action: str | None = None
 
