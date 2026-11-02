@@ -9,13 +9,17 @@ import {
   flush,
   getPrompt,
   init,
+  MAX_RECORD_BYTES,
   shutdown,
+  StreamCapture,
   type TelemetryOptions,
 } from "@telemetry-dev/sdk";
 import * as telemetrySdk from "@telemetry-dev/sdk";
 import Anthropic from "@anthropic-ai/sdk";
 import { createRequire } from "node:module";
-import { afterEach, expect, test, vi } from "vitest";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import { instrumentAnthropic, uninstrumentAnthropic, wrapAnthropic } from "../src/index.ts";
 
@@ -163,11 +167,20 @@ function createFakeFetch(...responses: Response[]): FakeFetch {
   return { fetch: fetchImpl, requests };
 }
 
+// Most tests reach the stream bound at 48 KiB: another stream holds a byte, and setupSpans sizes
+// the shared bound to leave a stream these tests start 48 KiB.
+const STREAM_LIMIT = 48 * 1024;
+let otherStream: StreamCapture | undefined;
+
+beforeEach(() => {
+  otherStream = new StreamCapture(1);
+});
+
 function setupSpans(
   metricExporter?: PushMetricExporter,
   captureOutput = true,
   mask?: TelemetryOptions["mask"],
-  options: Pick<TelemetryOptions, "captureInput" | "maxAttributeLength" | "onError"> = {},
+  options: Pick<TelemetryOptions, "batch" | "captureInput" | "maxAttributeLength" | "onError"> = {},
 ): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
   init(
@@ -179,6 +192,7 @@ function setupSpans(
       logLevel: "silent",
       captureOutput,
       mask,
+      batch: { maxStreamBytes: STREAM_LIMIT + 1 },
       ...options,
       fetch: async () => new Response(null, { status: 200 }),
     },
@@ -276,6 +290,7 @@ function streamEvents(): JsonRecord[] {
 }
 
 afterEach(async () => {
+  otherStream?.release();
   uninstrumentAnthropic();
   await shutdown();
   vi.restoreAllMocks();
@@ -1545,13 +1560,17 @@ test.each([
 test("deltas that fill the stream limit keep the accepted text and deliver every event", async () => {
   const spans = setupSpans();
 
-  const events = betaStreamEvents([
-    { type: "text", text: "" },
+  const events = betaStreamEvents(
     [
-      { type: "text_delta", text: "x".repeat(49_000) },
-      { type: "text_delta", text: "y".repeat(127) },
+      { type: "text", text: "" },
+      [
+        { type: "text_delta", text: "x".repeat(49_000) },
+        { type: "text_delta", text: "y".repeat(127) },
+        { type: "text_delta", text: "z" },
+      ],
     ],
-  ]);
+    [{ type: "text", text: "w" }, [{ type: "text_delta", text: "v" }]],
+  );
 
   const stream = await clientWith(
     createFakeFetch(namedSseResponse(events)).fetch,
@@ -1562,7 +1581,19 @@ test("deltas that fill the stream limit keep the accepted text and deliver every
     stream: true,
   });
 
-  expect(await collectStream(stream)).toEqual(events);
+  const received: unknown[] = [];
+
+  for await (const event of stream) {
+    received.push(event);
+
+    // The "y" delta cut the stream. The other stream then returns its byte, so the limit rises
+    // to MAX_RECORD_BYTES, and the later deltas and block still must not be kept.
+    if ((event as { delta?: { text?: string } }).delta?.text === "y".repeat(127)) {
+      otherStream?.release();
+    }
+  }
+
+  expect(received).toEqual(events);
   const span = await exportedSpan(spans);
 
   const output = jsonAttr<Array<{ content: Array<{ text?: string }> }>>(
@@ -1571,8 +1602,231 @@ test("deltas that fill the stream limit keep the accepted text and deliver every
   );
 
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
-  expect(output[0]?.content[0]?.text).toBe("x".repeat(49_000));
+  expect(output[0]?.content).toEqual([{ type: "text", text: "x".repeat(49_000) }]);
   expect(String(span.attributes["gen_ai.output.messages"]).length).toBeLessThanOrEqual(48 * 1024);
+});
+
+test.each([
+  [64 * 1024, false],
+  [MAX_RECORD_BYTES, true],
+] as const)("with the default bounds a stream of %s text bytes is cut: %s", async (length, cut) => {
+  otherStream?.release();
+  const spans = setupSpans(undefined, true, undefined, { batch: {} });
+  const piece = "x".repeat(1024 * 1024);
+
+  const deltas = Array.from({ length: Math.ceil(length / piece.length) }, (_, index) => ({
+    type: "text_delta",
+    text: piece.slice(0, Math.min(piece.length, length - index * piece.length)),
+  }));
+
+  const span = await streamedBetaSpan(
+    betaStreamEvents([{ type: "text", text: "" }, deltas]),
+    spans,
+  );
+  const text = jsonAttr<Array<{ content: Array<{ text: string }> }>>(
+    span,
+    "gen_ai.output.messages",
+  )[0]!.content[0]!.text;
+
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(cut ? true : undefined);
+  expect(text.length).toBe(cut ? MAX_RECORD_BYTES - 1024 * 1024 : length);
+});
+
+test("streams in flight share the stream bound; the stream that passes it is cut", async () => {
+  otherStream?.release();
+  const spans = setupSpans(undefined, true, undefined, { batch: { maxStreamBytes: 100_000 } });
+  const text = (fill: string) =>
+    betaStreamEvents([
+      { type: "text", text: "" },
+      [{ type: "text_delta", text: fill.repeat(60_000) }],
+    ]);
+  const create = (events: JsonRecord[]) =>
+    clientWith(createFakeFetch(namedSseResponse(events)).fetch).beta.messages.create({
+      model: "claude-opus-5",
+      max_tokens: 64,
+      messages: [{ role: "user", content: "Hi" }],
+      stream: true,
+    });
+
+  const first = (await create(text("a")))[Symbol.asyncIterator]();
+
+  // The first stream now holds its 60,000 bytes; the second may keep only the rest of 100,000.
+  for (let step = await first.next(); (step.value as JsonRecord).type !== "content_block_delta"; ) {
+    step = await first.next();
+  }
+
+  await collectStream(await create(text("b")));
+  for (let step = await first.next(); !step.done; ) step = await first.next();
+  // Both streams ended and gave their bytes back.
+  await collectStream(await create(text("c")));
+
+  const [second, firstSpan, third] = await finishedSpans(spans, 3);
+  const output = (span: ReadableSpan) =>
+    jsonAttr<Array<{ content: Array<{ text: string }> }>>(span, "gen_ai.output.messages")[0]!
+      .content[0]!.text;
+
+  expect(firstSpan!.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  expect(output(firstSpan!)).toBe("a".repeat(60_000));
+  expect(second!.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(output(second!)).toBe("");
+  expect(third!.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  expect(output(third!)).toBe("c".repeat(60_000));
+});
+
+test("a dropped stream whose controller is kept gives its bytes back when collected", async () => {
+  setupSpans();
+  setFlagsFromString("--expose-gc");
+  // With --expose-gc set, a new context defines gc().
+  const gc = runInNewContext("gc") as () => void;
+  const controller = new AbortController();
+  const client = wrapAnthropic({
+    messages: {
+      create: async (_params: unknown) => ({
+        controller,
+        async *[Symbol.asyncIterator]() {
+          yield* streamEvents();
+        },
+      }),
+    },
+  });
+
+  // The stream and its iterator are only reachable inside this function.
+  await (async () => {
+    const stream = await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 64,
+      messages: [],
+      stream: true,
+    });
+    const iterator = (stream as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+    for (let read = 0; read < 3; read += 1) await iterator.next();
+    expect(new StreamCapture().limit).toBeLessThan(STREAM_LIMIT);
+  })();
+
+  for (let attempt = 0; attempt < 20 && new StreamCapture().limit !== STREAM_LIMIT; attempt += 1) {
+    gc();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  expect(new StreamCapture().limit).toBe(STREAM_LIMIT);
+  expect(controller.signal.aborted).toBe(false);
+});
+
+// A probe that holds nothing sees the room that streams in flight leave. The stream must give
+// its bytes back however it ends.
+test.each(["ending its span throws", "the provider stream fails", "the caller stops early"])(
+  "a stream returns its bytes to the stream bound when %s",
+  async (ending) => {
+    const spans = setupSpans();
+    const events = streamEvents();
+
+    if (ending === "ending its span throws") {
+      const startSpan = telemetrySdk.startSpan;
+      vi.spyOn(telemetrySdk, "startSpan").mockImplementation((...args) => {
+        const span = startSpan(...args);
+        const end = span.end.bind(span);
+        vi.spyOn(span, "end").mockImplementation((fields) => {
+          end(fields);
+          throw new Error("span processor failed");
+        });
+
+        return span;
+      });
+    }
+
+    const source = {
+      controller: new AbortController(),
+      async *[Symbol.asyncIterator]() {
+        // message_start, the text block, and its first delta.
+        yield* events.slice(0, 3);
+
+        if (ending === "the provider stream fails") throw new Error("stream failed");
+        yield* events.slice(3);
+      },
+    };
+
+    const client = wrapAnthropic({ messages: { create: async (_params: unknown) => source } });
+    const stream = await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 64,
+      messages: [],
+      stream: true,
+    });
+    let roomWhileOpen: number | undefined;
+
+    const consumed = (async () => {
+      for await (const event of stream) {
+        if (readString(asRecord(event)?.type) !== "content_block_delta") continue;
+        roomWhileOpen ??= new StreamCapture().limit;
+
+        if (ending === "the caller stops early") break;
+      }
+    })();
+
+    if (ending === "the caller stops early") await consumed;
+    else
+      await expect(consumed).rejects.toThrow(
+        ending === "ending its span throws" ? "span processor failed" : "stream failed",
+      );
+
+    expect(roomWhileOpen).toBeLessThan(STREAM_LIMIT);
+    expect(new StreamCapture().limit).toBe(STREAM_LIMIT);
+
+    if (ending === "ending its span throws") {
+      expect(jsonAttr(await exportedSpan(spans), "gen_ai.output.messages")).toEqual([
+        { role: "assistant", content: [{ type: "text", text: "Hello world" }] },
+      ]);
+    }
+  },
+);
+
+test("citation deltas append in place, so many small deltas finish quickly", async () => {
+  otherStream?.release();
+  const spans = setupSpans(undefined, true, undefined, { batch: {} });
+
+  const citations = Array.from({ length: 50_000 }, (_, index) => ({
+    type: "char_location",
+    cited_text: "c",
+    document_index: 0,
+    start_char_index: index,
+    end_char_index: index + 1,
+  }));
+
+  const events = betaStreamEvents([
+    { type: "text", text: "" },
+    [
+      { type: "text_delta", text: "cited" },
+      ...citations.map((citation) => ({ type: "citations_delta", citation })),
+    ],
+  ]);
+
+  const source = {
+    controller: new AbortController(),
+    async *[Symbol.asyncIterator]() {
+      yield* events;
+    },
+  };
+
+  const client = wrapAnthropic({ messages: { create: async (_params: unknown) => source } });
+  const startedAt = performance.now();
+
+  await collectStream(
+    await client.messages.create({
+      model: "claude-opus-5",
+      max_tokens: 64,
+      messages: [],
+      stream: true,
+    }),
+  );
+
+  // With a copy of the array on each delta, this stream took about 8 s; in place it takes
+  // about 0.5 s.
+  expect(performance.now() - startedAt).toBeLessThan(2_000);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ type: "text", text: "cited", citations }] },
+  ]);
 });
 
 test.each([

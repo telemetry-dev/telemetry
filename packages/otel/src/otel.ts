@@ -15,7 +15,7 @@ import {
   type ExportMode,
   resolveEnv,
 } from "./config.ts";
-import { diag } from "./debug.ts";
+import { diag, reportError } from "./debug.ts";
 import {
   BATCHED_METRIC_INTERVAL_MS,
   createMetricsPipeline,
@@ -63,6 +63,16 @@ export class TelemetrySpanProcessor implements SpanProcessor {
   private readonly metrics?: MetricsPipeline;
 
   constructor(options: TelemetrySpanProcessorOptions = {}) {
+    let batch: Required<BatchOptions>;
+
+    try {
+      batch = resolveBatch(options.batch);
+    } catch (error) {
+      reportError(options.onError, error);
+
+      return;
+    }
+
     const env = resolveEnv();
     const apiKey = options.apiKey ?? env.TELEMETRY_DEV_API_KEY;
 
@@ -119,7 +129,7 @@ export class TelemetrySpanProcessor implements SpanProcessor {
     this.inner = new StampingSpanProcessor({
       exporter,
       exportMode,
-      batch: resolveBatch(options.batch),
+      batch,
       spanFilter: options.spanFilter,
       recordMetrics: metrics ? (span) => metrics.record(span) : undefined,
       onError: options.onError,

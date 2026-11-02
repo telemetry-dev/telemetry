@@ -66,7 +66,7 @@ Captured request fields include model, max tokens, temperature, top-p, stop sequ
 
 Streaming spans start when the request is made and end when the stream is consumed, closes early, or errors. The integration aggregates text, tool input JSON fragments, thinking deltas, signatures, usage, and the latest known stop reason before ending the span.
 
-Reconstructed output is bounded to 48 KiB and 1,000 items. The configured `maxAttributeLength` does not shrink these retention bounds; the core applies it to the exported attribute after the mask runs, with its `...[truncated]` marker, without setting `telemetry.dev.capture.truncated`. A stream that ends without `message_stop`, encounters a mapping failure, or
+Reconstructed output is kept up to 16 MiB, and all streams in flight share the `batch.maxStreamBytes` bound of the core (64 MiB by default). The configured `maxAttributeLength` does not shrink these retention bounds; the core applies it to the exported attribute after the mask runs, with its `...[truncated]` marker, without setting `telemetry.dev.capture.truncated`. A stream that ends without `message_stop`, encounters a mapping failure, or
 exceeds a capture bound sets `telemetry.dev.capture.truncated`. With a mask configured, incomplete
 output is omitted because the mask cannot inspect the complete value. When output capture is
 disabled, response IDs and models, finish reasons, usage, timing, and errors may still be recorded.

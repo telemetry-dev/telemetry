@@ -21,12 +21,14 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
+from ._capture import DEFAULT_MAX_STREAM_BYTES
 from ._config import SDK_VERSION, logger, report_error, resolve_config
 from ._export import (
     DEFAULT_MAX_QUEUE_BYTES,
     ExportFailures,
     ReportingSpanExporter,
     after_export,
+    resolve_byte_bound,
 )
 from ._metrics import GuardedOTLPMetricExporter, MetricsRecorder, sdk_meter_provider
 from ._processor import ExportMode, StampingSpanProcessor
@@ -105,7 +107,8 @@ class TelemetrySpanProcessor(SpanProcessor):
         max_export_batch_size: int = 64,
         schedule_delay_millis: float = 1000,
         max_queue_size: int = 2048,
-        max_queue_bytes: int = DEFAULT_MAX_QUEUE_BYTES,
+        max_queue_bytes: float | None = DEFAULT_MAX_QUEUE_BYTES,
+        max_stream_bytes: float | None = DEFAULT_MAX_STREAM_BYTES,
         export_timeout_millis: float = 30000,
         span_filter: Callable[[ReadableSpan], bool] | None = None,
         metrics: bool = True,
@@ -117,6 +120,16 @@ class TelemetrySpanProcessor(SpanProcessor):
         self._inner: StampingSpanProcessor | None = None
         self._meter_provider: MeterProvider | None = None
         self._on_error = on_error
+        try:
+            max_queue_bytes = resolve_byte_bound(
+                "max_queue_bytes", max_queue_bytes, DEFAULT_MAX_QUEUE_BYTES
+            )
+            max_stream_bytes = resolve_byte_bound(
+                "max_stream_bytes", max_stream_bytes, DEFAULT_MAX_STREAM_BYTES
+            )
+        except ValueError as exc:
+            report_error(on_error, "invalid TelemetrySpanProcessor option; it exports nothing", exc)
+            return
         config = resolve_config(
             api_key=api_key,
             base_url=base_url,
@@ -170,6 +183,7 @@ class TelemetrySpanProcessor(SpanProcessor):
             schedule_delay_millis=schedule_delay_millis,
             max_queue_size=max_queue_size,
             max_queue_bytes=max_queue_bytes,
+            max_stream_bytes=max_stream_bytes,
             export_timeout_millis=export_timeout_millis,
             span_filter=span_filter,
             metrics_recorder=metrics_recorder,

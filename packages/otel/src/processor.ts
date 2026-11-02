@@ -8,15 +8,23 @@ import {
   type SpanProcessor,
 } from "@opentelemetry/sdk-trace-base";
 
-import { type BatchOptions, batchExportTimeoutMillis, type ExportMode } from "./config.ts";
+import {
+  type BatchOptions,
+  batchExportTimeoutMillis,
+  DEFAULT_BATCH,
+  type ExportMode,
+  resolveBatch,
+} from "./config.ts";
 import { activeContext, PROPAGATED_KEY, propagatedFromContext } from "./context.ts";
 import { reportError } from "./debug.ts";
-import { ExportQueueBudget } from "./queue.ts";
+import { ExportQueueBudget, streamCaptureBudget } from "./queue.ts";
 
 export interface StampingProcessorOptions {
   exporter: SpanExporter;
   exportMode: ExportMode;
-  batch: Required<BatchOptions>;
+  /** The byte bounds default as in resolveBatch; an invalid one is reported and defaulted. */
+  batch: Required<Omit<BatchOptions, "maxQueueBytes" | "maxStreamBytes">> &
+    Pick<BatchOptions, "maxQueueBytes" | "maxStreamBytes">;
   spanFilter?: (span: ReadableSpan) => boolean;
   recordMetrics?: (span: ReadableSpan) => void;
   onError?: (error: Error) => void;
@@ -33,7 +41,21 @@ export class StampingSpanProcessor implements SpanProcessor {
   private readonly budget?: ExportQueueBudget;
 
   constructor(private readonly options: StampingProcessorOptions) {
-    const { batch } = options;
+    const batch = {
+      ...options.batch,
+      maxQueueBytes: DEFAULT_BATCH.maxQueueBytes,
+      maxStreamBytes: DEFAULT_BATCH.maxStreamBytes,
+    };
+
+    // Each bound on its own, so that an invalid one does not reset the other.
+    for (const key of ["maxQueueBytes", "maxStreamBytes"] as const) {
+      try {
+        batch[key] = resolveBatch({ [key]: options.batch[key] })[key];
+      } catch (error) {
+        reportError(options.onError, error);
+      }
+    }
+    streamCaptureBudget.maxBytes = batch.maxStreamBytes;
 
     if (options.exportMode === "immediate") {
       this.inner = new SimpleSpanProcessor(options.exporter);

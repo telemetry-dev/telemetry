@@ -6,7 +6,12 @@ import {
 } from "@opentelemetry/sdk-trace-base";
 import { HttpResponse } from "@smithy/protocol-http";
 
-import { init, shutdown, type MaskFn } from "@telemetry-dev/sdk";
+import { init, shutdown, StreamCapture, type MaskFn } from "@telemetry-dev/sdk";
+
+// Most tests reach the stream bound at 48 KiB: another stream holds a byte, and setup sizes the
+// shared bound to leave a stream these tests start 48 KiB.
+export const STREAM_LIMIT = 48 * 1024;
+let otherStream: StreamCapture | undefined;
 
 export function setup(
   options: {
@@ -15,9 +20,12 @@ export function setup(
     sampler?: Sampler;
     captureInput?: boolean;
     captureOutput?: boolean;
+    batch?: { maxStreamBytes?: number };
   } = {},
 ): InMemorySpanExporter {
   const spans = new InMemorySpanExporter();
+  otherStream?.release();
+  otherStream = new StreamCapture(1);
   init(
     {
       apiKey: "td_live_test",
@@ -26,6 +34,7 @@ export function setup(
       exportMode: "immediate",
       logLevel: "silent",
       fetch: async () => new Response(null, { status: 200 }),
+      batch: { maxStreamBytes: STREAM_LIMIT + 1 },
       ...options,
     },
     { spanExporter: spans, logRecordExporter: new InMemoryLogRecordExporter() },
@@ -34,7 +43,14 @@ export function setup(
   return spans;
 }
 
+/** Releases the byte of the other stream, so that a stream may keep up to the default bound. */
+export function releaseOtherStream(): void {
+  otherStream?.release();
+  otherStream = undefined;
+}
+
 export async function teardown(): Promise<void> {
+  releaseOtherStream();
   await shutdown();
 }
 

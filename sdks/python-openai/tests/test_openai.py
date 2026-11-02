@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import importlib
 import json
 import time
@@ -8,9 +9,11 @@ from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mappin
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
+import conftest
 import openai
 import pytest
 import telemetry_dev
+from conftest import STREAM_LIMIT
 from openai import AsyncOpenAI, OpenAI
 from openai.resources.audio.speech import AsyncSpeech, Speech
 from openai.resources.audio.transcriptions import AsyncTranscriptions, Transcriptions
@@ -49,6 +52,9 @@ def assert_stream_transport_error(error: BaseException, message: str) -> None:
     assert type(transport) is httpx.ReadError
     assert str(transport) == message
 
+
+# A value that no capture keeps whole; built once, since it is 16 MiB.
+OVERSIZED_TEXT = "x" * (telemetry_dev.MAX_RECORD_BYTES + 1)
 
 CHAT_MESSAGES: list[dict[str, str]] = [
     {"role": "system", "content": "You are helpful."},
@@ -790,7 +796,7 @@ async def test_interrupted_transcription_stream_records_bounded_partial_text(
 
     span = only_span(memory)
     output = str(attrs(span)["gen_ai.output.messages"])
-    assert output == "x" * 65_536
+    assert output == "x" * STREAM_LIMIT
     assert attrs(span)["telemetry.dev.capture.truncated"] is True
 
 
@@ -878,6 +884,10 @@ def test_complete_transcript_above_the_chat_stream_budget_is_kept(
     def identity_mask(value: Any, _context: Any) -> Any:
         return value
 
+    # Alone in the stream budget, a stream keeps up to MAX_RECORD_BYTES, past the bound that
+    # make() sets for the other tests.
+    assert conftest.other_stream is not None
+    conftest.other_stream.release()
     memory = make(mask=identity_mask) if masked else make()
     transcript = "x" * 55_000
 
@@ -1021,20 +1031,56 @@ async def test_short_transcription_stream_without_terminal_event_is_incomplete(
     assert a["telemetry.dev.capture.truncated"] is True
 
 
-def test_terminal_transcription_capture_is_incrementally_bounded(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(telemetry_dev_openai, "_TRANSCRIPT_CAPTURE_MAX_BYTES", 5)
+def test_terminal_transcription_capture_is_incrementally_bounded() -> None:
     mapper = vars(telemetry_dev_openai)["_media_stream_event_fields"]
 
     fields = mapper(
         SimpleNamespace(type="transcript.text.done", text=UnencodableText("ééé")),
         vars(telemetry_dev_openai)["_text_media_response"],
         True,
+        telemetry_dev.CaptureBudget(5),
     )
 
     assert fields["output"] == "éé"
     assert fields["attributes"]["telemetry.dev.capture.truncated"] is True
+
+
+class CountedBudget(telemetry_dev.CaptureBudget):
+    """Counts reads of remaining_bytes, which take the stream budget lock for a stream budget."""
+
+    reads = 0
+
+    @property
+    def remaining_bytes(self) -> int:
+        self.reads += 1
+        return super().remaining_bytes
+
+
+@pytest.mark.parametrize(
+    ("text", "max_bytes", "kept", "kept_bytes"),
+    [
+        ("x" * 9_000, 9_000, "x" * 9_000, 9_000),
+        ("x" * 9_000, 8_999, "x" * 8_999, 8_999),
+        # The 2-byte character that crosses the bound is dropped whole.
+        ("x" * 4_095 + "é" + "x", 4_096, "x" * 4_095, 4_095),
+        # An unpaired surrogate costs 6 bytes; the cut falls inside the second chunk.
+        ("x" * 4_096 + "\ud800" + "y", 4_102, "x" * 4_096 + "\ud800", 4_102),
+        ("x" * 4_096 + "\ud800" + "y", 4_101, "x" * 4_096, 4_096),
+        ("😀😀", 7, "😀", 4),
+    ],
+    ids=["fits", "one-over", "multibyte-over", "surrogate-fits", "surrogate-over", "astral-over"],
+)
+def test_capture_text_reads_the_remaining_bytes_once(
+    text: str, max_bytes: int, kept: str, kept_bytes: int
+) -> None:
+    budget = CountedBudget(max_bytes)
+
+    captured = vars(telemetry_dev_openai)["_capture_text"](text, budget)
+
+    assert captured == kept
+    assert budget.bytes_used == kept_bytes
+    assert budget.truncated is (kept != text)
+    assert budget.reads == 1
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -1100,10 +1146,10 @@ async def test_transcription_capture_uses_the_policy_that_created_its_span(
 
 @pytest.mark.parametrize("async_mode", [False, True])
 async def test_transcription_delta_capture_is_incrementally_bounded(
-    make: Any, monkeypatch: pytest.MonkeyPatch, async_mode: bool
+    make: Any, async_mode: bool
 ) -> None:
-    make()
-    monkeypatch.setattr(telemetry_dev_openai, "_TRANSCRIPT_CAPTURE_MAX_BYTES", 5)
+    # Another stream holds one byte of the 6, so this stream may keep 5.
+    make(max_stream_bytes=6)
     ended: list[dict[str, Any]] = []
     event = SimpleNamespace(type="transcript.text.delta", delta=UnencodableText("ééé"))
 
@@ -1963,10 +2009,246 @@ async def test_chat_streaming_bounds_retained_state_without_dropping_metadata(
     assert source_content.startswith(content)
     assert len(content) < len(source_content)
     assert not content.endswith("not-retained")
-    assert len(str(a["gen_ai.output.messages"]).encode()) <= 48 * 1024
+    assert len(str(a["gen_ai.output.messages"]).encode()) <= STREAM_LIMIT
     assert a["gen_ai.response.finish_reasons"] == ("stop",)
     assert a["gen_ai.usage.total_tokens"] == 7
     assert a["telemetry.dev.capture.truncated"] is True
+
+
+ONE_MIB = 1024 * 1024
+ONE_MIB_TEXT = "x" * ONE_MIB
+
+
+@pytest.mark.parametrize(
+    ("kind", "length", "cut"),
+    [
+        ("chat", 64 * 1024, False),
+        ("chat", telemetry_dev.MAX_RECORD_BYTES, True),
+        ("transcription-deltas", 64 * 1024 + 1, False),
+        ("transcription-done", 64 * 1024 + 1, False),
+    ],
+)
+def test_with_the_default_bounds_a_stream_is_cut_only_at_the_record_bound(
+    make: Any, kind: str, length: int, cut: bool
+) -> None:
+    assert conftest.other_stream is not None
+    conftest.other_stream.release()
+    memory = make(max_stream_bytes=64 * 1024 * 1024)
+    pieces = [ONE_MIB_TEXT[: min(ONE_MIB, length - start)] for start in range(0, length, ONE_MIB)]
+
+    if kind == "chat":
+        base = {"id": "chatcmpl_long", "object": "chat.completion.chunk", "created": 1}
+        events: list[dict[str, Any]] = [
+            {**base, "model": "gpt-4o-mini", "choices": [{"index": 0, "delta": {"content": piece}}]}
+            for piece in pieces
+        ]
+        events.append(
+            {
+                **base,
+                "model": "gpt-4o-mini",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+        )
+        stream = cast(
+            Any,
+            wrap_openai(sync_client(lambda _request: sse_response(events))).chat.completions.create,
+        )(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+    else:
+        events = [{"type": "transcript.text.delta", "delta": piece} for piece in pieces]
+        # Without a terminal text, the deltas the stream kept are the output.
+        events.append(
+            {"type": "transcript.text.done"}
+            | ({"text": "".join(pieces)} if kind == "transcription-done" else {})
+        )
+        stream = cast(
+            Any,
+            wrap_openai(
+                sync_client(lambda _request: sse_response(events))
+            ).audio.transcriptions.create,
+        )(model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True)
+    assert len(list(stream)) == len(events)
+
+    a = attrs(only_span(memory))
+    output = str(a["gen_ai.output.messages"])
+    text = json.loads(output)[0]["content"] if kind == "chat" else output
+    # A chat chunk that does not fit is rejected whole, so the cut stream keeps 15 of 16 MiB.
+    assert len(text) == (length - ONE_MIB if cut else length)
+    assert set(text) == {"x"}
+    assert a.get("telemetry.dev.capture.truncated") is (True if cut else None)
+
+
+def stream_room() -> int:
+    """The bytes a new stream may keep now; STREAM_LIMIT while only conftest.other_stream holds
+    stream bytes."""
+    probe = telemetry_dev.CaptureBudget.for_stream()
+    room = probe.max_bytes
+    probe.release()
+    return room
+
+
+def open_stream(kind: str, events: list[dict[str, Any]]) -> Any:
+    client = wrap_openai(sync_client(lambda _request: sse_response(events)))
+    if kind == "chat":
+        return cast(Any, client.chat.completions.create)(
+            model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+    if kind == "responses":
+        return cast(Any, client.responses.create)(model="gpt-4o", input="hi", stream=True)
+    return cast(Any, client.audio.transcriptions.create)(
+        model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
+    )
+
+
+def kept_then_ending_events(kind: str) -> list[dict[str, Any]]:
+    """Events whose first one keeps output and whose last one ends the span."""
+    if kind == "chat":
+        return chat_stream_events()
+    if kind == "responses":
+        return [
+            {"type": "response.in_progress", "response": response_payload(text="Hello")},
+            {"type": "response.completed", "response": response_payload(text="Hello world")},
+        ]
+    return [
+        {"type": "transcript.text.delta", "delta": "Hello"},
+        {"type": "transcript.text.done", "text": "Hello world"},
+    ]
+
+
+@pytest.mark.parametrize("kind", ["chat", "responses", "transcription"])
+def test_a_stream_whose_span_ended_returns_its_bytes(memory: SimpleNamespace, kind: str) -> None:
+    stream = open_stream(kind, kept_then_ending_events(kind))
+    next(stream)
+    assert stream_room() < STREAM_LIMIT
+
+    list(stream)
+
+    # The stream is still referenced, so only the span end can have returned its bytes, and the
+    # next stream gets the whole room again.
+    assert len(memory.span_exporter.get_finished_spans()) == 1
+    assert stream_room() == STREAM_LIMIT
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("kind", ["chat", "responses", "transcription"])
+async def test_a_stream_returns_its_bytes_when_ending_its_span_raises(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, async_mode: bool, kind: str
+) -> None:
+    original_end = telemetry_dev.SpanHandle.end
+
+    def end(handle: telemetry_dev.SpanHandle, *args: Any, **kwargs: Any) -> None:
+        original_end(handle, *args, **kwargs)
+        raise RuntimeError("span end failed")
+
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "end", end)
+    # Without the terminal event, the stream ends its span when its source ends.
+    events = kept_then_ending_events(kind)[:1]
+    room_while_held: int | None = None
+
+    if async_mode:
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return sse_response(events)
+
+        client: Any = wrap_openai(async_client(handler))
+        if kind == "chat":
+            stream = await client.chat.completions.create(
+                model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+            )
+        elif kind == "responses":
+            stream = await client.responses.create(model="gpt-4o", input="hi", stream=True)
+        else:
+            stream = await client.audio.transcriptions.create(
+                model="gpt-4o-transcribe", file=("audio.wav", b"audio"), stream=True
+            )
+        await stream.__anext__()
+        room_while_held = stream_room()
+        with pytest.raises(RuntimeError, match="span end failed"):
+            await stream.__anext__()
+        await client.close()
+    else:
+        stream = open_stream(kind, events)
+        next(stream)
+        room_while_held = stream_room()
+        with pytest.raises(RuntimeError, match="span end failed"):
+            next(stream)
+
+    assert room_while_held < STREAM_LIMIT
+    assert len(memory.span_exporter.get_finished_spans()) == 1
+    assert stream_room() == STREAM_LIMIT
+
+
+def test_terminal_transcription_text_is_kept_within_the_room_of_the_stream(make: Any) -> None:
+    # Another stream holds all but 1,000 bytes of the shared bound besides conftest.other_stream.
+    memory = make(max_stream_bytes=STREAM_LIMIT + 1 + 1_000)
+    other = telemetry_dev.CaptureBudget.for_stream()
+    other.bytes_used = STREAM_LIMIT
+    try:
+        assert stream_room() == 1_000
+        events = [{"type": "transcript.text.done", "text": "x" * 1_500}]
+        assert len(list(open_stream("transcription", events))) == 1
+    finally:
+        other.release()
+
+    a = attrs(only_span(memory))
+    assert a["gen_ai.output.messages"] == "x" * 1_000
+    assert a["telemetry.dev.capture.truncated"] is True
+
+
+@pytest.mark.parametrize("kind", ["chat", "transcription"])
+def test_a_dropped_stream_returns_its_bytes_without_the_cycle_collector(
+    memory: SimpleNamespace, kind: str
+) -> None:
+    stream = open_stream(kind, kept_then_ending_events(kind))
+    # A chat stream reserves its output list when it starts. Media streams iterate without a
+    # generator, so reading one event keeps the stream out of a cycle.
+    if kind == "transcription":
+        next(stream)
+    assert stream_room() < STREAM_LIMIT
+
+    gc.disable()
+    try:
+        del stream
+        assert stream_room() == STREAM_LIMIT
+    finally:
+        gc.enable()
+
+
+@pytest.mark.parametrize(
+    ("kind", "events"),
+    [
+        (
+            "responses",
+            [
+                {"type": "response.completed", "response": response_payload(text="Hello")},
+                # Smaller than the kept output, so only the end of the stream keeps it out.
+                {"type": "response.in_progress", "response": response_payload(text="y")},
+            ],
+        ),
+        (
+            "transcription",
+            [
+                {"type": "transcript.text.done", "text": "Hello"},
+                {"type": "transcript.text.delta", "delta": "y" * 1_000},
+            ],
+        ),
+    ],
+)
+def test_events_after_a_terminal_event_are_not_kept(
+    memory: SimpleNamespace, kind: str, events: list[dict[str, Any]]
+) -> None:
+    stream = open_stream(kind, events)
+    next(stream)
+    assert len(memory.span_exporter.get_finished_spans()) == 1
+
+    def kept() -> Any:
+        if kind == "responses":
+            return stream._retained_output, stream._output_budget.bytes_used
+        return list(stream._text_parts), stream._budget.bytes_used
+
+    before = kept()
+    next(stream)
+
+    assert kept() == before
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
@@ -2142,13 +2424,13 @@ async def test_post_finish_content_filter_chunk_keeps_chat_stream_complete(
 
 
 def test_chat_streaming_omits_bounded_prefix_when_mask_cannot_inspect_complete_output(
-    make: Any, monkeypatch: pytest.MonkeyPatch
+    make: Any,
 ) -> None:
     def mask(value: Any, _context: telemetry_dev.MaskContext) -> Any:
         return "[REDACTED]" if "SECRET" in json.dumps(value) else value
 
-    monkeypatch.setattr(telemetry_dev_openai, "_CHAT_STREAM_CAPTURE_MAX_BYTES", 128)
-    memory = make(mask=mask)
+    # Another stream holds one byte, so this stream may keep 128.
+    memory = make(mask=mask, max_stream_bytes=129)
     base = {
         "id": "chatcmpl_masked_stream",
         "object": "chat.completion.chunk",
@@ -2201,7 +2483,7 @@ def test_chat_streaming_omits_masked_output_without_terminal_finish_reason(make:
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
-async def test_chat_streaming_bounds_choice_and_finish_reason_state(
+async def test_chat_streaming_bounds_choice_state_and_keeps_every_finish_reason(
     memory: SimpleNamespace, async_mode: bool
 ) -> None:
     event: dict[str, Any] = {
@@ -2209,7 +2491,10 @@ async def test_chat_streaming_bounds_choice_and_finish_reason_state(
         "object": "chat.completion.chunk",
         "created": 1,
         "model": "gpt-4o-mini",
-        "choices": [{"index": index, "delta": {}, "finish_reason": "stop"} for index in range(400)],
+        # As many choices as one chunk may carry, so only the stream budget bounds them.
+        "choices": [
+            {"index": index, "delta": {}, "finish_reason": "stop"} for index in range(1_000)
+        ],
     }
 
     if async_mode:
@@ -2235,10 +2520,17 @@ async def test_chat_streaming_bounds_choice_and_finish_reason_state(
     a = attrs(only_span(memory))
     output = json.loads(str(a["gen_ai.output.messages"]))
     finish_reasons = cast(Sequence[str], a["gen_ai.response.finish_reasons"])
-    assert len(output) == 333
-    assert len(finish_reasons) == 200
-    assert len(str(a["gen_ai.output.messages"]).encode()) <= 48 * 1024
+    # The list costs 16 bytes and each {"role": "assistant"} 61 of the stream's bytes.
+    assert len(output) == (STREAM_LIMIT - 16) // 61
+    # Finish reasons have their own budget, which fits 1,000 of them.
+    assert finish_reasons == ("stop",) * 1_000
+    assert len(str(a["gen_ai.output.messages"]).encode()) <= STREAM_LIMIT
     assert a["telemetry.dev.capture.truncated"] is True
+
+
+# A finish reason is cut to 128 characters, and the finish reasons of a stream share a budget that
+# fits 1,000 records of the longest such reason: a control character escapes to 6 bytes.
+LONGEST_FINISH_REASON = "\x00" * 128
 
 
 def finish_reason_chunk(choices: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2251,30 +2543,45 @@ def finish_reason_chunk(choices: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def finish_reason_choices(indexes: range, reason: str) -> list[dict[str, Any]]:
+    return [{"index": index, "delta": {}, "finish_reason": reason} for index in indexes]
+
+
+# These fill the finish-reason budget exactly.
+FULL_FINISH_REASON_BUDGET = finish_reason_chunk(
+    finish_reason_choices(range(1_000), LONGEST_FINISH_REASON)
+)
+
+
 @pytest.mark.parametrize(
     ("events", "expected"),
     [
         pytest.param(
-            [
-                finish_reason_chunk(
-                    [{"index": index, "delta": {}, "finish_reason": "stop"} for index in range(200)]
-                ),
-                finish_reason_chunk([{"index": 0, "delta": {}, "finish_reason": "length"}]),
-            ],
-            ("length",) + ("stop",) * 199,
-            id="replacement-reclaims-items",
+            [finish_reason_chunk(finish_reason_choices(range(1), "r" * 127 + "st"))],
+            ("r" * 127 + "s",),
+            id="long-reason-is-cut-without-a-flag",
         ),
         pytest.param(
             [
-                finish_reason_chunk([{"index": 0, "delta": {}, "finish_reason": "x" * 70_000}]),
-                finish_reason_chunk([{"index": 0, "delta": {}, "finish_reason": "stop"}]),
+                FULL_FINISH_REASON_BUDGET,
+                finish_reason_chunk(finish_reason_choices(range(1), "\x01" * 128)),
             ],
-            ("stop",),
-            id="fitting-reason-clears-rejected-oversized-reason",
+            ("\x01" * 128,) + (LONGEST_FINISH_REASON,) * 999,
+            id="replacement-reclaims-bytes",
+        ),
+        pytest.param(
+            [
+                FULL_FINISH_REASON_BUDGET,
+                finish_reason_chunk(finish_reason_choices(range(1_000, 1_001), "stop")),
+                finish_reason_chunk(finish_reason_choices(range(1), "stop")),
+                finish_reason_chunk(finish_reason_choices(range(1_000, 1_001), "stop")),
+            ],
+            ("stop",) + (LONGEST_FINISH_REASON,) * 999 + ("stop",),
+            id="fitting-reason-clears-rejected-reason",
         ),
     ],
 )
-def test_chat_streaming_reclaims_finish_reason_items_on_replacement(
+def test_chat_streaming_keeps_finish_reasons_within_their_budget(
     make: Any, events: list[dict[str, Any]], expected: tuple[str, ...]
 ) -> None:
     memory = make(capture_output=False)
@@ -2292,17 +2599,16 @@ def test_chat_streaming_reclaims_finish_reason_items_on_replacement(
     assert "telemetry.dev.capture.truncated" not in a
 
 
-def test_chat_streaming_retains_exact_multibyte_finish_reason_budget(make: Any) -> None:
+def test_chat_streaming_bounds_finish_reasons_independently_of_output_capture(make: Any) -> None:
     memory = make(capture_output=False)
-    reason = ('"🙂\\\n' * 4_905) + "🙂"
-    event: dict[str, Any] = {
-        "id": "chatcmpl_finish_reason_budget",
-        "object": "chat.completion.chunk",
-        "created": 1,
-        "model": "gpt-4o-mini",
-        "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
-    }
-    client = wrap_openai(sync_client(lambda _request: sse_response([event])))
+    # Each reason is cut to the longest one before it is counted, so 1,000 fit and one more does
+    # not.
+    uncut = LONGEST_FINISH_REASON + "\x00"
+    events = [
+        finish_reason_chunk(finish_reason_choices(range(1_000), uncut)),
+        finish_reason_chunk(finish_reason_choices(range(1_000, 1_001), uncut)),
+    ]
+    client = wrap_openai(sync_client(lambda _request: sse_response(events)))
 
     list(
         cast(Any, client.chat.completions.create)(
@@ -2311,12 +2617,9 @@ def test_chat_streaming_retains_exact_multibyte_finish_reason_budget(make: Any) 
     )
 
     a = attrs(only_span(memory))
-    finish_reasons = list(cast(Sequence[str], a["gen_ai.response.finish_reasons"]))
-    assert len(reason) == 19_621
-    assert finish_reasons == [reason]
-    serialized = json.dumps(finish_reasons, ensure_ascii=False, separators=(",", ":")).encode()
-    assert len(serialized) == 49_058
-    assert "telemetry.dev.capture.truncated" not in a
+    assert a["gen_ai.response.finish_reasons"] == (LONGEST_FINISH_REASON,) * 1_000
+    assert "gen_ai.output.messages" not in a
+    assert a["telemetry.dev.capture.truncated"] is True
 
 
 def test_chat_streaming_incrementally_accounts_for_many_tiny_deltas(
@@ -2346,7 +2649,7 @@ def test_chat_streaming_incrementally_accounts_for_many_tiny_deltas(
     assert output_budget.truncated is True
     assert states[0].content == retained_content
     assert states[0].content_fragments.getvalue() == retained_content
-    assert output_budget.bytes_used == 48 * 1024
+    assert output_budget.bytes_used == STREAM_LIMIT
     assert json.dumps(implementation._chat_output(states), separators=(",", ":")) == json.dumps(
         [{"role": "assistant", "content": retained_content}], separators=(",", ":")
     )
@@ -2893,15 +3196,14 @@ def test_chat_streaming_bounds_rejected_finish_reason_indexes() -> None:
     finish_reason_reservations: dict[int, tuple[int, int]] = {}
     rejected_finish_reasons: set[int] = set()
     output_budget = implementation._chat_capture_budget()
-    finish_reason_budget = implementation._chat_capture_budget()
-    oversized_reason = "x" * 70_000
+    # No finish reason fits, so each one is rejected.
+    finish_reason_budget = telemetry_dev.CaptureBudget(0)
 
     for indexes in (range(1_000), range(1_000, 1_100)):
         implementation._record_chat_chunk(
             {
                 "choices": [
-                    {"index": index, "delta": {}, "finish_reason": oversized_reason}
-                    for index in indexes
+                    {"index": index, "delta": {}, "finish_reason": "stop"} for index in indexes
                 ]
             },
             states,
@@ -4698,7 +5000,7 @@ def test_bounded_responses_conversion_does_not_model_dump(make: Any) -> None:
     class Item:
         def __init__(self) -> None:
             self.type = "output_text"
-            self.text = "x" * 100_000
+            self.text = OVERSIZED_TEXT
 
         def model_dump(self, **_kwargs: Any) -> Any:
             raise AssertionError("model_dump must not run")
@@ -4778,7 +5080,7 @@ def test_responses_input_capture_failure_never_blocks_provider(make: Any, kind: 
             raise RuntimeError("hostile mapping")
 
     if kind == "oversized":
-        value: Any = {"text": "x" * 70_000}
+        value: Any = {"text": OVERSIZED_TEXT}
     elif kind == "deep":
         value = {}
         cursor = value

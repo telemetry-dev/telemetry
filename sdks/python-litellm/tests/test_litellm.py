@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import sys
+import tracemalloc
 from collections.abc import Iterator, Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any, cast
@@ -22,7 +24,13 @@ from opentelemetry.trace import StatusCode
 import telemetry_dev_litellm
 from telemetry_dev_litellm import instrument_litellm, uninstrument_litellm, wrap_router
 
+from . import conftest
+from .conftest import STREAM_LIMIT
+
 llm = cast(Any, litellm)
+# A JSON string of this many characters alone passes the bound of a non-stream capture.
+OVER_RECORD = "x" * telemetry_dev.MAX_RECORD_BYTES
+MIB_TEXT = "x" * (1024 * 1024)
 
 CHAT_MESSAGES: list[dict[str, str]] = [
     {"role": "system", "content": "You are helpful."},
@@ -1086,7 +1094,7 @@ def _bulk_stream_chunks(count: int) -> list[Any]:
 
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize("max_attribute_length", [0, 100, 1024 * 1024])
-def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
+def test_stream_beyond_the_stream_bound_is_flagged_and_withheld_from_a_mask(
     make: Any, monkeypatch: pytest.MonkeyPatch, masked: bool, max_attribute_length: int
 ) -> None:
     seen: list[str] = []
@@ -1116,13 +1124,54 @@ def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
         assert "gen_ai.output.messages" not in a
         assert not any("x" * 100 in value for value in seen)
     elif max_attribute_length == 1024 * 1024:
-        # The 48 KiB retention bound, not the 1 MiB cap, cuts the stream at a chunk boundary.
+        # The stream bound, not the 1 MiB cap, cuts the stream at a chunk boundary.
         content = json_attr(a["gen_ai.output.messages"])[0]["content"]
         assert set(content) == {"x"}
-        assert 0 < len(content) <= 48 * 1024
+        assert 0 < len(content) <= STREAM_LIMIT
         assert len(content) % 100 == 0
     else:
         assert len(str(a.get("gen_ai.output.messages", ""))) <= max_attribute_length
+
+
+@pytest.mark.parametrize(
+    ("length", "cut"), [(64 * 1024, False), (telemetry_dev.MAX_RECORD_BYTES, True)]
+)
+def test_with_the_default_bounds_a_chat_stream_is_cut_only_at_the_record_bound(
+    make: Any, monkeypatch: pytest.MonkeyPatch, length: int, cut: bool
+) -> None:
+    conftest.other_stream.release()
+    memory = make(max_stream_bytes=64 * 1024 * 1024)
+    chunks = [
+        ModelResponseStream(
+            id="long-stream",
+            model="gpt-4o-mini",
+            choices=[
+                StreamingChoices(
+                    index=0,
+                    delta=Delta(
+                        role="assistant",
+                        content=MIB_TEXT[: min(len(MIB_TEXT), length - start)],
+                    ),
+                )
+            ],
+        )
+        for start in range(0, length, len(MIB_TEXT))
+    ]
+
+    def fake_completion(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        return iter(chunks)
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    instrument_litellm()
+    stream = llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
+    assert list(stream) == chunks
+
+    a = attrs(only_span(memory))
+    text = json_attr(a["gen_ai.output.messages"])[0]["content"]
+    assert a.get("telemetry.dev.capture.truncated") is (True if cut else None)
+    # Each chunk costs its text plus well under 64 KiB of other fields, so the 16th 1 MiB
+    # chunk does not fit and is rejected whole.
+    assert len(text) == (telemetry_dev.MAX_RECORD_BYTES - len(MIB_TEXT) if cut else length)
 
 
 @pytest.mark.parametrize("extra_indices", [0, 5_000])
@@ -1566,9 +1615,10 @@ async def test_rerank_and_arerank_capture_rankings_usage_and_provider(
 def test_rerank_bounds_large_results_and_preserves_total_count(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # 2,000 results of 10,000 bytes pass the 16 MiB bound of a non-stream capture.
+    document = {"text": "x" * 10_000}
     results = [
-        {"index": index, "relevance_score": 0.5, "document": {"text": "x" * 1_000}}
-        for index in range(2_000)
+        {"index": index, "relevance_score": 0.5, "document": document} for index in range(2_000)
     ]
 
     def fake_rerank(**_kwargs: Any) -> SimpleNamespace:
@@ -1588,7 +1638,9 @@ def test_rerank_bounds_large_results_and_preserves_total_count(
 def test_rerank_bounds_large_inputs_without_changing_provider_documents(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    documents = [{"text": "x" * 1_000, "index": index} for index in range(2_000)]
+    # 2,000 documents of 10,000 bytes pass the 16 MiB bound of a non-stream capture.
+    text = "x" * 10_000
+    documents = [{"text": text, "index": index} for index in range(2_000)]
     received: list[Any] = []
 
     def fake_rerank(**kwargs: Any) -> SimpleNamespace:
@@ -2173,7 +2225,7 @@ def test_responses_stream_only_buffers_bounded_output_text(
 
 
 @pytest.mark.parametrize("max_attribute_length", [0, 100, 1024 * 1024])
-def test_masked_responses_stream_beyond_the_fixed_bound_is_withheld(
+def test_masked_responses_stream_beyond_the_stream_bound_is_withheld(
     make: Any, monkeypatch: pytest.MonkeyPatch, max_attribute_length: int
 ) -> None:
     seen: list[str] = []
@@ -2276,7 +2328,7 @@ def test_responses_stream_accounts_for_annotations_without_remeasuring_text(
             )
         return original_accept(budget, cast(object, value))
 
-    text = "x" * (telemetry_dev_litellm._STREAM_CAPTURE_MAX_BYTES - 5_000)  # pyright: ignore[reportPrivateUsage]
+    text = "x" * (STREAM_LIMIT - 5_000)
     events = [
         SimpleNamespace(
             type="response.output_text.delta",
@@ -2313,7 +2365,7 @@ def test_responses_stream_accounts_for_annotations_without_remeasuring_text(
 def test_responses_stream_rejected_annotation_preserves_text_and_marks_truncated(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    text = "x" * (telemetry_dev_litellm._STREAM_CAPTURE_MAX_BYTES - 5_000)  # pyright: ignore[reportPrivateUsage]
+    text = "x" * (STREAM_LIMIT - 5_000)
     events = [
         SimpleNamespace(
             type="response.output_text.delta",
@@ -2459,10 +2511,10 @@ class _Opaque:
 
 
 class _ModelDumpBomb:
-    """A response whose model_dump must not run; its output exceeds the 64 KiB non-stream bound."""
+    """A response whose model_dump must not run; its output exceeds the 16 MiB non-stream bound."""
 
     def __init__(self) -> None:
-        self.output = [{"type": "output_text", "text": "x" * 100_000}]
+        self.output = [{"type": "output_text", "text": OVER_RECORD}]
         self.status = "completed"
 
     def model_dump(self, **kwargs: Any) -> Any:
@@ -2470,6 +2522,8 @@ class _ModelDumpBomb:
 
 
 _SHARED_ITEM = {"text": "same"}
+ESCAPED_WITHIN_RECORD = "\x01" * 2_700_000
+ESCAPED_OVER_RECORD = "\x01" * 2_800_000
 
 
 @pytest.mark.parametrize(
@@ -2485,20 +2539,20 @@ _SHARED_ITEM = {"text": "same"}
             [{"opaque": None}],
             id="opaque-value-is-null",
         ),
-        # Control characters cost six bytes each once escaped, one as raw UTF-8, so 10,000 of
-        # them fit the 64 KiB bound and 11,000 do not.
+        # Control characters cost six bytes each once escaped, one as raw UTF-8, so 2,700,000
+        # of them fit the 16 MiB bound and 2,800,000 do not.
         pytest.param(
-            SimpleNamespace(status="completed", output=[{"payload": "\x01" * 10_000}]),
-            [{"payload": "\x01" * 10_000}],
+            SimpleNamespace(status="completed", output=[{"payload": ESCAPED_WITHIN_RECORD}]),
+            [{"payload": ESCAPED_WITHIN_RECORD}],
             id="escaped-string-within-bound",
         ),
         pytest.param(
-            SimpleNamespace(status="completed", output=[{"payload": "\x01" * 11_000}]),
+            SimpleNamespace(status="completed", output=[{"payload": ESCAPED_OVER_RECORD}]),
             None,
             id="escaped-string-over-bound",
         ),
         pytest.param(
-            SimpleNamespace(status="completed", output=[{"\x01" * 11_000: 1}]),
+            SimpleNamespace(status="completed", output=[{ESCAPED_OVER_RECORD: 1}]),
             None,
             id="escaped-key-over-bound",
         ),
@@ -2737,12 +2791,14 @@ def test_responses_stream_bounds_auxiliary_index_state(
         + len(stream._completed_items)
         + len(stream._truncated_items)
     )
-    assert retained <= stream._budget.max_items
+    # The budget has no item limit, so the structural cap bounds the index state.
+    max_items = telemetry_dev_litellm._STREAM_CAPTURE_MAX_ITEMS  # pyright: ignore[reportPrivateUsage]
+    assert retained <= max_items
     assert stream._retained_item_count == retained
     assert stream._truncated_key_count == sum(
         len(values) for values in stream._truncated_item_keys.values()
     )
-    assert len(stream._item_indexes) <= stream._budget.max_items
+    assert len(stream._item_indexes) <= max_items
     assert stream._truncation_overflow is True
     assert attrs(only_span(memory))["telemetry.dev.capture.truncated"] is True
 
@@ -2767,13 +2823,15 @@ def test_responses_stream_bounds_rejected_content_keys_for_one_owner(
 
     owner = ("index", 0)
     assert owner in stream._truncated_items
-    assert len(stream._truncated_item_keys[owner]) <= stream._budget.max_items
+    # The budget has no item limit, so the structural cap bounds the rejected keys.
+    max_items = telemetry_dev_litellm._STREAM_CAPTURE_MAX_ITEMS  # pyright: ignore[reportPrivateUsage]
+    assert len(stream._truncated_item_keys[owner]) <= max_items
     assert stream._truncated_key_count == len(stream._truncated_item_keys[owner])
     assert stream._truncation_overflow is True
     assert attrs(only_span(memory))["telemetry.dev.capture.truncated"] is True
 
 
-def test_responses_stream_charges_one_character_fragments_against_item_budget(
+def test_responses_stream_keeps_one_character_fragments_whole(
     memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     events = [
@@ -2793,11 +2851,42 @@ def test_responses_stream_charges_one_character_fragments_against_item_budget(
     assert list(stream) == events
 
     a = attrs(only_span(memory))
-    text = json_attr(a["gen_ai.output.messages"])[0]["text"]
-    # 2,000 one-character deltas fit the byte bound; only the 1,000-item bound cuts them.
-    assert set(text) == {"x"}
-    assert 0 < len(text) <= 1_000
-    assert a["telemetry.dev.capture.truncated"] is True
+    # 2,000 one-character deltas fit the byte bound, and the budget has no item limit.
+    assert json_attr(a["gen_ai.output.messages"]) == [{"type": "output_text", "text": "x" * 2_000}]
+    assert "telemetry.dev.capture.truncated" not in a
+
+
+def test_responses_stream_holds_one_character_deltas_in_about_their_charged_bytes(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    count = STREAM_LIMIT // 2
+    event = SimpleNamespace(
+        type="response.output_text.delta", output_index=0, content_index=0, delta="x"
+    )
+    events = [event] * count
+    monkeypatch.setattr(litellm, "responses", fake_responses_stream(events))
+    instrument_litellm()
+    stream = llm.responses(input="small deltas", model="gpt-4.1-mini", stream=True)
+
+    tracemalloc.start()
+    try:
+        before = tracemalloc.get_traced_memory()[0]
+        for _ in range(count):
+            next(stream)
+        held = tracemalloc.get_traced_memory()[0] - before
+    finally:
+        tracemalloc.stop()
+    stream.close()
+
+    # Each delta is charged one byte. Kept as a list entry each, the text would take a pointer
+    # per character, about nine times the charge. Before Python 3.12, StringIO itself keeps up
+    # to 100,000 writes as separate strings before it joins them, which for this cached
+    # one-character delta is the same pointer per character.
+    assert stream._budget.bytes_used < count + 1_024
+    assert held < (3 if sys.version_info >= (3, 12) else 12) * count
+    assert json_attr(attrs(only_span(memory))["gen_ai.output.messages"]) == [
+        {"type": "output_text", "text": "x" * count}
+    ]
 
 
 async def test_responses_stream_surrogate_deltas_fail_closed_and_finish(
@@ -2873,9 +2962,10 @@ def test_responses_stream_content_done_replaces_matching_text_deltas(
 
 
 def test_responses_stream_content_done_resolves_each_rejected_part(
-    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    make: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(telemetry_dev_litellm, "_STREAM_CAPTURE_MAX_BYTES", 500)
+    # Another stream holds a byte, so this stream keeps at most 500.
+    memory = make(max_stream_bytes=501)
     events = (
         [
             SimpleNamespace(
@@ -2983,9 +3073,10 @@ def test_responses_stream_reconstructs_refusal_and_function_arguments(
 
 @pytest.mark.parametrize("replacement", ["item", "terminal"])
 def test_responses_stream_replacement_resets_exhausted_partial_budget(
-    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, replacement: str
+    make: Any, monkeypatch: pytest.MonkeyPatch, replacement: str
 ) -> None:
-    monkeypatch.setattr(telemetry_dev_litellm, "_STREAM_CAPTURE_MAX_BYTES", 500)
+    # Another stream holds a byte, so this stream keeps at most 500.
+    memory = make(max_stream_bytes=501)
     events = [
         SimpleNamespace(
             type="response.output_text.delta",
@@ -3028,9 +3119,10 @@ def test_responses_stream_replacement_resets_exhausted_partial_budget(
 
 
 def test_responses_stream_oversized_terminal_retains_bounded_partial(
-    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    make: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(telemetry_dev_litellm, "_STREAM_CAPTURE_MAX_BYTES", 500)
+    # Another stream holds a byte, so this stream keeps at most 500.
+    memory = make(max_stream_bytes=501)
     terminal = responses_result()
     terminal.output = [{"type": "output_text", "text": "x" * 1_000}]
     events = [
@@ -3056,9 +3148,10 @@ def test_responses_stream_oversized_terminal_retains_bounded_partial(
 
 
 def test_responses_stream_keeps_a_prefix_after_a_rejected_delta(
-    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    make: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(telemetry_dev_litellm, "_STREAM_CAPTURE_MAX_BYTES", 500)
+    # Another stream holds a byte, so this stream keeps at most 500.
+    memory = make(max_stream_bytes=501)
     terminal = responses_result()
     terminal.output = [{"type": "output_text", "text": "x" * 1_000}]
     events = [

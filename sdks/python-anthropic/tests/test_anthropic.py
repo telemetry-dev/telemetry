@@ -5,12 +5,14 @@ import importlib.util
 import json
 import random
 import sys
+import time
 import types
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mapping, Sequence
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import anthropic
+import conftest
 import pytest
 import telemetry_dev
 from anthropic import Anthropic, AsyncAnthropic
@@ -21,9 +23,14 @@ from anthropic.resources.beta.messages import Messages as BetaMessages
 from anthropic.resources.messages import AsyncMessages, Messages
 from anthropic.types import MessageParam, TextBlock
 from anthropic.types.beta import BetaMessageParam
+from conftest import STREAM_LIMIT
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import StatusCode
 from pydantic import BaseModel, ConfigDict, Field
+
+# Tests that build a stream state without a client size the process-wide stream budget, which
+# only init() and the span processor set; the core's own tests use the same private name.
+from telemetry_dev._capture import stream_budget  # pyright: ignore[reportPrivateUsage]
 
 import telemetry_dev_anthropic
 from telemetry_dev_anthropic import instrument_anthropic, uninstrument_anthropic, wrap_anthropic
@@ -924,7 +931,7 @@ def test_stream_capture_does_not_invoke_expanding_model_dump() -> None:
             model_dump_calls += 1
             return {"type": "text_delta", "text": "safe", "items": list(range(5_000))}
 
-    captured = telemetry_dev_anthropic._bounded_native(ExpandingDelta())  # pyright: ignore[reportPrivateUsage]
+    captured = telemetry_dev_anthropic._bounded_native(ExpandingDelta(), STREAM_LIMIT)  # pyright: ignore[reportPrivateUsage]
 
     assert captured == {"type": "text_delta", "text": "safe"}
     assert model_dump_calls == 0
@@ -1023,7 +1030,7 @@ async def test_stream_bounds_retained_events_without_dropping_chunks(
     assert attrs(only_span(memory))["telemetry.dev.capture.truncated"] is True
 
 
-def test_stream_revalidates_expanded_tool_json_against_the_item_limit() -> None:
+def test_stream_revalidates_expanded_tool_json_against_the_byte_limit() -> None:
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
     record(
@@ -1040,7 +1047,8 @@ def test_stream_revalidates_expanded_tool_json_against_the_item_limit() -> None:
             "index": 0,
             "delta": {
                 "type": "input_json_delta",
-                "partial_json": json.dumps([0] * 1001, separators=(",", ":")),
+                # 32 KB of source that serializes to 56 KB of JSON, past STREAM_LIMIT.
+                "partial_json": "[" + ",".join(["1e5"] * 8_000) + "]",
             },
         },
         state,
@@ -1049,8 +1057,8 @@ def test_stream_revalidates_expanded_tool_json_against_the_item_limit() -> None:
 
     partial = telemetry_dev_anthropic._stream_partial(state)  # pyright: ignore[reportPrivateUsage]
 
-    # The expanded input is charged while streaming now, so the budget catches the item
-    # limit before the final check. The exported output and flag are unchanged.
+    # The expanded input is charged while streaming, so the budget catches the bound before
+    # the final check.
     assert state.budget.truncated is True
     assert partial["output"] is None
     assert partial["attributes"] == {"telemetry.dev.capture.truncated": True}
@@ -1829,14 +1837,16 @@ def streamed_beta_span(events: list[dict[str, Any]], memory: SimpleNamespace) ->
 
 @pytest.mark.parametrize("masked", [False, True])
 def test_stream_output_over_the_encoded_limit_keeps_a_bounded_prefix(
-    make: Any, masked: bool, monkeypatch: pytest.MonkeyPatch
+    make: Any, masked: bool
 ) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 1_000)
-
     def identity_mask(value: Any, _context: Any) -> Any:
         return value
 
-    memory = make(mask=identity_mask) if masked else make()
+    memory = (
+        make(mask=identity_mask, max_stream_bytes=1_000 + 1)
+        if masked
+        else make(max_stream_bytes=1_000 + 1)
+    )
     events = beta_stream_events(
         ({"type": "text", "text": ""}, [{"type": "text_delta", "text": "first"}]),
         (
@@ -1855,15 +1865,14 @@ def test_stream_output_over_the_encoded_limit_keeps_a_bounded_prefix(
         assert content == [{"type": "text", "text": "first"}, {"type": "text", "text": "ab"}]
 
 
-@pytest.mark.parametrize(("stream_limit", "complete"), [(48 * 1024, True), (1_000, False)])
-def test_many_small_deltas_do_not_exhaust_the_item_budget(
-    make: Any, monkeypatch: pytest.MonkeyPatch, stream_limit: int, complete: bool
+@pytest.mark.parametrize(("stream_limit", "complete"), [(STREAM_LIMIT, True), (1_000, False)])
+def test_many_small_deltas_are_bounded_by_their_bytes(
+    make: Any, stream_limit: int, complete: bool
 ) -> None:
     def identity_mask(value: Any, _context: Any) -> Any:
         return value
 
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", stream_limit)
-    memory = make(mask=identity_mask)
+    memory = make(mask=identity_mask, max_stream_bytes=stream_limit + 1)
     deltas = [{"type": "text_delta", "text": "Hello wor"} for _ in range(400)]
     events = beta_stream_events(({"type": "text", "text": ""}, deltas))
 
@@ -1927,6 +1936,131 @@ def test_deltas_that_fill_the_stream_limit_keep_the_text_that_was_accepted(
     output = json.loads(str(a["gen_ai.output.messages"]))
     assert a["telemetry.dev.capture.truncated"] is True
     assert output[0]["content"][0]["text"] == "x" * 49_000
+
+
+def _streamed_text(span: ReadableSpan) -> str:
+    return json.loads(str(attrs(span)["gen_ai.output.messages"]))[0]["content"][0]["text"]
+
+
+_MIB_TEXT = "x" * (1024 * 1024)
+
+
+@pytest.mark.parametrize(
+    ("length", "cut"), [(64 * 1024, False), (telemetry_dev.MAX_RECORD_BYTES, True)]
+)
+def test_with_the_default_bounds_a_stream_is_cut_only_at_max_record_bytes(
+    make: Any, length: int, cut: bool
+) -> None:
+    conftest.other_stream.release()
+    memory = make(max_stream_bytes=64 * 1024 * 1024)
+    deltas = [
+        {"type": "text_delta", "text": _MIB_TEXT[: length - start]}
+        for start in range(0, length, len(_MIB_TEXT))
+    ]
+
+    streamed_beta_span(beta_stream_events(({"type": "text", "text": ""}, deltas)), memory)
+
+    span = only_span(memory)
+    if cut:
+        # The text block and 15 deltas leave less than a MiB of MAX_RECORD_BYTES, so the 16th
+        # delta does not fit and is dropped whole.
+        assert attrs(span)["telemetry.dev.capture.truncated"] is True
+        assert _streamed_text(span) == "x" * (telemetry_dev.MAX_RECORD_BYTES - len(_MIB_TEXT))
+    else:
+        assert "telemetry.dev.capture.truncated" not in attrs(span)
+        assert _streamed_text(span) == "x" * length
+
+
+def test_a_long_stream_of_small_deltas_is_kept_in_linear_time(make: Any) -> None:
+    conftest.other_stream.release()
+    memory = make(max_stream_bytes=64 * 1024 * 1024)
+    # Small deltas that add up to MiBs per block: rebuilding the block's string on each delta
+    # copies all the text before it, minutes for this stream, against a second or so.
+    pieces = [_MIB_TEXT[: 1 + index % 1024] for index in range(3_000)]
+    text = "".join(pieces)
+    events = beta_stream_events(
+        (
+            {"type": "text", "text": ""},
+            [{"type": "text_delta", "text": piece} for piece in pieces],
+        ),
+        (
+            {"type": "thinking", "thinking": ""},
+            [{"type": "thinking_delta", "thinking": piece} for piece in pieces],
+        ),
+        (
+            {"type": "tool_use", "id": "t1", "name": "calc", "input": {}},
+            [
+                {"type": "input_json_delta", "partial_json": piece}
+                for piece in ['{"q":"', *pieces, '"}']
+            ],
+        ),
+    )
+
+    started = time.perf_counter()
+    a = streamed_beta_span(events, memory)
+    elapsed = time.perf_counter() - started
+
+    assert "telemetry.dev.capture.truncated" not in a
+    assert json.loads(str(a["gen_ai.output.messages"])) == [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": text},
+                {"type": "thinking", "thinking": text},
+                {"type": "tool_use", "id": "t1", "name": "calc", "input": {"q": text}},
+            ],
+        }
+    ]
+    assert elapsed < 20
+
+
+def test_streams_in_flight_share_the_stream_bound_and_the_stream_that_passes_it_is_cut(
+    make: Any,
+) -> None:
+    conftest.other_stream.release()
+    memory = make(max_stream_bytes=100_000)
+    responses = [
+        beta_stream_events(
+            ({"type": "text", "text": ""}, [{"type": "text_delta", "text": fill * 60_000}])
+        )
+        for fill in "abc"
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return named_sse_response(responses.pop(0))
+
+    client = wrapped_sync_client(handler)
+
+    def create() -> Any:
+        return client.beta.messages.create(
+            model="claude-opus-5", max_tokens=64, messages=BETA_MESSAGES, stream=True
+        )
+
+    # Each stream stays referenced, so only release() at its end, not garbage collection,
+    # gives its bytes back.
+    streams = [create()]
+    first = iter(streams[0])
+    # The first stream now holds its 60,000 bytes; the second may keep only the rest of 100,000.
+    for event in first:
+        if event.type == "content_block_delta":
+            break
+    streams.append(create())
+    for _event in streams[1]:
+        pass
+    for _event in first:
+        pass
+    # Both streams ended and gave their bytes back.
+    streams.append(create())
+    for _event in streams[2]:
+        pass
+
+    second, first_span, third = memory.span_exporter.get_finished_spans()
+    assert "telemetry.dev.capture.truncated" not in attrs(first_span)
+    assert _streamed_text(first_span) == "a" * 60_000
+    assert attrs(second)["telemetry.dev.capture.truncated"] is True
+    assert _streamed_text(second) == ""
+    assert "telemetry.dev.capture.truncated" not in attrs(third)
+    assert _streamed_text(third) == "c" * 60_000
 
 
 @pytest.mark.parametrize(("deltas", "complete"), [(200, True), (300, False)])
@@ -2099,13 +2233,21 @@ def test_settled_tool_input_charge_covers_what_is_still_retained(
 
 
 @pytest.mark.parametrize(
-    ("elements", "truncated"), [(8, False), (1_500, True), (5_000, True), (20_000, True)]
+    ("element", "elements", "truncated"),
+    [
+        ("1", 8, False),
+        ("1", 1_500, False),
+        # 32 KB of source that serializes to 56 KB of JSON, past STREAM_LIMIT.
+        ("1e5", 8_000, True),
+        # 10 KB of JSON in about 5,000 items, which a 16-byte item charge puts at 80 KB.
+        ("1", 5_000, False),
+    ],
 )
 def test_settled_tool_input_agrees_with_the_final_bounded_check(
-    elements: int, truncated: bool
+    element: str, elements: int, truncated: bool
 ) -> None:
     implementation = cast(Any, telemetry_dev_anthropic)
-    state = _tool_stream(['{"n":[' + ",".join(["1"] * elements) + "]}"])
+    state = _tool_stream(['{"n":[' + ",".join([element] * elements) + "]}"])
     truncated_while_streaming = state.budget.truncated
 
     dropped = implementation._stream_partial(state)["output"] is None
@@ -2610,11 +2752,8 @@ def test_beta_stream_records_mcp_tool_use_input(memory: SimpleNamespace) -> None
     assert content == [{**block, "input": {"q": "otel"}}]
 
 
-def test_beta_stream_records_fallback_model_after_capture_budget_is_exhausted(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 64)
-    memory = make()
+def test_beta_stream_records_fallback_model_after_capture_budget_is_exhausted(make: Any) -> None:
+    memory = make(max_stream_bytes=64 + 1)
     events = with_iterations(
         beta_stream_events(
             ({"type": "text", "text": ""}, [{"type": "text_delta", "text": "x" * 60}]),
@@ -2766,11 +2905,8 @@ def test_beta_stream_compaction_omitting_encrypted_content_keeps_the_previous_va
     ]
 
 
-def test_compaction_replacement_releases_only_its_own_budget_reservation(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 300)
-    make()
+def test_compaction_replacement_releases_only_its_own_budget_reservation(make: Any) -> None:
+    make(max_stream_bytes=300 + 1)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
     sibling = {"type": "text", "text": "hi"}
@@ -2800,11 +2936,8 @@ def test_compaction_replacement_releases_only_its_own_budget_reservation(
     assert state.blocks[1] == replacement
 
 
-def test_stream_keeps_short_compaction_replacement_within_budget(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 300)
-    memory = make()
+def test_stream_keeps_short_compaction_replacement_within_budget(make: Any) -> None:
+    memory = make(max_stream_bytes=300 + 1)
     a = streamed_beta_span(
         beta_stream_events(
             (
@@ -2823,11 +2956,8 @@ def test_stream_keeps_short_compaction_replacement_within_budget(
     ]
 
 
-def test_oversized_compaction_replacement_drops_stale_block_and_recovers(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 300)
-    make()
+def test_oversized_compaction_replacement_drops_stale_block_and_recovers(make: Any) -> None:
+    make(max_stream_bytes=300 + 1)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
     start = {"type": "compaction"}
@@ -2856,11 +2986,8 @@ def test_oversized_compaction_replacement_drops_stale_block_and_recovers(
     assert "attributes" not in partial
 
 
-def test_multiple_rejected_compaction_replacements_still_recover(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 300)
-    make()
+def test_multiple_rejected_compaction_replacements_still_recover(make: Any) -> None:
+    make(max_stream_bytes=300 + 1)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
     record(
@@ -2882,11 +3009,8 @@ def test_multiple_rejected_compaction_replacements_still_recover(
     assert state.blocks[0]["content"] == "recovered"
 
 
-def test_rejected_inherited_encrypted_content_stays_unresolved_until_replaced(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 300)
-    make()
+def test_rejected_inherited_encrypted_content_stays_unresolved_until_replaced(make: Any) -> None:
+    make(max_stream_bytes=300 + 1)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
     record(
@@ -2934,19 +3058,19 @@ def test_rejected_inherited_encrypted_content_stays_unresolved_until_replaced(
 
 
 @pytest.mark.parametrize("container_type", ["mapping", "sequence"])
-def test_stream_capture_bounds_native_container_traversal(container_type: str) -> None:
+def test_stream_capture_copies_native_containers_reading_each_item_once(
+    container_type: str,
+) -> None:
     reads = 0
 
     class HostileMapping(Mapping[str, Any]):
         def __len__(self) -> int:
-            return 400
+            return 5_000
 
         def __iter__(self) -> Iterator[str]:
             nonlocal reads
-            for index in range(400):
+            for index in range(5_000):
                 reads += 1
-                if reads > 1_000:
-                    raise AssertionError("exceeded the traversal limit")
                 yield f"key-{index}"
 
         def __getitem__(self, key: str) -> Any:
@@ -2954,7 +3078,7 @@ def test_stream_capture_bounds_native_container_traversal(container_type: str) -
 
     class HostileSequence(Sequence[Any]):
         def __len__(self) -> int:
-            return 749
+            return 5_000
 
         def __getitem__(self, index: int | slice) -> Any:
             nonlocal reads
@@ -2963,61 +3087,20 @@ def test_stream_capture_bounds_native_container_traversal(container_type: str) -
             if index >= len(self):
                 raise IndexError
             reads += 1
-            if reads > 1_000:
-                raise AssertionError("exceeded the traversal limit")
             return index
 
     value: Any = HostileMapping() if container_type == "mapping" else HostileSequence()
-    bounded = telemetry_dev_anthropic._bounded_native(value)  # pyright: ignore[reportPrivateUsage]
+    bounded = telemetry_dev_anthropic._bounded_native(value, STREAM_LIMIT)  # pyright: ignore[reportPrivateUsage]
 
-    assert reads <= 1_000
+    assert reads == 5_000
     assert bounded is not value
     if container_type == "mapping":
-        assert bounded == {f"key-{index}": f"key-{index}" for index in range(400)}
+        assert bounded == {f"key-{index}": f"key-{index}" for index in range(5_000)}
     else:
-        assert bounded == list(range(749))
+        assert bounded == list(range(5_000))
 
 
-@pytest.mark.parametrize("container_type", ["mapping", "sequence"])
-def test_stream_capture_rejects_containers_over_the_item_limit(container_type: str) -> None:
-    reads = 0
-
-    class OversizedMapping(Mapping[str, Any]):
-        def __len__(self) -> int:
-            return 5_000
-
-        def __iter__(self) -> Iterator[str]:
-            nonlocal reads
-            for index in range(5_000):
-                reads += 1
-                if reads > 1_000:
-                    raise AssertionError("exceeded the traversal limit")
-                yield f"key-{index}"
-
-        def __getitem__(self, key: str) -> Any:
-            return key
-
-    class OversizedSequence(Sequence[Any]):
-        def __len__(self) -> int:
-            return 5_000
-
-        def __getitem__(self, index: int | slice) -> Any:
-            nonlocal reads
-            if isinstance(index, slice):
-                raise AssertionError("sliced the sequence")
-            reads += 1
-            if reads > 1_000:
-                raise AssertionError("exceeded the traversal limit")
-            return index
-
-    value: Any = OversizedMapping() if container_type == "mapping" else OversizedSequence()
-    bounded = telemetry_dev_anthropic._bounded_native(value)  # pyright: ignore[reportPrivateUsage]
-
-    assert bounded is telemetry_dev_anthropic._OMIT  # pyright: ignore[reportPrivateUsage]
-    assert reads <= 1_000
-
-
-def test_stream_capture_rejects_large_pydantic_extras_and_ignores_subclassed_extras() -> None:
+def test_stream_capture_keeps_large_pydantic_extras_and_ignores_subclassed_extras() -> None:
     reads = 0
 
     class CountingExtras(dict[str, Any]):
@@ -3050,11 +3133,13 @@ def test_stream_capture_rejects_large_pydantic_extras_and_ignores_subclassed_ext
     assert "__pydantic_extra__" not in vars(model)
     implementation = cast(Any, telemetry_dev_anthropic)
 
-    assert implementation._bounded_native(model) is implementation._OMIT
+    assert implementation._bounded_native(model, STREAM_LIMIT) == {
+        f"key-{index}": index for index in range(5_000)
+    }
 
     model.__pydantic_extra__ = CountingExtras(model.__pydantic_extra__ or {})
 
-    assert implementation._bounded_native(model) == {}
+    assert implementation._bounded_native(model, STREAM_LIMIT) == {}
     assert reads == 0
 
 
@@ -3066,7 +3151,7 @@ def test_stream_capture_keeps_pydantic_extras_from_slot_storage() -> None:
     model = Model.model_validate({"type": "text", "citations_extra": "kept"})
     assert "__pydantic_extra__" not in vars(model)
 
-    bounded = telemetry_dev_anthropic._bounded_native(model)  # pyright: ignore[reportPrivateUsage]
+    bounded = telemetry_dev_anthropic._bounded_native(model, STREAM_LIMIT)  # pyright: ignore[reportPrivateUsage]
 
     assert bounded == {"type": "text", "citations_extra": "kept"}
 
@@ -3159,10 +3244,10 @@ def test_stream_capture_never_runs_storage_properties() -> None:
             return {"encrypted_content"}
 
     implementation = cast(Any, telemetry_dev_anthropic)
-    implementation._bounded_native(Hostile())
+    implementation._bounded_native(Hostile(), STREAM_LIMIT)
     implementation._field_present(Hostile(), "encrypted_content")
     for hostile in _spoofed_and_aliased_storage(calls):
-        implementation._bounded_native(hostile)
+        implementation._bounded_native(hostile, STREAM_LIMIT)
         implementation._field_present(hostile, "text")
 
     assert calls == []
@@ -3179,26 +3264,64 @@ def test_stream_capture_bounds_underreported_mapping_traversal() -> None:
             nonlocal reads
             for index in range(5_000):
                 reads += 1
-                if reads > 1_000:
-                    raise AssertionError("exceeded the traversal limit")
                 yield f"key-{index}"
 
         def __getitem__(self, key: str) -> Any:
             return key
 
-    bounded = telemetry_dev_anthropic._bounded_native(  # pyright: ignore[reportPrivateUsage]
-        UnderreportedMapping()
+    implementation = cast(Any, telemetry_dev_anthropic)
+    state = implementation._StreamState()
+    record = implementation._record_stream_event
+    # A text block leaves the stream 1,000 bytes, so the traversal stops within 1,000 items.
+    record(
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        state,
+    )
+    text = "x" * (state.budget.remaining_bytes - 1_000)
+    record(
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+        state,
+    )
+    assert state.budget.remaining_bytes == 1_000
+
+    record(
+        {"type": "content_block_start", "index": 1, "content_block": UnderreportedMapping()}, state
     )
 
-    assert bounded is telemetry_dev_anthropic._OMIT  # pyright: ignore[reportPrivateUsage]
     assert reads <= 1_000
+    assert 1 not in state.blocks
+    assert state.budget.truncated is True
 
 
-def test_rejected_unseen_compaction_replacement_recovers(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 300)
-    make()
+def test_text_delta_that_exactly_fills_the_stream_is_kept() -> None:
+    implementation = cast(Any, telemetry_dev_anthropic)
+    state = implementation._StreamState()
+    record = implementation._record_stream_event
+    record(
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        state,
+    )
+    filler = "x" * (state.budget.remaining_bytes - 3)
+
+    # Only the text of a delta is charged, so 3 bytes of room keep a 3-byte delta whole even
+    # though the delta has more items than that.
+    for text in (filler, "abc"):
+        record(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            },
+            state,
+        )
+
+    assert state.budget.truncated is False
+    assert state.budget.remaining_bytes == 0
+    assert state.blocks[0]["text"] == filler + "abc"
+
+
+def test_rejected_unseen_compaction_replacement_recovers(make: Any) -> None:
+    make(max_stream_bytes=300 + 1)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
 
@@ -3239,11 +3362,8 @@ def test_masked_beta_stream_omits_incomplete_retained_output(make: Any) -> None:
     assert a["telemetry.dev.capture.truncated"] is True
 
 
-def test_compaction_after_other_block_truncation_keeps_fitting_replacement(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 300)
-    make()
+def test_compaction_after_other_block_truncation_keeps_fitting_replacement(make: Any) -> None:
+    make(max_stream_bytes=300 + 1)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
 
@@ -3286,13 +3406,10 @@ def test_compaction_after_other_block_truncation_keeps_fitting_replacement(
     assert state.blocks[0] == {"type": "compaction", "content": "hi"}
 
 
-def test_signature_replacement_releases_its_previous_budget_reservation(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 350)
+def test_signature_replacement_releases_its_previous_budget_reservation(make: Any) -> None:
     # 350 bytes fits the block with the long signature (241 bytes) and the block with the
     # short one (144 bytes), but not both stacked (385 bytes).
-    make()
+    make(max_stream_bytes=350 + 1)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
     start = {"type": "thinking", "thinking": ""}
@@ -3317,7 +3434,7 @@ def test_first_compaction_delta_replaces_the_start_shell_reservation(
     completed = {"type": "compaction", "content": "x" * 50}
     expected = telemetry_dev.CaptureBudget()
     assert expected.accept(completed)
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", expected.bytes_used)
+    monkeypatch.setattr(stream_budget, "max_bytes", expected.bytes_used + 1)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
 
@@ -3339,11 +3456,8 @@ def test_first_compaction_delta_replaces_the_start_shell_reservation(
     assert state.budget.truncated is False
 
 
-def test_replacement_budget_invariants_hold_for_random_streams(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 600)
-    make()
+def test_replacement_budget_invariants_hold_for_random_streams(make: Any) -> None:
+    make(max_stream_bytes=600 + 1)
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
     rng = random.Random(1729)
 
@@ -3420,11 +3534,8 @@ def test_replacement_budget_invariants_hold_for_random_streams(
                 assert state.blocks.get(index) == kept
 
 
-def test_stream_drops_compaction_superseded_by_a_rejected_final_replacement(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 400)
-    memory = make()
+def test_stream_drops_compaction_superseded_by_a_rejected_final_replacement(make: Any) -> None:
+    memory = make(max_stream_bytes=400 + 1)
     a = streamed_beta_span(
         beta_stream_events(
             ({"type": "text", "text": ""}, [{"type": "text_delta", "text": "Hi"}]),
@@ -3445,13 +3556,10 @@ def test_stream_drops_compaction_superseded_by_a_rejected_final_replacement(
     assert a["telemetry.dev.capture.truncated"] is True
 
 
-def test_rejected_signature_keeps_thinking_and_drops_the_stale_signature(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 800)
+def test_rejected_signature_keeps_thinking_and_drops_the_stale_signature(make: Any) -> None:
     # 800 bytes fits the thinking text (698 bytes) and the block with the short signature
     # (636 bytes), but not the block with the oversized signature (1233 bytes).
-    memory = make()
+    memory = make(max_stream_bytes=800 + 1)
     a = streamed_beta_span(
         beta_stream_events(
             ({"type": "text", "text": ""}, [{"type": "text_delta", "text": "Hi"}]),
@@ -3478,11 +3586,8 @@ def test_rejected_signature_keeps_thinking_and_drops_the_stale_signature(
     ]
 
 
-def test_rejected_signature_stays_unresolved_until_a_replacement_is_accepted(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 300)
-    make()
+def test_rejected_signature_stays_unresolved_until_a_replacement_is_accepted(make: Any) -> None:
+    make(max_stream_bytes=300 + 1)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
     record(
@@ -3563,11 +3668,8 @@ def test_rejected_signature_releases_budget_for_sibling_and_recovers(make: Any) 
     )
 
 
-def test_rejected_unseen_replacements_use_sticky_bounded_truncation(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 100)
-    make()
+def test_rejected_unseen_replacements_use_sticky_bounded_truncation(make: Any) -> None:
+    make(max_stream_bytes=100 + 1)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
 
@@ -3586,11 +3688,8 @@ def test_rejected_unseen_replacements_use_sticky_bounded_truncation(
     assert state.blocks == {}
 
 
-def test_rejected_compaction_indexes_are_bounded_before_sticky_truncation(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 100)
-    make()
+def test_rejected_compaction_indexes_are_bounded_before_sticky_truncation(make: Any) -> None:
+    make(max_stream_bytes=100 + 1)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
 
@@ -3618,11 +3717,8 @@ def test_rejected_compaction_indexes_are_bounded_before_sticky_truncation(
     assert len(state.block_reservations) <= 1000
 
 
-def test_rejected_compaction_releases_budget_for_later_blocks(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 400)
-    memory = make()
+def test_rejected_compaction_releases_budget_for_later_blocks(make: Any) -> None:
+    memory = make(max_stream_bytes=400 + 1)
     a = streamed_beta_span(
         beta_stream_events(
             (
@@ -3642,11 +3738,8 @@ def test_rejected_compaction_releases_budget_for_later_blocks(
     ]
 
 
-def test_rejected_compactions_after_truncation_leave_no_state(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 300)
-    make()
+def test_rejected_compactions_after_truncation_leave_no_state(make: Any) -> None:
+    make(max_stream_bytes=300 + 1)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
     record({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}, state)
@@ -3720,7 +3813,7 @@ def test_oversized_compaction_replacement_keeps_inherited_encrypted_content_unre
         {
             "type": "content_block_delta",
             "index": 0,
-            "delta": {"type": "compaction_delta", "content": ["x"] * 1_001},
+            "delta": {"type": "compaction_delta", "content": "x" * STREAM_LIMIT},
         },
         state,
     )
@@ -3747,10 +3840,9 @@ def test_oversized_compaction_replacement_keeps_inherited_encrypted_content_unre
 
 @pytest.mark.parametrize("signature", ["sig", "s" * 200])
 def test_signature_at_a_tool_index_reserves_the_raw_tool_input_it_keeps(
-    make: Any, signature: str, monkeypatch: pytest.MonkeyPatch
+    make: Any, signature: str
 ) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 600)
-    make()
+    make(max_stream_bytes=600 + 1)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
     start: dict[str, Any] = {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}
@@ -3790,10 +3882,9 @@ def test_signature_at_a_tool_index_reserves_the_raw_tool_input_it_keeps(
 
 
 def test_dropped_compaction_at_a_tool_index_leaves_no_tool_input_for_later_blocks(
-    make: Any, monkeypatch: pytest.MonkeyPatch
+    make: Any,
 ) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 300)
-    make()
+    make(max_stream_bytes=300 + 1)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
 
@@ -3817,11 +3908,8 @@ def test_dropped_compaction_at_a_tool_index_leaves_no_tool_input_for_later_block
     ]
 
 
-def test_signature_after_truncation_remeasures_the_stripped_block(
-    make: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(telemetry_dev_anthropic, "_STREAM_CAPTURE_MAX_BYTES", 300)
-    make()
+def test_signature_after_truncation_remeasures_the_stripped_block(make: Any) -> None:
+    make(max_stream_bytes=300 + 1)
     state = telemetry_dev_anthropic._StreamState()  # pyright: ignore[reportPrivateUsage]
     record = telemetry_dev_anthropic._record_stream_event  # pyright: ignore[reportPrivateUsage]
     thinking = {"type": "thinking", "thinking": ""}

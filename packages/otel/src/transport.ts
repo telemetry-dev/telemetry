@@ -15,6 +15,7 @@ import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
 import { TRUNCATION_MARKER, truncate } from "./attrs.ts";
 import { DEFAULT_BATCH } from "./config.ts";
 import { reportError } from "./debug.ts";
+import { MAX_RECORD_BYTES } from "./queue.ts";
 
 export interface Transport {
   fetchImpl: typeof fetch;
@@ -392,10 +393,6 @@ const createExportLifecycle = (transport: Transport) => {
   return { exportBatch, timed, forceFlush, shutdown };
 };
 
-// The ingest rejects a body over 16 MiB after gzip decoding, so this limit applies to the
-// serialized request. Keep it equal to DECOMPRESSED_BODY_LIMIT in the ingest.
-const MAX_BODY_BYTES = 16 * 1024 * 1024;
-
 const CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated";
 
 interface Serializer<T> {
@@ -433,7 +430,7 @@ function fitRecord<T extends ExportRecord>(
     const serialized = serializer.serializeRequest([candidate]);
 
     if (!serialized) return undefined;
-    let excessBytes = serialized.byteLength - MAX_BODY_BYTES;
+    let excessBytes = serialized.byteLength - MAX_RECORD_BYTES;
 
     if (excessBytes <= 0) return serialized;
 
@@ -485,7 +482,7 @@ function createOtlpBatchSender<T extends ExportRecord>(
 
     if (!body || body.byteLength === 0) return false;
 
-    if (body.byteLength > MAX_BODY_BYTES) {
+    if (body.byteLength > MAX_RECORD_BYTES) {
       if (items.length > 1) {
         const mid = Math.ceil(items.length / 2);
         const first = await send(items.slice(0, mid));

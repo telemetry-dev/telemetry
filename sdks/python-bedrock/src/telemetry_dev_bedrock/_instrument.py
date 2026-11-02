@@ -13,7 +13,7 @@ from botocore.response import StreamingBody
 from ._fields import error_fields, merge_fields, metadata_fields
 from ._invoke_model import parse_body
 from ._registry import OperationSpec, lookup_operation
-from ._streams import InstrumentedEventStream
+from ._streams import InstrumentedEventStream, release_budget, stream_capture_budget
 
 _T = TypeVar("_T", bound=BaseClient)
 _SUPPORTED_SERVICES = frozenset({"bedrock-runtime", "bedrock-agent-runtime"})
@@ -318,8 +318,8 @@ class _InstrumentedStreamingBody(StreamingBody):
         super().__init__(body, getattr(body, "_content_length", None))
         self._body = body
         self._finish_callback = finish
-        # Fixed retention bound; the core applies max_attribute_length after the mask.
-        self._budget = telemetry_dev.CaptureBudget()
+        # The core applies max_attribute_length after the mask.
+        self._budget = stream_capture_budget()
         self._captured = bytearray()
         self._ended = False
 
@@ -403,9 +403,12 @@ class _InstrumentedStreamingBody(StreamingBody):
         if self._ended:
             return
         self._ended = True
-        captured = bytes(self._captured) if complete and not self._budget.truncated else None
-        # A body closed early, failed, or cut at the bound exports no output and is flagged.
-        self._finish_callback(captured, error, not complete or self._budget.truncated)
+        try:
+            captured = bytes(self._captured) if complete and not self._budget.truncated else None
+            # A body closed early, failed, or cut at the bound exports no output and is flagged.
+            self._finish_callback(captured, error, not complete or self._budget.truncated)
+        finally:
+            release_budget(self._budget)
 
 
 def _handle_streaming_body(

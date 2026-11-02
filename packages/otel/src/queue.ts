@@ -1,6 +1,91 @@
 import type { ExportResult } from "@opentelemetry/core";
 
+import { DEFAULT_BATCH } from "./config.ts";
 import { reportError } from "./debug.ts";
+
+/**
+ * The largest OTLP request the exporters send, in bytes. The ingest rejects a body over 16 MiB
+ * after gzip decoding; keep this equal to DECOMPRESSED_BODY_LIMIT in the ingest. A record that
+ * alone is larger has its longest values cut at export, so provider integrations keep at most
+ * this much of one stream.
+ */
+export const MAX_RECORD_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Bounds the bytes that provider integrations keep, across the process, for streams that have
+ * not ended, since each stream may keep up to MAX_RECORD_BYTES. A stream holds its bytes through
+ * a StreamCapture. While no other stream holds bytes, a stream may grow to MAX_RECORD_BYTES even
+ * past maxBytes, so that one large stream is not cut by the shared bound.
+ */
+export class StreamCaptureBudget {
+  private held = 0;
+
+  constructor(public maxBytes: number) {}
+
+  /** The total a stream that holds `own` bytes may hold now. */
+  limit(own: number): number {
+    const others = this.held - own;
+    const room = others > 0 ? this.maxBytes - others : MAX_RECORD_BYTES;
+
+    return Math.max(own, Math.min(MAX_RECORD_BYTES, room));
+  }
+
+  move(from: number, to: number): void {
+    this.held = Math.max(this.held + to - from, 0);
+  }
+}
+
+/** The budget of this process, sized by `batch.maxStreamBytes` when a span processor starts. */
+export const streamCaptureBudget = new StreamCaptureBudget(DEFAULT_BATCH.maxStreamBytes);
+
+interface HeldBytes {
+  bytes: number;
+}
+
+const releaseDropped =
+  typeof FinalizationRegistry === "function"
+    ? new FinalizationRegistry<HeldBytes>((held) => streamCaptureBudget.move(held.bytes, 0))
+    : undefined;
+
+/**
+ * The output bytes one stream keeps, held in streamCaptureBudget. A provider integration compares
+ * a new total against `limit` before it keeps more, sets `bytes` to what it keeps, and calls
+ * release() when the stream ends. A stream that is dropped without ending releases its bytes
+ * when it is garbage collected.
+ */
+export class StreamCapture {
+  private readonly held: HeldBytes = { bytes: 0 };
+  private releasedLimit: number | undefined;
+
+  constructor(initialBytes = 0) {
+    releaseDropped?.register(this, this.held, this);
+    this.bytes = initialBytes;
+  }
+
+  get limit(): number {
+    return this.releasedLimit ?? streamCaptureBudget.limit(this.held.bytes);
+  }
+
+  get bytes(): number {
+    return this.held.bytes;
+  }
+
+  set bytes(bytes: number) {
+    if (this.releasedLimit === undefined) streamCaptureBudget.move(this.held.bytes, bytes);
+    this.held.bytes = bytes;
+  }
+
+  /**
+   * Returns the bytes to the budget. After it, `limit` stays at the bytes held at release, so a
+   * stream that is still read after it ended keeps no more outside the bound.
+   */
+  release(): void {
+    if (this.releasedLimit !== undefined) return;
+    this.releasedLimit = Math.min(this.limit, this.held.bytes);
+    streamCaptureBudget.move(this.held.bytes, 0);
+    releaseDropped?.unregister(this);
+  }
+}
 
 interface QueuedRecord {
   readonly attributes: Readonly<Record<string, unknown>>;

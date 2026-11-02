@@ -29,6 +29,7 @@ from ._experiments import (
     run_experiment,
     run_experiment_async,
 )
+from ._export import MAX_RECORD_BYTES
 from ._logs import log
 from ._observe import observe
 from ._prompts import (
@@ -55,6 +56,7 @@ from ._spans import (
 from .otel import TelemetrySpanProcessor
 
 __all__ = [
+    "MAX_RECORD_BYTES",
     "NOT_GIVEN",
     "AsyncScorer",
     "AttributeValue",

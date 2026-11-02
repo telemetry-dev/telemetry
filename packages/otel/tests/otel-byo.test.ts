@@ -88,6 +88,21 @@ test("stamps propagated attributes with explicit ROOT_CONTEXT and no global cont
   expect(span.attributes["gen_ai.conversation.id"]).toBe("conv_local");
 });
 
+test("an invalid byte bound reaches onError and the processor exports nothing", async () => {
+  const errors: Error[] = [];
+
+  const { exporter, processor, tracer } = byoSetup({
+    batch: { maxStreamBytes: Number.NaN },
+    onError: (error) => errors.push(error),
+  });
+
+  tracer.startSpan("a").end();
+  await processor.forceFlush();
+  expect(exporter.getFinishedSpans()).toHaveLength(0);
+  expect(errors).toHaveLength(1);
+  expect(errors[0]).toBeInstanceOf(RangeError);
+});
+
 test("spanFilter narrows what gets exported", async () => {
   const { exporter, processor, tracer } = byoSetup({
     spanFilter: (span) => span.name.startsWith("keep"),

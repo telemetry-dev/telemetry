@@ -13,7 +13,9 @@ import {
   flush,
   getPrompt,
   init,
+  MAX_RECORD_BYTES,
   shutdown,
+  StreamCapture,
   type TelemetryOptions,
 } from "@telemetry-dev/sdk";
 import * as telemetrySdk from "@telemetry-dev/sdk";
@@ -24,7 +26,7 @@ import { Stream } from "openai/core/streaming";
 import { Completions } from "openai/resources/chat/completions/completions";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses";
 import { VERSION } from "openai/version";
-import { afterEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import packageJson from "../package.json" with { type: "json" };
 import {
@@ -192,11 +194,29 @@ function createFakeFetch(...responses: Response[]): FakeFetch {
   return { fetch: fetchImpl, requests };
 }
 
+// Most tests reach the stream bound at 48 KiB: another stream holds a byte, and the setup sizes
+// the shared bound to leave a stream these tests start 48 KiB.
+const STREAM_LIMIT = 48 * 1024;
+let otherStream: StreamCapture | undefined;
+
+// A string whose JSON alone passes MAX_RECORD_BYTES, the bound of a non-stream capture.
+const PAST_RECORD = "x".repeat(MAX_RECORD_BYTES);
+
+beforeEach(() => {
+  otherStream = new StreamCapture(1);
+});
+
 function setupSpans(
   metricExporter?: PushMetricExporter,
   options: Pick<
     TelemetryOptions,
-    "captureInput" | "captureOutput" | "mask" | "maxAttributeLength" | "onError" | "sampler"
+    | "batch"
+    | "captureInput"
+    | "captureOutput"
+    | "mask"
+    | "maxAttributeLength"
+    | "onError"
+    | "sampler"
   > = {},
 ): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
@@ -208,6 +228,7 @@ function setupSpans(
       exportMode: "immediate",
       logLevel: "silent",
       fetch: async () => new Response(null, { status: 200 }),
+      batch: { maxStreamBytes: STREAM_LIMIT + 1 },
       ...options,
     },
     { spanExporter, metricExporter },
@@ -300,6 +321,7 @@ async function collectStream(stream: AsyncIterable<unknown>): Promise<unknown[]>
 }
 
 afterEach(async () => {
+  otherStream?.release();
   uninstrumentOpenAI();
   await shutdown();
   vi.restoreAllMocks();
@@ -843,6 +865,12 @@ test("chat streams record finish reasons for every choice", async () => {
             delta: { role: "assistant", content: "Second" },
             finish_reason: "length",
           },
+          // A finish reason is cut to 128 characters without marking the capture cut.
+          {
+            index: 2,
+            delta: { role: "assistant", content: "Third" },
+            finish_reason: `${"r".repeat(127)}st`,
+          },
         ],
       },
     ]),
@@ -850,9 +878,9 @@ test("chat streams record finish reasons for every choice", async () => {
 
   const stream = await clientWith(fake.fetch).chat.completions.create({
     model: "gpt-4o",
-    messages: [{ role: "user", content: "Give two options" }],
+    messages: [{ role: "user", content: "Give three options" }],
     stream: true,
-    n: 2,
+    n: 3,
   });
 
   await collectStream(stream);
@@ -861,8 +889,14 @@ test("chat streams record finish reasons for every choice", async () => {
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
     { role: "assistant", content: "First" },
     { role: "assistant", content: "Second" },
+    { role: "assistant", content: "Third" },
   ]);
-  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop", "length"]);
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual([
+    "stop",
+    "length",
+    `${"r".repeat(127)}s`,
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
 });
 
 test("chat streams send the request unchanged by default", async () => {
@@ -2253,97 +2287,48 @@ test("chat streams mark clean EOF without a finish reason incomplete when output
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
-test("chat streams bound finish reasons independently of output capture", async () => {
-  const spans = setupSpans(undefined, { captureOutput: false });
+// A finish reason is cut to 128 characters, and the finish reasons of a chat stream share a budget
+// of 1,000 records of the largest JSON such a reason can take: a control character escapes to 6
+// bytes, and -Number.MAX_VALUE is the longest index.
+const LONGEST_FINISH_REASON = "\u0000".repeat(128);
 
-  const event = {
-    choices: Array.from({ length: 250 }, (_, index) => ({
-      index,
-      delta: {},
-      finish_reason: `reason-${index}-${'"🙂'.repeat(128)}`,
-    })),
-  };
+function finishReasonRecordBytes(index: number, finishReason: string): number {
+  return Buffer.byteLength(JSON.stringify({ index, finish_reason: finishReason }), "utf8");
+}
 
-  const source = new Stream(async function* () {
-    yield event;
-  }, new AbortController());
+const FINISH_REASON_BUDGET =
+  1_000 * finishReasonRecordBytes(-Number.MAX_VALUE, LONGEST_FINISH_REASON);
 
-  const client = wrapOpenAI({
-    chat: { completions: { create: async (_params: unknown) => source } },
-    responses: { create() {} },
-    embeddings: { create() {} },
-  });
+interface FinishReasonChoice {
+  index: number;
+  delta: { content?: string };
+  finish_reason: string;
+}
 
-  const stream = await client.chat.completions.create({
-    model: "gpt-4o",
-    messages: [],
-    stream: true,
-  });
+/**
+ * Choices with indexes from 0 that start with `first` and add the longest reasons while their
+ * records fit the finish-reason budget, split into chunks of at most 1,000 choices. `left` is the
+ * budget they leave, less than the record of one more longest reason.
+ */
+function choicesFillingFinishReasonBudget(first: FinishReasonChoice[] = []) {
+  const choices = [...first];
+  let left = FINISH_REASON_BUDGET;
 
-  const visible = await collectStream(stream);
+  for (const choice of first) left -= finishReasonRecordBytes(choice.index, choice.finish_reason);
 
-  expect(visible).toHaveLength(1);
-  expect(visible[0]).toBe(event);
-  const span = await exportedSpan(spans);
-  const finishReasons = span.attributes["gen_ai.response.finish_reasons"];
-  expect(Array.isArray(finishReasons)).toBe(true);
-  expect((finishReasons as unknown[]).length).toBeGreaterThan(0);
-  expect((finishReasons as string[]).length).toBeLessThanOrEqual(333);
-  expect(Buffer.byteLength(JSON.stringify(finishReasons), "utf8")).toBeLessThanOrEqual(48 * 1024);
-  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
-  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
-});
+  while (finishReasonRecordBytes(choices.length, LONGEST_FINISH_REASON) <= left) {
+    left -= finishReasonRecordBytes(choices.length, LONGEST_FINISH_REASON);
+    choices.push({ index: choices.length, delta: {}, finish_reason: LONGEST_FINISH_REASON });
+  }
 
-test("finish-reason truncation does not suppress captured output", async () => {
-  const spans = setupSpans();
+  const chunks = Array.from({ length: Math.ceil(choices.length / 1_000) }, (_, chunk) => ({
+    choices: choices.slice(chunk * 1_000, (chunk + 1) * 1_000),
+  }));
 
-  const event = {
-    choices: [
-      {
-        index: 0,
-        delta: { content: "kept" },
-        finish_reason: "x".repeat(70_000),
-      },
-    ],
-  };
+  return { choices, chunks, left };
+}
 
-  const source = new Stream(async function* () {
-    yield event;
-  }, new AbortController());
-
-  const client = wrapOpenAI({
-    chat: { completions: { create: async (_params: unknown) => source } },
-    responses: { create() {} },
-    embeddings: { create() {} },
-  });
-
-  const stream = await client.chat.completions.create({
-    model: "gpt-4o",
-    messages: [],
-    stream: true,
-  });
-
-  expect(await collectStream(stream)).toEqual([event]);
-  const span = await exportedSpan(spans);
-  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
-    { role: "assistant", content: "kept" },
-  ]);
-  expect(span.attributes["gen_ai.response.finish_reasons"]).toBeUndefined();
-  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
-});
-
-test("chat streams replace a retained finish reason within the shared limit", async () => {
-  const spans = setupSpans(undefined, { captureOutput: false });
-
-  const events = [
-    {
-      choices: [{ index: 0, delta: {}, finish_reason: "x".repeat(49_100) }],
-    },
-    {
-      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-    },
-  ];
-
+async function observedChatStream(events: unknown[]): Promise<AsyncIterable<unknown>> {
   const source = new Stream(async function* () {
     yield* events;
   }, new AbortController());
@@ -2354,95 +2339,100 @@ test("chat streams replace a retained finish reason within the shared limit", as
     embeddings: { create() {} },
   });
 
-  const stream = await client.chat.completions.create({
-    model: "gpt-4o",
-    messages: [],
-    stream: true,
-  });
+  return client.chat.completions.create({ model: "gpt-4o", messages: [], stream: true });
+}
 
-  expect(await collectStream(stream)).toEqual(events);
+test("chat streams bound finish reasons independently of output capture", async () => {
+  const spans = setupSpans(undefined, { captureOutput: false });
+  const { choices, chunks } = choicesFillingFinishReasonBudget();
+  // One more longest reason does not fit the budget.
+  const overflow = { index: choices.length, delta: {}, finish_reason: LONGEST_FINISH_REASON };
+  const events = [...chunks, { choices: [overflow] }];
+
+  expect(await collectStream(await observedChatStream(events))).toEqual(events);
   const span = await exportedSpan(spans);
-  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
+  expect(choices.length).toBeGreaterThan(1_000);
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(
+    choices.map((choice) => choice.finish_reason),
+  );
+  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("finish-reason truncation does not suppress captured output", async () => {
+  const spans = setupSpans(undefined, { mask: (value) => value });
+
+  const { choices, chunks } = choicesFillingFinishReasonBudget([
+    { index: 0, delta: { content: "kept" }, finish_reason: "stop" },
+  ]);
+
+  const overflow = { index: choices.length, delta: {}, finish_reason: LONGEST_FINISH_REASON };
+  const events = [...chunks, { choices: [overflow] }];
+
+  expect(await collectStream(await observedChatStream(events))).toEqual(events);
+  const span = await exportedSpan(spans);
+  const output = jsonAttr<unknown[]>(span, "gen_ai.output.messages");
+  expect(output).toHaveLength(choices.length + 1);
+  expect(output[0]).toEqual({ role: "assistant", content: "kept" });
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(
+    choices.map((choice) => choice.finish_reason),
+  );
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+});
+
+test("chat streams replace a retained finish reason within the finish-reason budget", async () => {
+  const spans = setupSpans(undefined, { captureOutput: false });
+  const { choices, chunks, left } = choicesFillingFinishReasonBudget();
+  const replacement = "\u0001".repeat(128);
+  // The replacement fits only in the bytes the reason it replaces frees.
+  expect(left).toBeLessThan(finishReasonRecordBytes(0, replacement));
+  const events = [...chunks, { choices: [{ index: 0, delta: {}, finish_reason: replacement }] }];
+
+  expect(await collectStream(await observedChatStream(events))).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual([
+    replacement,
+    ...choices.slice(1).map((choice) => choice.finish_reason),
+  ]);
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
 });
 
 test("chat streams invalidate a retained finish reason when its replacement is rejected", async () => {
   const spans = setupSpans(undefined, { captureOutput: false });
 
+  const { choices, chunks, left } = choicesFillingFinishReasonBudget([
+    { index: 0, delta: {}, finish_reason: "x".repeat(60) },
+  ]);
+
+  // The longest reason does not fit even in the bytes of the reason it replaces, which then frees
+  // them for the next choice.
+  expect(finishReasonRecordBytes(0, "x".repeat(60)) + left).toBeLessThan(
+    finishReasonRecordBytes(0, LONGEST_FINISH_REASON),
+  );
+
   const events = [
-    { choices: [{ index: 0, delta: {}, finish_reason: "x".repeat(60) }] },
-    { choices: [{ index: 0, delta: {}, finish_reason: "x".repeat(49_200) }] },
-    { choices: [{ index: 1, delta: {}, finish_reason: "stop" }] },
+    ...chunks,
+    { choices: [{ index: 0, delta: {}, finish_reason: LONGEST_FINISH_REASON }] },
+    { choices: [{ index: choices.length, delta: {}, finish_reason: "stop" }] },
   ];
 
-  const source = new Stream(async function* () {
-    yield* events;
-  }, new AbortController());
-
-  const client = wrapOpenAI({
-    chat: { completions: { create: async (_params: unknown) => source } },
-    responses: { create() {} },
-    embeddings: { create() {} },
-  });
-
-  const stream = await client.chat.completions.create({
-    model: "gpt-4o",
-    messages: [],
-    stream: true,
-  });
-
-  expect(await collectStream(stream)).toEqual(events);
+  expect(await collectStream(await observedChatStream(events))).toEqual(events);
   const span = await exportedSpan(spans);
-  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"]);
+  expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual([
+    ...choices.slice(1).map((choice) => choice.finish_reason),
+    "stop",
+  ]);
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
-test("chat streams reclaim finish-reason items when replacing a choice", async () => {
-  const spans = setupSpans(undefined, { captureOutput: false });
-
-  const events = [
-    {
-      choices: Array.from({ length: 333 }, (_, index) => ({
-        index,
-        delta: {},
-        finish_reason: `reason-${index}`,
-      })),
-    },
-    { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
-  ];
-
-  const source = new Stream(async function* () {
-    yield* events;
-  }, new AbortController());
-
-  const client = wrapOpenAI({
-    chat: { completions: { create: async (_params: unknown) => source } },
-    responses: { create() {} },
-    embeddings: { create() {} },
-  });
-
-  const stream = await client.chat.completions.create({
-    model: "gpt-4o",
-    messages: [],
-    stream: true,
-  });
-
-  expect(await collectStream(stream)).toEqual(events);
-  const span = await exportedSpan(spans);
-  const finishReasons = span.attributes["gen_ai.response.finish_reasons"] as string[];
-  expect(finishReasons).toHaveLength(333);
-  expect(finishReasons[0]).toBe("stop");
-  expect(finishReasons.at(-1)).toBe("reason-332");
-  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
-});
-
-test("chat streams bound retained choice states", async () => {
+test("chat streams keep every choice state that fits the stream bound", async () => {
   const spans = setupSpans();
 
   const event = {
     choices: Array.from({ length: 500 }, (_, index) => ({
       index,
       delta: {},
+      finish_reason: "stop",
     })),
   };
 
@@ -2466,11 +2456,63 @@ test("chat streams bound retained choice states", async () => {
   expect((await iterator.next()).value).toBe(event);
   expect(await iterator.next()).toEqual({ done: true, value: undefined });
   const span = await exportedSpan(spans);
-  const output = jsonAttr<unknown[]>(span, "gen_ai.output.messages");
-  expect(output).toHaveLength(499);
-  expect(String(span.attributes["gen_ai.output.messages"]).length).toBeLessThanOrEqual(48 * 1024);
-  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual(
+    Array.from({ length: 500 }, () => ({ role: "assistant" })),
+  );
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
 });
+
+test.each([
+  [64 * 1024, false],
+  [MAX_RECORD_BYTES, true],
+] as const)(
+  "with the default bounds a chat stream of %s content bytes is cut: %s",
+  async (length, cut) => {
+    otherStream?.release();
+    const spans = setupSpans(undefined, { batch: {} });
+    const piece = "x".repeat(1024 * 1024);
+
+    const events = [
+      ...Array.from({ length: Math.ceil(length / piece.length) }, (_, index) => ({
+        choices: [
+          {
+            index: 0,
+            delta: {
+              content: piece.slice(0, Math.min(piece.length, length - index * piece.length)),
+            },
+          },
+        ],
+      })),
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ];
+
+    const source = new Stream(async function* () {
+      yield* events;
+    }, new AbortController());
+
+    const client = wrapOpenAI({
+      chat: { completions: { create: async (_params: unknown) => source } },
+      responses: { create() {} },
+      embeddings: { create() {} },
+    });
+
+    const stream = await client.chat.completions.create({
+      model: "gpt-4o",
+      messages: [],
+      stream: true,
+    });
+
+    expect(await collectStream(stream)).toHaveLength(events.length);
+    const span = await exportedSpan(spans);
+    const content = jsonAttr<Array<{ content: string }>>(span, "gen_ai.output.messages")[0]!
+      .content;
+
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(cut ? true : undefined);
+    // [{"role":"assistant","content":""}] takes 35 bytes, so of 16 pieces of 1 MiB the last one
+    // does not fit.
+    expect(content.length).toBe(cut ? MAX_RECORD_BYTES - piece.length : length);
+  },
+);
 
 test("chat streams cap per-chunk choice and tool-call inspection", async () => {
   const errors: unknown[] = [];
@@ -3319,6 +3361,142 @@ test("responses streams retain the last fitting output when the terminal snapsho
   expect(span.attributes["gen_ai.usage.total_tokens"]).toBe(28);
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
+
+test("responses streams hold the bytes of a cut snapshot they keep before any snapshot fits", async () => {
+  const spans = setupSpans();
+
+  const snapshot = (status: string) => ({
+    id: "resp_cut_first",
+    status,
+    output: [
+      {
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "output_text", text: "a".repeat(30_000) },
+          { type: "output_text", text: "x".repeat(70_000) },
+        ],
+      },
+    ],
+  });
+
+  let limitWhileHeld: number | undefined;
+
+  const source = new Stream(async function* () {
+    yield { type: "response.in_progress", response: snapshot("in_progress") };
+    // The cut snapshot was recorded; a stream that starts now may keep only what it left.
+    const probe = new StreamCapture();
+    limitWhileHeld = probe.limit;
+    probe.release();
+    yield { type: "response.completed", response: snapshot("completed") };
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create: async (_params: unknown) => source },
+    embeddings: { create() {} },
+  });
+
+  const stream = await client.responses.create({ model: "gpt-4.1", input: "Go", stream: true });
+  expect(await collectStream(stream)).toHaveLength(2);
+
+  const span = await exportedSpan(spans);
+  const kept = String(span.attributes["gen_ai.output.messages"]);
+  // The capture drops the text that does not fit and keeps the rest of the snapshot.
+  expect(JSON.parse(kept)).toEqual([
+    {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "a".repeat(30_000) }, { type: "output_text" }],
+    },
+  ]);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+  expect(limitWhileHeld).toBe(STREAM_LIMIT - Buffer.byteLength(kept));
+});
+
+function throwOnSpanEnd(): void {
+  const startSpan = telemetrySdk.startSpan;
+
+  vi.spyOn(telemetrySdk, "startSpan").mockImplementation((...args) => {
+    const span = startSpan(...args);
+
+    return {
+      ...span,
+      end(fields) {
+        span.end(fields);
+        throw new Error("span end failed");
+      },
+    };
+  });
+}
+
+// The bytes a stream that starts now may keep: STREAM_LIMIT once only otherStream holds bytes.
+function streamRoom(): number {
+  const probe = new StreamCapture();
+  const room = probe.limit;
+  probe.release();
+
+  return room;
+}
+
+test.each(["chat", "responses", "transcription"] as const)(
+  "a %s stream releases its bytes when ending its span throws",
+  async (kind) => {
+    setupSpans();
+    throwOnSpanEnd();
+
+    // Each stream keeps output and ends at the end of the source.
+    const event =
+      kind === "chat"
+        ? { choices: [{ index: 0, delta: { content: "Hello" }, finish_reason: "stop" }] }
+        : kind === "responses"
+          ? {
+              type: "response.in_progress",
+              response: {
+                id: "resp_end_throws",
+                status: "in_progress",
+                output: [
+                  {
+                    type: "message",
+                    role: "assistant",
+                    content: [{ type: "output_text", text: "Hello" }],
+                  },
+                ],
+              },
+            }
+          : { type: "transcript.text.delta", delta: "Hello" };
+
+    let roomWhileHeld: number | undefined;
+
+    const source = new Stream(async function* () {
+      yield event;
+      roomWhileHeld = streamRoom();
+    }, new AbortController());
+
+    const create = async (_params: unknown) => source;
+
+    const client = wrapOpenAI({
+      chat: { completions: { create } },
+      responses: { create },
+      embeddings: { create() {} },
+      audio: { transcriptions: { create } },
+    });
+
+    const stream =
+      kind === "chat"
+        ? await client.chat.completions.create({ model: "gpt-4o", messages: [], stream: true })
+        : kind === "responses"
+          ? await client.responses.create({ model: "gpt-4.1", input: "Go", stream: true })
+          : await client.audio!.transcriptions!.create({
+              model: "gpt-4o-transcribe",
+              stream: true,
+            });
+
+    await expect(collectStream(stream)).rejects.toThrow("span end failed");
+    expect(roomWhileHeld).toBeLessThan(STREAM_LIMIT);
+    expect(streamRoom()).toBe(STREAM_LIMIT);
+  },
+);
 
 test("responses streams omit stale output when a masked terminal snapshot truncates", async () => {
   const spans = setupSpans(undefined, {
@@ -4661,8 +4839,9 @@ test("streaming transcription bounds captured output while yielding every event"
   expect(await collectStream(stream)).toEqual(events);
   const span = await exportedSpan(spans);
   const output = String(span.attributes["gen_ai.output.messages"]);
-  expect(output.length).toBeLessThanOrEqual(65_536);
-  expect(output).toBe("\\".repeat(32_767));
+  // Each backslash is two bytes in the JSON string, which with its quotes fills the stream bound.
+  expect(output).toBe("\\".repeat((STREAM_LIMIT - 2) / 2));
+  expect(JSON.stringify(output)).toHaveLength(STREAM_LIMIT);
   expect(output).not.toContain("...[truncated]");
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
   expect(span.attributes["gen_ai.usage.text.output_tokens"]).toBe(5);
@@ -4763,8 +4942,9 @@ test("streaming transcription bounds escaped Unicode at a code point boundary", 
   expect(await collectStream(stream)).toEqual(events);
   const span = await exportedSpan(spans);
   const output = String(span.attributes["gen_ai.output.messages"]);
-  expect(output.startsWith(prefix)).toBe(true);
-  expect(JSON.stringify(output).length).toBeLessThanOrEqual(65_536);
+  // The prefix is 12 UTF-8 bytes in the JSON string and each backslash 2; with the quotes, the
+  // kept text fills the stream bound.
+  expect(output).toBe(`${prefix}${"\\".repeat((STREAM_LIMIT - 2 - 12) / 2)}`);
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
@@ -4774,10 +4954,11 @@ test.each([
   [true, false],
   [true, true],
 ] as const)(
-  "a complete transcript above the chat stream budget is kept (streaming: %s, masked: %s)",
+  "a complete transcript that fills the stream bound is kept (streaming: %s, masked: %s)",
   async (streaming, masked) => {
     const spans = setupSpans(undefined, masked ? { mask: (value) => value } : {});
-    const transcript = "x".repeat(55_000);
+    // With its quotes, the transcript's JSON string is exactly the stream bound.
+    const transcript = "x".repeat(STREAM_LIMIT - 2);
 
     const events = [
       { type: "transcript.text.delta", delta: transcript },
@@ -4843,16 +5024,17 @@ test.each([false, true])(
 );
 
 test.each([
-  ["one oversized delta", 1, 70_000],
-  ["70,000 one-character deltas", 70_000, 1],
+  ["one oversized delta", 1, 70_000, "x"],
+  ["70,000 one-character deltas", 70_000, 1, "x"],
+  ["one oversized delta of three-byte characters", 1, 70_000, "東"],
 ])(
-  "streaming transcription retains at most the transcript ceiling from %s",
-  async (_case, count, size) => {
+  "streaming transcription retains at most the stream bound from %s",
+  async (_case, count, size, character) => {
     const spans = setupSpans();
 
     const events = Array.from({ length: count }, () => ({
       type: "transcript.text.delta",
-      delta: "x".repeat(size),
+      delta: character.repeat(size),
     }));
 
     const source = new Stream(async function* () {
@@ -4873,9 +5055,45 @@ test.each([
 
     expect(await collectStream(stream)).toHaveLength(events.length);
     const span = await exportedSpan(spans);
-    expect(span.attributes["gen_ai.output.messages"]).toBe("x".repeat(65_534));
+    // The bound counts UTF-8 bytes of the JSON string, quotes included.
+    expect(span.attributes["gen_ai.output.messages"]).toBe(
+      character.repeat(Math.floor((STREAM_LIMIT - 2) / Buffer.byteLength(character, "utf8"))),
+    );
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
   },
 );
+
+test("with the default bounds a streaming transcription past 64 KiB is kept whole", async () => {
+  otherStream?.release();
+  const spans = setupSpans(undefined, { batch: {} });
+  const transcript = "x".repeat(70_000);
+
+  const events = [
+    { type: "transcript.text.delta", delta: transcript },
+    { type: "transcript.text.done", text: transcript },
+  ];
+
+  const source = new Stream(async function* () {
+    yield* events;
+  }, new AbortController());
+
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+    audio: { transcriptions: { create: async (_params: unknown) => source } },
+  });
+
+  const stream = await client.audio!.transcriptions!.create({
+    model: "gpt-4o-transcribe",
+    stream: true,
+  });
+
+  expect(await collectStream(stream)).toEqual(events);
+  const span = await exportedSpan(spans);
+  expect(span.attributes["gen_ai.output.messages"]).toBe(transcript);
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+});
 
 test.each([
   ["enabled", true, "hello"],
@@ -5520,6 +5738,26 @@ test("realtime close fails pending spans and stops tracing later sends", async (
   expect(spans.getFinishedSpans()).toHaveLength(2);
 });
 
+test("a realtime trace releases its bytes when ending its span throws", () => {
+  setupSpans();
+  throwOnSpanEnd();
+
+  const connection = {
+    send(_event: unknown) {},
+    close() {},
+    on() {},
+    off() {},
+  };
+
+  const wrapped = wrapOpenAIRealtime(connection);
+
+  wrapped.send({ type: "response.create" });
+  // A pending trace holds the bytes of its empty output.
+  expect(streamRoom()).toBeLessThan(STREAM_LIMIT);
+  expect(() => wrapped.close()).toThrow("span end failed");
+  expect(streamRoom()).toBe(STREAM_LIMIT);
+});
+
 test("realtime wrapper preserves EventEmitter unhandled errors while finishing telemetry", async () => {
   const spans = setupSpans();
 
@@ -5975,7 +6213,7 @@ test.each([
   );
 });
 
-const CUT_CAPTURE_SECRET = `SECRET${"x".repeat(60_000)}`;
+const CUT_CAPTURE_SECRET = `SECRET${PAST_RECORD}`;
 
 function maskedKeys(mask: ReturnType<typeof vi.fn>): unknown[] {
   return mask.mock.calls.map(([, context]) => (context as { key?: unknown } | undefined)?.key);

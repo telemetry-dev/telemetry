@@ -10,12 +10,14 @@ import {
   getPrompt,
   init,
   type MaskFn,
+  MAX_RECORD_BYTES,
   shutdown,
   startActiveSpan,
+  StreamCapture,
   type TelemetryOptions,
 } from "@telemetry-dev/sdk";
 import * as telemetrySdk from "@telemetry-dev/sdk";
-import { afterEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import { instrumentOpenRouter, uninstrumentOpenRouter, wrapOpenRouter } from "../src/index.ts";
 
@@ -88,7 +90,20 @@ function createFakeFetcher(...responses: Response[]) {
   return { fetcher, requests };
 }
 
-function setupSpans(mask?: MaskFn, maxAttributeLength?: number): InMemorySpanExporter {
+// Most tests reach the stream bound at 64 KiB: another stream holds a byte, and the setup sizes
+// the shared bound to leave a stream these tests start 64 KiB.
+const STREAM_LIMIT = 64 * 1024;
+let otherStream: StreamCapture | undefined;
+
+beforeEach(() => {
+  otherStream = new StreamCapture(1);
+});
+
+function setupSpans(
+  mask?: MaskFn,
+  maxAttributeLength?: number,
+  batch: TelemetryOptions["batch"] = { maxStreamBytes: STREAM_LIMIT + 1 },
+): InMemorySpanExporter {
   const spanExporter = new InMemorySpanExporter();
 
   const options: TelemetryOptions = {
@@ -99,6 +114,7 @@ function setupSpans(mask?: MaskFn, maxAttributeLength?: number): InMemorySpanExp
     logLevel: "silent",
     mask,
     fetch: async () => new Response(null, { status: 200 }),
+    batch,
   };
 
   if (maxAttributeLength !== undefined) options.maxAttributeLength = maxAttributeLength;
@@ -306,6 +322,7 @@ function prototypeMethod<T extends object>(target: T, key: string) {
 }
 
 afterEach(async () => {
+  otherStream?.release();
   uninstrumentOpenRouter();
   await shutdown();
   vi.restoreAllMocks();
@@ -694,6 +711,85 @@ test.each(["chat", "responses"])("%s timestamps precede telemetry mapping", asyn
   });
 });
 
+test.each(["chat", "responses"])(
+  "%s streams record no chunk after the terminal event ends the span",
+  async (operation) => {
+    const spans = setupSpans();
+    let lateReads = 0;
+
+    const chunks =
+      operation === "chat"
+        ? [
+            { choices: [{ index: 0, delta: { role: "assistant", content: "Kept" } }] },
+            { choices: [], error: { code: 502, message: "upstream disconnected" } },
+          ]
+        : [
+            {
+              type: "response.completed",
+              response: {
+                id: "resp_terminal",
+                status: "completed",
+                output: [
+                  {
+                    type: "message",
+                    role: "assistant",
+                    content: [{ type: "output_text", text: "Kept" }],
+                  },
+                ],
+              },
+            },
+          ];
+
+    // The span ended and gave its bytes back, so a chunk after the terminal one must not be read.
+    const late =
+      operation === "chat"
+        ? {
+            get choices() {
+              lateReads += 1;
+
+              return [{ index: 0, delta: { content: "late" } }];
+            },
+          }
+        : {
+            get type() {
+              lateReads += 1;
+
+              return "response.output_text.delta";
+            },
+            delta: "late",
+          };
+
+    const source = new ReadableStream({
+      start(controller) {
+        for (const chunk of [...chunks, late]) controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+
+    const client = wrapOpenRouter({
+      chat: { send: async (_params: unknown) => source },
+      responses: { send: async (_params: unknown) => source },
+      embeddings: {},
+    });
+
+    const stream =
+      operation === "chat"
+        ? await client.chat.send({
+            chatRequest: { model: "openai/gpt-4o", messages: [], stream: true },
+          })
+        : await client.responses.send({
+            responsesRequest: { model: "openai/gpt-4o", input: "Hi", stream: true },
+          });
+
+    const received = await collectStream(stream);
+    const span = await exportedSpan(spans);
+    expect(lateReads).toBe(0);
+    expect(received.slice(0, -1)).toEqual(chunks);
+    expect(received.at(-1)).toBe(late);
+    expect(String(span.attributes["gen_ai.output.messages"])).toContain("Kept");
+  },
+);
+
 test("consumed chat streams remain readable, reconstruct tool calls, and use final usage without request mutation", async () => {
   const spans = setupSpans();
 
@@ -846,6 +942,39 @@ async function streamedChatSpan(
 
   return exportedSpan(spans);
 }
+
+// Each 1 MiB content delta costs 16 bytes more than its text, and the role 25 bytes. Fifteen
+// deltas fit in MAX_RECORD_BYTES, the sixteenth does not, so the cut stream keeps 15 MiB.
+test.each([
+  [64 * 1024, false],
+  [MAX_RECORD_BYTES, true],
+] as const)(
+  "with the default bounds a chat stream of %s text bytes is cut: %s",
+  async (length, cut) => {
+    otherStream?.release();
+    const spans = setupSpans(undefined, undefined, {});
+    const piece = "x".repeat(1024 * 1024);
+
+    const deltas = Array.from({ length: Math.ceil(length / piece.length) }, (_, index) => {
+      const content = piece.slice(0, Math.min(piece.length, length - index * piece.length));
+
+      return chatChunk(
+        "stream_default",
+        index === 0 ? { role: "assistant", content } : { content },
+      );
+    });
+
+    const span = await streamedChatSpan(spans, [
+      ...deltas,
+      chatChunk("stream_default", {}, { finishReason: "stop" }),
+    ]);
+
+    const output = jsonAttr<Array<{ content?: string }>>(span, "gen_ai.output.messages");
+
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(cut ? true : undefined);
+    expect(output[0]?.content?.length).toBe(cut ? MAX_RECORD_BYTES - 1024 * 1024 : length);
+  },
+);
 
 test.each([0, 100, 1024 * 1024])(
   "chat stream past the fixed bound is flagged and withheld from a mask (maxAttributeLength %i)",

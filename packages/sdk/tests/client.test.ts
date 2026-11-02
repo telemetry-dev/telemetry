@@ -8,9 +8,11 @@ import {
   flush,
   init,
   log,
+  MAX_RECORD_BYTES,
   observe,
   shutdown,
   startSpan,
+  StreamCapture,
   type TelemetryOptions,
 } from "../src/index.ts";
 import { setup } from "./helpers.ts";
@@ -63,6 +65,56 @@ test.each([-1, 1.5, Number.NaN, Number.NEGATIVE_INFINITY])(
     expect(logged).not.toHaveBeenCalled();
   },
 );
+
+test.each([
+  ["maxStreamBytes", 1.5],
+  ["maxStreamBytes", Number.NaN],
+  ["maxStreamBytes", -1],
+  ["maxQueueBytes", -1],
+])("invalid batch.%s %s fails open through onError", (key, value) => {
+  const errors: Error[] = [];
+
+  const client = init({
+    apiKey: "td_live_test",
+    batch: { [key]: value },
+    onError: (error) => errors.push(error),
+    logLevel: "silent",
+  });
+
+  expect(client.enabled).toBe(false);
+  expect(errors).toHaveLength(1);
+  expect(errors[0]).toBeInstanceOf(RangeError);
+  expect(errors[0]?.message).toContain(key);
+});
+
+test("batch.maxStreamBytes Infinity is no bound on the streams in flight", () => {
+  setup({ batch: { maxStreamBytes: Number.POSITIVE_INFINITY } });
+  // Past the default bound of 64 MiB, so with it a new stream would get no room.
+  const others = new StreamCapture(70 * 1024 * 1024);
+
+  try {
+    expect(new StreamCapture().limit).toBe(MAX_RECORD_BYTES);
+  } finally {
+    others.release();
+  }
+});
+
+test("batch.maxQueueBytes Infinity is no bound on the queued spans", async () => {
+  const errors: Error[] = [];
+  const { spans } = setup({
+    exportMode: "batched",
+    batch: { scheduledDelayMillis: 1_000_000, maxQueueBytes: Number.POSITIVE_INFINITY },
+    onError: (error) => errors.push(error),
+  });
+  // One string held by five spans: 70 MiB in the queue, past the default bound of 64 MiB.
+  const payload = "q".repeat(14 * 1024 * 1024);
+
+  for (let i = 0; i < 5; i += 1) startSpan("queued", { attributes: { payload } }).end();
+  await flush();
+
+  expect(spans.getFinishedSpans()).toHaveLength(5);
+  expect(errors).toEqual([]);
+});
 
 test("null maxAttributeLength sends values whole for untyped callers", async () => {
   const untypedOptions: TelemetryOptions = JSON.parse('{"maxAttributeLength":null}');

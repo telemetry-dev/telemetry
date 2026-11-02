@@ -11,9 +11,15 @@ from opentelemetry.sdk.trace.export import (
     SpanExporter,
 )
 
+from ._capture import DEFAULT_MAX_STREAM_BYTES, stream_budget
 from ._config import report_error
 from ._context import propagated_attributes
-from ._export import DEFAULT_MAX_QUEUE_BYTES, ExportQueueBudget, after_export
+from ._export import (
+    DEFAULT_MAX_QUEUE_BYTES,
+    ExportQueueBudget,
+    after_export,
+    resolve_byte_bound,
+)
 from ._metrics import MetricsRecorder
 
 ExportMode = Literal["batched", "immediate"]
@@ -30,12 +36,19 @@ class StampingSpanProcessor(SpanProcessor):
         max_export_batch_size: int = 64,
         schedule_delay_millis: float = 1000,
         max_queue_size: int = 2048,
-        max_queue_bytes: int = DEFAULT_MAX_QUEUE_BYTES,
+        max_queue_bytes: float | None = DEFAULT_MAX_QUEUE_BYTES,
+        max_stream_bytes: float | None = DEFAULT_MAX_STREAM_BYTES,
         export_timeout_millis: float = 30000,
         span_filter: Callable[[ReadableSpan], bool] | None = None,
         metrics_recorder: MetricsRecorder | None = None,
         on_error: Callable[[BaseException], None] | None = None,
     ) -> None:
+        max_queue_bytes = resolve_byte_bound(
+            "max_queue_bytes", max_queue_bytes, DEFAULT_MAX_QUEUE_BYTES
+        )
+        stream_budget.max_bytes = resolve_byte_bound(
+            "max_stream_bytes", max_stream_bytes, DEFAULT_MAX_STREAM_BYTES
+        )
         self._span_filter = span_filter
         self._metrics_recorder = metrics_recorder
         self._on_error = on_error

@@ -137,6 +137,29 @@ def test_create_span_exporter_posts_traces_with_bearer_gzip() -> None:
         assert request.headers["content-encoding"] == "gzip"
 
 
+@pytest.mark.parametrize("option", ["max_queue_bytes", "max_stream_bytes"])
+def test_an_invalid_byte_bound_reaches_on_error_and_the_processor_exports_nothing(
+    option: str,
+) -> None:
+    errors: list[BaseException] = []
+    exporter = InMemorySpanExporter()
+    options: dict[str, Any] = {option: -1}
+    processor = TelemetrySpanProcessor(
+        exporter, export_mode="immediate", on_error=errors.append, **options
+    )
+    provider = provider_with(processor)
+    try:
+        end_span(provider, "invalid")
+        assert processor.force_flush() is True
+    finally:
+        provider.shutdown()
+
+    assert exporter.get_finished_spans() == ()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert option in str(errors[0])
+
+
 def test_no_posts_keyless_even_with_base_url_env(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

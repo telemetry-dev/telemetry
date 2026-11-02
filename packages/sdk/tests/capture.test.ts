@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   boundedCapture,
   boundedCaptureDetails,
+  MAX_RECORD_BYTES,
   truncate,
   TRUNCATION_MARKER,
 } from "../src/capture.ts";
@@ -185,7 +186,25 @@ describe("boundedCapture", () => {
     const input = Array.from({ length: 1_100 }, () => "oversized");
     input.push("kept");
 
-    expect(boundedCapture(input, { maxBytes: 10 })).toEqual({
+    expect(boundedCapture(input, { maxBytes: 10, maxItems: 1_000 })).toEqual({
+      value: [],
+      truncated: true,
+    });
+    expect(boundedCapture(input, { maxBytes: 10, maxItems: 2_000 })).toEqual({
+      value: ["kept"],
+      truncated: true,
+    });
+    // By default as many values as maxBytes are visited, also the holes of a sparse array.
+    expect(boundedCapture(input, { maxBytes: 10 })).toEqual({ value: [], truncated: true });
+    expect(boundedCapture(new Array(1_000_000_000), { maxBytes: 100 })).toEqual({
+      value: [],
+      truncated: true,
+    });
+    // 30 units that need 62 bytes: each is scanned before it is rejected, and the second one
+    // takes the scanned characters past maxBytes.
+    const wide = "é".repeat(30);
+
+    expect(boundedCapture([wide, wide, wide, "kept"], { maxBytes: 50 })).toEqual({
       value: [],
       truncated: true,
     });
@@ -195,11 +214,44 @@ describe("boundedCapture", () => {
     );
 
     skipped.kept = 1;
+    const skip = (key: string) => key.startsWith("skip");
 
-    expect(boundedCapture(skipped, { skip: (key) => key.startsWith("skip") })).toEqual({
+    expect(boundedCapture(skipped, { skip, maxItems: 1_000 })).toEqual({
       value: {},
       truncated: true,
     });
+    expect(boundedCapture(skipped, { skip })).toEqual({ value: { kept: 1 }, truncated: false });
+  });
+
+  test("keeps a value whole up to MAX_RECORD_BYTES of JSON by default", () => {
+    const fits = "x".repeat(MAX_RECORD_BYTES - 2);
+
+    expect(boundedCaptureDetails(fits)).toEqual({
+      value: fits,
+      truncated: false,
+      bytes: MAX_RECORD_BYTES,
+      items: 1,
+    });
+    expect(boundedCapture([fits]).truncated).toBe(true);
+  });
+
+  test("visits no more values once its bytes are spent", () => {
+    const text = "x".repeat(100);
+    const input: Record<string, unknown> = { a: text };
+
+    for (let index = 0; index < 1_000; index += 1) input[`late${index}`] = 0;
+
+    // Braces, the key "a" with its colon, and the quoted text.
+    expect(boundedCaptureDetails(input, { maxBytes: 2 + 4 + 102 })).toEqual({
+      value: { a: text },
+      truncated: true,
+      bytes: 108,
+      items: 2,
+    });
+    // Brackets and the quoted text.
+    expect(
+      boundedCaptureDetails([text, ...Array.from({ length: 1_000 }, () => 0)], { maxBytes: 104 }),
+    ).toEqual({ value: [text], truncated: true, bytes: 104, items: 2 });
   });
 
   test("counts inherited enumerable properties toward the traversal cap", () => {

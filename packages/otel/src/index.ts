@@ -58,7 +58,7 @@ export {
 
 export { StampingSpanProcessor, type StampingProcessorOptions } from "./processor.ts";
 
-export { ExportQueueBudget } from "./queue.ts";
+export { ExportQueueBudget, MAX_RECORD_BYTES, StreamCapture } from "./queue.ts";
 
 export {
   sessionIdOf,

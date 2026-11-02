@@ -266,7 +266,8 @@ def _bounded_capture(value: Any, capture: Literal["input", "output"]) -> tuple[A
     )
     if not enabled:
         return None, False
-    # Fixed retention bound; the core applies max_attribute_length after the mask.
+    # A value past the record bound (MAX_RECORD_BYTES) is not kept; the core applies
+    # max_attribute_length after the mask.
     budget = telemetry_dev.CaptureBudget()
     return (value if budget.accept(value) else None), budget.truncated
 

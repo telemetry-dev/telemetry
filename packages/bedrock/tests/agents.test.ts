@@ -10,6 +10,7 @@ import {
 } from "@aws-sdk/client-bedrock-agent-runtime";
 import type { Attributes } from "@opentelemetry/api";
 import { SamplingDecision } from "@opentelemetry/sdk-trace-base";
+import { MAX_RECORD_BYTES } from "@telemetry-dev/sdk";
 import { afterEach, expect, test } from "vitest";
 
 import {
@@ -607,10 +608,17 @@ test("masked InvokeAgent keeps complete return control after the text bound", as
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual({ returnControl });
 });
 
-test.each([
-  ["bytes", [{ apiInvocationInput: { actionGroup: "x".repeat(60_000) } }]],
-  ["items", Array.from({ length: 1_500 }, () => ({ function: "f" }))],
-])("masked InvokeAgent drops return control beyond its own %s bound", async (_, inputs) => {
+// Return control whose JSON is one byte past MAX_RECORD_BYTES, the bound of its own check.
+const oversizedReturnControl = (() => {
+  const shape = (actionGroup: string) => ({
+    invocationId: "inv-oversized",
+    invocationInputs: [{ apiInvocationInput: { actionGroup } }],
+  });
+
+  return shape("x".repeat(MAX_RECORD_BYTES - JSON.stringify(shape("")).length + 1));
+})();
+
+test("masked InvokeAgent drops return control beyond its own bytes bound", async () => {
   const seen: string[] = [];
 
   const spans = setup({
@@ -626,7 +634,7 @@ test.each([
       {
         completion: streamOf([
           { chunk: { bytes: bytes("Short answer") } },
-          { returnControl: { invocationId: "inv-oversized", invocationInputs: inputs } },
+          { returnControl: oversizedReturnControl },
         ]),
       },
     ]),
@@ -645,6 +653,34 @@ test.each([
   expect(
     seen.some((value) => value.includes("inv-oversized") || value.includes("Short answer")),
   ).toBe(false);
+});
+
+test("masked InvokeAgent keeps return control of more than 1,000 items whole", async () => {
+  const returnControl = {
+    invocationId: "inv-many",
+    invocationInputs: Array.from({ length: 1_500 }, () => ({ function: "f" })),
+  };
+
+  const spans = setup({ mask: (value) => value });
+
+  const client = wrapBedrockAgents(
+    new FakeClient([
+      {
+        completion: streamOf([{ chunk: { bytes: bytes("Short answer") } }, { returnControl }]),
+      },
+    ]),
+  );
+
+  const response = (await client.send(
+    new InvokeAgentCommand({ agentId: "agent-1", agentAliasId: "a", sessionId: "s" }),
+  )) as { completion: AsyncIterable<unknown> };
+
+  await collect(response.completion);
+
+  const [span] = spans.getFinishedSpans();
+  expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  expect(span.attributes["td.metadata.return_control"]).toBe("true");
+  expect(jsonAttr(span, "gen_ai.output.messages")).toEqual({ returnControl });
 });
 
 test("Rerank captures queries, sources, model, ranking, and pagination metadata", async () => {
@@ -717,29 +753,32 @@ test("Rerank captures queries, sources, model, ranking, and pagination metadata"
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual(results);
 });
 
+// Rerank sources and results whose JSON passes MAX_RECORD_BYTES, the default capture bound.
+const MEBIBYTE_TEXT = "x".repeat(1024 * 1024);
+
+const largeSources = Array.from({ length: 17 }, (_, index) => ({
+  type: "INLINE" as const,
+  inlineDocumentSource: {
+    type: "TEXT" as const,
+    textDocument: { text: `source-${index}:${MEBIBYTE_TEXT}` },
+  },
+}));
+
+const largeResults = Array.from({ length: 17 }, (_, index) => ({
+  index,
+  relevanceScore: 1 / (index + 1),
+  document: { type: "TEXT", textDocument: { text: `result-${index}:${MEBIBYTE_TEXT}` } },
+}));
+
 test("Rerank bounds large source and result captures while preserving counts", async () => {
   const spans = setup();
 
-  const sources = Array.from({ length: 2_000 }, (_, index) => ({
-    type: "INLINE" as const,
-    inlineDocumentSource: {
-      type: "TEXT" as const,
-      textDocument: { text: `source-${index}:${"x".repeat(1_000)}` },
-    },
-  }));
-
-  const results = Array.from({ length: 2_000 }, (_, index) => ({
-    index,
-    relevanceScore: 1 / (index + 1),
-    document: { type: "TEXT", textDocument: { text: `result-${index}:${"y".repeat(1_000)}` } },
-  }));
-
-  const client = wrapBedrockAgents(new FakeClient([{ results }]));
+  const client = wrapBedrockAgents(new FakeClient([{ results: largeResults }]));
 
   await client.send(
     new RerankCommand({
       queries: [{ type: "TEXT", textQuery: { text: "observability" } }],
-      sources,
+      sources: largeSources,
       rerankingConfiguration: {
         type: "BEDROCK_RERANKING_MODEL",
         bedrockRerankingConfiguration: {
@@ -755,11 +794,24 @@ test("Rerank bounds large source and result captures while preserving counts", a
   const input = jsonAttr(span, "gen_ai.input.messages");
   const output = jsonAttr(span, "gen_ai.output.messages");
 
-  expect(input.sources.length).toBeLessThan(sources.length);
-  expect(output.length).toBeLessThan(results.length);
-  expect(JSON.stringify(input).length).toBeLessThanOrEqual(48 * 1_024);
-  expect(JSON.stringify(output).length).toBeLessThanOrEqual(48 * 1_024);
-  expect(span.attributes["td.metadata.result_count"]).toBe("2000");
+  const textsOf = (values: any[]): string[] =>
+    values.flatMap((value) => {
+      const text = (value.inlineDocumentSource ?? value.document).textDocument.text;
+
+      return text === undefined ? [] : [text];
+    });
+
+  const sameTexts = (kept: string[], sent: string[]) =>
+    kept.every((text, index) => text === sent[index]);
+
+  // Fifteen 1 MiB texts and their JSON fit in MAX_RECORD_BYTES; the sixteenth does not.
+  expect(textsOf(input.sources)).toHaveLength(15);
+  expect(sameTexts(textsOf(input.sources), textsOf(largeSources))).toBe(true);
+  expect(textsOf(output)).toHaveLength(15);
+  expect(sameTexts(textsOf(output), textsOf(largeResults))).toBe(true);
+  expect(JSON.stringify(input).length).toBeLessThanOrEqual(MAX_RECORD_BYTES);
+  expect(JSON.stringify(output).length).toBeLessThanOrEqual(MAX_RECORD_BYTES);
+  expect(span.attributes["td.metadata.result_count"]).toBe("17");
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
@@ -774,26 +826,12 @@ test("Rerank withholds captures cut to the retention bound from a mask", async (
     },
   });
 
-  const sources = Array.from({ length: 2_000 }, (_, index) => ({
-    type: "INLINE" as const,
-    inlineDocumentSource: {
-      type: "TEXT" as const,
-      textDocument: { text: `source-${index}:${"x".repeat(1_000)}` },
-    },
-  }));
-
-  const results = Array.from({ length: 2_000 }, (_, index) => ({
-    index,
-    relevanceScore: 1 / (index + 1),
-    document: { type: "TEXT", textDocument: { text: `result-${index}:${"y".repeat(1_000)}` } },
-  }));
-
-  const client = wrapBedrockAgents(new FakeClient([{ results }]));
+  const client = wrapBedrockAgents(new FakeClient([{ results: largeResults }]));
 
   await client.send(
     new RerankCommand({
       queries: [{ type: "TEXT", textQuery: { text: "observability" } }],
-      sources,
+      sources: largeSources,
       rerankingConfiguration: {
         type: "BEDROCK_RERANKING_MODEL",
         bedrockRerankingConfiguration: {
@@ -811,7 +849,7 @@ test("Rerank withholds captures cut to the retention bound from a mask", async (
   expect(keys).not.toContain("gen_ai.output.messages");
   expect(span.attributes["gen_ai.input.messages"]).toBeUndefined();
   expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
-  expect(span.attributes["td.metadata.result_count"]).toBe("2000");
+  expect(span.attributes["td.metadata.result_count"]).toBe("17");
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
 
@@ -829,20 +867,12 @@ test("Rerank without a mask passes cut input to the sampler", async () => {
     },
   });
 
-  const sources = Array.from({ length: 2_000 }, (_, index) => ({
-    type: "INLINE" as const,
-    inlineDocumentSource: {
-      type: "TEXT" as const,
-      textDocument: { text: `source-${index}:${"x".repeat(1_000)}` },
-    },
-  }));
-
   const client = wrapBedrockAgents(new FakeClient([{ results: [] }]));
 
   await client.send(
     new RerankCommand({
       queries: [{ type: "TEXT", textQuery: { text: "observability" } }],
-      sources,
+      sources: largeSources,
       rerankingConfiguration: {
         type: "BEDROCK_RERANKING_MODEL",
         bedrockRerankingConfiguration: {

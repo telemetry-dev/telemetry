@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from collections.abc import Callable, Generator
 from types import SimpleNamespace
 from typing import Any
@@ -16,6 +17,12 @@ import telemetry_dev_bedrock
 MakeClient = Callable[..., SimpleNamespace]
 
 
+# Another stream holds a byte of the shared stream budget, and make() sizes that budget at
+# STREAM_LIMIT + 1, so each test stream keeps at most STREAM_LIMIT, the old fixed stream bound.
+STREAM_LIMIT = 48 * 1024
+other_stream: telemetry_dev.CaptureBudget = telemetry_dev.CaptureBudget()
+
+
 @pytest.fixture(autouse=True)
 def isolate_sdk(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
     for var in (
@@ -26,7 +33,13 @@ def isolate_sdk(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
     ):
         monkeypatch.delenv(var, raising=False)
     telemetry_dev_bedrock.uninstrument_bedrock()
+    # A stream that an earlier test left unfinished holds its bytes until it is collected.
+    gc.collect()
+    global other_stream
+    other_stream = telemetry_dev.CaptureBudget.for_stream()
+    other_stream.bytes_used = 1
     yield
+    other_stream.release()
     telemetry_dev_bedrock.uninstrument_bedrock()
     telemetry_dev.shutdown()
 
@@ -48,6 +61,7 @@ def make() -> MakeClient:
             "environment": "test",
             "log_level": "silent",
             "disable_atexit": True,
+            "max_stream_bytes": STREAM_LIMIT + 1,
         }
         options.update(kwargs)
         client = telemetry_dev.init(**options)

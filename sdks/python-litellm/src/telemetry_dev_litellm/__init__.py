@@ -9,6 +9,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from functools import wraps
 from inspect import Parameter
+from io import StringIO
 from typing import Any, TypeVar, cast
 
 import litellm
@@ -30,8 +31,8 @@ _PENDING_CLOSE_TASKS: set[asyncio.Future[Any]] = set()
 _installed = False
 _install_lock = threading.Lock()
 _OMIT = object()
-# Retention uses fixed bounds; the core applies max_attribute_length after the mask.
-_STREAM_CAPTURE_MAX_BYTES = 48 * 1024
+# The core applies max_attribute_length after the mask. More choices, or more responses items
+# and rejected parts tracked for truncation, than this are not kept.
 _STREAM_CAPTURE_MAX_ITEMS = 1000
 # Retained finish reasons stay outside the output budget so a terminal one is still exported,
 # so each is capped instead.
@@ -109,7 +110,37 @@ def _native(value: Any) -> Any:
 
 
 def _stream_capture_budget() -> telemetry_dev.CaptureBudget:
-    return telemetry_dev.CaptureBudget(_STREAM_CAPTURE_MAX_BYTES, _STREAM_CAPTURE_MAX_ITEMS)
+    # Older cores have no for_stream and bound each budget at 64 KiB on its own.
+    for_stream = getattr(telemetry_dev.CaptureBudget, "for_stream", None)
+    budget = for_stream() if callable(for_stream) else telemetry_dev.CaptureBudget()
+    return cast(telemetry_dev.CaptureBudget, budget)
+
+
+def _release_budget(budget: telemetry_dev.CaptureBudget) -> None:
+    release = getattr(budget, "release", None)
+    if callable(release):
+        release()
+
+
+def _reserve_bytes(budget: telemetry_dev.CaptureBudget, total: int) -> bool:
+    # Older cores have no reserve_bytes; there the caller's check against max_bytes stands.
+    reserve = getattr(budget, "reserve_bytes", None)
+    if callable(reserve):
+        return bool(reserve(total))
+    budget.bytes_used = total
+    return True
+
+
+def _adopt_budget(
+    stream: telemetry_dev.CaptureBudget, measured: telemetry_dev.CaptureBudget
+) -> bool:
+    """Takes the counts of a budget that measured a replacement into the stream's own budget,
+    which holds the bytes in the stream budget. Returns False, and takes nothing, when another
+    stream took the room after the measure."""
+    if not _reserve_bytes(stream, measured.bytes_used):
+        return False
+    stream.items_used = measured.items_used
+    return True
 
 
 def _capture_masked(handle: telemetry_dev.SpanHandle) -> bool:
@@ -146,7 +177,9 @@ def _bounded_responses_native(
         ):
             active_budget.truncated = True
             raise _CaptureLimit
-        active_budget.bytes_used += byte_count
+        if not _reserve_bytes(active_budget, active_budget.bytes_used + byte_count):
+            active_budget.truncated = True
+            raise _CaptureLimit
         active_budget.items_used += item_count
 
     def convert(item: Any, item_type: str | None, depth: int) -> Any:
@@ -1016,7 +1049,9 @@ class _InstrumentedStream:
                 response_id=response_id,
                 response_model=response_model,
             )
-        if self._budget.accept(chunk):
+        # A chunk object keeps its delta fields where the budget does not walk, so the budget
+        # measures its JSON copy.
+        if not self._budget.truncated and self._budget.accept(_native(chunk)):
             self._chunks.append(chunk)
 
     def _finish(self, error: BaseException | None = None) -> None:
@@ -1079,7 +1114,10 @@ class _InstrumentedStream:
             fields["error"] = error
             if self._request_provider is None and fields.get("provider") is None:
                 fields["provider"] = _provider_from_error(error)
-        self._end(**fields)
+        try:
+            self._end(**fields)
+        finally:
+            _release_budget(self._budget)
 
     def close(self) -> None:
         self._finish()
@@ -1268,10 +1306,11 @@ class _InstrumentedResponsesStream:
     def _materialize_partial(self, value: dict[str, Any]) -> dict[str, Any]:
         if "_field" not in value:
             return value
+        # Each partial value with a "_field" is created with a StringIO under "_fragments".
         field = cast(str, value["_field"])
-        fragments = cast(list[str], value["_fragments"])
+        fragments = cast(StringIO, value["_fragments"])
         return {key: item for key, item in value.items() if key not in {"_field", "_fragments"}} | {
-            field: "".join(fragments)
+            field: fragments.getvalue()
         }
 
     def _set_completed_item(self, key: object, value: Any) -> None:
@@ -1316,7 +1355,7 @@ class _InstrumentedResponsesStream:
         budget.bytes_used = max(0, self._budget.bytes_used - removed_bytes)
         budget.items_used = max(0, self._budget.items_used - removed_items)
         before = (budget.bytes_used, budget.items_used)
-        if not budget.accept(value):
+        if not budget.accept(value) or not _adopt_budget(self._budget, budget):
             return False
         for key in keys:
             self._charges.pop(key, None)
@@ -1324,7 +1363,6 @@ class _InstrumentedResponsesStream:
             budget.bytes_used - before[0],
             budget.items_used - before[1],
         )
-        self._budget = budget
         self._budget.truncated = bool(self._truncated_items) or self._truncation_overflow
         return True
 
@@ -1347,7 +1385,7 @@ class _InstrumentedResponsesStream:
         budget.items_used = max(0, self._budget.items_used - removed_items)
         before = (budget.bytes_used, budget.items_used)
         converted, budget = _bounded_responses_native(value, budget=budget)
-        if converted is None or budget.truncated:
+        if converted is None or budget.truncated or not _adopt_budget(self._budget, budget):
             return False, None
         for key in keys:
             self._charges.pop(key, None)
@@ -1355,7 +1393,6 @@ class _InstrumentedResponsesStream:
             budget.bytes_used - before[0],
             budget.items_used - before[1],
         )
-        self._budget = budget
         self._budget.truncated = bool(self._truncated_items) or self._truncation_overflow
         return True, converted
 
@@ -1366,12 +1403,14 @@ class _InstrumentedResponsesStream:
             self._budget.truncated = True
             return False
         if storage_key not in self._charges:
-            candidate = self._materialize_partial({**target, "_fragments": [delta]})
+            candidate = self._materialize_partial({**target, "_fragments": StringIO(delta)})
             return self._replace_charge([], candidate, storage_key)
         if self._budget.items_used >= self._budget.max_items:
             self._budget.truncated = True
             return False
-        self._budget.bytes_used += delta_bytes
+        if not _reserve_bytes(self._budget, self._budget.bytes_used + delta_bytes):
+            self._budget.truncated = True
+            return False
         self._budget.items_used += 1
         charged_bytes, charged_items = self._charges[storage_key]
         self._charges[storage_key] = (charged_bytes + delta_bytes, charged_items + 1)
@@ -1399,16 +1438,16 @@ class _InstrumentedResponsesStream:
             keys = self._truncated_item_keys[owner]
             if key in keys:
                 return
-            if self._truncated_key_count < self._budget.max_items:
+            if self._truncated_key_count < _STREAM_CAPTURE_MAX_ITEMS:
                 keys.add(key)
                 self._truncated_key_count += 1
             else:
                 self._truncation_overflow = True
             return
-        if self._retained_item_count < self._budget.max_items:
+        if self._retained_item_count < _STREAM_CAPTURE_MAX_ITEMS:
             self._truncated_items.add(owner)
             self._retained_item_count += 1
-            if self._truncated_key_count < self._budget.max_items:
+            if self._truncated_key_count < _STREAM_CAPTURE_MAX_ITEMS:
                 self._truncated_item_keys[owner] = {key}
                 self._truncated_key_count += 1
             else:
@@ -1494,7 +1533,7 @@ class _InstrumentedResponsesStream:
                             **(target or {}),
                             "type": "output_text" if field == "text" else "refusal",
                             "_field": field,
-                            "_fragments": [],
+                            "_fragments": StringIO(),
                         }
                 elif event_type in {
                     "response.reasoning_summary_text.delta",
@@ -1523,7 +1562,7 @@ class _InstrumentedResponsesStream:
                             **(target or {}),
                             "type": kind,
                             "_field": field,
-                            "_fragments": [],
+                            "_fragments": StringIO(),
                         }
                 elif event_type in {
                     "response.function_call_arguments.delta",
@@ -1545,7 +1584,7 @@ class _InstrumentedResponsesStream:
                             **(seeded if isinstance(seeded, dict) else {}),
                             "type": event_kind[0],
                             "_field": event_kind[1],
-                            "_fragments": [],
+                            "_fragments": StringIO(),
                         }
                         item_id = _string(_field(event, "item_id"))
                         if item_id is not None:
@@ -1555,12 +1594,13 @@ class _InstrumentedResponsesStream:
                             if value is not None:
                                 target[field] = value
                 if target is not None:
-                    fragments = cast(list[str], target["_fragments"])
+                    # Every target above is created with a StringIO under "_fragments".
+                    fragments = cast(StringIO, target["_fragments"])
                     accepted = not self._delta_rejected_before(storage_key) and self._append_delta(
                         storage_key, target, delta
                     )
                     if accepted:
-                        fragments.append(delta)
+                        fragments.write(delta)
                         self._remember_item_index(event, item_key)
                         if event_type in {
                             "response.function_call_arguments.delta",
@@ -1731,11 +1771,16 @@ class _InstrumentedResponsesStream:
         )
         if response is not None and self._capture_output:
             terminal_output, terminal_budget = _bounded_responses_native(
-                _field(response, "output"), budget=_stream_capture_budget()
+                _field(response, "output"),
+                budget=telemetry_dev.CaptureBudget(self._budget.max_bytes, self._budget.max_items),
             )
-            if terminal_output is not None and not terminal_budget.truncated:
+            if (
+                terminal_output is not None
+                and not terminal_budget.truncated
+                and _adopt_budget(self._budget, terminal_budget)
+            ):
                 fields["output"] = terminal_output
-                self._budget = terminal_budget
+                self._budget.truncated = False
                 self._retained_item_count -= len(self._truncated_items)
                 self._truncated_items.clear()
                 self._truncated_item_keys.clear()
@@ -1755,7 +1800,10 @@ class _InstrumentedResponsesStream:
             fields["error"] = error
             if self._request_provider is None:
                 fields["provider"] = _provider_from_error(error)
-        self._end(**fields)
+        try:
+            self._end(**fields)
+        finally:
+            _release_budget(self._budget)
 
     def close(self) -> None:
         self._finish()

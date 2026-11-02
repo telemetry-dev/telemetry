@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any, cast
 
+import conftest
 import httpx
 import pytest
 import telemetry_dev
+from conftest import STREAM_LIMIT
 from openrouter import OpenRouter
 from openrouter.chat import Chat
 from openrouter.components import (
@@ -710,6 +713,34 @@ def test_chat_stream_capture_is_bounded_without_losing_terminal_metadata(
     assert a["gen_ai.usage.cost"] == 0.04
 
 
+ONE_MIB = 1024 * 1024
+ONE_MIB_TEXT = "x" * ONE_MIB
+
+
+@pytest.mark.parametrize(
+    ("length", "cut"), [(64 * 1024, False), (telemetry_dev.MAX_RECORD_BYTES, True)]
+)
+def test_with_the_default_bounds_a_chat_stream_is_cut_only_at_the_record_bound(
+    make: Any, length: int, cut: bool
+) -> None:
+    assert conftest.other_stream is not None
+    conftest.other_stream.release()
+    memory = make(max_stream_bytes=64 * 1024 * 1024)
+    pieces = [ONE_MIB_TEXT[: min(ONE_MIB, length - start)] for start in range(0, length, ONE_MIB)]
+    events = [
+        *(chat_chunk({"role": "assistant", "content": piece}) for piece in pieces),
+        chat_chunk({}, finish_reason="stop"),
+    ]
+
+    a = _streamed_chat(memory, events)
+
+    content = json.loads(str(a["gen_ai.output.messages"]))[0]["content"]
+    # A chunk that does not fit is rejected whole, so the cut stream keeps 15 of 16 MiB.
+    assert len(content) == (length - ONE_MIB if cut else length)
+    assert set(content) == {"x"}
+    assert a.get("telemetry.dev.capture.truncated") is (True if cut else None)
+
+
 def _streamed_chat(memory: SimpleNamespace, events: list[dict[str, Any]]) -> dict[str, object]:
     def handler(request: httpx.Request) -> httpx.Response:
         return sse_response(events)
@@ -760,7 +791,7 @@ def test_configured_cap_applies_after_the_mask_not_to_stream_retention(
 
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize("max_attribute_length", [0, 100, 1024 * 1024])
-def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
+def test_stream_beyond_the_stream_bound_is_flagged_and_withheld_from_a_mask(
     make: Any, masked: bool, max_attribute_length: int
 ) -> None:
     seen: list[str] = []
@@ -785,10 +816,10 @@ def test_stream_beyond_the_fixed_bound_is_flagged_and_withheld_from_a_mask(
         assert "gen_ai.output.messages" not in a
         assert not any("x" * 100 in value for value in seen)
     elif max_attribute_length == 1024 * 1024:
-        # The 64 KiB retention bound, not the 1 MiB cap, cuts the stream at a chunk boundary.
+        # The stream bound, not the 1 MiB cap, cuts the stream at a chunk boundary.
         content = json.loads(str(a["gen_ai.output.messages"]))[0]["content"]
         assert set(content) == {"x"}
-        assert 0 < len(content) <= 64 * 1024
+        assert 0 < len(content) <= STREAM_LIMIT
         assert len(content) % 100 == 0
     else:
         assert len(str(a.get("gen_ai.output.messages", ""))) <= max_attribute_length
@@ -813,7 +844,7 @@ def test_masked_chat_stream_closed_early_withholds_partial_output(make: Any) -> 
 
 
 @pytest.mark.parametrize("max_attribute_length", [0, 100, 1024 * 1024])
-def test_masked_responses_stream_beyond_the_fixed_bound_is_withheld(
+def test_masked_responses_stream_beyond_the_stream_bound_is_withheld(
     make: Any, max_attribute_length: int
 ) -> None:
     seen: list[str] = []
@@ -1033,6 +1064,110 @@ async def test_async_stream_close_completes_under_cancellation(memory: SimpleNam
         await close_under_cancellation(stream)
 
     assert len(memory.span_exporter.get_finished_spans()) == 2
+
+
+def stream_room() -> int:
+    """The bytes a new stream may keep now; STREAM_LIMIT while only conftest.other_stream holds
+    stream bytes."""
+    probe = telemetry_dev.CaptureBudget.for_stream()
+    room = probe.max_bytes
+    probe.release()
+    return room
+
+
+def completed_response_event() -> dict[str, Any]:
+    return {"type": "response.completed", "sequence_number": 0, "response": responses_payload()}
+
+
+def text_delta_event(delta: str) -> dict[str, Any]:
+    return {
+        "type": "response.output_text.delta",
+        "sequence_number": 1,
+        "item_id": "msg_1",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": delta,
+        "logprobs": [],
+    }
+
+
+def open_stream(kind: str, events: list[dict[str, Any]]) -> Any:
+    client = wrap_open_router(sync_client(lambda _request: sse_response(events)))
+    if kind == "chat":
+        return cast(Any, client.chat.send)(
+            model="openai/gpt-4o-mini", messages=CHAT_MESSAGES, stream=True
+        )
+    return cast(Any, client.responses.send)(model="openai/gpt-4o-mini", input="hi", stream=True)
+
+
+def first_events(kind: str) -> list[dict[str, Any]]:
+    """Events whose first one keeps output and whose last one ends the span."""
+    if kind == "chat":
+        return chat_stream_events()
+    return [text_delta_event("Hello"), completed_response_event()]
+
+
+@pytest.mark.parametrize("kind", ["chat", "responses"])
+def test_a_stream_whose_span_ended_returns_its_bytes(memory: SimpleNamespace, kind: str) -> None:
+    stream = open_stream(kind, first_events(kind))
+    next(stream)
+    assert stream_room() < STREAM_LIMIT
+
+    list(stream)
+
+    # The stream is still referenced, so only the span end can have returned its bytes, and the
+    # next stream gets the whole room again.
+    assert len(memory.span_exporter.get_finished_spans()) == 1
+    assert stream_room() == STREAM_LIMIT
+
+
+@pytest.mark.parametrize("kind", ["chat", "responses"])
+def test_a_dropped_stream_returns_its_bytes_without_the_cycle_collector(
+    memory: SimpleNamespace, kind: str
+) -> None:
+    stream = open_stream(kind, first_events(kind))
+    # Consuming would keep the stream in a cycle with its own generator, so the bytes a consumed
+    # stream would keep are reserved directly.
+    budget = stream._budget if kind == "chat" else stream._state._budget
+    assert budget.accept("x" * 100)
+    del budget
+    assert stream_room() < STREAM_LIMIT
+
+    gc.disable()
+    try:
+        del stream
+        assert stream_room() == STREAM_LIMIT
+    finally:
+        gc.enable()
+
+
+def test_chat_chunks_after_an_ending_chunk_error_are_not_kept(memory: SimpleNamespace) -> None:
+    events = [
+        chat_chunk({"role": "assistant", "content": "Hel"}, error={"code": 502, "message": "x"}),
+        chat_chunk({"content": "y" * 1_000}),
+    ]
+    stream = open_stream("chat", events)
+    next(stream)
+    assert len(memory.span_exporter.get_finished_spans()) == 1
+    kept = stream._budget.bytes_used
+
+    next(stream)
+
+    assert stream._states[0].content == "Hel"
+    assert stream._budget.bytes_used == kept
+
+
+def test_responses_events_after_a_terminal_event_are_not_kept(memory: SimpleNamespace) -> None:
+    stream = open_stream("responses", [completed_response_event(), text_delta_event("y" * 1_000)])
+    next(stream)
+    assert len(memory.span_exporter.get_finished_spans()) == 1
+    kept = stream._state._budget.bytes_used
+    output = stream._state._output()
+
+    next(stream)
+
+    assert stream._state._output() == output
+    assert stream._state._budget.bytes_used == kept
 
 
 def test_responses_send_maps_fields(memory: SimpleNamespace) -> None:

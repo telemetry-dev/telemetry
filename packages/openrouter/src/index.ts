@@ -1,8 +1,10 @@
 import {
+  MAX_RECORD_BYTES,
   startSpan,
   type SpanFields,
   type SpanHandle,
   type StartSpanOptions,
+  StreamCapture,
 } from "@telemetry-dev/sdk";
 import * as telemetrySdk from "@telemetry-dev/sdk";
 import { activeContext } from "@telemetry-dev/otel";
@@ -14,8 +16,8 @@ const WRAPPED = Symbol("telemetry.dev.openrouter.wrapped");
 const ORIGINAL = Symbol("telemetry.dev.openrouter.original");
 const wrappedClients = new WeakSet<object>();
 const CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated";
-const MAX_STREAM_CAPTURE_BYTES = 64 * 1024;
-const MAX_STREAM_CAPTURE_ITEMS = 1024;
+// More choices than this are not kept, and the capture is marked cut.
+const MAX_STREAM_CHOICES = 1024;
 const MAX_STREAM_CAPTURE_DEPTH = 32;
 const STREAM_CAPTURE_ITEM_BYTES = 16;
 const FINISH_REASON_MAX_LENGTH = 128;
@@ -66,32 +68,45 @@ function jsonEscapedLength(codePoint: number): number {
     : 6;
 }
 
-class StreamCaptureBudget {
-  private bytesUsed = 0;
-  private itemsUsed = 0;
+/**
+ * The output bytes a stream keeps. A stream's own budget holds them in a StreamCapture, so the
+ * process-wide bound applies; preflight copies hold nothing and measure against its limit.
+ */
+class OutputBudget {
+  private used = 0;
   truncated = false;
+
+  constructor(
+    private readonly capture?: StreamCapture,
+    private readonly fixedLimit = MAX_RECORD_BYTES,
+  ) {}
+
+  private get bytesUsed(): number {
+    return this.used;
+  }
+
+  private set bytesUsed(bytes: number) {
+    this.used = bytes;
+    if (this.capture) this.capture.bytes = bytes;
+  }
+
+  private get limit(): number {
+    return this.capture?.limit ?? this.fixedLimit;
+  }
 
   accept<T>(value: T): boolean {
     if (this.truncated) return false;
 
     try {
-      const measured = this.measure(
-        value,
-        MAX_STREAM_CAPTURE_BYTES - this.bytesUsed,
-        MAX_STREAM_CAPTURE_ITEMS - this.itemsUsed,
-        0,
-        new Set(),
-      );
+      const measured = this.measure(value, this.limit - this.bytesUsed, 0, new Set());
 
-      if (!measured) {
+      if (measured === undefined) {
         this.truncated = true;
 
         return false;
       }
 
-      const [byteCount, itemCount] = measured;
-      this.bytesUsed += byteCount;
-      this.itemsUsed += itemCount;
+      this.bytesUsed += measured;
 
       return true;
     } catch {
@@ -102,16 +117,25 @@ class StreamCaptureBudget {
   }
 
   canAccept<T>(value: T): boolean {
-    const candidate = new StreamCaptureBudget();
-    candidate.bytesUsed = this.bytesUsed;
-    candidate.itemsUsed = this.itemsUsed;
+    const candidate = this.preflight();
+    candidate.used = this.used;
     candidate.truncated = this.truncated;
 
     return candidate.accept(value);
   }
 
+  /** A budget that starts empty and holds nothing, for a value that would replace this one's. */
+  preflight(): OutputBudget {
+    return new OutputBudget(undefined, this.limit);
+  }
+
+  /** A budget that starts empty and takes over this one's bytes once it accepts a value. */
+  successor(): OutputBudget {
+    return new OutputBudget(this.capture, this.limit);
+  }
+
   replace<T>(value: T): boolean {
-    const replacement = new StreamCaptureBudget();
+    const replacement = this.preflight();
 
     if (!replacement.accept(value)) {
       this.truncated = true;
@@ -119,30 +143,27 @@ class StreamCaptureBudget {
       return false;
     }
 
-    this.bytesUsed = replacement.bytesUsed;
-    this.itemsUsed = replacement.itemsUsed;
+    this.bytesUsed = replacement.used;
     this.truncated = false;
 
     return true;
   }
 
+  release(): void {
+    this.capture?.release();
+  }
+
   private measure<T>(
     value: T,
     remainingBytes: number,
-    remainingItems: number,
     depth: number,
     seen: Set<object>,
-  ): [number, number] | undefined {
-    if (
-      remainingBytes < STREAM_CAPTURE_ITEM_BYTES ||
-      remainingItems <= 0 ||
-      depth > MAX_STREAM_CAPTURE_DEPTH
-    ) {
+  ): number | undefined {
+    if (remainingBytes < STREAM_CAPTURE_ITEM_BYTES || depth > MAX_STREAM_CAPTURE_DEPTH) {
       return undefined;
     }
 
     let byteCount = STREAM_CAPTURE_ITEM_BYTES;
-    let itemCount = 1;
     const text = readString(value);
 
     if (text !== undefined) {
@@ -157,54 +178,40 @@ class StreamCaptureBudget {
         if (byteCount > remainingBytes) return undefined;
       }
 
-      return [byteCount, itemCount];
+      return byteCount;
     }
 
     const record = asRecord(value);
 
-    if (!record) return [byteCount, itemCount];
+    if (!record) return byteCount;
 
-    if (seen.has(record)) return [byteCount, itemCount];
+    if (seen.has(record)) return byteCount;
     seen.add(record);
     const values = asArray(value);
 
     if (values) {
       for (const child of values) {
-        const measured = this.measure(
-          child,
-          remainingBytes - byteCount,
-          remainingItems - itemCount,
-          depth + 1,
-          seen,
-        );
+        const measured = this.measure(child, remainingBytes - byteCount, depth + 1, seen);
 
-        if (!measured) return undefined;
-        byteCount += measured[0];
-        itemCount += measured[1];
+        if (measured === undefined) return undefined;
+        byteCount += measured;
       }
 
-      return [byteCount, itemCount];
+      return byteCount;
     }
 
     for (const key in record) {
       if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
 
       for (const part of [key, record[key]]) {
-        const measured = this.measure(
-          part,
-          remainingBytes - byteCount,
-          remainingItems - itemCount,
-          depth + 1,
-          seen,
-        );
+        const measured = this.measure(part, remainingBytes - byteCount, depth + 1, seen);
 
-        if (!measured) return undefined;
-        byteCount += measured[0];
-        itemCount += measured[1];
+        if (measured === undefined) return undefined;
+        byteCount += measured;
       }
     }
 
-    return [byteCount, itemCount];
+    return byteCount;
   }
 }
 
@@ -602,12 +609,12 @@ function endOnce(span: SpanHandle): (fields?: SpanFields) => void {
 function getChoiceState(
   states: Map<number, ChatChoiceState>,
   index: number,
-  budget: StreamCaptureBudget,
+  budget: OutputBudget,
 ): ChatChoiceState | undefined {
   let state = states.get(index);
 
   if (!state) {
-    if (states.size >= MAX_STREAM_CAPTURE_ITEMS) {
+    if (states.size >= MAX_STREAM_CHOICES) {
       budget.truncated = true;
 
       return undefined;
@@ -683,7 +690,7 @@ function chatPartialFields(
   states: Map<number, ChatChoiceState>,
   usage: SpanFields["usage"],
   costUsd: number | undefined,
-  budget: StreamCaptureBudget,
+  budget: OutputBudget,
   capture: { completed: boolean; maskOutput: boolean } = { completed: true, maskOutput: false },
 ): SpanFields {
   const finishReasons = [...states.entries()]
@@ -703,11 +710,7 @@ function chatPartialFields(
   return fields;
 }
 
-function recordChatChunk<T>(
-  chunk: T,
-  states: Map<number, ChatChoiceState>,
-  budget: StreamCaptureBudget,
-) {
+function recordChatChunk<T>(chunk: T, states: Map<number, ChatChoiceState>, budget: OutputBudget) {
   const c = asRecord(chunk) ?? {};
 
   for (const choice of asArray(c.choices) ?? []) {
@@ -785,6 +788,9 @@ function observeStream(
 ): ReadableStream<JsonValue> {
   let reader: ReadableStreamDefaultReader<JsonValue> | undefined;
   let released = false;
+  // The span ended at a terminal event and its bytes went back to the budget, so later chunks
+  // pass through unrecorded.
+  let terminated = false;
 
   const getReader = () => {
     reader ??= source.getReader();
@@ -813,9 +819,12 @@ function observeStream(
             return;
           }
 
-          const terminal = observer.record(result.value, receivedAt);
+          const terminal = terminated ? undefined : observer.record(result.value, receivedAt);
 
-          if (terminal) end(terminal);
+          if (terminal) {
+            terminated = true;
+            end(terminal);
+          }
           controller.enqueue(result.value);
         } catch (error) {
           release();
@@ -850,7 +859,7 @@ function createObservedChatStream(
   end: (fields?: SpanFields) => void,
 ): ReadableStream<JsonValue> {
   const states = new Map<number, ChatChoiceState>();
-  const budget = new StreamCaptureBudget();
+  const budget = new OutputBudget(new StreamCapture());
   let usage: SpanFields["usage"];
   let costUsd: number | undefined;
   let responseId: string | undefined;
@@ -949,7 +958,13 @@ function createObservedChatStream(
         return fields;
       },
     },
-    end,
+    (fields) => {
+      try {
+        end(fields);
+      } finally {
+        budget.release();
+      }
+    },
   );
 }
 
@@ -1073,7 +1088,7 @@ function syncResponsesItem(state: ResponsesOutputItemState): void {
 }
 
 function replaceResponsesOutput<T>(
-  budget: StreamCaptureBudget,
+  budget: OutputBudget,
   output: T,
   providerCapture: { truncated: boolean },
 ): boolean {
@@ -1099,7 +1114,7 @@ function recordResponsesEvent(
   event: JsonRecord,
   states: Map<number, ResponsesOutputItemState>,
   syntheticEvents: JsonRecord[],
-  budget: StreamCaptureBudget,
+  budget: OutputBudget,
   providerCapture: { truncated: boolean },
 ): boolean {
   const type = readString(event.type);
@@ -1109,7 +1124,7 @@ function recordResponsesEvent(
 
   if (type === "response.output_item.added" || type === "response.output_item.done") {
     const replacement = type.endsWith(".done");
-    const preflight = replacement ? new StreamCaptureBudget() : budget;
+    const preflight = replacement ? budget.preflight() : budget;
 
     if (!preflight.canAccept(event.item)) {
       budget.truncated = true;
@@ -1139,7 +1154,7 @@ function recordResponsesEvent(
 
   if (type === "response.content_part.added" || type === "response.content_part.done") {
     const replacement = type.endsWith(".done");
-    const preflight = replacement ? new StreamCaptureBudget() : budget;
+    const preflight = replacement ? budget.preflight() : budget;
 
     if (!preflight.canAccept(event.part)) {
       budget.truncated = true;
@@ -1278,7 +1293,7 @@ function recordResponsesEvent(
     type === "response.reasoning_summary_part.done"
   ) {
     const replacement = type.endsWith(".done");
-    const preflight = replacement ? new StreamCaptureBudget() : budget;
+    const preflight = replacement ? budget.preflight() : budget;
 
     if (!preflight.canAccept(event.part)) {
       budget.truncated = true;
@@ -1477,7 +1492,7 @@ function createObservedResponsesStream(
   const outputStates = new Map<number, ResponsesOutputItemState>();
   const syntheticEvents: JsonRecord[] = [];
   const providerCapture = { truncated: false };
-  let budget = new StreamCaptureBudget();
+  let budget = new OutputBudget(new StreamCapture());
   let sawFirst = false;
   let sawTerminalSnapshot = false;
 
@@ -1512,7 +1527,7 @@ function createObservedResponsesStream(
           let output = retainedOutput;
 
           if (response.output !== undefined) {
-            const responseBudget = new StreamCaptureBudget();
+            const responseBudget = budget.successor();
 
             if (!responseBudget.canAccept(response.output)) {
               budget.truncated = true;
@@ -1603,7 +1618,13 @@ function createObservedResponsesStream(
         return fields;
       },
     },
-    end,
+    (fields) => {
+      try {
+        end(fields);
+      } finally {
+        budget.release();
+      }
+    },
   );
 }
 

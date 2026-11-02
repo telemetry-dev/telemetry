@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from collections.abc import Callable, Generator
 from types import SimpleNamespace
 from typing import Any
@@ -20,13 +21,28 @@ ENV_VARS = (
     "OTEL_SERVICE_NAME",
 )
 
+# The stream bound these tests were written against. Another stream holds one byte of the shared
+# stream budget (other_stream), and make() sizes that budget at STREAM_LIMIT + 1, so each stream
+# a test starts is bounded at STREAM_LIMIT instead of growing to MAX_RECORD_BYTES.
+STREAM_LIMIT = 48 * 1024
+other_stream: telemetry_dev.CaptureBudget | None = None
+
 
 @pytest.fixture(autouse=True)
 def isolate_sdk(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
     telemetry_dev_openai.uninstrument_openai()
     for var in ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    # A stream an earlier test dropped in a reference cycle holds stream bytes until it is
+    # collected, which would shrink the room left for this test's streams.
+    gc.collect()
+    global other_stream
+    other = telemetry_dev.CaptureBudget.for_stream()
+    other.bytes_used = 1
+    other_stream = other
     yield
+    other.release()
+    other_stream = None
     telemetry_dev_openai.uninstrument_openai()
     telemetry_dev.shutdown()
 
@@ -51,6 +67,7 @@ def make() -> MakeClient:
             "environment": "test",
             "log_level": "silent",
             "disable_atexit": True,
+            "max_stream_bytes": STREAM_LIMIT + 1,
         }
         options.update(kwargs)
         client = telemetry_dev.init(**options)

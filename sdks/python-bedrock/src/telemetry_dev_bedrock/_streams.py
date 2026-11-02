@@ -5,6 +5,7 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
+from io import StringIO
 from typing import Any, cast
 
 import telemetry_dev
@@ -13,15 +14,22 @@ from ._fields import clean, error_fields, merge_fields, usage_from_converse
 from ._invoke_model import claude_usage_fields, usage_number
 from ._messages import normalize_content_block
 
-# Retention uses fixed bounds; the core applies max_attribute_length after the mask.
-_STREAM_CAPTURE_MAX_BYTES = 48 * 1024
-_STREAM_CAPTURE_MAX_ITEMS = 1000
+# The core applies max_attribute_length after the mask.
 _CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated"
 _OMIT = object()
 
 
 def stream_capture_budget() -> telemetry_dev.CaptureBudget:
-    return telemetry_dev.CaptureBudget(_STREAM_CAPTURE_MAX_BYTES, _STREAM_CAPTURE_MAX_ITEMS)
+    # Older cores have no for_stream and bound each budget at 64 KiB on its own.
+    for_stream = getattr(telemetry_dev.CaptureBudget, "for_stream", None)
+    budget = for_stream() if callable(for_stream) else telemetry_dev.CaptureBudget()
+    return cast(telemetry_dev.CaptureBudget, budget)
+
+
+def release_budget(budget: telemetry_dev.CaptureBudget) -> None:
+    release = getattr(budget, "release", None)
+    if callable(release):
+        release()
 
 
 def capture_masked(handle: Any) -> bool:
@@ -98,11 +106,29 @@ class ConverseStreamState(StreamState):
     def __init__(self) -> None:
         self.budget = stream_capture_budget()
         self.role = "assistant"
-        self.blocks: dict[int, dict[str, Any]] = {}
+        self._blocks: dict[int, dict[str, Any]] = {}
+        # Appended text waits here and is joined when the blocks are read: adding each delta
+        # to the string copies all the text before it, which is quadratic in a long stream.
+        self._appended: dict[tuple[int, str], StringIO] = {}
         self.stop_reason: str | None = None
         self.usage: dict[str, int] | None = None
         self.metadata: dict[str, Any] = {}
         self.response_model: str | None = None
+
+    @property
+    def blocks(self) -> dict[int, dict[str, Any]]:
+        for (index, key), parts in self._appended.items():
+            block = self._blocks[index]
+            block[key] = block[key] + parts.getvalue()
+        self._appended.clear()
+        return self._blocks
+
+    def _append(self, index: int, block: dict[str, Any], key: str, text: str) -> None:
+        parts = self._appended.get((index, key))
+        if parts is None:
+            block.setdefault(key, "")
+            parts = self._appended[(index, key)] = StringIO()
+        parts.write(text)
 
     def feed(self, event: Any) -> None:
         if not isinstance(event, dict):
@@ -161,16 +187,16 @@ class ConverseStreamState(StreamState):
             idx = index if isinstance(index, int) else 0
             delta = delta_event.get("delta") if isinstance(delta_event.get("delta"), dict) else {}
             if self.budget.accept(delta):
-                block = self.blocks.setdefault(idx, {"kind": "text", "text": ""})
+                block = self._blocks.setdefault(idx, {"kind": "text", "text": ""})
                 if isinstance(delta.get("text"), str):
                     block["kind"] = "text"
-                    block["text"] = f"{block.get('text', '')}{delta['text']}"
+                    self._append(idx, block, "text", delta["text"])
                 tool_delta = (
                     delta.get("toolUse") if isinstance(delta.get("toolUse"), dict) else None
                 )
                 if tool_delta and isinstance(tool_delta.get("input"), str):
                     block["kind"] = "tool"
-                    block["input"] = f"{block.get('input', '')}{tool_delta['input']}"
+                    self._append(idx, block, "input", tool_delta["input"])
                 reasoning = (
                     delta.get("reasoningContent")
                     if isinstance(delta.get("reasoningContent"), dict)
@@ -181,7 +207,7 @@ class ConverseStreamState(StreamState):
                     text = reasoning.get("text") if isinstance(reasoning.get("text"), str) else ""
                     if not text and reasoning.get("redactedContent") is not None:
                         text = "[redacted]"
-                    block["text"] = f"{block.get('text', '')}{text}"
+                    self._append(idx, block, "text", text)
                 image = delta.get("image")
                 if isinstance(image, dict):
                     content_value = block.get("content")
@@ -207,17 +233,16 @@ class ConverseStreamState(StreamState):
                     current_content: list[Any] = (
                         current_content_value if isinstance(current_content_value, list) else []
                     )
+                    current_content.extend(tool_result)
                     block["kind"] = "content"
-                    block["content"] = {
-                        "toolResult": {**current, "content": [*current_content, *tool_result]}
-                    }
+                    block["content"] = {"toolResult": {**current, "content": current_content}}
                 citation = delta.get("citation")
                 if isinstance(citation, dict):
                     citations_value = block.get("citations")
-                    citations: list[Any] = (
-                        citations_value if isinstance(citations_value, list) else []
-                    )
-                    block["citations"] = [*citations, citation]
+                    if isinstance(citations_value, list):
+                        cast(list[Any], citations_value).append(citation)
+                    else:
+                        block["citations"] = [citation]
         stop = event.get("messageStop")
         if isinstance(stop, dict) and isinstance(stop.get("stopReason"), str):
             self.stop_reason = stop["stopReason"]
@@ -429,7 +454,7 @@ class AgentStreamState(StreamState):
     def __init__(self, *, capture_trace: bool = False) -> None:
         self.budget = stream_capture_budget()
         self.capture_trace = capture_trace
-        self.text = ""
+        self.text_fragments = StringIO()
         # Trace metadata shares the budget but does not make the text incomplete.
         self.text_rejected = False
         self.usage: dict[str, int] = {}
@@ -459,7 +484,7 @@ class AgentStreamState(StreamState):
         piece = bytes(raw).decode("utf-8") if isinstance(raw, bytes | bytearray) else raw
         if isinstance(piece, str) and piece:
             if self.budget.accept(piece):
-                self.text += piece
+                self.text_fragments.write(piece)
             else:
                 self.text_rejected = True
         return_control = (
@@ -467,10 +492,11 @@ class AgentStreamState(StreamState):
         )
         if return_control is not None:
             self.saw_return_control = True
-            # Return control replaces the text output, so it gets its own fresh bound and
-            # survives text that already spent the shared budget; one that alone does not fit
-            # is dropped and the capture is marked incomplete.
-            if stream_capture_budget().accept(return_control):
+            # Return control replaces the text output, so it gets its own record-sized bound
+            # and survives text that already spent the stream budget; it is the decoded event
+            # itself, not a copy, so it is not counted there. One that alone does not fit is
+            # dropped and the capture is marked incomplete.
+            if telemetry_dev.CaptureBudget().accept(return_control):
                 self.return_control = return_control
             else:
                 self.return_control = None
@@ -499,10 +525,11 @@ class AgentStreamState(StreamState):
             }
         )
         output: Any = None
+        text = self.text_fragments.getvalue()
         if self.return_control is not None:
             output = {"returnControl": self.return_control}
-        elif self.text:
-            output = [{"role": "assistant", "parts": [{"type": "text", "content": self.text}]}]
+        elif text:
+            output = [{"role": "assistant", "parts": [{"type": "text", "content": text}]}]
         return clean({"output": output, "usage": self.usage or None, "metadata": metadata or None})
 
     def output_truncated(self) -> bool:
@@ -560,7 +587,7 @@ class AgentStreamState(StreamState):
 class RagStreamState(StreamState):
     def __init__(self) -> None:
         self.budget = stream_capture_budget()
-        self.text = ""
+        self.text_fragments = StringIO()
         self.citation_count = 0
         self.guardrail_action: str | None = None
 
@@ -569,7 +596,7 @@ class RagStreamState(StreamState):
             return
         output = event.get("output") if isinstance(event.get("output"), dict) else {}
         if isinstance(output.get("text"), str) and self.budget.accept(output["text"]):
-            self.text += output["text"]
+            self.text_fragments.write(output["text"])
         if "citation" in event:
             self.citation_count += 1
         guard = event.get("guardrail") if isinstance(event.get("guardrail"), dict) else {}
@@ -578,10 +605,11 @@ class RagStreamState(StreamState):
 
     def finish(self, *, partial: bool) -> dict[str, Any]:
         del partial
+        text = self.text_fragments.getvalue()
         return clean(
             {
-                "output": [{"role": "assistant", "parts": [{"type": "text", "content": self.text}]}]
-                if self.text
+                "output": [{"role": "assistant", "parts": [{"type": "text", "content": text}]}]
+                if text
                 else None,
                 "metadata": clean(
                     {
@@ -702,15 +730,20 @@ class InstrumentedEventStream:
         if self._ended:
             return
         self._ended = True
-        fields = self._state.finish(partial=partial)
-        if partial or self._state.budget.truncated:
-            fields = mark_capture_incomplete(
-                fields,
-                self._mask_output_when_incomplete and (partial or self._state.output_truncated()),
-            )
-        if error is not None:
-            fields = merge_fields(fields, error_fields(error))
-        self._finish_callback(fields)
+        # The output is read before the release, which fixes the stream's bound.
+        try:
+            fields = self._state.finish(partial=partial)
+            if partial or self._state.budget.truncated:
+                fields = mark_capture_incomplete(
+                    fields,
+                    self._mask_output_when_incomplete
+                    and (partial or self._state.output_truncated()),
+                )
+            if error is not None:
+                fields = merge_fields(fields, error_fields(error))
+            self._finish_callback(fields)
+        finally:
+            release_budget(self._state.budget)
 
 
 @dataclass(frozen=True)
