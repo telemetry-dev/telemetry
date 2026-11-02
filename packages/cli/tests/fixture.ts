@@ -427,6 +427,8 @@ export const PAYLOADS: Record<string, string> = {
   ]),
   output:
     "I found both charges. I've refunded the duplicate; it will reach your card in 5-10 days.",
+  // Longer than the 50 pages the CLI reads, in characters outside the Basic Multilingual Plane.
+  error: "🙂".repeat(2_100),
 };
 
 const loose = z.looseObject({});
@@ -646,18 +648,19 @@ const server = () => {
   });
   tool("get_usage_summary", () => usage());
   tool("get_span_payload", (args) => {
-    const text = PAYLOADS[String(args.field)] ?? "";
+    // Offsets and counts are in code points, as the server counts them.
+    const characters = Array.from(PAYLOADS[String(args.field)] ?? "");
     const offset = Number(args.offset ?? 0);
     // Small pages, so the CLI has to follow next_offset.
-    const end = Math.min(text.length, offset + 40);
+    const end = Math.min(characters.length, offset + 40);
 
     return {
       field: args.field,
-      total_characters: text.length,
+      total_characters: characters.length,
       stored_text_truncated: false,
       offset,
-      next_offset: end < text.length ? end : null,
-      text: text.slice(offset, end),
+      next_offset: end < characters.length ? end : null,
+      text: characters.slice(offset, end).join(""),
     };
   });
 
