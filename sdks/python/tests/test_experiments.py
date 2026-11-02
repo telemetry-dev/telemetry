@@ -792,6 +792,16 @@ def test_in_ci_mode_a_check_that_failed_items_failed_names_their_count_and_a_mea
         "  length: 12.0 (pass mark 10.0)\n"
     )
 
+    twice = result(checkStatus="failed", itemsTotal=4, itemsDone=4, itemsFailed=3)
+    with fake_api(results=[twice]) as api:
+        with pytest.raises(ExperimentError) as caught:
+            experiment(api, runs_per_item=2)
+
+    assert str(caught.value) == (
+        f"The check of support-golden-v3 failed: 3 of 4 runs failed. {EXPERIMENT_URL}"
+    )
+    assert "\n  3 of 4 runs failed.\n" in capsys.readouterr().out
+
 
 @pytest.mark.parametrize(
     ("options", "ci"),

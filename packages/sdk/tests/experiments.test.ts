@@ -882,6 +882,18 @@ test("in CI mode a check that failed items failed names their count, and a mean 
       "  length: 12.0 (pass mark 10.0)",
     ].join("\n"),
   );
+
+  const twice = (await experiment(
+    fakeApi({
+      results: [result({ checkStatus: "failed", itemsTotal: 4, itemsDone: 4, itemsFailed: 3 })],
+    }),
+    { runsPerItem: 2 },
+  ).catch((caught: unknown) => caught)) as ExperimentError;
+
+  expect(twice.message).toBe(
+    `The check of support-golden-v3 failed: 3 of 4 runs failed. ${URL_OF_EXPERIMENT}`,
+  );
+  expect(vi.mocked(console.log).mock.calls.at(-1)?.[0]).toContain("\n  3 of 4 runs failed.");
 });
 
 test.each([
