@@ -12,8 +12,10 @@ import os
 import signal
 import threading
 import time
+import tracemalloc
 import weakref
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from io import StringIO
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -1401,6 +1403,170 @@ def test_with_the_default_bounds_a_stream_is_cut_only_at_the_record_bound(
     # Each part costs its text plus 52 bytes, so the 16th 1 MiB part does not fit and is
     # rejected whole.
     assert len(text) == (telemetry_dev.MAX_RECORD_BYTES - len(MIB_TEXT) if cut else length)
+
+
+def test_a_stream_of_small_deltas_holds_about_the_bytes_it_is_charged(make: Any) -> None:
+    conftest.other_stream.release()
+    memory = make(max_stream_bytes=64 * 1024 * 1024)
+    # Reads at which memory is measured, after the memory a stream takes once. No multiple of
+    # 1,000, 1,024, 2,000, 2,048, 4,096, 5,000, 8,192 or 10,000 lies between them, so with
+    # batches of any of these sizes, or none, the 650 deltas read between them stay separate
+    # strings; with batches of 256 they are joined.
+    checkpoints = (7_325, 7_975)
+    chunk = {
+        "candidates": [{"index": 0, "content": {"role": "model", "parts": [{"text": "abcd"}]}}]
+    }
+    client, _transport = client_with_transport([[chunk] * checkpoints[-1]])
+    # With automatic function calling, the SDK itself appends each chunk to the request contents
+    # it keeps.
+    stream = wrap_google_genai(client).models.generate_content_stream(
+        model="gemini-2.5-flash",
+        contents=USER_CONTENT,
+        config={"automatic_function_calling": {"disable": True}},
+    )
+
+    held: list[int] = []
+    tracemalloc.start()
+    try:
+        for read, _chunk in enumerate(stream, 1):
+            if read in checkpoints:
+                # What the stream does not hold, such as decoding garbage in reference cycles,
+                # is freed first.
+                gc.collect()
+                held.append(tracemalloc.get_traced_memory()[0])
+    finally:
+        tracemalloc.stop()
+
+    # Each delta is decoded into a new string and charged at least its 4 bytes.
+    # Before Python 3.12, StringIO keeps each written string apart, about 15 times that, unless
+    # the deltas are joined first. Measured between two reads, so that what the stream holds
+    # whatever its length does not count. The allowance covers the spare room of a StringIO
+    # from Python 3.12 and the memory the core's accounting keeps, and what 256 waiting deltas
+    # hold, about 16 KB, but not 650 more.
+    charged = 4 * (checkpoints[1] - checkpoints[0])
+    assert held[1] - held[0] < 1.3 * charged + 16 * 1024
+    output = json.loads(str(attrs(only_span(memory))["gen_ai.output.messages"]))
+    assert output[0]["parts"][0]["text"] == "abcd" * checkpoints[-1]
+
+
+@pytest.mark.parametrize("handler", ["read", "interrupt"])
+@pytest.mark.parametrize("step", ["append", "join", "write"])
+def test_a_signal_handler_inside_a_delta_buffer_write_keeps_each_delta_once(
+    step: str, handler: str
+) -> None:
+    # A signal handler runs on the thread it interrupts, so one that closes the stream reads
+    # the buffer inside a write, and SIGINT raises KeyboardInterrupt there: here right after a
+    # delta is appended, right after the waiting deltas are read to be joined onto the tail,
+    # and right after text is written to the StringIO.
+    buffer = google_genai_instrumentation._DeltaBuffer()
+    reads: list[str] = []
+    fired = False
+
+    def run_handler() -> None:
+        nonlocal fired
+        if not fired:
+            fired = True
+            if handler == "interrupt":
+                raise KeyboardInterrupt
+            reads.append(buffer.getvalue())
+
+    class Pending(list[str]):
+        def append(self, text: str, /) -> None:
+            super().append(text)
+            if step == "append":
+                run_handler()
+
+        def __iter__(self) -> Iterator[str]:
+            yield from super().__iter__()
+            if step == "join":
+                run_handler()
+
+    class Written(StringIO):
+        def write(self, text: str, /) -> int:
+            count = super().write(text)
+            if step == "write":
+                run_handler()
+            return count
+
+    buffer._buffer = Written()
+    # Distinct deltas, so that a delta written twice shows; 10 characters, so that the first
+    # batch of 256 waits as the tail and the second is written to the StringIO with it.
+    deltas = [f"{index:010d}" for index in range(600)]
+    interrupted: list[tuple[int, str]] = []
+
+    def write_all() -> None:
+        for index, delta in enumerate(deltas):
+            if index == 256:
+                # Hooked once the tail holds the first batch, which a join must not lose or
+                # leave for a read to write as well.
+                buffer._pending = Pending()
+            try:
+                buffer.write(delta)
+            except KeyboardInterrupt:
+                interrupted.append((index, buffer.getvalue()))
+
+    # Without a reentrant lock the read waits forever for its own thread.
+    writer = threading.Thread(target=write_all, daemon=True)
+    writer.start()
+    writer.join(10)
+    assert not writer.is_alive(), "the read inside the write waited for the lock it holds"
+
+    text = "".join(deltas)
+    assert buffer.getvalue() == text
+    if handler == "interrupt":
+        # The write that the exception came in had taken its delta.
+        [(index, value)] = interrupted
+        assert value == "".join(deltas[: index + 1])
+    else:
+        assert reads
+        assert all(text.startswith(value) for value in reads)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.filterwarnings("ignore:This process:DeprecationWarning")
+@pytest.mark.parametrize("read_first", [False, True])
+def test_a_delta_buffer_locked_by_another_thread_at_a_fork_works_in_the_child(
+    read_first: bool,
+) -> None:
+    buffer = google_genai_instrumentation._DeltaBuffer()
+    buffer.write("ab")
+    locked = threading.Event()
+    release = threading.Event()
+
+    def hold_lock() -> None:
+        with buffer._lock:
+            locked.set()
+            release.wait()
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    try:
+        assert locked.wait(10)
+        pid = os.fork()
+        if pid == 0:
+            # The thread that holds the lock does not run in the child, so it never releases it.
+            code = 1
+            try:
+                if read_first:
+                    buffer.getvalue()
+                buffer.write("cd")
+                code = 0 if buffer.getvalue() == "abcd" else 1
+            finally:
+                os._exit(code)
+    finally:
+        release.set()
+        holder.join()
+
+    deadline = time.monotonic() + 10
+    waited, status = os.waitpid(pid, os.WNOHANG)
+    while waited == 0 and time.monotonic() < deadline:
+        time.sleep(0.05)
+        waited, status = os.waitpid(pid, os.WNOHANG)
+    if waited == 0:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    assert waited == pid, "the child waited on the lock it copied held"
+    assert os.waitstatus_to_exitcode(status) == 0
 
 
 @pytest.mark.parametrize("extra_indices", [0, 5_000])

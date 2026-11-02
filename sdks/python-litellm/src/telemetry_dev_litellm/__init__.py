@@ -1157,6 +1157,77 @@ class _InstrumentedStream:
             await _maybe_await(close())
 
 
+# On Python 3.10 and 3.11, StringIO keeps up to 100,000 written strings in a list before it
+# joins them, about 60 bytes each that the stream bound does not charge: 15 bytes a character
+# for 4-character deltas. Deltas are joined 256 at a time, so that those waiting hold under
+# about 22 KB, onto a string that is written once it has 4,096 characters, so that what is
+# written costs about 1.5% more than its text. Python 3.12 dropped the list.
+_DELTA_BATCH = 256
+_WRITE_CHARS = 4096
+
+
+class _DeltaBuffer:
+    # A write takes several steps, unlike one StringIO call, so without the lock a read on
+    # another thread, such as one that closes the stream, could copy a batch twice or drop it.
+    # A fork copies the lock held if another thread was writing, and that thread does not run
+    # in the child to release it. Every fork, also one that runs no at-fork hooks, changes the
+    # process ID, so a child takes a new lock. The check is inline because it runs per delta.
+    # A signal handler runs on the thread it interrupts, so one that reads the stream, such as
+    # one that closes it, can read inside a write. So the lock is reentrant, and each step takes
+    # the deltas and the tail out of the buffer before it joins or writes them, so that a read
+    # inside the step does not write them as well; that read returns a prefix, which can leave
+    # out the deltas being joined. A handler that writes inside a step is not supported. An
+    # exception inside a step, such as KeyboardInterrupt from a handler, puts back the text the
+    # step took unless the StringIO has it, so that a later read still has every delta.
+    __slots__ = ("_buffer", "_lock", "_pending", "_pid", "_tail")
+
+    def __init__(self) -> None:
+        self._buffer = StringIO()
+        self._lock = threading.RLock()
+        self._pid = os.getpid()
+        self._pending: list[str] = []
+        self._tail = ""
+
+    def write(self, text: str) -> None:
+        pid = os.getpid()
+        if self._pid != pid:
+            self._lock = threading.RLock()
+            self._pid = pid
+        with self._lock:
+            self._pending.append(text)
+            if len(self._pending) >= _DELTA_BATCH:
+                self._join(_WRITE_CHARS)
+
+    def getvalue(self) -> str:
+        pid = os.getpid()
+        if self._pid != pid:
+            self._lock = threading.RLock()
+            self._pid = pid
+        with self._lock:
+            self._join(1)
+            return self._buffer.getvalue()
+
+    def _join(self, write_at: int) -> None:
+        if not self._pending and len(self._tail) < write_at:
+            return
+        written = self._buffer.tell()
+        pending: list[str] = []
+        tail = ""
+        try:
+            pending, self._pending = self._pending, []
+            tail, self._tail = self._tail, ""
+            joined = "".join([tail, *pending])
+            if len(joined) >= write_at:
+                self._buffer.write(joined)
+            else:
+                self._tail = joined
+        except BaseException:
+            if self._buffer.tell() == written:
+                self._pending[:0] = pending
+                self._tail = tail + self._tail
+            raise
+
+
 class _InstrumentedResponsesStream:
     def __init__(
         self,
@@ -1323,9 +1394,10 @@ class _InstrumentedResponsesStream:
     def _materialize_partial(self, value: dict[str, Any]) -> dict[str, Any]:
         if "_field" not in value:
             return value
-        # Each partial value with a "_field" is created with a StringIO under "_fragments".
+        # Each partial value with a "_field" has a _DeltaBuffer under "_fragments", or a StringIO
+        # when _append_delta measures its first delta.
         field = cast(str, value["_field"])
-        fragments = cast(StringIO, value["_fragments"])
+        fragments = cast(_DeltaBuffer | StringIO, value["_fragments"])
         return {key: item for key, item in value.items() if key not in {"_field", "_fragments"}} | {
             field: fragments.getvalue()
         }
@@ -1550,7 +1622,7 @@ class _InstrumentedResponsesStream:
                             **(target or {}),
                             "type": "output_text" if field == "text" else "refusal",
                             "_field": field,
-                            "_fragments": StringIO(),
+                            "_fragments": _DeltaBuffer(),
                         }
                 elif event_type in {
                     "response.reasoning_summary_text.delta",
@@ -1579,7 +1651,7 @@ class _InstrumentedResponsesStream:
                             **(target or {}),
                             "type": kind,
                             "_field": field,
-                            "_fragments": StringIO(),
+                            "_fragments": _DeltaBuffer(),
                         }
                 elif event_type in {
                     "response.function_call_arguments.delta",
@@ -1601,7 +1673,7 @@ class _InstrumentedResponsesStream:
                             **(seeded if isinstance(seeded, dict) else {}),
                             "type": event_kind[0],
                             "_field": event_kind[1],
-                            "_fragments": StringIO(),
+                            "_fragments": _DeltaBuffer(),
                         }
                         item_id = _string(_field(event, "item_id"))
                         if item_id is not None:
@@ -1611,8 +1683,8 @@ class _InstrumentedResponsesStream:
                             if value is not None:
                                 target[field] = value
                 if target is not None:
-                    # Every target above is created with a StringIO under "_fragments".
-                    fragments = cast(StringIO, target["_fragments"])
+                    # Every target above is created with a _DeltaBuffer under "_fragments".
+                    fragments = cast(_DeltaBuffer, target["_fragments"])
                     accepted = not self._delta_rejected_before(storage_key) and self._append_delta(
                         storage_key, target, delta
                     )

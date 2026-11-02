@@ -772,12 +772,92 @@ def _end_once(handle: telemetry_dev.SpanHandle) -> Callable[..., None]:
     return end
 
 
+# On Python 3.10 and 3.11, StringIO keeps up to 100,000 written strings in a list before it
+# joins them, about 60 bytes each that the stream bound does not charge: 15 bytes a character
+# for 4-character deltas. Deltas are joined 256 at a time, so that those waiting hold under
+# about 22 KB, onto a string that is written once it has 4,096 characters, so that what is
+# written costs about 1.5% more than its text. Python 3.12 dropped the list.
+_DELTA_BATCH = 256
+_WRITE_CHARS = 4096
+
+
+class _DeltaBuffer:
+    # A write takes several steps, unlike one StringIO call, so without the lock a read on
+    # another thread, such as one that closes the stream, could copy a batch twice or drop it.
+    # A fork copies the lock held if another thread was writing, and that thread does not run
+    # in the child to release it. Every fork, also one that runs no at-fork hooks, changes the
+    # process ID, so a child takes a new lock. The check is inline because it runs per delta.
+    # A signal handler runs on the thread it interrupts, so one that reads the stream, such as
+    # one that closes it, can read inside a write. So the lock is reentrant, and each step takes
+    # the deltas and the tail out of the buffer before it joins or writes them, so that a read
+    # inside the step does not write them as well; that read returns a prefix, which can leave
+    # out the deltas being joined. A handler that writes inside a step is not supported. An
+    # exception inside a step, such as KeyboardInterrupt from a handler, puts back the text the
+    # step took unless the StringIO has it, so that a later read still has every delta.
+    __slots__ = ("_buffer", "_length", "_lock", "_pending", "_pid", "_tail")
+
+    def __init__(self) -> None:
+        self._buffer = StringIO()
+        self._length = 0
+        self._lock = threading.RLock()
+        self._pid = os.getpid()
+        self._pending: list[str] = []
+        self._tail = ""
+
+    def write(self, text: str) -> None:
+        pid = os.getpid()
+        if self._pid != pid:
+            self._lock = threading.RLock()
+            self._pid = pid
+        with self._lock:
+            # Counted first: a signal handler runs only once a call returns, so none runs
+            # between the count and the append, and one that raises after the append, or in
+            # a join, finds the delta counted.
+            self._length += len(text)
+            self._pending.append(text)
+            if len(self._pending) >= _DELTA_BATCH:
+                self._join(_WRITE_CHARS)
+
+    def tell(self) -> int:
+        # Read on every content delta, so it counts the pending deltas instead of writing them.
+        return self._length
+
+    def getvalue(self) -> str:
+        pid = os.getpid()
+        if self._pid != pid:
+            self._lock = threading.RLock()
+            self._pid = pid
+        with self._lock:
+            self._join(1)
+            return self._buffer.getvalue()
+
+    def _join(self, write_at: int) -> None:
+        if not self._pending and len(self._tail) < write_at:
+            return
+        written = self._buffer.tell()
+        pending: list[str] = []
+        tail = ""
+        try:
+            pending, self._pending = self._pending, []
+            tail, self._tail = self._tail, ""
+            joined = "".join([tail, *pending])
+            if len(joined) >= write_at:
+                self._buffer.write(joined)
+            else:
+                self._tail = joined
+        except BaseException:
+            if self._buffer.tell() == written:
+                self._pending[:0] = pending
+                self._tail = tail + self._tail
+            raise
+
+
 class _ChatChoice:
     def __init__(self) -> None:
         self.role: str | None = None
         self.role_resolved = True
-        self.content_fragments = StringIO()
-        self.refusal_fragments = StringIO()
+        self.content_fragments = _DeltaBuffer()
+        self.refusal_fragments = _DeltaBuffer()
         self.function_call: dict[str, Any] | None = None
         self.unresolved_function_scalars: set[str] = set()
         self.tool_calls: dict[int, dict[str, Any]] = {}
@@ -994,8 +1074,8 @@ def _capture_tool_call_payload(
             unresolved.add(unresolved_name)
     if not budget.truncated and value is not None:
         fragments = payload.get(value_key)
-        had_value = isinstance(fragments, StringIO)
-        value_fragments = fragments if had_value else StringIO()
+        had_value = isinstance(fragments, _DeltaBuffer)
+        value_fragments = fragments if had_value else _DeltaBuffer()
         if value or not had_value:
             if _capture_chat_string(
                 value,
@@ -1148,8 +1228,8 @@ def _capture_function_call_delta(
             state.unresolved_function_scalars.add("name")
     if not budget.truncated and arguments is not None:
         fragments = current.get("arguments")
-        had_arguments = isinstance(fragments, StringIO)
-        argument_fragments = fragments if had_arguments else StringIO()
+        had_arguments = isinstance(fragments, _DeltaBuffer)
+        argument_fragments = fragments if had_arguments else _DeltaBuffer()
         if arguments or not had_arguments:
             if _capture_chat_string(
                 arguments,
@@ -1387,7 +1467,7 @@ def _chat_message(state: _ChatChoice) -> dict[str, Any]:
     if state.function_call is not None:
         captured_function_call = dict(state.function_call)
         arguments = captured_function_call.get("arguments")
-        if isinstance(arguments, StringIO):
+        if isinstance(arguments, _DeltaBuffer):
             captured_function_call["arguments"] = arguments.getvalue()
         if "name" in state.unresolved_function_scalars:
             captured_function_call.pop("name", None)
@@ -1406,7 +1486,7 @@ def _chat_message(state: _ChatChoice) -> dict[str, Any]:
                 if isinstance(raw_payload, Mapping):
                     captured_payload = dict(cast(Mapping[str, Any], raw_payload))
                     fragments = captured_payload.get(value_key)
-                    if isinstance(fragments, StringIO):
+                    if isinstance(fragments, _DeltaBuffer):
                         captured_payload[value_key] = fragments.getvalue()
                 else:
                     captured_payload = {}
@@ -2311,7 +2391,7 @@ def _media_stream_event_fields(
 def _media_stream_end_fields(
     fields: Mapping[str, Any],
     response_mapper: ResponseMapper,
-    text_parts: Sequence[str],
+    text_fragments: _DeltaBuffer,
     budget: telemetry_dev.CaptureBudget,
     mask_output_when_incomplete: bool,
     stream_incomplete: bool,
@@ -2326,8 +2406,9 @@ def _media_stream_end_fields(
         )
         if "output" not in result:
             capture_incomplete = capture_incomplete or budget.truncated
-            if text_parts and not (mask_output_when_incomplete and capture_incomplete):
-                result["output"] = "".join(text_parts)
+            text = text_fragments.getvalue()
+            if text and not (mask_output_when_incomplete and capture_incomplete):
+                result["output"] = text
         else:
             capture_incomplete = capture_incomplete or terminal_truncated
         if mask_output_when_incomplete and capture_incomplete:
@@ -2396,7 +2477,7 @@ class _InstrumentedMediaStream:
         # Bound to the budget, not self, so the callback adds no reference cycle.
         self._end_stream = _ending_stream(_end_once(handle), partial(_release_budget, self._budget))
         self._ended = False
-        self._text_parts: list[str] = []
+        self._text_fragments = _DeltaBuffer()
         self._saw_delta = False
         self._saw_terminal = False
         self._report_error = _chat_span_reporter(handle)
@@ -2484,7 +2565,7 @@ class _InstrumentedMediaStream:
             if text:
                 captured = _capture_text(text, self._budget)
                 if captured:
-                    self._text_parts.append(captured)
+                    self._text_fragments.write(captured)
         if event_type in _MEDIA_TERMINAL_EVENTS:
             error = _media_stream_error(event, event_type)
             self._end(**self._finish_fields(), **({"error": error} if error is not None else {}))
@@ -2493,7 +2574,7 @@ class _InstrumentedMediaStream:
         return _media_stream_end_fields(
             self._fields,
             self._response_mapper,
-            self._text_parts,
+            self._text_fragments,
             self._budget,
             self._mask_output_when_incomplete,
             not self._saw_terminal or self._mapping_failed,
@@ -2524,7 +2605,7 @@ class _InstrumentedAsyncMediaStream:
         # Bound to the budget, not self, so the callback adds no reference cycle.
         self._end_stream = _ending_stream(_end_once(handle), partial(_release_budget, self._budget))
         self._ended = False
-        self._text_parts: list[str] = []
+        self._text_fragments = _DeltaBuffer()
         self._saw_delta = False
         self._saw_terminal = False
         self._report_error = _chat_span_reporter(handle)
@@ -2619,7 +2700,7 @@ class _InstrumentedAsyncMediaStream:
             if text:
                 captured = _capture_text(text, self._budget)
                 if captured:
-                    self._text_parts.append(captured)
+                    self._text_fragments.write(captured)
         if event_type in _MEDIA_TERMINAL_EVENTS:
             error = _media_stream_error(event, event_type)
             self._end(**self._finish_fields(), **({"error": error} if error is not None else {}))
@@ -2628,7 +2709,7 @@ class _InstrumentedAsyncMediaStream:
         return _media_stream_end_fields(
             self._fields,
             self._response_mapper,
-            self._text_parts,
+            self._text_fragments,
             self._budget,
             self._mask_output_when_incomplete,
             not self._saw_terminal or self._mapping_failed,
