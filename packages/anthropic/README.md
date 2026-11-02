@@ -72,8 +72,7 @@ output is omitted because the mask cannot inspect the complete value. When outpu
 disabled, response IDs and models, finish reasons, usage, timing, and errors may still be recorded.
 Capture flags do not gate stop sequences or caller-supplied metadata or raw attributes; redact those
 separately when needed. Exception messages and stack traces are recorded only when both
-`captureInput` and `captureOutput` are on, and pass through `mask`. Older `@telemetry-dev/sdk`
-versions record them regardless of capture flags. Request tools and `tool_choice` are part of the captured input, so `captureInput: false` removes them. Each tool's type and name are still recorded in `gen_ai.tool.definitions`, and `mask` does not apply to them; descriptions and input schemas are not.
+`captureInput` and `captureOutput` are on, and pass through `mask`. Request tools and `tool_choice` are part of the captured input, so `captureInput: false` removes them. Each tool's type and name are still recorded in `gen_ai.tool.definitions`, and `mask` does not apply to them; descriptions and input schemas are not.
 
 ## Native Claude SDK spans
 

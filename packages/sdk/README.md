@@ -436,14 +436,6 @@ after the ended span passes `spanFilter`, including interrupted streams. Chunk t
 histogram state and does not retain individual intervals. Pull-based timing includes consumer delay
 between reads. An explicit timestamp uses the same monotonic millisecond clock for every chunk.
 
-Provider integrations feature-detect stream APIs. With an older core SDK that lacks the stream
-capture policy, streams are still traced with usage, model, finish reason, and timing. Output is
-retained within the same fixed bounds as with a current core, but a mask is assumed to be
-configured, so incomplete output is withheld. Instrumentation failures are not reported to `onError` with such a core. If only
-`recordOutputChunk` is unavailable, tracing and reconstruction continue but chunk-interval metrics
-are unavailable. Upgrade the core SDK with provider integrations to enable the full stream
-telemetry.
-
 ## Serverless
 
 Use `exportMode: "immediate"` and either `await flush()` before returning or pass the platform

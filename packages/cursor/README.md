@@ -147,8 +147,7 @@ without its task text.
 
 Span exception messages and stack traces, including the `error_message` of
 `sessionEnd` and of a failed tool or `Task` call, are recorded only when both
-settings are `true`. Older `@telemetry-dev/sdk` versions record them regardless of
-the settings.
+settings are `true`.
 
 The two settings do not cover these values, which are always exported:
 

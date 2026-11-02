@@ -84,7 +84,7 @@ created from the OpenAI SDK's CommonJS build. Use `wrapOpenAI()` for CommonJS cl
 
 The integration maps native OpenAI request/response shapes directly into telemetry.dev fields. It does not normalize messages into another schema.
 
-Non-streamed chat and Responses input and output, and Realtime instructions, are bounded to 16 MiB each. A value over the bound sets `telemetry.dev.capture.truncated`. Without a mask, the bounded part is kept. With a mask configured, the value is omitted because the mask cannot inspect the complete value. Input is omitted before the span starts, so a custom `sampler` sees the bounded input when no mask is configured; with an older `@telemetry-dev/sdk` that cannot report whether a mask is configured, cut input is omitted as if one were.
+Non-streamed chat and Responses input and output, and Realtime instructions, are bounded to 16 MiB each. A value over the bound sets `telemetry.dev.capture.truncated`. Without a mask, the bounded part is kept. With a mask configured, the value is omitted because the mask cannot inspect the complete value. Input is omitted before the span starts, so a custom `sampler` sees the bounded input when no mask is configured.
 
 ## Streaming
 
@@ -92,7 +92,7 @@ Chat completion streams are traced. Requests are sent unchanged by default, so t
 
 Streamed chat output and Realtime output are kept up to 16 MiB, and all streams in flight share the `batch.maxStreamBytes` bound of the core (64 MiB by default); each streamed finish reason is cut to its first 128 characters, without setting `telemetry.dev.capture.truncated`, and the finish reasons of a stream have their own budget, which fits at least 1,000 of them; the configured `maxAttributeLength` does not shrink these retention bounds; the core applies it to the exported attribute after the mask runs, with its `...[truncated]` marker, without setting `telemetry.dev.capture.truncated`. A chat stream inspects at most 1,000 choices and 1,000 tool calls in each chunk, and Realtime output keeps output and content indexes below 1,000; past these caps the rest is not kept and `telemetry.dev.capture.truncated` is set. When present, `gen_ai.output.messages` contains bounded partial output. If output and/or finish-reason capture is incomplete, including when a choice ends without `finish_reason`, `telemetry.dev.capture.truncated` is `true`. With a mask configured, incomplete output is omitted because the mask cannot inspect the complete value. When output capture is disabled or omitted, response IDs and models, finish reasons, usage, timing, and errors may still be recorded.
 
-Capture flags do not gate stop sequences or caller-supplied metadata or raw attributes; redact those separately when needed. Exception messages and stack traces are recorded only when both `captureInput` and `captureOutput` are on, and pass through `mask`. Older `@telemetry-dev/sdk` versions record them regardless of capture flags.
+Capture flags do not gate stop sequences or caller-supplied metadata or raw attributes; redact those separately when needed. Exception messages and stack traces are recorded only when both `captureInput` and `captureOutput` are on, and pass through `mask`.
 
 ```ts
 const openai = wrapOpenAI(new OpenAI(), { injectStreamUsage: true });

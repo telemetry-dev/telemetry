@@ -80,8 +80,7 @@ capture is disabled, response IDs and models, finish reasons, usage, timing, and
 be recorded.
 Capture flags do not gate stop sequences or caller-supplied metadata or raw attributes; redact those
 separately when needed. Exception messages and stack traces are recorded only when both
-`capture_input` and `capture_output` are on, and pass through `mask`. Older `telemetry-dev`
-versions record them regardless of capture flags. Request tools and `tool_choice` are part of the captured input, so `capture_input=False` removes them. Each tool's type and name are still recorded in `gen_ai.tool.definitions`, and `mask` does not apply to them; descriptions and input schemas are not.
+`capture_input` and `capture_output` are on, and pass through `mask`. Request tools and `tool_choice` are part of the captured input, so `capture_input=False` removes them. Each tool's type and name are still recorded in `gen_ai.tool.definitions`, and `mask` does not apply to them; descriptions and input schemas are not.
 
 `messages.stream()` starts the span when the context manager is entered, because that is when the Anthropic SDK opens the HTTP stream.
 
