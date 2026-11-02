@@ -115,12 +115,12 @@ For Python, use `capture_input=False` and `capture_output=False`.
 Some integrations work differently: MCP captures no tool arguments or results unless you pass
 `capturePayloads: true`, the AI SDK integration follows AI SDK's `recordInputs` and `recordOutputs`,
 Cursor reads `captureInput` and `captureOutput` from its own config file, and TanStack AI has no
-capture setting of its own and records chat messages and tool payloads.
+capture setting of its own and records chat messages, tool payloads, and error messages.
 Disabling output capture omits message content; response IDs and models, finish reasons, usage,
 timing, and errors may still be recorded when providers supply them. For streamed OpenAI chat,
 usage requires provider support or the documented stream-usage option in the OpenAI integration.
-Capture flags do not gate stop sequences, tool descriptions and definitions (`gen_ai.tool.description`, `gen_ai.tool.definitions`), caller-supplied metadata or raw attributes, or exception
-messages and stack traces; redact those separately when needed.
+Capture flags do not gate stop sequences, tool descriptions and definitions (`gen_ai.tool.description`, `gen_ai.tool.definitions`), or caller-supplied metadata or raw attributes; redact those separately when needed.
+The core SDKs record exception messages and stack traces only when both input and output capture are on, and pass them through the mask.
 Streamed output is kept within fixed size limits that each provider package's README lists, and
 [Privacy](https://telemetry.dev/docs/platform/privacy) describes what is sent and how to redact it.
 
@@ -131,6 +131,8 @@ Streamed output is kept within fixed size limits that each provider package's RE
 - **Provider integrations.** Add tracing to your existing model client without a separate request API.
 - **Session context.** Group activity by user and session, and pass trace context between services.
 - **Capture controls.** Disable SDK input and output capture, or mask captured content before export.
+- **Prompts.** Fetch the prompts that you manage in telemetry.dev, and record which version each model call used.
+- **Experiments and scores.** Run your code on a dataset, check its scores in CI, and record scores, such as user feedback, on a trace, a span, or a session.
 - **OpenTelemetry.** Send traces, logs, and metrics through standard OTLP/HTTP.
 
 ## Integrations
@@ -197,6 +199,7 @@ pnpm run py:build
 `py:test:bounds` runs each Python package's tests against the lowest and the highest third-party dependency versions its declared ranges allow. It always uses the local `telemetry-dev` checkout, not the lowest published `telemetry-dev` a provider package accepts.
 
 CI runs dependency, code, test, build, and release-safety checks for TypeScript and Python.
+The TypeScript job also packs each npm package that has a release version and fails when a target of its `exports` or `bin` is not in the tarball.
 The [SDK conformance guide](docs/sdk-conformance.md) defines the shared telemetry format and behavior.
 
 Maintainers: [RELEASING.md](RELEASING.md) describes versioning, publishing, and release retries.

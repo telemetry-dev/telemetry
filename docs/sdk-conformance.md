@@ -359,9 +359,14 @@ the `dataset` option has no value, and a different `dataset` option is a `TypeEr
 `TELEMETRY_DEV_EXPERIMENT_MIN_SCORES` holds `name=value` pairs that commas or new lines separate.
 The value must match `-?\d+(\.\d+)?` (ASCII digits), else it is a `TypeError`. These marks win over
 the `minScores` option for the same name. When `TELEMETRY_DEV_EXPERIMENT_RESULTS` names a file, the
-SDK adds the JSON of the `GET /v1/experiments/{id}` body to it as one line.
+SDK adds the JSON of the `GET /v1/experiments/{id}` body to it as one line, then `ci`, the CI mode
+of the run (a boolean), and `runsPerItem`. The action fails the job for a failed experiment only
+when its line has `ci` true.
 
-The SDKs print one line when the experiment starts and the result when it ends. A run with no
+The SDKs print one line when the experiment starts and the result when it ends. The result and the
+`check_failed` error show a rate as a whole percent and any other score, with its pass mark, to one
+decimal as `toFixed(1)` of JavaScript does: it rounds the exact float value, a half away from zero,
+thus the float 4.35 gives 4.3 and 4.25 gives 4.3. A run with no
 enabled client, or in an environment other than `experiment`, logs a warning.
 
 ## The shared scenario

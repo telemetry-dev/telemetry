@@ -85,7 +85,7 @@ Global instrumentation wraps `botocore.client.BaseClient._make_api_call` and fil
 | --- | --- | --- | --- |
 | `capture_agent_trace` | `False` | Agent Runtime streams | Aggregates trace usage and counts by default. When enabled, also attaches trace events as `td.metadata.agent_trace`, filtered as described below. |
 
-`td.metadata.agent_trace` is truncated but never passed to your `mask`, so each trace event is rebuilt from an explicit allowlist instead:
+`td.metadata.agent_trace` is metadata, which is cut at `max_attribute_length` when you set one (at 65,536 characters by default with `telemetry-dev` 0.3.2 or earlier) but never passed to your `mask`, so each trace event is rebuilt from an explicit allowlist instead:
 
 - Envelope fields: `agentId`, `agentAliasId`, `agentVersion`, `sessionId`, `collaboratorName`, `eventTime`, and the alias ARNs in `callerChain`.
 - Content the agent sends to a model, tool, or guardrail (`modelInvocationInput`, `invocationInput`, `inputAssessments`) is kept as received when `capture_input` is on.
@@ -94,7 +94,7 @@ Global instrumentation wraps `botocore.client.BaseClient._make_api_call` and fil
 - When a `mask` is set, all of this content is withheld.
 - Withheld content and the trace structure around it keep only trace ids, step types, the foundation model, guardrail action, failure code, and the usage, timings, and `clientRequestId` from AWS's trace `metadata`.
 
-Any other field, including unknown trace types and the AWS SDK's `$unknown` union member, is omitted even when both capture options are on; a content part that is kept is exported whole, including any fields inside it that are not listed here. Errors are not covered by this filtering: AWS exceptions, including errors raised inside the stream, still record the provider's error message on the span.
+Any other field, including unknown trace types and the AWS SDK's `$unknown` union member, is omitted even when both capture options are on; a content part that is kept is exported whole, including any fields inside it that are not listed here. Errors are not covered by this filtering: an AWS exception, including one raised inside the stream, records the provider's error message on the span when both `capture_input` and `capture_output` are on, and the message passes through `mask`.
 
 ```py
 agent = wrap_bedrock(

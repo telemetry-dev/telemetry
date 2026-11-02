@@ -41,6 +41,8 @@ from ._semconv import (
 from ._serialize import AttributeValue, fit_object_values, json_dumps, serialize_content
 
 _FETCH_TIMEOUT_S = 10.0
+# How often a call that waits for a fetch checks that it still runs in the process of the fetch.
+_FORK_CHECK_S = 0.1
 # How long a failed fetch with no copy answers calls, so that they do not each fetch again.
 _ERROR_TTL_S = 10.0
 # The longest Retry-After that get_prompt honors, so that a bad header cannot stop fetches.
@@ -608,8 +610,11 @@ class _Entry:
     checked_at: float = 0.0
     # No fetch before this time: the Retry-After of the last 429 or 503 response.
     retry_at: float = 0.0
-    # Set when the running fetch ends.
-    pending: threading.Event | None = None
+    # One held lock for each call that waits for the running fetch, which releases them when it
+    # ends; None when no fetch runs. Not a threading.Event: its wait takes the lock of the event
+    # again when it wakes, and a fork while another thread of the parent holds that lock, as in
+    # set(), leaves the copy in the child held forever. A call waits only on its own lock.
+    pending: list[threading.Lock] | None = None
     # The process whose thread runs the fetch. A forked process gets the entry, but not the thread.
     pending_pid: int = 0
     # When calls stop waiting for the running fetch.
@@ -617,37 +622,47 @@ class _Entry:
 
 
 _cache: OrderedDict[tuple[str, str, str, str], _Entry] = OrderedDict()
-# Reentrant, so that a fork in a thread that holds the lock, for example in a signal handler, does
-# not wait for itself in _lock_for_fork. _reset_in_child can replace it, so read it from the module
-# each time.
-_cache_lock = threading.RLock()
+# The cache lock of each process, by process ID. A forked process gets a copy of the lock of its
+# parent, and when a thread of the parent held it, no thread in the child can release the copy. A
+# fork that runs no hooks, as a fork in C code, does not reset it, but the child has a new ID.
+_cache_locks: dict[int, threading.RLock] = {}
 # Whether _lock_for_fork got the lock in this thread. os.fork() runs the after hooks also when a
 # before hook raises, for example in a signal handler.
 _forking = threading.local()
 
 
+def _cache_lock() -> threading.RLock:
+    """Reentrant, so that a fork in a thread that holds the lock, for example in a signal handler,
+    does not wait for itself in _lock_for_fork."""
+    pid = os.getpid()
+    lock = _cache_locks.get(pid)
+    if lock is None:
+        # The first call in this process. The locks of other processes are of no use here.
+        # list() copies the keys at once: other threads can change the dict.
+        for other in list(_cache_locks):
+            if other != pid:
+                _cache_locks.pop(other, None)
+        # setdefault, so that threads that get here at the same time share one lock.
+        lock = _cache_locks.setdefault(pid, threading.RLock())
+    return lock
+
+
 def _lock_for_fork() -> None:
-    _cache_lock.acquire()
+    _cache_lock().acquire()
     _forking.locked = True
 
 
 def _unlock_after_fork() -> None:
     if getattr(_forking, "locked", False):
         _forking.locked = False
-        _cache_lock.release()
+        _cache_lock().release()
 
 
 def _reset_in_child() -> None:
-    """Unlock the cache, and drop the fetches of the parent: the child has none of its threads."""
-    global _cache_lock
-    if getattr(_forking, "locked", False):
-        _forking.locked = False
-        _cache_lock.release()
-    else:
-        # The before hook did not get the lock, because a signal stopped its wait, or did not run,
-        # as in uWSGI with py-call-osafterfork. A thread of the parent can hold the lock, and only
-        # this thread exists here.
-        _cache_lock = threading.RLock()
+    """Drop the locks and the fetches of the parent: the child has none of its threads. The locks
+    go too, because the child can get the ID of an ended process whose lock _cache_locks keeps."""
+    _forking.locked = False
+    _cache_locks.clear()
     for entry in _cache.values():
         entry.pending = None
 
@@ -673,7 +688,7 @@ def _load(
     older than the TTL. Only a call with no copy waits for a fetch, until the fetch's deadline. A
     failed fetch with no copy fails the calls of the next ``_ERROR_TTL_S`` (or the TTL, if it is
     shorter) without a fetch."""
-    with _cache_lock:
+    with _cache_lock():
         entry = _cache.get(key)
         if entry is None:
             if len(_cache) >= _MAX_CACHE_ENTRIES:
@@ -682,25 +697,44 @@ def _load(
         now = monotonic()
         ttl = ttl_seconds if entry.response is not None else min(ttl_seconds, _ERROR_TTL_S)
         if entry.pending is not None and entry.pending_pid != os.getpid():
-            # A fork in C code that runs no hooks copied the fetch but not its thread. This check
-            # does not replace the lock. If a thread of the parent held the lock at that fork, a
-            # call in the child waits for the lock with no limit.
+            # A fork in C code that runs no hooks copied the fetch but not its thread.
             entry.pending = None
         # A local, because a fork in this thread, as in a signal handler, can clear entry.pending.
         pending = entry.pending
-        if now >= max(entry.checked_at + ttl, entry.retry_at) and pending is None:
-            pending = entry.pending = threading.Event()
+        start = now >= max(entry.checked_at + ttl, entry.retry_at) and pending is None
+        if start:
+            pending = entry.pending = []
             entry.pending_pid = os.getpid()
             entry.deadline = now + _FETCH_TIMEOUT_S
+        waiter: threading.Lock | None = None
+        if entry.response is None and pending is not None:
+            if now >= entry.deadline and entry.pending_pid == os.getpid():
+                # A fetch past its deadline, as in an address lookup: add no waiter for it. A
+                # forked child goes on to the wait, which fetches again in the child.
+                raise _timeout()
+            # Before the fetch thread starts. After a fork here in this thread, as in a signal
+            # handler, this thread holds only the copy of the parent's cache lock. The fetch thread
+            # of the child takes the child's lock, so it could end before a later add.
+            waiter = threading.Lock()
+            waiter.acquire()
+            pending.append(waiter)
+        if start:
             threading.Thread(
                 target=_refresh, args=(entry, pending, fetch, on_error), daemon=True
             ).start()
         if entry.response is not None:
             return entry.response
         deadline = entry.deadline
-    if pending is not None and not pending.wait(deadline - monotonic()):
-        raise _timeout()
-    with _cache_lock:
+        pending_pid = entry.pending_pid
+    if waiter is not None:
+        while not waiter.acquire(timeout=max(0.0, min(_FORK_CHECK_S, deadline - monotonic()))):
+            if os.getpid() != pending_pid:
+                # A fork in a signal handler during the wait. The child has the wait, but not the
+                # thread of the fetch.
+                return _load(key, ttl_seconds, fetch, on_error)
+            if monotonic() >= deadline:
+                raise _timeout()
+    with _cache_lock():
         response, error = entry.response, entry.error
     if response is not None:
         return response
@@ -713,7 +747,7 @@ def _load(
 
 def _refresh(
     entry: _Entry,
-    done: threading.Event,
+    waiters: list[threading.Lock],
     fetch: Callable[[], dict[str, Any]],
     on_error: Callable[[BaseException], None] | None,
 ) -> None:
@@ -723,7 +757,7 @@ def _refresh(
         response = fetch()
     except Exception as exc:
         error = exc
-    with _cache_lock:
+    with _cache_lock():
         stale = entry.response
         delay = (
             error._retry_after  # pyright: ignore[reportPrivateUsage]
@@ -740,7 +774,9 @@ def _refresh(
         entry.pending = None
     if error is not None and stale is not None:
         report_error(on_error, "fetching the prompt failed; using the last copy", error)
-    done.set()
+    # No call adds to the list once entry.pending is None.
+    for waiter in waiters:
+        waiter.release()
 
 
 class _Deadline:

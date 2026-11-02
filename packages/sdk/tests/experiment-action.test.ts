@@ -395,15 +395,26 @@ test("report.mjs writes the summary, posts it on the pull request, and sets the 
 });
 
 test("report.mjs fails the job for a failed experiment before the last, when the script exits with 0", async () => {
-  const passed = { ...result, name: "reply-short", checkStatus: "passed", itemsFailed: 0 };
+  // The lines of an SDK that writes the CI mode.
+  const failed = { ...result, ci: true, runsPerItem: 1 };
+  const passed = { ...failed, name: "reply-short", checkStatus: "passed", itemsFailed: 0 };
   const stopped = { ...passed, name: "reply-stopped", status: "stopped", checkStatus: null };
+  // A failed check and a stopped experiment of a script that runs with the CI mode off.
+  const notInCi = { ...result, name: "reply-local", ci: false, runsPerItem: 3 };
+  const stoppedNotInCi = { ...stopped, name: "reply-local-stopped", ci: false };
 
   const failedFirst = await report({ EXPERIMENT_EXIT_CODE: "0", INPUT_COMMENT: "false" }, [
-    result,
+    failed,
     stopped,
     passed,
   ]);
+  // A line of an SDK from before the ci field, which version 1.0.0 did not fail the job for.
+  const olderSdk = await report({ EXPERIMENT_EXIT_CODE: "0", INPUT_COMMENT: "false" }, [result]);
   const allPassed = await report({ EXPERIMENT_EXIT_CODE: "0", INPUT_COMMENT: "false" }, [passed]);
+  const offCi = await report({ EXPERIMENT_EXIT_CODE: "0", INPUT_COMMENT: "false" }, [
+    notInCi,
+    stoppedNotInCi,
+  ]);
 
   expect(failedFirst.code).toBe(1);
   expect(failedFirst.stdout).toContain(
@@ -414,8 +425,19 @@ test("report.mjs fails the job for a failed experiment before the last, when the
   );
   // check-status stays the one of the last experiment, as version 1 says.
   expect(failedFirst.outputs["check-status"]).toBe("passed");
+  expect(failedFirst.summary).not.toContain("runs each");
+  expect(failedFirst.summary).not.toContain("does not fail the job");
+  expect(olderSdk.code).toBe(0);
+  expect(olderSdk.stdout).not.toContain("::error");
+  expect(olderSdk.summary).not.toContain("does not fail the job");
   expect(allPassed.code).toBe(0);
   expect(allPassed.outputs["check-status"]).toBe("passed");
+  expect(offCi.code).toBe(0);
+  expect(offCi.stdout).not.toContain("::error");
+  expect(offCi.summary).toContain(
+    "Check failed. 40 items, 3 runs each: 118 of 120 runs completed, 2 failed.\n\n" +
+      "The CI mode of this experiment was off, thus it does not fail the job.",
+  );
 });
 
 /** The body of the comment that the action posts for the result. */

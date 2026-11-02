@@ -103,10 +103,6 @@ metric readers, so supplying `metric_reader=` disables this histogram. Duration,
 time-to-first-chunk metrics remain available; the first accepted streamed span with two or more
 recorded chunks reports this limitation once through `on_error` and the SDK logger.
 
-Provider integrations feature-detect `record_output_chunk`. Older core SDKs without that method
-continue delivering streams and tracing normally, but do not emit chunk-interval metrics. Upgrade
-the core SDK with provider integrations to enable the new metric.
-
 ### Span types
 
 `type=` maps to `gen_ai.operation.name`:
@@ -233,13 +229,13 @@ pinned = telemetry_dev.get_prompt("support/reply", version=13)
   call returns it at once and fetches a new copy in a background thread. Only a call with no copy
   waits for a fetch, for 10 seconds at most, also when the network stops. Calls for the same
   prompt share one fetch. `get_prompt_async` runs the same function in a worker thread.
-- A process that `os.fork()` makes keeps the copies of its parent. This includes a process of
-  `multiprocessing` with the `fork` start method. A call that starts in the child does not wait
-  for a fetch of the parent. If the call must fetch, it starts a new fetch.
-- If a signal handler forks while a call waits for a fetch, that call continues in the child. No
-  thread of the child completes that fetch. Thus the call waits until 10 seconds after the start
-  of the fetch. Then the call returns the `fallback`, or raises `PromptError` with the code
-  `timeout`.
+- A forked process keeps the copies of its parent: a process that `os.fork()` makes, one that
+  `multiprocessing` makes with the `fork` start method, or one that C code forks without running
+  fork hooks. A call that starts in the child does not wait for a fetch of the parent, or for a
+  lock that a thread of the parent held. If the call must fetch, it starts a new fetch.
+- If a signal handler forks while a call waits for a fetch, that call continues in the child,
+  where no thread completes that fetch. Thus the call looks at the cache again, and starts a new
+  fetch if it must, which it waits for up to 10 seconds more.
 - If a fetch fails, `get_prompt` returns the last copy that it fetched and reports the error
   through `on_error`. With no copy, it returns the `fallback` (`version` is `None` and
   `is_fallback` is `True`). With no fallback, it raises `PromptError` whose `code` tells why, for
@@ -374,9 +370,12 @@ result = telemetry_dev.run_experiment(
 - `run_experiment` sends the outputs in batches of 100 items at most, and then waits up to 30
   minutes for the server evaluators. Then it prints the scores and returns an `ExperimentResult`:
   `status`, `check_status`, item counts, `scores` with the value, the baseline value, the change,
-  and the pass mark of each score, and the `url` of the experiment page.
+  the pass mark, and the failed runs (`items_failed`) of each score, and the `url` of the
+  experiment page.
 - `min_scores` sets a pass mark for each score name: the lowest pass rate (0 to 1) of a pass/fail
-  score, or the lowest mean of a number score. A score under its mark fails the check.
+  score, or the lowest mean of a number score. A score under its mark fails the check. A run whose
+  task raises has no score, so the value of a score leaves it out, and with pass marks a failed
+  run fails the check.
 - A failed request raises `ExperimentError` whose `code` tells why, for example
   `dataset_not_found`, `dataset_empty`, `evaluator_not_found`, `insufficient_scope`,
   `missing_api_key`, or `timeout`. A read of the dataset or the result, a post of outputs, and the
@@ -411,8 +410,8 @@ the result on the pull request. It gives `run_experiment` the `dataset` input in
 `TELEMETRY_DEV_EXPERIMENT_DATASET`, which must agree with the `dataset` of the script, and the
 `min-scores` input in `TELEMETRY_DEV_EXPERIMENT_MIN_SCORES`, which wins over `min_scores` for the
 same name. Use the action as `telemetry-dev/telemetry/actions/experiment@experiment-action-v1`, a
-tag that moves to each 1.x release of the action. In the action, a failed experiment fails the job
-also with `ci=False`.
+tag that moves to each 1.x release of the action. In the action, a failed experiment with `ci=False`
+shows its result but does not fail the job.
 
 ## Scores
 
@@ -422,13 +421,16 @@ user on a reply:
 ```python
 import telemetry_dev
 
-# When the app replies, keep the trace id of the reply with the message:
+# When the app replies, keep the trace id and the span id of the reply with the message:
 with telemetry_dev.start_span("reply") as span:
     text = reply_to_customer(message)
-    trace_id = f"{span.span.get_span_context().trace_id:032x}"
+    context = span.span.get_span_context()
+    trace_id, span_id = f"{context.trace_id:032x}", f"{context.span_id:016x}"
 
 # Later, when the user clicks thumbs down:
-telemetry_dev.score(name="user_feedback", trace_id=trace_id, value=0, comment="Wrong amount")
+telemetry_dev.score(
+    name="user_feedback", trace_id=trace_id, span_id=span_id, value=0, comment="Wrong amount"
+)
 ```
 
 - Give `trace_id`, `session_id`, or the two, and a `span_id` of the trace for a score on one span.
@@ -438,10 +440,14 @@ telemetry_dev.score(name="user_feedback", trace_id=trace_id, value=0, comment="W
   after it sends a `ScoreError` to `on_error`. It checks the score before it sends it
   (`invalid_score`). The trace id of a span from a client that is not enabled is all zeros, and
   `score` reports it as `invalid_score`.
-- The rates of the dashboard count one `user_feedback` vote for each trace, span, or session: a
-  later `user_feedback` score on the same trace and span (or on the same session, for feedback with
-  no trace) replaces the earlier one. The SDK sends feedback with no author, so all the feedback that
-  the SDK sends on one trace, or on one span of it, counts as one vote: the newest.
+- Give the `span_id` of the reply for feedback on one reply. The SDK puts all the turns of a session
+  in one trace, so feedback with only a `trace_id` counts for the turn that started last before the
+  feedback came, which can be a later turn than the reply.
+- The rates of the dashboard count one `user_feedback` vote for each span, turn, or session: a
+  later `user_feedback` score on the same span (on the same turn, for feedback with only a trace,
+  or on the same session, for feedback with no trace) replaces the earlier one. The SDK sends
+  feedback with no author, so all the feedback that the SDK sends on one span or one turn counts as
+  one vote: the newest.
 - `score` makes one request, with no retry. `score_async` runs it in a worker thread. The key
   needs Run experiments in its Access on the API keys page (the `scores:write` scope).
 
@@ -491,6 +497,10 @@ from telemetry_dev.otel import create_telemetry_span_exporter
 span_exporter = create_telemetry_span_exporter()
 your_tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter))
 ```
+
+`create_telemetry_span_exporter` takes `api_key`, `base_url`, and `timeout`, in seconds (default
+`10.0`). The timeout covers each export request with its retries, also each request of a batch
+that is split.
 
 `TelemetrySpanProcessor` remains available from the package root for compatibility:
 

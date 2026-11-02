@@ -14,6 +14,7 @@ import urllib.parse
 from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from decimal import Decimal
 from time import perf_counter
 from typing import Any, Literal, TypeAlias, TypeGuard, cast
 
@@ -98,7 +99,9 @@ class ExperimentScore:
     up/down score, or the mean of a number score. ``kind`` is None before the score has values.
     ``baseline_value`` is the value in the experiment that this one compares with, by default the
     dataset baseline. ``delta`` is whole points of a pass rate, or the change of a mean to one
-    decimal. ``passed`` is None when the score has no pass mark."""
+    decimal. ``passed`` is None when the score has no pass mark. ``items_failed`` is the count of
+    runs that failed: they have no score, so ``value`` leaves them out, and the check fails. It is
+    None from a server that does not send it."""
 
     name: str
     kind: str | None
@@ -109,6 +112,7 @@ class ExperimentScore:
     delta: float | None
     min_score: float | None
     passed: bool | None
+    items_failed: int | None = None
 
 
 @dataclass(frozen=True)
@@ -894,10 +898,12 @@ def _finish(api: Api, run: _Run, created: _Created) -> ExperimentResult:
     flush()
     _complete(api, created)
     result, body = _wait_for_result(api, created.id)
-    write_result(os.environ, body, api.on_error)
-    print(_describe(result), flush=True)
+    # The action skips the check of a result with the CI mode off, and counts the items from runs.
+    line = {**cast("dict[str, Any]", body), "ci": run.in_ci, "runsPerItem": run.runs_per_item}
+    write_result(os.environ, line, api.on_error)
+    print(_describe(result, run.runs_per_item), flush=True)
     if run.in_ci:
-        _check_result(result)
+        _check_result(result, run.runs_per_item)
     return result
 
 
@@ -939,7 +945,7 @@ def _wait_for_result(api: Api, experiment_id: str) -> tuple[ExperimentResult, ob
         interval = min(interval * 2, _MAX_POLL_INTERVAL_S)
 
 
-def _check_result(result: ExperimentResult) -> None:
+def _check_result(result: ExperimentResult, runs_per_item: int) -> None:
     """In CI mode, a failed check or an experiment that did not complete fails the run."""
     if result.status != "completed":
         reason = f": {result.error}" if result.error else ""
@@ -956,6 +962,8 @@ def _check_result(result: ExperimentResult) -> None:
         for score in result.scores
         if score.passed is False
     ]
+    if result.items_failed > 0:
+        failed.insert(0, _items_failed_text(result, runs_per_item))
     detail = f": {'; '.join(failed)}" if failed else ""
     raise ExperimentError(
         "check_failed",
@@ -964,7 +972,16 @@ def _check_result(result: ExperimentResult) -> None:
     )
 
 
-def _describe(result: ExperimentResult) -> str:
+def _items_failed_text(result: ExperimentResult, runs_per_item: int) -> str:
+    """As "5 of 6 items failed": a failed item has no score, so it fails the check.
+
+    The counts are of runs, which are items only when each item runs once.
+    """
+    unit = "runs" if runs_per_item > 1 else "items"
+    return f"{result.items_failed} of {result.items_done} {unit} failed"
+
+
+def _describe(result: ExperimentResult, runs_per_item: int) -> str:
     if result.status != "completed":
         outcome = result.status + (f": {result.error}" if result.error else "")
     elif result.check_status is None:
@@ -972,6 +989,8 @@ def _describe(result: ExperimentResult) -> str:
     else:
         outcome = f"completed. The check {result.check_status}"
     lines = [f"Experiment {result.name} {outcome}. {result.url}"]
+    if result.items_failed > 0:
+        lines.append(f"  {_items_failed_text(result, runs_per_item)}.")
     for score in result.scores:
         mark = (
             ""
@@ -987,8 +1006,9 @@ def _format(kind: str | None, value: float | None) -> str:
         return "no score"
     if kind in _RATE_KINDS:
         return f"{_js_round(value * 100)}%"
-    rounded = _js_round(value * 100) / 100
-    return str(int(rounded)) if rounded.is_integer() else repr(rounded)
+    # toFixed(1) of JavaScript: the exact value, its sign apart, with a half rounded up.
+    tenths = math.floor(Decimal(abs(value)) * 10 + Decimal("0.5"))
+    return f"{'-' if value < 0 else ''}{tenths // 10}.{tenths % 10}"
 
 
 def _js_round(value: float) -> int:
@@ -1110,7 +1130,9 @@ def _parse_score(raw: object) -> ExperimentScore | None:
     score = cast("dict[str, Any]", raw)
     name, kind, passed = score.get("name"), score.get("kind"), score.get("passed")
     pass_count, fail_count = score.get("passCount"), score.get("failCount")
-    nullable = [score.get(key) for key in ("value", "baselineValue", "delta", "minScore")]
+    nullable = [
+        score.get(key) for key in ("value", "baselineValue", "delta", "minScore", "itemsFailed")
+    ]
     if (
         not isinstance(name, str)
         or not (kind is None or isinstance(kind, str))
@@ -1120,7 +1142,7 @@ def _parse_score(raw: object) -> ExperimentScore | None:
         or not (passed is None or isinstance(passed, bool))
     ):
         return None
-    value, baseline_value, delta, min_score = nullable
+    value, baseline_value, delta, min_score, items_failed = nullable
     return ExperimentScore(
         name=name,
         kind=kind,
@@ -1131,6 +1153,7 @@ def _parse_score(raw: object) -> ExperimentScore | None:
         delta=delta,
         min_score=min_score,
         passed=passed,
+        items_failed=None if items_failed is None else int(cast("float", items_failed)),
     )
 
 

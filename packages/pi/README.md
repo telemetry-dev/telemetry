@@ -118,11 +118,12 @@ These values obey the telemetry.dev SDK `captureInput` and `captureOutput` setti
 `true`. Use `mask` to remove values before capture. Use `maxAttributeLength` to limit serialized
 attributes.
 
-A failed tool's result text is also used as the exception message, but only when `captureOutput` is
-on and no `mask` is set. Otherwise the exception message is `tool <name> failed`, and the result text
-stays in the tool output, which follows `captureOutput` and `mask`. A failed assistant message's
+The SDK records an exception message only when both `captureInput` and `captureOutput` are on, and
+passes it through `mask`. With both on and no `mask`, a failed tool's result text is also its
+exception message. With a `mask` set, the exception message is `tool <name> failed`, and the result
+text stays in the tool output, which follows `captureOutput` and `mask`. A failed assistant message's
 `errorMessage` is a provider diagnostic, not tool output: chat and agent spans use it as the exception
-message regardless of `captureOutput` and `mask`.
+message also when a `mask` is set, and the `mask` receives it.
 
 ## Limitations
 

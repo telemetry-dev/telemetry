@@ -35,7 +35,7 @@ Use a plugin file when you need an option that is a function, such as `mask`. Th
 ```json
 {
   "dependencies": {
-    "@telemetry-dev/opencode": "^0.1.9"
+    "@telemetry-dev/opencode": "^0.2.2"
   }
 }
 ```
@@ -105,9 +105,9 @@ export const TelemetryDev = telemetryDevPlugin({
 });
 ```
 
-A failed tool's error text is what opencode returns to the model, so it counts as tool output: it is recorded as the exception message only when `captureOutput` is on and no `mask` is set. Otherwise the exception message is `tool <name> failed`. Failed tool spans have no output attribute, so with a `mask` set the error text is not exported at all.
+The SDK records an exception message only when both `captureInput` and `captureOutput` are on, and passes it through `mask`. A failed tool's error text is what opencode returns to the model, so it counts as tool output: it is the exception message only when no `mask` is set. With a `mask`, the exception message is `tool <name> failed`. Failed tool spans have no output attribute, so with a `mask` set the error text is not exported at all.
 
-`session.error` text follows the same rule, because opencode publishes a failed prompt attachment's Read error there. Its exception message on the agent, chat, and pending tool spans becomes `session error` when `captureOutput` is off or a `mask` is set; the span keeps the host's error name as its type. The `session.error` log omits `opencode.error.message` when `captureOutput` is off and passes it through `mask` when one is set. An assistant message's `error` is a provider diagnostic: the chat span uses it as the exception message regardless of `captureOutput` and `mask`.
+`session.error` text follows the same rule, because opencode publishes a failed prompt attachment's Read error there. Its exception message on the agent, chat, and pending tool spans becomes `session error` when a `mask` is set; the span keeps the host's error name as its type. The `session.error` log omits `opencode.error.message` when `captureOutput` is off and passes it through `mask` when one is set. An assistant message's `error` is a provider diagnostic: the chat span uses it as the exception message also when a `mask` is set, and the `mask` receives it.
 
 Assistant output text is not captured because opencode's completed assistant message event exposes accumulated metadata and usage, not a final text payload. Prompt input remains available on the parent `invoke_agent` span when input capture is enabled.
 
