@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.3](https://github.com/telemetry-dev/telemetry/compare/opencode-v0.2.2...opencode-v0.2.3) (2026-11-02)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/sdk bumped to 0.2.3
+
 ## [0.2.2](https://github.com/telemetry-dev/telemetry/compare/opencode-v0.2.1...opencode-v0.2.2) (2026-10-30)
 
 
