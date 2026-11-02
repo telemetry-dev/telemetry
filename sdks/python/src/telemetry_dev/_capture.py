@@ -14,6 +14,7 @@ from itertools import chain
 from typing import Final, cast
 
 from ._export import MAX_RECORD_BYTES
+from ._process_lock import ProcessLock
 
 DEFAULT_MAX_STREAM_BYTES: Final = 64 * 1024 * 1024
 _MAX_DEPTH: Final = 32
@@ -64,28 +65,22 @@ class _StreamBudget:
     give_back() and a move made under the lock are queued, and the next call that takes the
     lock applies them, and a reserve() made under the lock is refused. The collector calls the
     finalizer of a dropped stream's budget before the ``finally`` block that ends the stream, so
-    once a list is given back, later moves of it count as nothing. A forked child starts a new
-    generation, and lists of the parent's streams count as holding nothing in it.
+    once a list is given back, later moves of it count as nothing. A forked process starts a new
+    generation at its first call that takes the lock, also after a fork that runs no hooks, and
+    lists of the parent's streams count as holding nothing in it.
     """
 
     def __init__(self, max_bytes: int) -> None:
         self.max_bytes = max_bytes
-        self._lock = threading.Lock()
-        # Set on a thread from before it takes the lock until after it lets go of it.
+        self._lock = ProcessLock(threading.Lock)
+        # The process ID on a thread from before it takes the lock until after it lets go of it.
+        # A process ID, not True: a signal handler that forks inside the block leaves the flag
+        # set on the thread that goes on in the child, where it must not count.
         self._local = threading.local()
+        self._counts_pid = os.getpid()
         self._held = 0
         self._generation = 0
         self._queued: deque[tuple[list[int], int]] = deque()
-        if hasattr(os, "register_at_fork"):
-            # Streams of the parent do not run in a forked child.
-            os.register_at_fork(after_in_child=self._reset)
-
-    def _reset(self) -> None:
-        self._lock = threading.Lock()
-        self._local = threading.local()
-        self._held = 0
-        self._generation += 1
-        self._queued.clear()
 
     def new_held(self) -> list[int]:
         return [0, self._generation, 0]
@@ -106,21 +101,29 @@ class _StreamBudget:
         held[0] = to
 
     def _locked_by_this_thread(self) -> bool:
-        return getattr(self._local, "locking", False)
+        return getattr(self._local, "locking", None) == os.getpid()
 
     def _apply_queued(self) -> None:
+        pid = os.getpid()
+        if self._counts_pid != pid:
+            # The streams of the parent do not run in a forked process. Only a thread that holds
+            # the lock of this process gets here, so one thread starts the counts over.
+            self._counts_pid = pid
+            self._held = 0
+            self._generation += 1
+            self._queued.clear()
         while self._queued:
             self._move(*self._queued.popleft())
 
     @contextmanager
     def _locked(self) -> Generator[None]:
-        self._local.locking = True
+        self._local.locking = os.getpid()
         try:
-            with self._lock:
+            with self._lock():
                 self._apply_queued()
                 yield
         finally:
-            self._local.locking = False
+            self._local.locking = None
 
     def _limit(self, held: list[int]) -> int:
         own = held[0] if held[1] == self._generation else 0
@@ -133,15 +136,16 @@ class _StreamBudget:
         only when the lock is free, so while another thread moves a stream the result can be
         that move behind."""
         if not self._locked_by_this_thread():
-            self._local.locking = True
+            self._local.locking = os.getpid()
             try:
-                if self._lock.acquire(blocking=False):
+                lock = self._lock()
+                if lock.acquire(blocking=False):
                     try:
                         self._apply_queued()
                     finally:
-                        self._lock.release()
+                        lock.release()
             finally:
-                self._local.locking = False
+                self._local.locking = None
         return self._limit(held)
 
     def reserve(self, held: list[int], to: int) -> bool:

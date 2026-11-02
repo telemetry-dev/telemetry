@@ -3,7 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
+import signal
 import sys
+import threading
+import time
 import tracemalloc
 from collections.abc import Iterator, Mapping, Sequence
 from types import SimpleNamespace
@@ -3472,3 +3476,44 @@ def test_provider_attribution_non_openai(memory: SimpleNamespace) -> None:
     assert azure_flag_attrs["gen_ai.request.model"] == "my-azure-deploy"
     assert deployment_attrs["gen_ai.provider.name"] == "azure.ai.openai"
     assert deployment_attrs["gen_ai.request.model"] == "deployment-from-kwarg"
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_forked_child_does_not_wait_for_an_install_lock_that_a_thread_of_the_parent_held() -> (
+    None
+):
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        # A private name: the test must hold the real install lock across the fork.
+        with telemetry_dev_litellm._install_lock:  # pyright: ignore[reportPrivateUsage]
+            held.set()
+            release.wait()
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    try:
+        assert held.wait(10)
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                # The holder thread does not exist here, so this must not wait for it.
+                uninstrument_litellm()
+                code = 0
+            finally:
+                # The child must not return into pytest.
+                os._exit(code)
+    finally:
+        release.set()
+    holder.join(10)
+    # A child that waits for the lock fails the test instead of hanging the suite.
+    deadline = time.monotonic() + 10
+    while (waited := os.waitpid(pid, os.WNOHANG)) == (0, 0):
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pytest.fail("The forked process did not end in 10 s")
+        time.sleep(0.01)
+    assert os.waitstatus_to_exitcode(waited[1]) == 0

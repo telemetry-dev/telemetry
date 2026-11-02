@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import os
 import re
 import threading
 import time
@@ -36,6 +37,22 @@ _ORIGINAL_ATTR = "_telemetry_dev_google_genai_original"
 _ORIGINALS: list[tuple[type[Any], str, Any]] = []
 _installed = False
 _install_lock = threading.Lock()
+
+
+def _reset_install_lock_in_child() -> None:
+    """A thread of the parent can hold the lock at a fork, and only this thread exists here."""
+    global _install_lock
+    _install_lock = threading.Lock()
+
+
+# A hook is enough: a fork that runs no hooks, as uWSGI's fork of its workers by default,
+# starts from its master, which serves no requests. os.register_at_fork cannot remove a hook,
+# and importlib.reload runs this module again with the same globals, so the hook of the first
+# run stays. Windows has no fork.
+if hasattr(os, "register_at_fork") and "_install_fork_hook" not in globals():
+    _install_fork_hook = True
+    os.register_at_fork(after_in_child=_reset_install_lock_in_child)
+
 _T = TypeVar("_T")
 _AFC_USAGE_STATE: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "telemetry_dev_google_genai_afc_usage_state", default=None
@@ -473,9 +490,24 @@ class _VideoOperationTracker:
         self._pending: OrderedDict[tuple[object, str], tuple[str, Callable[..., None]]] = (
             OrderedDict()
         )
-        self._lock = threading.Lock()
+        # The lock of each process, by process ID. A fork can copy the lock while another thread
+        # holds it, and no thread of the child can release the copy. Not a fork hook:
+        # os.register_at_fork keeps each hook for good, and each wrapped client has a tracker.
+        # Not the lock helper of telemetry-dev: the oldest version this package supports lacks it.
+        self._locks = {os.getpid(): threading.Lock()}
         self._closed = False
         self._closed_scopes: WeakKeyDictionary[object, set[str]] = WeakKeyDictionary()
+
+    def _lock(self) -> threading.Lock:
+        pid = os.getpid()
+        lock = self._locks.get(pid)
+        if lock is None:
+            # setdefault, so that threads that get here at the same time share one lock.
+            lock = self._locks.setdefault(pid, threading.Lock())
+            for other in list(self._locks):
+                if other != pid:
+                    self._locks.pop(other, None)
+        return lock
 
     def _scope(self, resource: Any) -> object:
         return _field(resource, "_api_client") if self._scoped else self
@@ -484,7 +516,7 @@ class _VideoOperationTracker:
         evicted: Callable[..., None] | None = None
         closed_error: RuntimeError | None = None
         scope = self._scope(resource)
-        with self._lock:
+        with self._lock():
             if self._closed:
                 closed_error = RuntimeError(
                     "Google GenAI instrumentation removed during video operation"
@@ -505,13 +537,13 @@ class _VideoOperationTracker:
             evicted(error=RuntimeError("video operation tracking capacity exceeded"))
 
     def take(self, resource: Any, name: str) -> Callable[..., None] | None:
-        with self._lock:
+        with self._lock():
             pending = self._pending.pop((self._scope(resource), name), None)
         return pending[1] if pending is not None else None
 
     def close_scope(self, resource: Any, transport: str) -> None:
         scope = self._scope(resource)
-        with self._lock:
+        with self._lock():
             self._closed_scopes.setdefault(scope, set()).add(transport)
             pending: list[Callable[..., None]] = []
             for key, (pending_transport, end) in list(self._pending.items()):
@@ -522,7 +554,7 @@ class _VideoOperationTracker:
             end(error=RuntimeError("Google GenAI client closed during video operation"))
 
     def close(self) -> None:
-        with self._lock:
+        with self._lock():
             if self._closed:
                 return
             self._closed = True

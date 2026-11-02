@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+import os
+import signal
+import threading
+import time
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any, cast
@@ -26,6 +30,7 @@ from openrouter.responses import Responses
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import StatusCode
 
+import telemetry_dev_openrouter
 from telemetry_dev_openrouter import (
     instrument_openrouter,
     uninstrument_openrouter,
@@ -2621,3 +2626,44 @@ def test_fail_open_without_telemetry_init() -> None:
 
     assert result.id == "gen_123"
     assert telemetry_dev.get_client() is None
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_forked_child_does_not_wait_for_an_install_lock_that_a_thread_of_the_parent_held() -> (
+    None
+):
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        # A private name: the test must hold the real install lock across the fork.
+        with telemetry_dev_openrouter._install_lock:  # pyright: ignore[reportPrivateUsage]
+            held.set()
+            release.wait()
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    try:
+        assert held.wait(10)
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                # The holder thread does not exist here, so this must not wait for it.
+                uninstrument_openrouter()
+                code = 0
+            finally:
+                # The child must not return into pytest.
+                os._exit(code)
+    finally:
+        release.set()
+    holder.join(10)
+    # A child that waits for the lock fails the test instead of hanging the suite.
+    deadline = time.monotonic() + 10
+    while (waited := os.waitpid(pid, os.WNOHANG)) == (0, 0):
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pytest.fail("The forked process did not end in 10 s")
+        time.sleep(0.01)
+    assert os.waitstatus_to_exitcode(waited[1]) == 0

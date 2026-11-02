@@ -58,11 +58,12 @@ from ._metrics import (
     OutputChunkAggregation,
     sdk_meter_provider,
 )
+from ._process_lock import ProcessLock
 from ._processor import ExportMode, StampingSpanProcessor
 from ._semconv import SCOPE_NAME
 from ._serialize import Mask, serialize_content
 
-_lock = threading.RLock()
+_lock = ProcessLock(threading.RLock)
 _client: Client | None = None
 
 
@@ -298,7 +299,7 @@ class Client:
 
     def shutdown(self, timeout_s: float = 10.0) -> None:
         global _client
-        with _lock:
+        with _lock():
             if self._shutdown:
                 return
             self._shutdown = True
@@ -406,7 +407,7 @@ def init(
         report_error(on_error, "init failed; telemetry disabled", exc)
         client = Client(config=config, enabled=False)
 
-    with _lock:
+    with _lock():
         previous = _client
         _client = client
     if previous is not None:

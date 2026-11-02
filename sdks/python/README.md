@@ -478,6 +478,27 @@ telemetry_dev.init(export_mode="immediate")
 telemetry_dev.flush()  # force-flush traces + logs + metrics
 ```
 
+## Forking servers
+
+A server that forks its workers from the process that called `init()`, as gunicorn,
+`multiprocessing` with the `fork` start method, or `os.fork()`, needs no setup. Python runs the
+fork hooks of the SDK and of OpenTelemetry in each worker, and the SDK does not wait in a worker
+for a lock that a thread of the parent held at the fork.
+
+uWSGI loads the app before it forks its workers, and by default it runs no Python fork hooks in
+them. Traces and logs still go out, but the OpenTelemetry metric reader starts its thread again
+only in a fork hook, so a worker sends metrics only when it calls `telemetry_dev.flush()`. Set one
+of these uWSGI options:
+
+- `lazy-apps = true`: each worker loads the app, and thus calls `init()` itself.
+- `py-call-uwsgi-fork-hooks = true` (uWSGI 2.0.21 and later): uWSGI runs the Python fork hooks
+  around each fork. Before 2.0.27, it runs only the hooks of the child, which is enough for the
+  SDK.
+
+Before uWSGI 2.0.27, Python threads run only with `enable-threads = true` or more than one
+`threads`. The SDK sends telemetry from its own threads, so set one of them too, also with
+`lazy-apps`.
+
 ## Bring your own OTel (`telemetry_dev.otel`)
 
 If you already run an OpenTelemetry SDK, attach the telemetry.dev processor to your provider
