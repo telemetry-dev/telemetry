@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import secrets
 import threading
 import time
 from collections.abc import Generator
@@ -27,7 +28,10 @@ class CapturedRequest:
 
 @dataclass
 class CaptureServer:
+    # The URL has a random path. Other local processes can send requests to the port; the server
+    # answers a request outside the path with 404 and leaves it out of requests and replies.
     url: str
+    # The requests under url, with the path below it.
     requests: list[CapturedRequest]
     # The HTTP status of each response. To make an ingest outage, set an error status such as 503.
     status: int = 200
@@ -54,14 +58,27 @@ def otlp_capture_server() -> Generator[CaptureServer]:
     captured: list[CapturedRequest] = []
     # Concurrent GETs take the next reply under this lock, so two cannot both pop the last ones.
     replies_lock = threading.Lock()
+    prefix = f"/{secrets.token_hex(8)}"
 
     class Handler(BaseHTTPRequestHandler):
+        def own_path(self) -> str | None:
+            if not self.path.startswith(f"{prefix}/"):
+                self.send_response(404)
+                self.send_header("content-length", "0")
+                self.end_headers()
+                # The body of a POST is still unread.
+                self.close_connection = True
+                return None
+            return self.path.removeprefix(prefix)
+
         def do_POST(self) -> None:
+            path = self.own_path()
+            if path is None:
+                return
             length = int(self.headers.get("content-length") or 0)
             body = self.rfile.read(length)
             request = CapturedRequest(
-                # self.path collapses a leading "//" (gh-87389); keep the raw target.
-                path=self.requestline.split(" ")[1],
+                path=path,
                 headers={key.lower(): value for key, value in self.headers.items()},
                 body=body,
             )
@@ -74,10 +91,13 @@ def otlp_capture_server() -> Generator[CaptureServer]:
             self.end_headers()
 
         def do_GET(self) -> None:
+            path = self.own_path()
+            if path is None:
+                return
             delay = capture.delay
             captured.append(
                 CapturedRequest(
-                    path=self.requestline.split(" ")[1],
+                    path=path,
                     headers={key.lower(): value for key, value in self.headers.items()},
                     body=b"",
                 )
@@ -106,7 +126,7 @@ def otlp_capture_server() -> Generator[CaptureServer]:
         target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
     )
     host, port = server.server_address[0], server.server_address[1]
-    capture = CaptureServer(url=f"http://{host}:{port}", requests=captured)
+    capture = CaptureServer(url=f"http://{host}:{port}{prefix}", requests=captured)
     thread.start()
     try:
         yield capture
