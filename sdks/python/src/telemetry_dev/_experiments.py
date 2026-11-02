@@ -901,9 +901,9 @@ def _finish(api: Api, run: _Run, created: _Created) -> ExperimentResult:
     # The action skips the check of a result with the CI mode off, and counts the items from runs.
     line = {**cast("dict[str, Any]", body), "ci": run.in_ci, "runsPerItem": run.runs_per_item}
     write_result(os.environ, line, api.on_error)
-    print(_describe(result), flush=True)
+    print(_describe(result, run.runs_per_item), flush=True)
     if run.in_ci:
-        _check_result(result)
+        _check_result(result, run.runs_per_item)
     return result
 
 
@@ -945,7 +945,7 @@ def _wait_for_result(api: Api, experiment_id: str) -> tuple[ExperimentResult, ob
         interval = min(interval * 2, _MAX_POLL_INTERVAL_S)
 
 
-def _check_result(result: ExperimentResult) -> None:
+def _check_result(result: ExperimentResult, runs_per_item: int) -> None:
     """In CI mode, a failed check or an experiment that did not complete fails the run."""
     if result.status != "completed":
         reason = f": {result.error}" if result.error else ""
@@ -963,7 +963,7 @@ def _check_result(result: ExperimentResult) -> None:
         if score.passed is False
     ]
     if result.items_failed > 0:
-        failed.insert(0, _items_failed_text(result))
+        failed.insert(0, _items_failed_text(result, runs_per_item))
     detail = f": {'; '.join(failed)}" if failed else ""
     raise ExperimentError(
         "check_failed",
@@ -972,12 +972,16 @@ def _check_result(result: ExperimentResult) -> None:
     )
 
 
-def _items_failed_text(result: ExperimentResult) -> str:
-    """As "5 of 6 items failed": a failed item has no score, so it fails the check."""
-    return f"{result.items_failed} of {result.items_done} items failed"
+def _items_failed_text(result: ExperimentResult, runs_per_item: int) -> str:
+    """As "5 of 6 items failed": a failed item has no score, so it fails the check.
+
+    The counts are of runs, which are items only when each item runs once.
+    """
+    unit = "runs" if runs_per_item > 1 else "items"
+    return f"{result.items_failed} of {result.items_done} {unit} failed"
 
 
-def _describe(result: ExperimentResult) -> str:
+def _describe(result: ExperimentResult, runs_per_item: int) -> str:
     if result.status != "completed":
         outcome = result.status + (f": {result.error}" if result.error else "")
     elif result.check_status is None:
@@ -986,7 +990,7 @@ def _describe(result: ExperimentResult) -> str:
         outcome = f"completed. The check {result.check_status}"
     lines = [f"Experiment {result.name} {outcome}. {result.url}"]
     if result.items_failed > 0:
-        lines.append(f"  {_items_failed_text(result)}.")
+        lines.append(f"  {_items_failed_text(result, runs_per_item)}.")
     for score in result.scores:
         mark = (
             ""

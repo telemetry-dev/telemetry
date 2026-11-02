@@ -299,9 +299,9 @@ export async function runExperiment(options: RunExperimentOptions): Promise<Expe
     { ...(body as Record<string, unknown>), ci: run.inCi, runsPerItem: run.runsPerItem },
     api.onError,
   );
-  console.log(describe(result));
+  console.log(describe(result, run.runsPerItem));
 
-  if (run.inCi) checkResult(result);
+  if (run.inCi) checkResult(result, run.runsPerItem);
 
   return result;
 }
@@ -800,7 +800,7 @@ async function waitForResult(
 }
 
 /** In CI mode, a failed check or an experiment that did not complete fails the run. */
-function checkResult(result: ExperimentResult): void {
+function checkResult(result: ExperimentResult, runsPerItem: number): void {
   if (result.status !== "completed") {
     throw new ExperimentError(
       "experiment_failed",
@@ -819,7 +819,7 @@ function checkResult(result: ExperimentResult): void {
         `${score.name} is ${formatScore(score.kind, score.value)}, under the pass mark ${formatScore(score.kind, score.minScore)}`,
     );
 
-  if (result.itemsFailed > 0) failed.unshift(itemsFailedText(result));
+  if (result.itemsFailed > 0) failed.unshift(itemsFailedText(result, runsPerItem));
 
   throw new ExperimentError(
     "check_failed",
@@ -829,12 +829,15 @@ function checkResult(result: ExperimentResult): void {
   );
 }
 
-/** "5 of 6 items failed": a failed item has no score, so it fails the check. */
-function itemsFailedText(result: ExperimentResult): string {
-  return `${result.itemsFailed} of ${result.itemsDone} items failed`;
+/**
+ * "5 of 6 items failed": a failed item has no score, so it fails the check. The counts are of
+ * runs, which are items only when each item runs once.
+ */
+function itemsFailedText(result: ExperimentResult, runsPerItem: number): string {
+  return `${result.itemsFailed} of ${result.itemsDone} ${runsPerItem > 1 ? "runs" : "items"} failed`;
 }
 
-function describe(result: ExperimentResult): string {
+function describe(result: ExperimentResult, runsPerItem: number): string {
   const outcome =
     result.status !== "completed"
       ? `${result.status}${result.error ? `: ${result.error}` : ""}`
@@ -844,7 +847,7 @@ function describe(result: ExperimentResult): string {
 
   return [
     `Experiment ${result.name} ${outcome}. ${result.url}`,
-    ...(result.itemsFailed > 0 ? [`  ${itemsFailedText(result)}.`] : []),
+    ...(result.itemsFailed > 0 ? [`  ${itemsFailedText(result, runsPerItem)}.`] : []),
     ...result.scores.map(
       (score) =>
         `  ${score.name}: ${formatScore(score.kind, score.value)}` +
