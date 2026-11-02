@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import copy
 import os
 import threading
@@ -280,19 +281,42 @@ def exporting() -> Generator[None]:
         _export_state.depth -= 1
 
 
+# The keys of the work items whose thread has not finished.
 _pending_lock = threading.Lock()
 _pending: set[object] = set()
 
 
-def after_export(key: object, work: Callable[[], object]) -> bool:
+def _reset_pending_in_child() -> None:
+    """Drops the keys of the parent: the child has none of their threads, so they would make it
+    skip each later work item with the same key. A thread of the parent can hold the lock, and
+    only this thread exists here."""
+    global _pending_lock
+    _pending_lock = threading.Lock()
+    _pending.clear()
+
+
+# os.register_at_fork cannot remove a hook, and importlib.reload runs this module again with the
+# same globals, so the hook of the first run stays. Windows has no fork.
+if hasattr(os, "register_at_fork") and "_pending_fork_hook" not in globals():
+    _pending_fork_hook = True
+    os.register_at_fork(after_in_child=_reset_pending_in_child)
+
+
+def after_export(key: object, work: Callable[[], object], *, shutdown: bool = False) -> bool:
     """Runs work on a new thread when this thread is inside an export of this SDK.
 
     The batch processors and the metric reader hold a lock while they export, and flush and
     shutdown wait for that lock. An on_error callback runs inside the export, so a flush or
     shutdown it calls would wait for its own thread forever. On the new thread, the work waits
-    until the export ends. A work item with the same key that has not finished yet takes the
-    place of this one, so a burst of reports starts one thread. The thread is not a daemon, so
-    the process exits only after the work. Returns whether this thread must skip the work.
+    until the export ends, unless the exporter holds no lock, as in immediate mode. A work item
+    with the same key that has not finished yet takes the place of this one, so a burst of
+    reports starts one thread.
+
+    A ``shutdown`` runs on a non-daemon thread, so the process exits only after it, and at exit
+    if the thread cannot start; it is bounded by the timeouts of the shutdown. A flush runs on a
+    daemon thread: it can wait for every queued record to be sent, which in an outage has no
+    bound, and the shutdown at exit sends what is left. Returns whether this thread must skip
+    the work.
     """
     if not getattr(_export_state, "depth", 0):
         return False
@@ -309,11 +333,20 @@ def after_export(key: object, work: Callable[[], object]) -> bool:
                 _pending.discard(key)
 
     try:
-        threading.Thread(target=run, name="telemetry-dev-after-export").start()
+        # Set explicitly: a new thread inherits daemon from the export thread, which is a daemon.
+        threading.Thread(target=run, name="telemetry-dev-after-export", daemon=not shutdown).start()
     except BaseException:
-        with _pending_lock:
-            _pending.discard(key)
-        logger.warning("telemetry-dev: could not start a thread for a flush or shutdown")
+        # Running the work here waits for this thread, and returning False does the same.
+        if shutdown:
+            # The key stays pending until exit, so a burst of reports registers one exit handler.
+            logger.warning(
+                "telemetry-dev: could not start a thread for a shutdown; it runs at exit"
+            )
+            atexit.register(run)
+        else:
+            with _pending_lock:
+                _pending.discard(key)
+            logger.warning("telemetry-dev: could not start a thread for a flush")
     return True
 
 
