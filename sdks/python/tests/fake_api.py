@@ -4,6 +4,7 @@ cursor, an experiment that takes item posts of at most 100 and skips repeats, an
 from __future__ import annotations
 
 import json
+import secrets
 import sys
 import threading
 import time
@@ -83,6 +84,8 @@ class Late:
 
 @dataclass
 class FakeApi:
+    # The URL has a random path. Other local processes can send requests to the port; the server
+    # answers a request outside the path with 404 and leaves it out of requests and override.
     url: str
     items: list[dict[str, Any]] = field(default_factory=lambda: [dataset_item(1), dataset_item(2)])
     page_size: int = 100
@@ -159,6 +162,7 @@ class FakeApi:
 @contextmanager
 def fake_api(**options: Any) -> Generator[FakeApi]:
     api: FakeApi | None = None
+    prefix = f"/{secrets.token_hex(8)}"
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -169,13 +173,20 @@ def fake_api(**options: Any) -> Generator[FakeApi]:
 
         def _answer(self) -> None:
             assert api is not None
+            target = urlsplit(self.path)
+            if not target.path.startswith(f"{prefix}/"):
+                self.send_response(404)
+                self.send_header("content-length", "0")
+                self.end_headers()
+                # The body of a POST is still unread.
+                self.close_connection = True
+                return
             length = int(self.headers.get("content-length") or 0)
             raw = self.rfile.read(length) if length else b""
-            target = urlsplit(self.path)
             reply = api.answer(
                 ApiRequest(
                     method=self.command,
-                    path=target.path,
+                    path=target.path.removeprefix(prefix),
                     query=dict(parse_qsl(target.query)),
                     headers={key.lower(): value for key, value in self.headers.items()},
                     body=json.loads(raw) if raw else None,
@@ -211,7 +222,7 @@ def fake_api(**options: Any) -> Generator[FakeApi]:
         target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
     )
     host, port = server.server_address[0], server.server_address[1]
-    api = FakeApi(url=f"http://{host}:{port}", **options)
+    api = FakeApi(url=f"http://{host}:{port}{prefix}", **options)
     thread.start()
     try:
         yield api
