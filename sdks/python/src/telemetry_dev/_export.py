@@ -8,6 +8,7 @@ import threading
 import weakref
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
+from enum import Enum
 from typing import Any, TypeVar, cast
 
 from opentelemetry.exporter.otlp.proto.common._log_encoder import encode_logs
@@ -115,42 +116,182 @@ def _fit_log(item: Any) -> Any:
     return None if fitted is None else _log_with_values(item, *fitted)
 
 
+# Upper bounds of the protobuf size of OTLP fields, without encoding them. Python counts code
+# points, and each takes at most 4 UTF-8 bytes, or 1 in an ASCII string. Each field or message
+# also takes a tag and a length of at most 2 and 5 bytes, and a number at most 10; the constants
+# round those up.
+_FIELD_BOUND = 16
+_RECORD_BOUND = 256
+_EVENT_BOUND = 64
+_LINK_BOUND = 128
+_MAX_BOUND_DEPTH = 32
+
+
+def _text_bound(text: str | None) -> int:
+    text = text or ""
+    return _FIELD_BOUND + (len(text) if text.isascii() else 4 * len(text))
+
+
+def _value_bound(value: object, depth: int = 0) -> int | None:
+    """At least the encoded size of ``value`` as an OTLP AnyValue, or None for a value that the
+    encoder may treat in a way this does not cover."""
+    if depth > _MAX_BOUND_DEPTH:
+        return None
+    if value is None or isinstance(value, bool | int | float):
+        return _FIELD_BOUND
+    if isinstance(value, str):
+        return _text_bound(value)
+    if isinstance(value, bytes):
+        return _FIELD_BOUND + len(value)
+    total = _FIELD_BOUND
+    # Sequence first, as the encoder tests them.
+    if isinstance(value, Sequence):
+        for item in cast("Sequence[object]", value):
+            item_bound = _value_bound(item, depth + 1)
+            if item_bound is None:
+                return None
+            total += _FIELD_BOUND + item_bound
+        return total
+    if isinstance(value, Mapping):
+        for key, item in cast("Mapping[object, object]", value).items():
+            item_bound = _value_bound(item, depth + 1)
+            if not isinstance(key, str) or item_bound is None:
+                return None
+            total += _FIELD_BOUND + _text_bound(key) + item_bound
+        return total
+    return None
+
+
+def _sum_bounds(bounds: Sequence[int | None]) -> int | None:
+    return None if None in bounds else sum(cast("Sequence[int]", bounds))
+
+
+def _origin_bound(resource: Any, scope: Any) -> int | None:
+    """The resource and scope of a record. The encoder writes each once per group of records;
+    counting them for each record keeps this an upper bound."""
+    if scope is None:
+        scope_bound: int | None = _FIELD_BOUND
+    else:
+        scope_bound = _sum_bounds(
+            [
+                _FIELD_BOUND,
+                _text_bound(scope.name),
+                _text_bound(scope.version),
+                _text_bound(getattr(scope, "schema_url", None)),
+                _value_bound(dict(getattr(scope, "attributes", None) or {})),
+            ]
+        )
+    return _sum_bounds(
+        [
+            scope_bound,
+            _value_bound(dict(resource.attributes)),
+            _text_bound(getattr(resource, "schema_url", None)),
+        ]
+    )
+
+
+def _span_bound(span: ReadableSpan) -> int | None:
+    bounds: list[int | None] = [
+        _RECORD_BOUND,
+        _text_bound(span.name),
+        _text_bound(span.context.trace_state.to_header() if span.context else None),
+        _text_bound(span.status.description),
+        _value_bound(dict(span.attributes or {})),
+        _origin_bound(span.resource, span.instrumentation_scope),
+    ]
+    for event in span.events:
+        bounds += [
+            _EVENT_BOUND,
+            _text_bound(event.name),
+            _value_bound(dict(event.attributes or {})),
+        ]
+    for link in span.links:
+        bounds += [
+            _LINK_BOUND,
+            _text_bound(link.context.trace_state.to_header()),
+            _value_bound(dict(link.attributes or {})),
+        ]
+    return _sum_bounds(bounds)
+
+
+def _log_bound(item: Any) -> int | None:
+    record = item.log_record
+    return _sum_bounds(
+        [
+            _RECORD_BOUND,
+            _text_bound(record.severity_text),
+            _text_bound(getattr(record, "event_name", None)),
+            _value_bound(record.body),
+            _value_bound(dict(record.attributes or {})),
+            _origin_bound(item.resource, getattr(item, "instrumentation_scope", None)),
+        ]
+    )
+
+
+def _fits_by_bound(records: Sequence[_Record], bound: Callable[[_Record], int | None]) -> bool:
+    """Whether the records surely fit in one request, which spares an encode to measure them."""
+    total = 0
+    for record in records:
+        try:
+            record_bound = bound(record)
+        except Exception:
+            # The bound only spares an encode, so a record it cannot read is measured instead.
+            return False
+        if record_bound is None:
+            return False
+        total += record_bound
+        if total > MAX_RECORD_BYTES:
+            return False
+    return True
+
+
+class _Dropped(Enum):
+    DROPPED = "dropped"
+
+
 def _send_within_limit(
     records: Sequence[_Record],
     *,
+    bound: Callable[[_Record], int | None],
     size: Callable[[Sequence[_Record]], int],
     fit: Callable[[_Record], _Record | None],
     send: Callable[[Sequence[_Record]], _Result],
-    success: _Result,
     failure: _Result,
     label: str,
     on_error: Callable[[BaseException], None] | None,
-) -> _Result:
-    """Send records in requests of at most MAX_RECORD_BYTES, like the TypeScript exporter."""
-    if not records or size(records) <= MAX_RECORD_BYTES:
+) -> _Result | _Dropped:
+    """Send records in requests of at most MAX_RECORD_BYTES, like the TypeScript exporter.
+
+    Stops at the first failed request. Returns DROPPED when no request was sent because every
+    record was dropped: that is not a failure, but nothing reached the ingest either.
+    """
+    if not records or _fits_by_bound(records, bound) or size(records) <= MAX_RECORD_BYTES:
         return send(records)
     if len(records) > 1:
         middle = (len(records) + 1) // 2
-        results = [
-            _send_within_limit(
+        delivered: _Result | _Dropped = _Dropped.DROPPED
+        for part in (records[:middle], records[middle:]):
+            result = _send_within_limit(
                 part,
+                bound=bound,
                 size=size,
                 fit=fit,
                 send=send,
-                success=success,
                 failure=failure,
                 label=label,
                 on_error=on_error,
             )
-            for part in (records[:middle], records[middle:])
-        ]
-        return failure if failure in results else success
+            if result is failure:
+                return failure
+            if result is not _Dropped.DROPPED:
+                delivered = result
+        return delivered
     fitted = fit(records[0])
     if fitted is None:
         # A record the ingest can never accept is dropped instead of failing the batch forever.
         message = f"{label} record exceeds max export size, dropped"
         report_error(on_error, message, ValueError(message))
-        return success
+        return _Dropped.DROPPED
     message = f"{label} record exceeds max export size; its longest values were truncated"
     report_error(on_error, message, ValueError(message))
     return send([fitted])
@@ -418,10 +559,10 @@ class ReportingSpanExporter(SpanExporter):
             try:
                 result = _send_within_limit(
                     list(spans),
+                    bound=_span_bound,
                     size=lambda batch: encode_spans(batch).ByteSize(),
                     fit=_fit_span,
                     send=self._inner.export,
-                    success=SpanExportResult.SUCCESS,
                     failure=SpanExportResult.FAILURE,
                     label="span",
                     on_error=self._on_error,
@@ -429,6 +570,9 @@ class ReportingSpanExporter(SpanExporter):
             except BaseException as exc:
                 self._failures.report("span export failed", exc)
                 return SpanExportResult.FAILURE
+            if result is _Dropped.DROPPED:
+                # Every record was dropped: the export did not fail, and the series goes on.
+                return SpanExportResult.SUCCESS
             if result is SpanExportResult.FAILURE:
                 self._failures.report(
                     "span export failed",
@@ -463,10 +607,10 @@ class ReportingLogExporter(LogRecordExporter):
             try:
                 result = _send_within_limit(
                     list(batch),
+                    bound=_log_bound,
                     size=lambda records: encode_logs(records).ByteSize(),
                     fit=_fit_log,
                     send=self._inner.export,
-                    success=LogRecordExportResult.SUCCESS,
                     failure=LogRecordExportResult.FAILURE,
                     label="log",
                     on_error=self._on_error,
@@ -474,6 +618,9 @@ class ReportingLogExporter(LogRecordExporter):
             except BaseException as exc:
                 self._failures.report("log export failed", exc)
                 return LogRecordExportResult.FAILURE
+            if result is _Dropped.DROPPED:
+                # Every record was dropped: the export did not fail, and the series goes on.
+                return LogRecordExportResult.SUCCESS
             if result is LogRecordExportResult.FAILURE:
                 self._failures.report(
                     "log export failed",

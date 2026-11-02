@@ -1,4 +1,4 @@
-import { ExportResultCode } from "@opentelemetry/core";
+import { ExportResultCode, loggingErrorHandler, setGlobalErrorHandler } from "@opentelemetry/core";
 import { diag, trace } from "@opentelemetry/api";
 import { InMemorySpanExporter, type SpanExporter } from "@opentelemetry/sdk-trace-base";
 import { afterEach, expect, test, vi } from "vitest";
@@ -493,6 +493,54 @@ test("batched spans and logs past maxQueueBytes are dropped and reported once un
   expect(logs.getFinishedLogRecords()).toHaveLength(5);
   expect(errors).toHaveLength(4);
 });
+
+test.each([
+  [
+    "span",
+    "/v1/traces",
+    (value: string) => startSpan("large", { type: "tool", input: value }).end(),
+  ],
+  ["log", "/v1/logs", (value: string) => log(value)],
+])(
+  "a batch of %s records split into two requests may take one timeout for each request",
+  async (_kind, path, record) => {
+    const REQUEST_MS = 600;
+    const errors: unknown[] = [];
+    const requests: string[] = [];
+    // The log batch processor reports its timeout here rather than to onError.
+    setGlobalErrorHandler((error) => errors.push(error));
+
+    try {
+      init({
+        apiKey: "td_live_test",
+        baseUrl: "https://ingest.test",
+        exportMode: "batched",
+        // Two requests take longer than one timeout, so a batch timeout of one request fails this.
+        batch: { scheduledDelayMillis: 1_000_000, exportTimeoutMillis: 1_000 },
+        logLevel: "silent",
+        onError: (error) => errors.push(error),
+        fetch: async (input) => {
+          requests.push(new URL(input instanceof Request ? input.url : input).pathname);
+          await new Promise((resolve) => setTimeout(resolve, REQUEST_MS));
+
+          return new Response(null, { status: 200 });
+        },
+      });
+
+      // Two values of 9 MB: together they exceed the 16 MiB request limit, each one fits.
+      record("p".repeat(9_000_000));
+      record("q".repeat(9_000_000));
+      await flush();
+
+      expect(errors).toEqual([]);
+      expect(requests.filter((pathname) => pathname === path)).toHaveLength(2);
+    } finally {
+      setGlobalErrorHandler(loggingErrorHandler());
+    }
+  },
+  // Values near the 16 MiB limit take seconds to serialize.
+  30_000,
+);
 
 test("captureMasked reports whether the active client has a mask", () => {
   expect(captureMasked()).toBe(false);
