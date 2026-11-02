@@ -120,8 +120,32 @@ def mark_capture_incomplete(fields: dict[str, Any], mask_output: bool) -> dict[s
     return marked
 
 
+def stream_span_reporter(handle: Any) -> Callable[[BaseException], None]:
+    reported = False
+
+    # One report per stream: a mapper that fails on one event likely fails on each one after it.
+    def report(cause: BaseException) -> None:
+        nonlocal reported
+        if reported:
+            return
+        reported = True
+        try:
+            handle.report_error(cause)
+        except Exception:
+            return
+
+    return report
+
+
 class StreamState:
     budget: telemetry_dev.CaptureBudget
+    # feed() sets it once the output of the event is kept, so a failure after it loses only
+    # metadata. A state that does not set it has every failure count as lost output.
+    output_recorded = False
+    # Set when kept metadata is lost: it flags the capture without cutting the output.
+    metadata_lost = False
+    # The stream that feeds the state sets it, for failures that feed() handles itself.
+    report_error: Callable[[BaseException], None]
 
     def feed(self, event: Any) -> bool | None:
         raise NotImplementedError
@@ -316,6 +340,7 @@ class ConverseStreamState(StreamState):
                         cast(list[Any], citations_value).append(citation)
                     else:
                         block["citations"] = [citation]
+        self.output_recorded = True
         stop = event.get("messageStop")
         if isinstance(stop, dict) and isinstance(stop.get("stopReason"), str):
             self.stop_reason = stop["stopReason"]
@@ -405,10 +430,18 @@ class InvokeModelStreamState(StreamState):
             return False
         try:
             parsed = json.loads(text)
-        except json.JSONDecodeError:
-            return bool(text)
+        except json.JSONDecodeError as exc:
+            # A blank chunk carries no output.
+            if not text.strip():
+                return False
+            # The chunk's output is lost. Handled here, not raised, so the chunk-timing fallback
+            # does not decode it again; the truncated budget keeps no later chunk.
+            self.budget.truncated = True
+            self.report_error(exc)
+            return True
         if self.budget.accept(parsed):
             self.chunks.append(parsed)
+        self.output_recorded = True
         if isinstance(parsed, dict):
             self._collect_anthropic_usage(parsed)
             if isinstance(parsed.get("amazon-bedrock-invocationMetrics"), dict):
@@ -575,11 +608,18 @@ class AgentStreamState(StreamState):
                 self.return_control = None
                 self.return_control_rejected = True
                 self.budget.truncated = True
+        self.output_recorded = True
         trace = event.get("trace") if isinstance(event.get("trace"), dict) else None
         if trace:
             self.trace_count += 1
             if self.capture_trace:
-                retained = _project_trace(trace, _TRACE_PART, self.trace_capture)
+                try:
+                    retained = _project_trace(trace, _TRACE_PART, self.trace_capture)
+                except Exception:
+                    # The trace content is lost, as a trace dropped by the bound is, but no
+                    # text is, so later text is still kept.
+                    self.metadata_lost = True
+                    raise
                 if self.budget.accept(retained):
                     self.traces.append(retained)
             self._collect_trace(trace)
@@ -741,6 +781,7 @@ class InstrumentedEventStream:
         finish: Callable[[dict[str, Any]], None],
         started_at: float,
         handle: Any,
+        report_error: Callable[[BaseException], None],
     ) -> None:
         self._stream = stream
         self._state = state
@@ -751,6 +792,8 @@ class InstrumentedEventStream:
         self._first = False
         self._track_output_chunks = isinstance(state, ConverseStreamState | InvokeModelStreamState)
         self._mask_output_when_incomplete = capture_masked(handle)
+        self._report_error = report_error
+        state.report_error = self._report_error
 
     def __iter__(self) -> Iterator[Any]:
         completed = False
@@ -762,17 +805,32 @@ class InstrumentedEventStream:
                     self._finish_callback(
                         {"time_to_first_chunk_ms": (received_at - self._started_at) * 1000}
                     )
+                self._state.output_recorded = False
                 try:
                     state_has_output = self._state.feed(event)
-                except Exception:
+                except Exception as exc:
+                    self._report_error(exc)
+                    if not self._state.output_recorded:
+                        # The event may have carried output that is now lost. The truncated
+                        # budget keeps no later output, so the output stays a prefix.
+                        self._state.budget.truncated = True
+                        if isinstance(self._state, AgentStreamState):
+                            # The lost event may have carried text. Return control still
+                            # replaces it.
+                            self._state.text_rejected = True
                     state_has_output = None
-                if self._track_output_chunks and (
-                    state_has_output if state_has_output is not None else _event_has_output(event)
-                ):
+                if self._track_output_chunks:
+                    # Chunk timing must not reach the caller. When feed() failed, the fallback
+                    # reads the event again and can fail the same way, which feed() reported.
                     try:
-                        record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-                        if callable(record_output_chunk):
-                            record_output_chunk(received_at * 1000)
+                        if (
+                            state_has_output
+                            if state_has_output is not None
+                            else _event_has_output(event)
+                        ):
+                            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
+                            if callable(record_output_chunk):
+                                record_output_chunk(received_at * 1000)
                     except Exception:
                         pass
                 yield event
@@ -805,8 +863,14 @@ class InstrumentedEventStream:
         self._ended = True
         # The output is read before the release, which fixes the stream's bound.
         try:
-            fields = self._state.finish(partial=partial)
-            if partial or self._state.budget.truncated:
+            try:
+                fields = self._state.finish(partial=partial)
+            except Exception as exc:
+                # The output that the stream kept is lost.
+                self._report_error(exc)
+                self._state.budget.truncated = True
+                fields = {}
+            if partial or self._state.budget.truncated or self._state.metadata_lost:
                 fields = mark_capture_incomplete(
                     fields,
                     self._mask_output_when_incomplete

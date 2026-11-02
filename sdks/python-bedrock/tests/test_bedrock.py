@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import gc
 import io
 import json
@@ -8,6 +9,7 @@ import os
 import signal
 import threading
 import time
+import traceback
 import tracemalloc
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -22,10 +24,12 @@ from botocore.exceptions import ClientError, EventStreamError
 from botocore.response import StreamingBody
 from botocore.stub import Stubber
 from conftest import STREAM_LIMIT
+from opentelemetry.trace import StatusCode
 
 import telemetry_dev_bedrock._instrument as bedrock_instrument
 import telemetry_dev_bedrock._streams as bedrock_streams
 from telemetry_dev_bedrock import instrument_bedrock, uninstrument_bedrock, wrap_bedrock
+from telemetry_dev_bedrock._registry import SERVICE_OPERATIONS
 
 # A JSON string of this many characters alone passes the bound of a non-stream capture.
 OVER_RECORD = "x" * telemetry_dev.MAX_RECORD_BYTES
@@ -125,6 +129,12 @@ def _json_attr(span: Any, key: str) -> Any:
     value = span.attributes[key]
     assert isinstance(value, str)
     return json.loads(value)
+
+
+def _instrumentation_errors(errors: list[BaseException]) -> list[BaseException]:
+    # The in-memory metric reader reports at the first span with chunk timing that only the
+    # built-in OTLP exporter exports the interval metric.
+    return [error for error in errors if "time_per_output_chunk" not in str(error)]
 
 
 SUPPORT_PROMPT = telemetry_dev.ChatPrompt(
@@ -649,7 +659,8 @@ def test_with_the_default_bounds_a_converse_stream_is_cut_only_at_the_record_bou
     make: Any, monkeypatch: pytest.MonkeyPatch, length: int, cut: bool
 ) -> None:
     conftest.other_stream.release()
-    memory = make(max_stream_bytes=64 * 1024 * 1024)
+    errors: list[BaseException] = []
+    memory = make(max_stream_bytes=64 * 1024 * 1024, on_error=errors.append)
     deltas = [
         MIB_TEXT[: min(len(MIB_TEXT), length - start)] for start in range(0, length, len(MIB_TEXT))
     ]
@@ -661,6 +672,12 @@ def test_with_the_default_bounds_a_converse_stream_is_cut_only_at_the_record_bou
 
     _state, span = _streamed_converse(memory, monkeypatch, events)
 
+    # A mapping failure would also flag the capture and keep the same 15 deltas, so this is the
+    # assertion that tells it from the cut at the bound.
+    failures = _instrumentation_errors(errors)
+    assert not failures, "".join(
+        line for cause in failures for line in traceback.format_exception(cause)
+    )
     text = _json_attr(span, "gen_ai.output.messages")[0]["parts"][0]["content"]
     assert span.attributes.get("telemetry.dev.capture.truncated") is (True if cut else None)
     # Each delta costs its text plus 52 bytes, so the 16th 1 MiB delta does not fit and is
@@ -2106,6 +2123,347 @@ def test_masked_agent_stream_withholds_text_only_when_text_was_rejected(
         output = _json_attr(span, "gen_ai.output.messages")
         assert output[0]["parts"][0]["content"] == "Complete answer"
         assert any("Complete answer" in value for value in seen)
+
+
+_COMPLETE = {"chunk": {"bytes": b"Complete answer"}}
+_AFTER = {"chunk": {"bytes": b" after"}}
+_UNDECODABLE = {"chunk": {"bytes": b"\xff"}}
+
+
+@pytest.mark.parametrize(
+    ("events", "failing", "masked", "kept", "cut", "reported"),
+    [
+        (
+            [_COMPLETE, _UNDECODABLE, _AFTER],
+            None,
+            False,
+            "Complete answer",
+            True,
+            UnicodeDecodeError,
+        ),
+        # The last text event: a later text event would be rejected, which withholds the output
+        # from a mask on its own.
+        ([_COMPLETE, _UNDECODABLE], None, True, None, True, UnicodeDecodeError),
+        (
+            [_COMPLETE, {"trace": {"trace": {}}}, _AFTER],
+            (bedrock_streams.AgentStreamState, "_collect_trace"),
+            False,
+            "Complete answer after",
+            False,
+            ValueError,
+        ),
+        # The captured trace content is lost, as a trace dropped by the bound is, but no text
+        # is: it is kept, also from a mask.
+        (
+            [_COMPLETE, {"trace": {"trace": {}}}, _AFTER],
+            (bedrock_streams, "_project_trace"),
+            True,
+            "Complete answer after",
+            True,
+            ValueError,
+        ),
+        ([_COMPLETE], (bedrock_streams.AgentStreamState, "finish"), False, None, True, ValueError),
+    ],
+    ids=["text", "masked-text", "trace-summary", "masked-trace-content", "end"],
+)
+def test_an_agent_stream_mapping_failure_is_reported_and_flags_only_lost_output(
+    make: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[dict[str, Any]],
+    failing: tuple[Any, str] | None,
+    masked: bool,
+    kept: str | None,
+    cut: bool,
+    reported: type[BaseException],
+) -> None:
+    if failing is not None:
+
+        def fail(*_args: Any, **_kwargs: Any) -> Any:
+            raise ValueError("mapper broke")
+
+        monkeypatch.setattr(*failing, fail)
+    errors: list[BaseException] = []
+    options: dict[str, Any] = {"on_error": errors.append}
+    if masked:
+        options["mask"] = identity_mask
+    memory = make(**options)
+    client = _client("bedrock-agent-runtime")
+    _stub_api_call(
+        client, [{"completion": FakeEventStream(events), "sessionId": "sess-1"}], monkeypatch
+    )
+    wrap_bedrock(client, capture_agent_trace=True)
+
+    # boto3 generates service methods at runtime, so invoke_agent is not on the static type.
+    response = client.invoke_agent(  # type: ignore[attr-defined]
+        agentId="agent-1", agentAliasId="alias", sessionId="sess-1", inputText="hi"
+    )
+    assert list(response["completion"]) == events
+
+    assert [type(error) for error in _instrumentation_errors(errors)] == [reported]
+    span = memory.span_exporter.get_finished_spans()[0]
+    assert span.attributes.get("telemetry.dev.capture.truncated") is (True if cut else None)
+    if kept is None:
+        assert "gen_ai.output.messages" not in span.attributes
+    else:
+        # A lost text event keeps no later text, so the output is a prefix of the stream; a lost
+        # trace loses no text.
+        output = _json_attr(span, "gen_ai.output.messages")
+        assert output[0]["parts"][0]["content"] == kept
+
+
+def _converse_delta(text: str) -> dict[str, Any]:
+    return {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": text}}}
+
+
+def _invoke_chunk(text: str) -> dict[str, Any]:
+    return {"chunk": {"bytes": _body({"completion": text})}}
+
+
+@pytest.mark.parametrize(
+    ("operation", "failing", "events", "kept", "cut", "reported"),
+    [
+        (
+            "converse_stream",
+            (bedrock_streams, "usage_from_converse", None),
+            # The usage comes before more text, so a usage failure that cut the output would
+            # show.
+            [
+                {"messageStart": {"role": "assistant"}},
+                _converse_delta("Hello"),
+                {"metadata": {"usage": {"inputTokens": 1, "outputTokens": 2}}},
+                _converse_delta(" world"),
+                {"messageStop": {"stopReason": "end_turn"}},
+            ],
+            "Hello world",
+            False,
+            ValueError,
+        ),
+        (
+            "converse_stream",
+            (bedrock_streams.ConverseStreamState, "_append", 2),
+            [
+                {"messageStart": {"role": "assistant"}},
+                _converse_delta("Hello"),
+                _converse_delta(" lost"),
+                _converse_delta(" after"),
+                {"messageStop": {"stopReason": "end_turn"}},
+            ],
+            "Hello",
+            True,
+            ValueError,
+        ),
+        (
+            "invoke_model_with_response_stream",
+            # Each chunk fails, and the stream reports once.
+            (bedrock_streams.InvokeModelStreamState, "_collect_anthropic_usage", None),
+            [_invoke_chunk("Hello"), _invoke_chunk(" world")],
+            "Hello world",
+            False,
+            ValueError,
+        ),
+        (
+            "invoke_model_with_response_stream",
+            None,
+            [_invoke_chunk("Hello"), {"chunk": {"bytes": b"\xff"}}, _invoke_chunk(" after")],
+            "Hello",
+            True,
+            UnicodeDecodeError,
+        ),
+        # The chunk-timing fallback reads the chunk again and fails the same way, which must not
+        # reach the caller. Nesting past the recursion limit fails json.loads with an error that
+        # is not a JSONDecodeError on every supported Python.
+        (
+            "invoke_model_with_response_stream",
+            None,
+            [_invoke_chunk("Hello"), {"chunk": {"bytes": b"[" * 100_000}}, _invoke_chunk(" after")],
+            "Hello",
+            True,
+            RecursionError,
+        ),
+        (
+            "invoke_model_with_response_stream",
+            None,
+            # The later undecodable chunk fails too, and the stream reports once.
+            [
+                _invoke_chunk("Hello"),
+                {"chunk": {"bytes": b'{"completion": "lost'}},
+                _invoke_chunk(" after"),
+                {"chunk": {"bytes": b"\xff"}},
+            ],
+            "Hello",
+            True,
+            json.JSONDecodeError,
+        ),
+        (
+            "invoke_model_with_response_stream",
+            None,
+            # A blank chunk carries no output, so it is neither lost nor flagged.
+            [_invoke_chunk("Hello"), {"chunk": {"bytes": b"\n"}}, _invoke_chunk(" after")],
+            "Hello after",
+            False,
+            None,
+        ),
+    ],
+    ids=[
+        "converse-usage",
+        "converse-delta",
+        "invoke-usage",
+        "invoke-undecodable",
+        "invoke-unparsable",
+        "invoke-not-json",
+        "invoke-blank",
+    ],
+)
+def test_a_runtime_stream_mapping_failure_is_reported_and_flags_only_lost_output(
+    make: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    failing: tuple[Any, str, int | None] | None,
+    events: list[dict[str, Any]],
+    kept: str,
+    cut: bool,
+    reported: type[BaseException] | None,
+) -> None:
+    if failing is not None:
+        owner, name, failing_call = failing
+        original = getattr(owner, name)
+        calls = 0
+
+        def fail(*args: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            if failing_call is None or calls == failing_call:
+                raise ValueError("mapper broke")
+            return original(*args)
+
+        monkeypatch.setattr(owner, name, fail)
+    errors: list[BaseException] = []
+    memory = make(on_error=errors.append)
+    client = _client("bedrock-runtime")
+    # boto3 generates service methods at runtime, so BaseClient's static type does not have them.
+    if operation == "converse_stream":
+        _stub_api_call(client, [{"stream": FakeEventStream(events)}], monkeypatch)
+        wrap_bedrock(client)
+        stream = cast(Any, client).converse_stream(modelId="m", messages=[])["stream"]
+    else:
+        _stub_api_call(client, [{"body": FakeEventStream(events)}], monkeypatch)
+        wrap_bedrock(client)
+        stream = cast(Any, client).invoke_model_with_response_stream(
+            modelId="anthropic.claude-3-haiku",
+            contentType="application/json",
+            body=_body({"messages": [], "max_tokens": 10}),
+        )["body"]
+    assert list(stream) == events
+
+    assert [type(error) for error in _instrumentation_errors(errors)] == (
+        [reported] if reported else []
+    )
+    span = memory.span_exporter.get_finished_spans()[0]
+    assert span.attributes.get("telemetry.dev.capture.truncated") is (True if cut else None)
+    # Text after a lost delta or chunk is not kept, so the output is a prefix of the stream.
+    output = _json_attr(span, "gen_ai.output.messages")
+    assert output[0]["parts"][0]["content"] == kept
+
+
+@pytest.mark.parametrize(
+    ("operation", "event_fails"),
+    [("Converse", False), ("ConverseStream", False), ("ConverseStream", True)],
+    ids=["converse", "converse-stream", "converse-stream-and-event"],
+)
+def test_a_response_mapping_failure_is_reported_and_ends_the_span(
+    make: Any, monkeypatch: pytest.MonkeyPatch, operation: str, event_fails: bool
+) -> None:
+    def fail(*_args: Any) -> Any:
+        raise ValueError("mapper broke")
+
+    if event_fails:
+        # A failure of the stream's events after one of its response fields is reported once.
+        monkeypatch.setattr(bedrock_streams.ConverseStreamState, "_append", fail)
+    operations = SERVICE_OPERATIONS["bedrock-runtime"]
+    monkeypatch.setitem(
+        operations, operation, dataclasses.replace(operations[operation], response_fields=fail)
+    )
+    errors: list[BaseException] = []
+    memory = make(on_error=errors.append)
+    client = _client("bedrock-runtime")
+    metadata = {"RequestId": "req-1", "HTTPStatusCode": 200}
+    events = [
+        {"messageStart": {"role": "assistant"}},
+        _converse_delta("Hello"),
+        {"messageStop": {"stopReason": "end_turn"}},
+    ]
+    response: dict[str, Any] = (
+        {
+            "output": {"message": {"role": "assistant", "content": [{"text": "Hello"}]}},
+            "stopReason": "end_turn",
+            "ResponseMetadata": metadata,
+        }
+        if operation == "Converse"
+        else {"stream": FakeEventStream(events), "ResponseMetadata": metadata}
+    )
+    _stub_api_call(client, [response], monkeypatch)
+    wrap_bedrock(client)
+
+    # boto3 generates service methods at runtime, so BaseClient's static type does not have them.
+    if operation == "Converse":
+        cast(Any, client).converse(modelId="m", messages=[])
+    else:
+        assert list(cast(Any, client).converse_stream(modelId="m", messages=[])["stream"]) == events
+
+    assert [str(error) for error in _instrumentation_errors(errors)] == ["mapper broke"]
+    span = memory.span_exporter.get_finished_spans()[0]
+    assert span.status.status_code is not StatusCode.ERROR
+    assert span.attributes["gen_ai.response.id"] == "req-1"
+    if operation == "Converse":
+        # The call succeeded, but its response fields and output are lost.
+        assert span.attributes["telemetry.dev.capture.truncated"] is True
+        assert "gen_ai.output.messages" not in span.attributes
+    elif event_fails:
+        assert span.attributes["telemetry.dev.capture.truncated"] is True
+    else:
+        # A stream records its output from its events, so only the response's own fields are lost.
+        assert "telemetry.dev.capture.truncated" not in span.attributes
+        output = _json_attr(span, "gen_ai.output.messages")
+        assert output[0]["parts"][0]["content"] == "Hello"
+
+
+@pytest.mark.parametrize(
+    ("raw", "reported"),
+    [
+        (b'{"completion": "\xff"}', UnicodeDecodeError),
+        (b'{"completion": "cut', json.JSONDecodeError),
+        # A blank body holds no output, so nothing is lost.
+        (b"   ", None),
+    ],
+    ids=["not-utf-8", "not-json", "blank"],
+)
+def test_an_invoke_model_body_that_fails_to_map_is_reported_and_flagged(
+    make: Any, monkeypatch: pytest.MonkeyPatch, raw: bytes, reported: type[BaseException] | None
+) -> None:
+    errors: list[BaseException] = []
+    memory = make(on_error=errors.append)
+    client = _client("bedrock-runtime")
+    _stub_api_call(
+        client,
+        [{"body": StreamingBody(io.BytesIO(raw), len(raw)), "contentType": "application/json"}],
+        monkeypatch,
+    )
+    wrap_bedrock(client)
+
+    # boto3 generates service methods at runtime, so BaseClient's static type does not have them.
+    response = cast(Any, client).invoke_model(
+        modelId="anthropic.claude-3-haiku",
+        contentType="application/json",
+        body=_body({"messages": [], "max_tokens": 10}),
+    )
+    assert response["body"].read() == raw
+
+    assert [type(error) for error in _instrumentation_errors(errors)] == (
+        [reported] if reported else []
+    )
+    span = memory.span_exporter.get_finished_spans()[0]
+    assert span.attributes.get("telemetry.dev.capture.truncated") is (True if reported else None)
+    assert "gen_ai.output.messages" not in span.attributes
 
 
 def _pii_assessment(match: str) -> dict[str, Any]:

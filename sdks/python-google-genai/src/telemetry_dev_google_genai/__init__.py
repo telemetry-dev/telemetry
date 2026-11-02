@@ -221,8 +221,11 @@ def _record_afc_usage(response: Any) -> Any:
                 state["tool_use_prompt_tokens"] = int(state.get("tool_use_prompt_tokens", 0)) + int(
                     tool_use
                 )
-    except Exception:
-        return response
+    except Exception as exc:
+        # The turn's usage is lost, so the call's usage is undercounted; its output is not cut.
+        report_error = state.get("report_error")
+        if callable(report_error):
+            report_error(exc)
     return response
 
 
@@ -258,11 +261,26 @@ def _clean_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in fields.items() if value is not None}
 
 
-def _safe_fields(mapper: ResponseMapper, response: Any) -> dict[str, Any]:
+def _safe_fields(
+    mapper: ResponseMapper,
+    response: Any,
+    handle: telemetry_dev.SpanHandle | None,
+    report_error: Callable[[BaseException], None] | None = None,
+) -> dict[str, Any]:
     try:
         return mapper(response)
-    except Exception:
-        return {}
+    except Exception as exc:
+        if report_error is not None:
+            report_error(exc)
+        elif handle is not None:
+            _stream_span_reporter(handle)(exc)
+        else:
+            # A finished video operation is ended where its span handle is not kept.
+            client = telemetry_dev.get_client()
+            if client is not None:
+                client.report("provider instrumentation failed", exc)
+        # The call succeeded, so it is not failed; its output and response fields are lost.
+        return {"attributes": {_CAPTURE_TRUNCATED_ATTRIBUTE: True}}
 
 
 def _end_once(handle: telemetry_dev.SpanHandle) -> Callable[..., None]:
@@ -901,8 +919,13 @@ class _CandidateState:
 
 
 class _StreamState:
-    def __init__(self, metadata_content: bool = False) -> None:
+    def __init__(
+        self,
+        metadata_content: bool = False,
+        report_error: Callable[[BaseException], None] = lambda _cause: None,
+    ) -> None:
         self.metadata_content = metadata_content
+        self.report_error = report_error
         self.candidates: dict[int, _CandidateState] = {}
         self.finish_reasons: dict[int, str] = {}
         self.usage: dict[str, int | float] | None = None
@@ -916,6 +939,10 @@ class _StreamState:
         # The bytes charged for each value that a chunk replaces whole, by key.
         self.replaced_bytes: dict[str, int] = {}
         self.output_truncated = False
+        # Set when response content outside the output is lost: metadata kept as response
+        # content (metadata_content), or the AFC history. It flags the capture without cutting
+        # the output or withholding it from a mask.
+        self.metadata_lost = False
 
 
 def _reserve_bytes(budget: telemetry_dev.CaptureBudget, total: int) -> bool:
@@ -985,7 +1012,7 @@ def _capture_metadata_content(handle: telemetry_dev.SpanHandle) -> bool:
 def _mark_stream_capture(
     fields: dict[str, Any], state: _StreamState, *, completed: bool, mask_output: bool
 ) -> dict[str, Any]:
-    if completed and not state.budget.truncated:
+    if completed and not state.budget.truncated and not state.metadata_lost:
         return fields
     attributes = fields.get("attributes")
     fields["attributes"] = {
@@ -1038,11 +1065,37 @@ def _fold_turn(state: _StreamState) -> None:
     state.usage = None
 
 
+def _stream_span_reporter(
+    handle: telemetry_dev.SpanHandle,
+) -> Callable[[BaseException], None]:
+    reported = False
+
+    # One report per stream: a mapper that fails on one chunk likely fails on each one after it.
+    def report(cause: BaseException) -> None:
+        nonlocal reported
+        if reported:
+            return
+        reported = True
+        try:
+            handle.report_error(cause)
+        except Exception:
+            return
+
+    return report
+
+
 def _record_chunk(chunk: Any, state: _StreamState) -> None:
     try:
         _record_chunk_inner(chunk, state)
-    except Exception:
-        return
+    except Exception as exc:
+        # Candidate metadata, usage, prompt feedback and the function-calling history are
+        # guarded where they are recorded. Any other failure, such as one in the response ID,
+        # model version or finish reason, may stop the chunk before some of its parts, or those
+        # of a later candidate, are recorded. The truncated budget keeps no later part, so the
+        # output stays a prefix of the stream.
+        state.budget.truncated = True
+        state.output_truncated = True
+        state.report_error(exc)
 
 
 def _record_chunk_inner(chunk: Any, state: _StreamState) -> None:
@@ -1078,16 +1131,52 @@ def _record_chunk_inner(chunk: Any, state: _StreamState) -> None:
         finish = _enum_value(_field(candidate, "finish_reason"))
         if finish is not None:
             state.finish_reasons[candidate_index] = finish[:_FINISH_REASON_MAX_LENGTH]
-        _record_candidate_metadata(
-            candidate,
-            candidate_index,
-            state.attrs,
-            state.metadata_content,
-            lambda key, value: _accept_replacement(state, key, value),
-        )
+        try:
+            _record_candidate_metadata(
+                candidate,
+                candidate_index,
+                state.attrs,
+                state.metadata_content,
+                lambda key, value: _accept_replacement(state, key, value),
+            )
+        except Exception as exc:
+            _lose_metadata(state, exc)
+    try:
+        _record_chunk_usage(chunk, state)
+    except Exception as exc:
+        state.report_error(exc)
+    try:
+        _record_prompt_feedback(chunk, state)
+    except Exception as exc:
+        _lose_metadata(state, exc)
+    try:
+        _record_afc_history(chunk, state)
+    except Exception as exc:
+        # The history is the only record of the tool calls and their results, so losing it
+        # flags the capture whether or not a mask is configured. It is not output, so the
+        # output is not cut; the last history that mapped, if any, is kept, and a later one
+        # that maps replaces it.
+        state.metadata_lost = True
+        state.report_error(exc)
+
+
+def _lose_metadata(state: _StreamState, cause: BaseException) -> None:
+    # Metadata is not output, so the output stays whole. With metadata_content the metadata is
+    # response content, and its loss flags the capture as the bound does when it drops it.
+    # Without it only the structure is kept, which holds no response content, so its loss is
+    # reported only.
+    if state.metadata_content:
+        state.metadata_lost = True
+    state.report_error(cause)
+
+
+def _record_chunk_usage(chunk: Any, state: _StreamState) -> None:
     usage = _generate_usage(_field(chunk, "usage_metadata"), state.attrs)
     if usage:
         state.usage = usage
+
+
+def _record_prompt_feedback(chunk: Any, state: _StreamState) -> None:
     feedback = _field(chunk, "prompt_feedback")
     block_reason = _enum_value(_field(feedback, "block_reason"))
     if block_reason:
@@ -1101,6 +1190,9 @@ def _record_chunk_inner(chunk: Any, state: _StreamState) -> None:
         key = "google_genai.response.prompt_safety_ratings"
         if encoded is not None and _accept_replacement(state, key, encoded):
             state.attrs[key] = encoded
+
+
+def _record_afc_history(chunk: Any, state: _StreamState) -> None:
     history = _field(chunk, "automatic_function_calling_history")
     if history:
         native_history = _native(history)
@@ -1111,7 +1203,10 @@ def _record_chunk_inner(chunk: Any, state: _StreamState) -> None:
 def _stream_fields(state: _StreamState) -> dict[str, Any]:
     try:
         return _stream_fields_inner(state)
-    except Exception:
+    except Exception as exc:
+        # The output that the stream kept is lost.
+        state.budget.truncated = True
+        state.report_error(exc)
         return {}
 
 
@@ -1188,7 +1283,12 @@ def _start_embed_span(
     return handle, _end_once(handle), time.perf_counter()
 
 
-def _first_chunk_update(chunk: Any, handle: telemetry_dev.SpanHandle, started_at: float) -> None:
+def _first_chunk_update(
+    chunk: Any,
+    handle: telemetry_dev.SpanHandle,
+    started_at: float,
+    report_error: Callable[[BaseException], None],
+) -> None:
     try:
         update: dict[str, Any] = {
             "time_to_first_chunk_ms": (time.perf_counter() - started_at) * 1000,
@@ -1200,8 +1300,9 @@ def _first_chunk_update(chunk: Any, handle: telemetry_dev.SpanHandle, started_at
         if response_model:
             update["response_model"] = response_model
         handle.update(**_clean_fields(update))
-    except Exception:
-        return
+    except Exception as exc:
+        # Only the first-chunk timing and IDs are lost; the chunk is still recorded.
+        report_error(exc)
 
 
 def _chunk_has_output(chunk: Any) -> bool:
@@ -1259,10 +1360,13 @@ class _ObservedStream:
         self._inner = inner
         self._handle = handle
         self._started_at = started_at
-        self._state = _StreamState(_capture_metadata_content(handle))
+        self._state = _StreamState(_capture_metadata_content(handle), _stream_span_reporter(handle))
         self._end = _ending_stream(end, self._state)
         self._saw_first = False
         self._afc_usage_state = afc_usage_state
+        if afc_usage_state is not None:
+            # An AFC turn that fails to map reports through the stream, once per stream.
+            afc_usage_state["report_error"] = self._state.report_error
         self._completed = False
         self._mask_output_when_incomplete = _capture_masked(handle)
 
@@ -1323,13 +1427,17 @@ class _ObservedStream:
         finally:
             if token is not None:
                 _AFC_USAGE_STATE.reset(token)
-        if _chunk_has_output(chunk):
-            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-            if callable(record_output_chunk):
-                record_output_chunk(received_at * 1000)
+        try:
+            if _chunk_has_output(chunk):
+                record_output_chunk = getattr(self._handle, "record_output_chunk", None)
+                if callable(record_output_chunk):
+                    record_output_chunk(received_at * 1000)
+        except Exception as exc:
+            # Only the chunk's timing is lost; the chunk is still recorded.
+            self._state.report_error(exc)
         if not self._saw_first:
             self._saw_first = True
-            _first_chunk_update(chunk, self._handle, self._started_at)
+            _first_chunk_update(chunk, self._handle, self._started_at, self._state.report_error)
         _record_chunk(chunk, self._state)
         return chunk
 
@@ -1352,10 +1460,13 @@ class _ObservedAsyncStream:
         self._inner = inner
         self._handle = handle
         self._started_at = started_at
-        self._state = _StreamState(_capture_metadata_content(handle))
+        self._state = _StreamState(_capture_metadata_content(handle), _stream_span_reporter(handle))
         self._end = _ending_stream(end, self._state)
         self._saw_first = False
         self._afc_usage_state = afc_usage_state
+        if afc_usage_state is not None:
+            # An AFC turn that fails to map reports through the stream, once per stream.
+            afc_usage_state["report_error"] = self._state.report_error
         self._completed = False
         self._mask_output_when_incomplete = _capture_masked(handle)
 
@@ -1419,13 +1530,17 @@ class _ObservedAsyncStream:
         finally:
             if token is not None:
                 _AFC_USAGE_STATE.reset(token)
-        if _chunk_has_output(chunk):
-            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-            if callable(record_output_chunk):
-                record_output_chunk(received_at * 1000)
+        try:
+            if _chunk_has_output(chunk):
+                record_output_chunk = getattr(self._handle, "record_output_chunk", None)
+                if callable(record_output_chunk):
+                    record_output_chunk(received_at * 1000)
+        except Exception as exc:
+            # Only the chunk's timing is lost; the chunk is still recorded.
+            self._state.report_error(exc)
         if not self._saw_first:
             self._saw_first = True
-            _first_chunk_update(chunk, self._handle, self._started_at)
+            _first_chunk_update(chunk, self._handle, self._started_at, self._state.report_error)
         _record_chunk(chunk, self._state)
         return chunk
 
@@ -1504,6 +1619,10 @@ def _wrap_sync_generate(
             provider_resolver(resource),
         )
         afc_state = _afc_usage_state(kwargs.get("config"))
+        # The call reports once, whether an AFC turn or the response fails to map.
+        report_error = _stream_span_reporter(handle)
+        if afc_state is not None:
+            afc_state["report_error"] = report_error
         token = _AFC_USAGE_STATE.set(afc_state) if afc_state is not None else None
         try:
             result = original(*args, **kwargs)
@@ -1515,7 +1634,10 @@ def _wrap_sync_generate(
                 _AFC_USAGE_STATE.reset(token)
         metadata_content = _capture_metadata_content(handle)
         fields = _safe_fields(
-            lambda response: _generate_response_fields(response, metadata_content), result
+            lambda response: _generate_response_fields(response, metadata_content),
+            result,
+            handle,
+            report_error,
         )
         end(**_fields_with_afc_usage(fields, afc_state))
         return result
@@ -1556,7 +1678,7 @@ def _wrap_sync_embed(
     @wraps(original)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         resource = args[0] if args else None
-        _handle, end, _started_at = _start_embed_span(
+        handle, end, _started_at = _start_embed_span(
             kwargs.get("model"),
             kwargs.get("contents"),
             kwargs.get("config"),
@@ -1567,7 +1689,7 @@ def _wrap_sync_embed(
         except BaseException as exc:
             end(error=exc)
             raise
-        end(**_safe_fields(_embed_response_fields, result))
+        end(**_safe_fields(_embed_response_fields, result, handle))
         return result
 
     setattr(wrapper, _WRAPPED_ATTR, True)
@@ -1588,6 +1710,10 @@ def _wrap_async_generate(
             provider_resolver(resource),
         )
         afc_state = _afc_usage_state(kwargs.get("config"))
+        # The call reports once, whether an AFC turn or the response fails to map.
+        report_error = _stream_span_reporter(handle)
+        if afc_state is not None:
+            afc_state["report_error"] = report_error
         token = _AFC_USAGE_STATE.set(afc_state) if afc_state is not None else None
         try:
             result = await original(*args, **kwargs)
@@ -1599,7 +1725,10 @@ def _wrap_async_generate(
                 _AFC_USAGE_STATE.reset(token)
         metadata_content = _capture_metadata_content(handle)
         fields = _safe_fields(
-            lambda response: _generate_response_fields(response, metadata_content), result
+            lambda response: _generate_response_fields(response, metadata_content),
+            result,
+            handle,
+            report_error,
         )
         end(**_fields_with_afc_usage(fields, afc_state))
         return result
@@ -1640,7 +1769,7 @@ def _wrap_async_embed(
     @wraps(original)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         resource = args[0] if args else None
-        _handle, end, _started_at = _start_embed_span(
+        handle, end, _started_at = _start_embed_span(
             kwargs.get("model"),
             kwargs.get("contents"),
             kwargs.get("config"),
@@ -1651,7 +1780,7 @@ def _wrap_async_embed(
         except BaseException as exc:
             end(error=exc)
             raise
-        end(**_safe_fields(_embed_response_fields, result))
+        end(**_safe_fields(_embed_response_fields, result, handle))
         return result
 
     setattr(wrapper, _WRAPPED_ATTR, True)
@@ -1821,7 +1950,9 @@ def _wrap_sync_media(
                 tracker.add(resource, operation_name, "sync", end)
             else:
                 end(
-                    **_safe_fields(lambda value: _media_response_fields(value, output_type), result)
+                    **_safe_fields(
+                        lambda value: _media_response_fields(value, output_type), result, handle
+                    )
                 )
             return result
 
@@ -1862,7 +1993,9 @@ def _wrap_async_media(
                 tracker.add(resource, operation_name, "async", end)
             else:
                 end(
-                    **_safe_fields(lambda value: _media_response_fields(value, output_type), result)
+                    **_safe_fields(
+                        lambda value: _media_response_fields(value, output_type), result, handle
+                    )
                 )
             return result
 
@@ -1901,7 +2034,9 @@ def _wrap_sync_operation_get(
                 end = tracker.take(resource, name)
                 if end is not None:
                     end(
-                        **_safe_fields(lambda value: _media_response_fields(value, "video"), result)
+                        **_safe_fields(
+                            lambda value: _media_response_fields(value, "video"), result, None
+                        )
                     )
             return result
 
@@ -1934,7 +2069,9 @@ def _wrap_async_operation_get(
                 end = tracker.take(resource, name)
                 if end is not None:
                     end(
-                        **_safe_fields(lambda value: _media_response_fields(value, "video"), result)
+                        **_safe_fields(
+                            lambda value: _media_response_fields(value, "video"), result, None
+                        )
                     )
             return result
 

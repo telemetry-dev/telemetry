@@ -46,7 +46,10 @@ def claude_usage_fields(usage: dict[str, Any]) -> dict[str, Any]:
     return fields
 
 
-def parse_body(body: Any, content_type: Any = "application/json") -> Any:
+def parse_body(body: Any, content_type: Any = "application/json", *, strict: bool = False) -> Any:
+    """Decodes a JSON body. Returns None when the content type is not JSON, or the body is
+    blank, unreadable, or not bytes, str, or a seekable stream. A body that is not UTF-8
+    raises. A body that is not valid JSON returns None, or raises with ``strict``."""
     if isinstance(content_type, str) and "json" not in content_type:
         return None
     if isinstance(body, bytes | bytearray):
@@ -79,6 +82,8 @@ def parse_body(body: Any, content_type: Any = "application/json") -> Any:
     try:
         return json.loads(raw)
     except Exception:
+        if strict and raw.strip():
+            raise
         return None
 
 
