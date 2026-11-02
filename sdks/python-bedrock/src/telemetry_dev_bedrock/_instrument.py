@@ -14,7 +14,12 @@ from botocore.response import StreamingBody
 from ._fields import error_fields, merge_fields, metadata_fields
 from ._invoke_model import parse_body
 from ._registry import OperationSpec, lookup_operation
-from ._streams import InstrumentedEventStream, release_budget, stream_capture_budget
+from ._streams import (
+    InstrumentedEventStream,
+    release_budget,
+    stream_capture_budget,
+    stream_span_reporter,
+)
 
 _T = TypeVar("_T", bound=BaseClient)
 _SUPPORTED_SERVICES = frozenset({"bedrock-runtime", "bedrock-agent-runtime"})
@@ -153,7 +158,7 @@ def _call_with_span(
         return response
 
     if operation_name == "InvokeModel" and isinstance(response.get("body"), StreamingBody):
-        return _handle_streaming_body(spec, api_params, response, end)
+        return _handle_streaming_body(spec, api_params, response, end, handle)
 
     stream_key = spec.stream_key
     if stream_key is not None and response.get(stream_key) is not None:
@@ -162,11 +167,14 @@ def _call_with_span(
             end(**metadata_fields(response))
             return response
         state = state_factory(capture_agent_trace)
+        report_error = stream_span_reporter(handle)
         try:
             base_fields = merge_fields(
                 metadata_fields(response), spec.response_fields(api_params, response)
             )
-        except Exception:
+        except Exception as exc:
+            # The stream's own output and metadata are still recorded from its events.
+            report_error(exc)
             base_fields = metadata_fields(response)
 
         def finish(fields: dict[str, Any]) -> None:
@@ -181,11 +189,19 @@ def _call_with_span(
         return {
             **response,
             stream_key: InstrumentedEventStream(
-                response[stream_key], state, finish, started_at, handle
+                response[stream_key], state, finish, started_at, handle, report_error
             ),
         }
 
-    end(**merge_fields(metadata_fields(response), spec.response_fields(api_params, response)))
+    try:
+        fields = merge_fields(metadata_fields(response), spec.response_fields(api_params, response))
+    except Exception as exc:
+        # The call succeeded, so it is not failed; its output and response fields are lost.
+        stream_span_reporter(handle)(exc)
+        fields = merge_fields(
+            metadata_fields(response), {"attributes": {"telemetry.dev.capture.truncated": True}}
+        )
+    end(**fields)
     return response
 
 
@@ -432,23 +448,29 @@ def _handle_streaming_body(
     params: dict[str, Any],
     response: dict[str, Any],
     end: Callable[..., None],
+    handle: Any,
 ) -> dict[str, Any]:
     body = cast(StreamingBody, response["body"])
     base_fields = metadata_fields(response)
+    report_error = stream_span_reporter(handle)
 
     def finish(raw: bytes | None, error: BaseException | None, truncated: bool) -> None:
         fields = base_fields
         if raw is not None:
-            parsed = parse_body(raw, response.get("contentType"))
-            response_for_fields = {**response, "_telemetry_dev_parsed_body": parsed}
             try:
+                # A JSON body that fails to decode lost its output, so it fails here; a body whose
+                # content type is not JSON returns None.
+                parsed = parse_body(raw, response.get("contentType"), strict=True)
+                response_for_fields = {**response, "_telemetry_dev_parsed_body": parsed}
                 fields = merge_fields(
                     base_fields, spec.response_fields(params, response_for_fields)
                 )
-            except Exception:
-                fields = base_fields
+            except Exception as exc:
+                report_error(exc)
+                truncated = True
         if truncated:
-            # An incomplete body cannot be parsed, so no output is exported.
+            # An incomplete body cannot be parsed, and a body that failed to map lost its
+            # output, so no output is exported.
             fields = merge_fields(fields, {"attributes": {"telemetry.dev.capture.truncated": True}})
         if error is not None:
             fields = merge_fields(fields, error_fields(error))

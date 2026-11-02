@@ -12,6 +12,7 @@ import os
 import signal
 import threading
 import time
+import traceback
 import tracemalloc
 import weakref
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
@@ -1244,7 +1245,15 @@ def test_streaming_bounds_payload_without_dropping_terminal_metadata(
     assert a["telemetry.dev.capture.truncated"] is True
 
 
-def _streamed_text(memory: SimpleNamespace, texts: list[str]) -> tuple[Any, dict[str, object]]:
+def _instrumentation_reports(reported: list[BaseException]) -> list[BaseException]:
+    # The in-memory metric reader reports at the first span with chunk timing that only the
+    # built-in OTLP exporter exports the interval metric.
+    return [cause for cause in reported if "time_per_output_chunk" not in str(cause)]
+
+
+def _streamed_text(
+    memory: SimpleNamespace, texts: list[str], *, async_mode: bool = False
+) -> tuple[Any, dict[str, object]]:
     chunks: list[dict[str, Any]] = [
         {"candidates": [{"index": 0, "content": {"role": "model", "parts": [{"text": text}]}}]}
         for text in texts
@@ -1257,10 +1266,23 @@ def _streamed_text(memory: SimpleNamespace, texts: list[str]) -> tuple[Any, dict
         }
     )
     client, _transport = client_with_transport([chunks])
-    stream = wrap_google_genai(client).models.generate_content_stream(
-        model="gemini-2.5-flash", contents=USER_CONTENT
-    )
-    assert len(list(stream)) == len(chunks)
+    wrapped = wrap_google_genai(client)
+    if async_mode:
+        import asyncio
+
+        async def run() -> tuple[Any, list[Any]]:
+            stream = await wrapped.aio.models.generate_content_stream(
+                model="gemini-2.5-flash", contents=USER_CONTENT
+            )
+            return stream, [chunk async for chunk in stream]
+
+        stream, collected = asyncio.run(run())
+    else:
+        stream = wrapped.models.generate_content_stream(
+            model="gemini-2.5-flash", contents=USER_CONTENT
+        )
+        collected = list(stream)
+    assert len(collected) == len(chunks)
     return stream._state, attrs(only_span(memory))
 
 
@@ -1391,13 +1413,20 @@ def test_with_the_default_bounds_a_stream_is_cut_only_at_the_record_bound(
     make: Any, length: int, cut: bool
 ) -> None:
     conftest.other_stream.release()
-    memory = make(max_stream_bytes=64 * 1024 * 1024)
+    reported: list[BaseException] = []
+    memory = make(max_stream_bytes=64 * 1024 * 1024, on_error=reported.append)
     texts = [
         MIB_TEXT[: min(len(MIB_TEXT), length - start)] for start in range(0, length, len(MIB_TEXT))
     ]
 
     _state, a = _streamed_text(memory, texts)
 
+    # A mapping failure would also flag the capture and keep the same 15 parts, so this is the
+    # assertion that tells it from the cut at the bound.
+    failures = _instrumentation_reports(reported)
+    assert not failures, "".join(
+        line for cause in failures for line in traceback.format_exception(cause)
+    )
     text = json.loads(str(a["gen_ai.output.messages"]))[0]["parts"][0]["text"]
     assert a.get("telemetry.dev.capture.truncated") is (True if cut else None)
     # Each part costs its text plus 52 bytes, so the 16th 1 MiB part does not fit and is
@@ -1690,6 +1719,174 @@ def test_masked_stream_closed_early_withholds_partial_output(make: Any) -> None:
     a = attrs(only_span(memory))
     assert "gen_ai.output.messages" not in a
     assert a["telemetry.dev.capture.truncated"] is True
+
+
+def _streamed_afc(memory: SimpleNamespace, *, async_mode: bool) -> dict[str, object]:
+    def get_weather(location: str) -> str:
+        """Get the weather."""
+        return f"sunny in {location}"
+
+    call = {"functionCall": {"name": "get_weather", "args": {"location": "Paris"}}}
+    usage = {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}
+    # From google-genai 2.25 the wrapper also sees the function-call turn; distinct response ids
+    # keep it a separate message on every version.
+    # The final answer comes in several chunks, so a failure that cut the output would show.
+    answer: list[dict[str, Any]] = [
+        {
+            "responseId": "afc-2",
+            "candidates": [{"index": 0, "content": {"role": "model", "parts": [{"text": text}]}}],
+        }
+        for text in ("It is ", "sunny", " in Paris.")
+    ]
+    answer[-1]["candidates"][0]["finishReason"] = "STOP"
+    answer[-1]["usageMetadata"] = usage
+    answer[-1]["promptFeedback"] = {"blockReason": "OTHER"}
+    turns = [
+        [
+            {
+                "responseId": "afc-1",
+                "candidates": [{"index": 0, "content": {"role": "model", "parts": [call]}}],
+            }
+        ],
+        answer,
+    ]
+    client, _transport = client_with_transport(turns)
+    wrapped = wrap_google_genai(client)
+    request: dict[str, Any] = {
+        "model": "gemini-2.5-flash",
+        "contents": USER_CONTENT,
+        "config": types.GenerateContentConfig(tools=[get_weather]),
+    }
+    if async_mode:
+        import asyncio
+
+        async def run() -> None:
+            stream = await wrapped.aio.models.generate_content_stream(**request)
+            async for _chunk in stream:
+                pass
+
+        asyncio.run(run())
+    else:
+        list(wrapped.models.generate_content_stream(**request))
+    return attrs(only_span(memory))
+
+
+def _carries_afc_history(chunk: Any, *_args: Any) -> bool:
+    return bool(chunk.automatic_function_calling_history)
+
+
+def _is_function_call_turn(response: Any, *_args: Any) -> bool:
+    return response.response_id == "afc-1"
+
+
+@pytest.mark.parametrize(
+    ("mapper", "failing_call", "masked", "kept", "cut", "history"),
+    [
+        ("_record_chunk_inner", 2, False, "a", True, None),
+        # The last text chunk: a later part would be rejected, which withholds the output on
+        # its own.
+        ("_record_chunk_inner", 3, True, None, True, None),
+        # Inside the parts loop: the part is charged but lost.
+        ("_append_part", 2, False, "a", True, None),
+        ("_stream_fields_inner", 1, False, None, True, None),
+        # Without a mask the metadata is kept whole, as response content, so its loss is
+        # flagged; a mask keeps only its structure, whose loss is not.
+        ("_record_candidate_metadata", 2, False, "abc", True, None),
+        ("_record_candidate_metadata", 2, True, "abc", False, None),
+        # Each chunk fails, and the stream reports once.
+        ("_record_chunk_usage", None, False, "abc", False, None),
+        ("_record_prompt_feedback", None, False, "abc", True, None),
+        # The history is the only record of the tool call and its result, so its loss is
+        # flagged, also with a mask; it is not output, so the answer is kept whole and not
+        # withheld. Only chunks with a history fail.
+        ("_record_afc_history", _carries_afc_history, False, "It is sunny in Paris.", True, False),
+        ("_record_afc_history", _carries_afc_history, True, "It is sunny in Paris.", True, False),
+        ("_generate_usage", None, False, "It is sunny in Paris.", False, True),
+        # Only the function-call turn's usage fails to map, where only the AFC usage reads it.
+        (
+            "_generate_response_fields",
+            _is_function_call_turn,
+            False,
+            "It is sunny in Paris.",
+            False,
+            True,
+        ),
+        # The chunk timings fail for each chunk, and the first-chunk update fails; neither is
+        # output. The span's end calls update too, so only the first call fails.
+        ("_chunk_has_output", None, False, "abc", False, None),
+        ("SpanHandle.update", 1, False, "abc", False, None),
+    ],
+    ids=[
+        "chunk",
+        "masked-chunk",
+        "part",
+        "end",
+        "candidate-metadata",
+        "masked-candidate-metadata",
+        "usage",
+        "prompt-feedback",
+        "afc-history",
+        "masked-afc-history",
+        "afc-usage",
+        "afc-turn-usage",
+        "chunk-timing",
+        "first-chunk",
+    ],
+)
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_a_stream_mapping_failure_is_reported_and_flags_only_lost_output(
+    make: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    mapper: str,
+    failing_call: int | Callable[..., bool] | None,
+    masked: bool,
+    kept: str | None,
+    cut: bool,
+    history: bool | None,
+    async_mode: bool,
+) -> None:
+    owner: Any = google_genai_instrumentation
+    if mapper == "SpanHandle.update":
+        owner, mapper = telemetry_dev.SpanHandle, "update"
+    original = getattr(owner, mapper)
+    calls = 0
+
+    def failing(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if (
+            failing_call is None
+            or calls == failing_call
+            or (callable(failing_call) and failing_call(*args))
+        ):
+            raise ValueError("mapper broke")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, mapper, failing)
+    reported: list[BaseException] = []
+    options: dict[str, Any] = {"on_error": reported.append}
+    if masked:
+        options["mask"] = identity_mask
+    memory = make(**options)
+
+    if history is None:
+        _state, a = _streamed_text(memory, ["a", "b", "c"], async_mode=async_mode)
+    else:
+        a = _streamed_afc(memory, async_mode=async_mode)
+
+    assert [str(cause) for cause in _instrumentation_reports(reported)] == ["mapper broke"]
+    assert a.get("telemetry.dev.capture.truncated") is (True if cut else None)
+    if kept is None:
+        assert "gen_ai.output.messages" not in a
+    else:
+        # The part after the lost one is not kept, so the output is a prefix of the stream.
+        assert json.loads(str(a["gen_ai.output.messages"]))[-1]["parts"] == [{"text": kept}]
+    if history is not None:
+        # Each metadata step has its own guard, so a failed one skips none of the others.
+        assert a["google_genai.response.block_reason"] == "OTHER"
+        assert ("google_genai.automatic_function_calling" in a) is history
+        messages = json.dumps(json.loads(str(a["gen_ai.input.messages"])))
+        assert ("functionResponse" in messages) is history
 
 
 def test_streaming_rejects_oversized_grounding_without_dropping_terminal_metadata(
@@ -2653,23 +2850,89 @@ def test_async_stream_supports_anext_protocol(memory: SimpleNamespace) -> None:
     ]
 
 
-def test_mapper_failures_are_fail_open(
-    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("operation", "mapper"),
+    [
+        ("generate", "_generate_response_fields"),
+        # Each AFC turn and the response fail to map, and the call reports once.
+        ("generate-afc", "_generate_response_fields"),
+        ("embed", "_embed_response_fields"),
+        ("video-done", "_media_response_fields"),
+        # A polled video operation ends its span where the handle is not kept.
+        ("video-polled", "_media_response_fields"),
+    ],
+)
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_mapper_failures_are_fail_open_reported_and_flagged(
+    make: Any, monkeypatch: pytest.MonkeyPatch, operation: str, mapper: str, async_mode: bool
 ) -> None:
+    import asyncio
+
     import telemetry_dev_google_genai as integration
 
     def boom(*args: Any) -> Any:
         raise ValueError("mapper broke")
 
     monkeypatch.setattr(integration, "_generate_request_fields", boom)
-    monkeypatch.setattr(integration, "_generate_response_fields", boom)
-    client, _transport = client_with_transport([happy_payload()])
+    monkeypatch.setattr(integration, mapper, boom)
+    reported: list[BaseException] = []
+    memory = make(on_error=reported.append)
+    video = {"name": "operations/video-1", "done": operation == "video-done"}
+    payloads: list[Any] = [
+        {"generate": happy_payload(), "embed": embed_payload()}.get(operation, video)
+    ]
+    if operation == "generate-afc":
+        call_part = {"functionCall": {"name": "get_weather", "args": {"location": "Paris"}}}
+        payloads = [
+            {"candidates": [{"content": {"role": "model", "parts": [call_part]}}]},
+            happy_payload(),
+        ]
+    client, _transport = client_with_transport(payloads)
+    completed = types.GenerateVideosOperation.model_validate({**video, "done": True})
+
+    def get_operation(operation: Any) -> Any:
+        return completed
+
+    async def async_get(operation: Any) -> Any:
+        return completed
+
+    client.operations.get = get_operation
+    client.aio.operations.get = async_get
     wrapped = wrap_google_genai(client)
-    response = wrapped.models.generate_content(model="gemini-2.5-flash", contents=USER_CONTENT)
-    assert response.text == "Telemetry works."
+    models = wrapped.aio.models if async_mode else wrapped.models
+    operations = wrapped.aio.operations if async_mode else wrapped.operations
+
+    def call(result: Any) -> Any:
+        return asyncio.run(result) if async_mode else result
+
+    def get_weather(location: str) -> str:
+        """Get the weather."""
+        return f"sunny in {location}"
+
+    if operation in {"generate", "generate-afc"}:
+        config = (
+            types.GenerateContentConfig(tools=[get_weather])
+            if operation == "generate-afc"
+            else None
+        )
+        response = call(
+            models.generate_content(model="gemini-2.5-flash", contents=USER_CONTENT, config=config)
+        )
+        assert response.text == "Telemetry works."
+    elif operation == "embed":
+        call(models.embed_content(model="gemini-embedding-001", contents=["embed me"]))
+    else:
+        submitted = call(models.generate_videos(model="veo-3.0", prompt="a graph"))
+        if operation == "video-polled":
+            call(operations.get(submitted))
+
+    assert [str(cause) for cause in _instrumentation_reports(reported)] == ["mapper broke"]
     span = only_span(memory)
-    assert span.name == "chat gemini-2.5-flash"
+    if operation in {"generate", "generate-afc"}:
+        assert span.name == "chat gemini-2.5-flash"
     assert span.status.status_code == StatusCode.UNSET
+    # The call succeeded, but its output and response fields are lost.
+    assert attrs(span)["telemetry.dev.capture.truncated"] is True
 
 
 def test_tool_definitions_include_new_builtin_markers() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import inspect
 import json
 import math
 import os
@@ -1265,7 +1266,13 @@ def test_stream_finish_reasons_are_capped_at_a_fixed_length(
     def fake_completion(*args: Any, **kwargs: Any) -> Iterator[Any]:
         return iter(chunks)
 
+    def no_rebuild(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
     monkeypatch.setattr(litellm, "completion", fake_completion)
+    # A rebuild of these chunks would fail, which flags the capture on its own; without one the
+    # stream keeps its own finish reasons.
+    monkeypatch.setattr(litellm, "stream_chunk_builder", no_rebuild)
     instrument_litellm()
     stream = llm.completion(model="gpt-4o-mini", messages=CHAT_MESSAGES, stream=True)
     assert list(stream) == chunks
@@ -1408,6 +1415,562 @@ def test_masked_stream_closed_early_withholds_partial_output(make: Any) -> None:
     a = attrs(only_span(memory))
     assert "gen_ai.output.messages" not in a
     assert a["telemetry.dev.capture.truncated"] is True
+
+
+_STREAM = telemetry_dev_litellm._InstrumentedStream  # pyright: ignore[reportPrivateUsage]
+_RESPONSES_STREAM = telemetry_dev_litellm._InstrumentedResponsesStream  # pyright: ignore[reportPrivateUsage]
+
+
+def _failing(
+    owner: Any, name: str, call: int | None = None, caller: str | None = None
+) -> tuple[Any, str, int | None, str | None]:
+    """Names a function that raises on its ``call``-th call (every call when None) from the
+    integration, or only from its function ``caller``."""
+    return owner, name, call, caller
+
+
+_BUILD = _failing(litellm, "stream_chunk_builder")
+_FIELDS = _failing(telemetry_dev_litellm, "_responses_response_without_output")
+
+
+@pytest.mark.parametrize(
+    ("call", "failing", "response", "masked", "kept", "cut"),
+    [
+        pytest.param(
+            "chat-stream", [_BUILD], "completed", False, None, True, id="chat-stream-rebuild"
+        ),
+        pytest.param(
+            "chat-stream", [_BUILD], "completed", True, None, True, id="masked-chat-stream-rebuild"
+        ),
+        pytest.param(
+            "chat-stream",
+            [_failing(telemetry_dev_litellm, "_completion_response")],
+            "completed",
+            False,
+            None,
+            True,
+            id="chat-stream-mapping",
+        ),
+        pytest.param(
+            "chat-stream",
+            [_failing(telemetry_dev_litellm, "_completion_response")],
+            "completed",
+            True,
+            None,
+            True,
+            id="masked-chat-stream-mapping",
+        ),
+        pytest.param(
+            "chat",
+            [_failing(telemetry_dev_litellm, "_completion_response")],
+            "completed",
+            False,
+            None,
+            True,
+            id="chat",
+        ),
+        pytest.param(
+            "chat-async",
+            [_failing(telemetry_dev_litellm, "_completion_response")],
+            "completed",
+            False,
+            None,
+            True,
+            id="chat-async",
+        ),
+        pytest.param(
+            "responses",
+            [_failing(telemetry_dev_litellm, "_responses_response")],
+            "completed",
+            False,
+            None,
+            True,
+            id="responses",
+        ),
+        pytest.param(
+            "responses-async",
+            [_failing(telemetry_dev_litellm, "_responses_response")],
+            "completed",
+            False,
+            None,
+            True,
+            id="responses-async",
+        ),
+        # A failed response whose fields fail to map is still recorded as failed.
+        pytest.param(
+            "responses",
+            [_failing(telemetry_dev_litellm, "_responses_response")],
+            "failed",
+            False,
+            None,
+            True,
+            id="responses-failed",
+        ),
+        pytest.param(
+            "responses-async",
+            [_failing(telemetry_dev_litellm, "_responses_response")],
+            "failed",
+            False,
+            None,
+            True,
+            id="responses-async-failed",
+        ),
+        # The output of a Responses stream is mapped apart from the response's own fields, so it
+        # is kept, also from a mask.
+        pytest.param(
+            "responses-stream", [_FIELDS], "completed", False, "Hello", True, id="responses-stream"
+        ),
+        pytest.param(
+            "responses-stream",
+            [_FIELDS],
+            "completed",
+            True,
+            "Hello",
+            True,
+            id="masked-responses-stream",
+        ),
+        pytest.param(
+            "responses-stream",
+            [_FIELDS],
+            "failed",
+            False,
+            "Hello",
+            True,
+            id="responses-stream-failed",
+        ),
+        # With no terminal output the output is rebuilt from the deltas, which nothing cut.
+        pytest.param(
+            "responses-stream",
+            [_FIELDS],
+            "deltas",
+            True,
+            "Hello after",
+            True,
+            id="masked-responses-stream-deltas",
+        ),
+        # An empty terminal output does not replace the deltas.
+        pytest.param(
+            "responses-stream",
+            [_FIELDS],
+            "empty",
+            True,
+            "Hello after",
+            True,
+            id="masked-responses-stream-empty-snapshot",
+        ),
+        # The terminal output fails to map; the response's own fields are kept.
+        pytest.param(
+            "responses-stream",
+            [_failing(telemetry_dev_litellm, "_adopt_budget")],
+            "failed",
+            False,
+            None,
+            True,
+            id="responses-stream-terminal-budget",
+        ),
+        pytest.param(
+            "responses-stream",
+            [_failing(telemetry_dev_litellm, "_bounded_responses_native", caller="_finish")],
+            "failed",
+            False,
+            None,
+            True,
+            id="responses-stream-terminal-output",
+        ),
+        # A chunk or event whose output fails to record cuts the output there.
+        pytest.param(
+            "chat-stream",
+            [_failing(telemetry_dev_litellm, "_native", 2, caller="_record")],
+            "completed",
+            False,
+            "Hel",
+            True,
+            id="chat-stream-content",
+        ),
+        # The first chunk fails to map and the later chunks come late: the first-chunk time and
+        # the chunk timings still come from the chunks as they arrived.
+        pytest.param(
+            "chat-stream-spaced",
+            [_failing(telemetry_dev_litellm, "_native", 1, caller="_record")],
+            "completed",
+            False,
+            None,
+            True,
+            id="chat-stream-spaced-first-chunk",
+        ),
+        pytest.param(
+            "chat-stream",
+            [_failing(_STREAM, "_record", 2)],
+            "completed",
+            False,
+            "Hel",
+            True,
+            id="chat-stream-chunk",
+        ),
+        pytest.param(
+            "chat-stream",
+            [_failing(_STREAM, "_record", 2)],
+            "completed",
+            True,
+            None,
+            True,
+            id="masked-chat-stream-chunk",
+        ),
+        pytest.param(
+            "chat-stream-async",
+            [_failing(_STREAM, "_record", 2)],
+            "completed",
+            False,
+            "Hel",
+            True,
+            id="chat-stream-async-chunk",
+        ),
+        # A chunk and the end fail, and the stream reports once.
+        pytest.param(
+            "chat-stream",
+            [_failing(_STREAM, "_record", 2), _BUILD],
+            "completed",
+            False,
+            None,
+            True,
+            id="chat-stream-chunk-and-end",
+        ),
+        # A failure in a chunk's metadata loses only that metadata. Every chunk fails, and the
+        # stream reports once.
+        pytest.param(
+            "chat-stream",
+            [_failing(telemetry_dev_litellm, "_usage_from", caller="_record")],
+            "completed",
+            False,
+            "Hello world streaming",
+            False,
+            id="chat-stream-usage",
+        ),
+        pytest.param(
+            "chat-stream",
+            [_failing(telemetry_dev.SpanHandle, "update")],
+            "completed",
+            True,
+            "Hello world streaming",
+            False,
+            id="masked-chat-stream-first-chunk",
+        ),
+        pytest.param(
+            "responses-stream",
+            [_failing(telemetry_dev.SpanHandle, "update")],
+            "deltas",
+            True,
+            "Hello after",
+            False,
+            id="masked-responses-stream-first-event",
+        ),
+        pytest.param(
+            "responses-stream",
+            [_failing(_RESPONSES_STREAM, "_record", 2)],
+            "deltas",
+            False,
+            "Hel",
+            True,
+            id="responses-stream-event",
+        ),
+        pytest.param(
+            "responses-stream",
+            [_failing(_RESPONSES_STREAM, "_record", 2)],
+            "deltas",
+            True,
+            None,
+            True,
+            id="masked-responses-stream-event",
+        ),
+        pytest.param(
+            "responses-stream-async",
+            [_failing(_RESPONSES_STREAM, "_record", 2)],
+            "deltas",
+            False,
+            "Hel",
+            True,
+            id="responses-stream-async-event",
+        ),
+        # A complete terminal output replaces what was recorded, so nothing is lost; an empty
+        # one does not.
+        pytest.param(
+            "responses-stream",
+            [_failing(_RESPONSES_STREAM, "_record", 2)],
+            "snapshot",
+            True,
+            "Hello",
+            False,
+            id="masked-responses-stream-event-snapshot",
+        ),
+        pytest.param(
+            "responses-stream",
+            [_failing(_RESPONSES_STREAM, "_record", 2)],
+            "empty",
+            False,
+            "Hel",
+            True,
+            id="responses-stream-event-empty-snapshot",
+        ),
+        # Nothing was recorded before the lost event; the truncated budget still keeps the empty
+        # terminal output from clearing the cut.
+        pytest.param(
+            "responses-stream",
+            [_failing(_RESPONSES_STREAM, "_record", 1)],
+            "empty",
+            False,
+            None,
+            True,
+            id="responses-stream-first-event-empty-snapshot",
+        ),
+        # An event and then the end, inside the terminal event, fail past the end's own guards;
+        # the span still ends and the stream reports once.
+        pytest.param(
+            "responses-stream",
+            [
+                _failing(_RESPONSES_STREAM, "_record", 2),
+                _failing(telemetry_dev_litellm, "_mark_capture_incomplete"),
+            ],
+            "deltas",
+            False,
+            None,
+            True,
+            id="responses-stream-event-and-end",
+        ),
+        # With no terminal output and no other cut, the output fails to rebuild from the deltas.
+        pytest.param(
+            "responses-stream",
+            [_failing(_RESPONSES_STREAM, "_partial_output")],
+            "deltas",
+            False,
+            None,
+            True,
+            id="responses-stream-rebuild",
+        ),
+        # A stream closed after two chunks or events whose output fails to rebuild does not raise
+        # into close().
+        pytest.param(
+            "chat-stream-closed",
+            [_BUILD],
+            "completed",
+            False,
+            None,
+            True,
+            id="chat-stream-closed-rebuild",
+        ),
+        pytest.param(
+            "chat-stream-closed",
+            [_failing(_STREAM, "_record", 2), _BUILD],
+            "completed",
+            False,
+            None,
+            True,
+            id="chat-stream-chunk-and-close",
+        ),
+        pytest.param(
+            "responses-stream-closed",
+            [_failing(_RESPONSES_STREAM, "_partial_output")],
+            "deltas",
+            True,
+            None,
+            True,
+            id="masked-responses-stream-closed-rebuild",
+        ),
+        pytest.param(
+            "responses-stream-closed-async",
+            [_failing(_RESPONSES_STREAM, "_partial_output")],
+            "deltas",
+            False,
+            None,
+            True,
+            id="responses-stream-closed-async-rebuild",
+        ),
+        pytest.param(
+            "responses-stream-closed",
+            [
+                _failing(_RESPONSES_STREAM, "_record", 2),
+                _failing(_RESPONSES_STREAM, "_partial_output"),
+            ],
+            "deltas",
+            False,
+            None,
+            True,
+            id="responses-stream-event-and-close",
+        ),
+    ],
+)
+async def test_a_response_that_fails_to_map_is_reported_and_flagged(
+    make: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    call: str,
+    failing: list[tuple[Any, str, int | None, str | None]],
+    response: str,
+    masked: bool,
+    kept: str | None,
+    cut: bool,
+) -> None:
+    def failing_on(original: Any, failing_call: int | None, caller: str | None) -> Any:
+        calls = 0
+
+        # LiteLLM calls stream_chunk_builder itself at the end of a stream, so only the
+        # integration's calls fail.
+        def fail(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            frame = inspect.stack(0)[1].frame
+            if frame.f_globals.get("__name__") == "telemetry_dev_litellm" and (
+                caller is None or frame.f_code.co_name == caller
+            ):
+                calls += 1
+                if failing_call is None or calls == failing_call:
+                    raise ValueError("mapper broke")
+            return original(*args, **kwargs)
+
+        return fail
+
+    terminal = responses_result("failed" if response == "failed" else "completed")
+    events: list[SimpleNamespace] = []
+    if response in {"deltas", "snapshot", "empty"}:
+        if response != "snapshot":
+            terminal.output = None if response == "deltas" else []
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta=delta)
+            for delta in ("Hel", "lo", " after")
+        ]
+    events.append(
+        SimpleNamespace(
+            type="response.failed" if response == "failed" else "response.completed",
+            response=terminal,
+        )
+    )
+
+    def fake_responses(*_args: Any, **kwargs: Any) -> Any:
+        return ResponsesStream(events) if kwargs.get("stream") else terminal
+
+    async def fake_aresponses(*_args: Any, **kwargs: Any) -> Any:
+        return AsyncResponsesStream(events) if kwargs.get("stream") else terminal
+
+    chunk_gap_s = 0.3
+    # litellm.completion has a partly unknown static type.
+    original_completion = cast(Any, litellm).completion
+
+    def spaced_completion(*args: Any, **kwargs: Any) -> Any:
+        stream = original_completion(*args, **kwargs)
+
+        def spaced() -> Iterator[Any]:
+            for index, chunk in enumerate(stream):
+                if index == 1:
+                    time.sleep(chunk_gap_s)
+                yield chunk
+
+        return spaced()
+
+    timestamps: list[float] = []
+    original_record_output_chunk = telemetry_dev.SpanHandle.record_output_chunk
+
+    def record_output_chunk(
+        handle: telemetry_dev.SpanHandle, timestamp_ms: float | None = None
+    ) -> telemetry_dev.SpanHandle:
+        assert timestamp_ms is not None
+        timestamps.append(timestamp_ms)
+        return original_record_output_chunk(handle, timestamp_ms)
+
+    for owner, name, failing_call, caller in failing:
+        monkeypatch.setattr(owner, name, failing_on(getattr(owner, name), failing_call, caller))
+    monkeypatch.setattr(litellm, "responses", fake_responses)
+    monkeypatch.setattr(litellm, "aresponses", fake_aresponses)
+    monkeypatch.setattr(telemetry_dev.SpanHandle, "record_output_chunk", record_output_chunk)
+    if call == "chat-stream-spaced":
+        monkeypatch.setattr(litellm, "completion", spaced_completion)
+    reported: list[BaseException] = []
+    options: dict[str, Any] = {"on_error": reported.append}
+    if masked:
+        options["mask"] = identity_mask
+    memory = make(**options)
+    instrument_litellm()
+    chat: dict[str, Any] = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "stream"}],
+        "mock_response": "Hello world streaming",
+    }
+    if call in {"chat-stream", "chat-stream-spaced"}:
+        stream = llm.completion(**chat, stream=True)
+        assert "".join(chunk.choices[0].delta.content or "" for chunk in stream) == (
+            "Hello world streaming"
+        )
+    elif call == "chat-stream-async":
+        stream = await llm.acompletion(**chat, stream=True)
+        assert "".join([chunk.choices[0].delta.content or "" async for chunk in stream]) == (
+            "Hello world streaming"
+        )
+    elif call == "chat-stream-closed":
+        stream = llm.completion(**chat, stream=True)
+        next(stream)
+        next(stream)
+        stream.close()
+    elif call == "chat":
+        assert llm.completion(**chat).choices[0].message.content == "Hello world streaming"
+    elif call == "chat-async":
+        await llm.acompletion(**chat)
+    elif call == "responses":
+        assert llm.responses(input="hi", model="gpt-4.1-mini").id == "resp_123"
+    elif call == "responses-async":
+        await llm.aresponses(input="hi", model="gpt-4.1-mini")
+    elif call == "responses-stream":
+        assert list(llm.responses(input="hi", model="gpt-4.1-mini", stream=True)) == events
+    elif call == "responses-stream-closed":
+        stream = llm.responses(input="hi", model="gpt-4.1-mini", stream=True)
+        next(stream)
+        next(stream)
+        stream.close()
+    elif call == "responses-stream-closed-async":
+        stream = await llm.aresponses(input="hi", model="gpt-4.1-mini", stream=True)
+        await stream.__anext__()
+        await stream.__anext__()
+        await stream.aclose()
+    else:
+        stream = await llm.aresponses(input="hi", model="gpt-4.1-mini", stream=True)
+        assert [event async for event in stream] == events
+
+    # The in-memory metric reader reports at the first span with chunk timing that only the
+    # built-in OTLP exporter exports the interval metric.
+    failures = [cause for cause in reported if "time_per_output_chunk" not in str(cause)]
+    assert [str(cause) for cause in failures] == ["mapper broke"]
+    span = only_span(memory)
+    if response == "failed":
+        assert span.status.status_code is StatusCode.ERROR
+        exception = next(event for event in span.events if event.name == "exception")
+        assert exception.attributes is not None
+        assert exception.attributes["exception.message"] == "provider rejected response"
+    else:
+        assert span.status.status_code is not StatusCode.ERROR
+    a = attrs(span)
+    assert a.get("telemetry.dev.capture.truncated") is (True if cut else None)
+    failing_names = {name for _owner, name, _call, _caller in failing}
+    if call == "responses-stream" and response == "failed" and _FIELDS[1] not in failing_names:
+        # The response's own fields outlive a failure in its output.
+        assert a["gen_ai.usage.input_tokens"] == 12
+    if kept is None:
+        assert "gen_ai.output.messages" not in a
+    else:
+
+        def texts(value: Any) -> list[Any]:
+            if isinstance(value, dict):
+                return [
+                    text for item in cast(dict[str, Any], value).values() for text in texts(item)
+                ]
+            if isinstance(value, list):
+                return [text for item in cast(list[Any], value) for text in texts(item)]
+            return [value]
+
+        # The kept text is whole, so text after a lost chunk is not in it.
+        assert kept in texts(json_attr(a["gen_ai.output.messages"]))
+    if call in {"chat-stream", "chat-stream-async"}:
+        # Fields the stream keeps outside the rebuild are still recorded.
+        assert tuple(cast(Any, a["gen_ai.response.finish_reasons"])) == ("stop",)
+    if call == "chat-stream-spaced":
+        assert cast(float, a["gen_ai.response.time_to_first_chunk"]) < chunk_gap_s
+        # One timing for each of the seven chunks with text, the lost first one included.
+        assert len(timestamps) == 7
+        assert timestamps[1] - timestamps[0] >= chunk_gap_s * 1000
 
 
 def test_streaming_mid_stream_error_records_error(memory: SimpleNamespace) -> None:

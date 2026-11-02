@@ -846,13 +846,6 @@ def _end_once(handle: telemetry_dev.SpanHandle) -> Callable[..., None]:
     return end
 
 
-def _safe_response_fields(mapper: ResponseMapper, response: Any) -> dict[str, Any]:
-    try:
-        return mapper(response)
-    except Exception:
-        return {}
-
-
 def _safe_start_span(
     op: str, mapper: RequestMapper, args: tuple[Any, ...], kwargs: Mapping[str, Any]
 ) -> tuple[telemetry_dev.SpanHandle, Callable[..., None], float, str | None]:
@@ -924,6 +917,8 @@ class _InstrumentedStream:
         self._finish_reasons: dict[int, str] = {}
         self._choice_indices: set[int] = set()
         self._finish_reasons_truncated = False
+        self._reported = False
+        self._output_recorded = False
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -946,7 +941,7 @@ class _InstrumentedStream:
             except BaseException:
                 pass
             raise
-        self._record(chunk, received_at)
+        self._record_guarded(chunk, received_at)
         return chunk
 
     def __aiter__(self) -> AsyncIterator[Any]:
@@ -967,7 +962,7 @@ class _InstrumentedStream:
             except BaseException:
                 pass
             raise
-        self._record(chunk, received_at)
+        self._record_guarded(chunk, received_at)
         return chunk
 
     def __enter__(self) -> _InstrumentedStream:
@@ -1000,7 +995,85 @@ class _InstrumentedStream:
             return bool(await _maybe_await(exit_method(exc_type, exc, tb)))
         return False
 
+    def _report(self, exc: Exception) -> None:
+        # A stream reports only its first failure; a broken mapper fails on every chunk.
+        if self._reported:
+            return
+        self._reported = True
+        try:
+            self._handle.report_error(exc)
+        except Exception:
+            pass
+
+    def _record_guarded(self, chunk: Any, received_at: float) -> None:
+        self._output_recorded = False
+        try:
+            self._record(chunk, received_at)
+        except Exception as exc:
+            if not self._output_recorded:
+                # The chunk may be lost. The truncated budget keeps no later chunk, so the
+                # output stays a prefix, flagged and withheld from a mask.
+                self._budget.truncated = True
+            self._report(exc)
+
     def _record(self, chunk: Any, received_at: float) -> None:
+        # Timings are recorded before the chunk is mapped, so a failure in its mapping neither
+        # moves the first-chunk time to a later chunk nor drops the chunk from the chunk timings;
+        # like a chunk past the bound, a lost chunk was still delivered. Each timing step loses
+        # only its own value when it fails.
+        if not self._saw_first:
+            self._saw_first = True
+            try:
+                self._handle.update(time_to_first_chunk_ms=(received_at - self._started_at) * 1000)
+            except Exception as exc:
+                self._report(exc)
+            try:
+                self._handle.update(
+                    response_id=_string(_field(chunk, "id")),
+                    response_model=_string(_field(chunk, "model")),
+                )
+            except Exception as exc:
+                self._report(exc)
+        try:
+            has_output = False
+            for choice in _sequence_items(_field(chunk, "choices")):
+                delta = _field(choice, "delta")
+                has_output = (
+                    has_output
+                    or any(
+                        isinstance(value, str) and bool(value)
+                        for value in (
+                            _field(delta, "content"),
+                            _field(delta, "reasoning_content"),
+                            _field(delta, "refusal"),
+                            _field(_field(delta, "audio"), "data"),
+                        )
+                    )
+                    or (
+                        isinstance(_field(_field(delta, "function_call"), "arguments"), str)
+                        and bool(_field(_field(delta, "function_call"), "arguments"))
+                    )
+                    or any(
+                        isinstance(arguments, str) and bool(arguments)
+                        for arguments in (
+                            _field(_field(tool, "function"), "arguments")
+                            for tool in _sequence_items(_field(delta, "tool_calls"))
+                        )
+                    )
+                )
+            if has_output:
+                self._saw_output = True
+                record_output_chunk = getattr(self._handle, "record_output_chunk", None)
+                if callable(record_output_chunk):
+                    record_output_chunk(received_at * 1000)
+        except Exception as exc:
+            self._report(exc)
+        # The chunk is kept before its metadata is read, so a failure in the metadata (ID,
+        # model, usage, finish reasons) loses only that metadata. A chunk object keeps its delta
+        # fields where the budget does not walk, so the budget measures its JSON copy.
+        if not self._budget.truncated and self._budget.accept(_native(chunk)):
+            self._chunks.append(chunk)
+        self._output_recorded = True
         response_id = _string(_field(chunk, "id"))
         if self._response_id is None and response_id is not None:
             self._response_id = response_id
@@ -1010,32 +1083,7 @@ class _InstrumentedStream:
         usage = _usage_from(_field(chunk, "usage"))
         if usage is not None and (self._usage is None or _reports_tokens(usage)):
             self._usage = usage
-        has_output = False
         for fallback_index, choice in enumerate(_sequence_items(_field(chunk, "choices"))):
-            delta = _field(choice, "delta")
-            has_output = (
-                has_output
-                or any(
-                    isinstance(value, str) and bool(value)
-                    for value in (
-                        _field(delta, "content"),
-                        _field(delta, "reasoning_content"),
-                        _field(delta, "refusal"),
-                        _field(_field(delta, "audio"), "data"),
-                    )
-                )
-                or (
-                    isinstance(_field(_field(delta, "function_call"), "arguments"), str)
-                    and bool(_field(_field(delta, "function_call"), "arguments"))
-                )
-                or any(
-                    isinstance(arguments, str) and bool(arguments)
-                    for arguments in (
-                        _field(_field(tool, "function"), "arguments")
-                        for tool in _sequence_items(_field(delta, "tool_calls"))
-                    )
-                )
-            )
             choice_index = _number(_field(choice, "index"))
             key = (
                 int(choice_index)
@@ -1054,22 +1102,6 @@ class _InstrumentedStream:
             finish_reason = _string(_field(choice, "finish_reason"))
             if finish_reason is not None:
                 self._finish_reasons[key] = finish_reason[:_FINISH_REASON_MAX_LENGTH]
-        if has_output:
-            self._saw_output = True
-            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-            if callable(record_output_chunk):
-                record_output_chunk(received_at * 1000)
-        if not self._saw_first:
-            self._saw_first = True
-            self._handle.update(
-                time_to_first_chunk_ms=(time.perf_counter() - self._started_at) * 1000,
-                response_id=response_id,
-                response_model=response_model,
-            )
-        # A chunk object keeps its delta fields where the budget does not walk, so the budget
-        # measures its JSON copy.
-        if not self._budget.truncated and self._budget.accept(_native(chunk)):
-            self._chunks.append(chunk)
 
     def _finish(self, error: BaseException | None = None) -> None:
         if self._finished:
@@ -1080,10 +1112,12 @@ class _InstrumentedStream:
         try:
             stream_chunk_builder = cast(Callable[..., Any], cast(Any, litellm).stream_chunk_builder)
             rebuilt = stream_chunk_builder(self._chunks, messages=self._messages)
-        except Exception:
-            rebuilt = None
-        if rebuilt is not None:
-            fields = _safe_response_fields(_completion_response, rebuilt)
+            if rebuilt is not None:
+                fields = _completion_response(rebuilt)
+        except Exception as exc:
+            # The output is lost; the truncated budget flags it and keeps it from a mask.
+            self._budget.truncated = True
+            self._report(exc)
         rebuilt_usage = fields.get("usage")
         if self._usage is not None and (
             rebuilt_usage is None
@@ -1258,6 +1292,8 @@ class _InstrumentedResponsesStream:
         self._budget = _stream_capture_budget()
         self._charges: dict[object, tuple[int, int]] = {}
         self._annotation_charge_keys: dict[object, dict[int, object]] = {}
+        self._reported = False
+        self._record_failed = False
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -1279,7 +1315,7 @@ class _InstrumentedResponsesStream:
             except BaseException:
                 pass
             raise
-        self._record(event, received_at)
+        self._record_guarded(event, received_at)
         return event
 
     def __aiter__(self) -> AsyncIterator[Any]:
@@ -1299,7 +1335,7 @@ class _InstrumentedResponsesStream:
             except BaseException:
                 pass
             raise
-        self._record(event, received_at)
+        self._record_guarded(event, received_at)
         return event
 
     def __enter__(self) -> _InstrumentedResponsesStream:
@@ -1561,16 +1597,53 @@ class _InstrumentedResponsesStream:
         if not keys and not self._truncation_overflow:
             self._resolve_truncated(item_key)
 
+    def _report(self, exc: Exception) -> None:
+        # A stream reports only its first failure; a broken mapper fails on every event.
+        if self._reported:
+            return
+        self._reported = True
+        try:
+            self._handle.report_error(exc)
+        except Exception:
+            pass
+
+    def _record_guarded(self, event: Any, received_at: float) -> None:
+        try:
+            # After a lost event only the terminal events are read, so the output rebuilt from
+            # deltas stays a prefix; a complete terminal snapshot still replaces it.
+            if self._record_failed and _string(_field(event, "type")) not in {
+                "response.completed",
+                "response.incomplete",
+                "response.failed",
+                "error",
+            }:
+                return
+            self._record(event, received_at)
+        except Exception as exc:
+            self._record_failed = True
+            self._budget.truncated = True
+            self._report(exc)
+            if self._finished:
+                # The end failed after it began, so the span ends here, flagged, with no output.
+                try:
+                    self._end(attributes={_CAPTURE_TRUNCATED_ATTRIBUTE: True})
+                finally:
+                    _release_budget(self._budget)
+
     def _record(self, event: Any, received_at: float) -> None:
         event_type = _string(_field(event, "type"))
         response = _field(event, "response")
         if not self._saw_first:
             self._saw_first = True
-            self._handle.update(
-                time_to_first_chunk_ms=(received_at - self._started_at) * 1000,
-                response_id=_string(_field(response, "id")),
-                response_model=_string(_field(response, "model")),
-            )
+            try:
+                self._handle.update(
+                    time_to_first_chunk_ms=(received_at - self._started_at) * 1000,
+                    response_id=_string(_field(response, "id")),
+                    response_model=_string(_field(response, "model")),
+                )
+            except Exception as exc:
+                # Only the first-event timing and IDs are lost; the event's output is recorded.
+                self._report(exc)
         if event_type in {
             "response.output_item.added",
             "response.content_part.added",
@@ -1853,36 +1926,73 @@ class _InstrumentedResponsesStream:
         if self._finished:
             return
         self._finished = True
-        fields = (
-            _safe_response_fields(_responses_response_without_output, response)
-            if response is not None
-            else {}
-        )
+        fields: dict[str, Any] = {}
+        fields_lost = False
+        if response is not None:
+            try:
+                fields = _responses_response_without_output(response)
+            except Exception as exc:
+                # Only the response's own fields are lost: the output is mapped apart, so it is
+                # flagged but not cut or withheld from a mask. A failed response is still
+                # recorded as failed.
+                fields_lost = True
+                self._report(exc)
+                try:
+                    fields = {"error": _response_error(response)}
+                except Exception:
+                    pass
         if response is not None and self._capture_output:
-            terminal_output, terminal_budget = _bounded_responses_native(
-                _field(response, "output"),
-                budget=telemetry_dev.CaptureBudget(self._budget.max_bytes, self._budget.max_items),
-            )
-            if (
-                terminal_output is not None
-                and not terminal_budget.truncated
-                and _adopt_budget(self._budget, terminal_budget)
-            ):
-                fields["output"] = terminal_output
-                self._budget.truncated = False
-                self._retained_item_count -= len(self._truncated_items)
-                self._truncated_items.clear()
-                self._truncated_item_keys.clear()
-                self._truncated_key_count = 0
-                self._truncation_overflow = False
-            elif _field(response, "output") is not None or terminal_budget.truncated:
+            try:
+                terminal_output, terminal_budget = _bounded_responses_native(
+                    _field(response, "output"),
+                    budget=telemetry_dev.CaptureBudget(
+                        self._budget.max_bytes, self._budget.max_items
+                    ),
+                )
+                # An empty terminal output does not replace output recorded from the deltas, or
+                # lost with an event, so it is read as no terminal output. A lost event leaves the
+                # budget truncated until this replacement, so the truncated budget covers it.
+                replaces_recorded = terminal_output != [] or not (
+                    self._charges or self._budget.truncated
+                )
+                if (
+                    terminal_output is not None
+                    and replaces_recorded
+                    and not terminal_budget.truncated
+                    and _adopt_budget(self._budget, terminal_budget)
+                ):
+                    fields["output"] = terminal_output
+                    self._budget.truncated = False
+                    self._retained_item_count -= len(self._truncated_items)
+                    self._truncated_items.clear()
+                    self._truncated_item_keys.clear()
+                    self._truncated_key_count = 0
+                    self._truncation_overflow = False
+                elif replaces_recorded and (
+                    _field(response, "output") is not None or terminal_budget.truncated
+                ):
+                    self._budget.truncated = True
+            except Exception as exc:
+                # The terminal output is lost; the output rebuilt from the deltas, if any, is
+                # flagged and withheld from a mask, and the mapped fields are kept.
+                fields.pop("output", None)
                 self._budget.truncated = True
+                self._report(exc)
         if "output" not in fields:
-            partial_output = self._partial_output()
+            try:
+                partial_output = self._partial_output()
+            except Exception as exc:
+                # The output cannot be rebuilt whole, so none is exported, and the stream is
+                # flagged.
+                partial_output = None
+                self._budget.truncated = True
+                self._report(exc)
             if partial_output:
                 fields["output"] = partial_output
         if self._budget.truncated or response is None or error is not None:
             _mark_capture_incomplete(fields, self._mask_output_when_incomplete)
+        elif fields_lost:
+            _mark_capture_incomplete(fields, False)
         if self._request_provider is not None:
             fields.pop("provider", None)
         if error is not None:
@@ -1996,7 +2106,20 @@ def _wrap_sync(
             elif op == "rerank":
                 active_mapper = _rerank_response_without_output
         try:
-            fields = _safe_response_fields(active_mapper, result)
+            fields = active_mapper(result)
+        except Exception as exc:
+            # The output and response fields are lost; the call is failed only if the response
+            # says so.
+            try:
+                handle.report_error(exc)
+            except Exception:
+                pass
+            fields: dict[str, Any] = {"attributes": {_CAPTURE_TRUNCATED_ATTRIBUTE: True}}
+            if op == "responses":
+                try:
+                    fields["error"] = _response_error(result)
+                except Exception:
+                    pass
         except BaseException as exc:
             end(
                 error=exc,
@@ -2056,7 +2179,20 @@ def _wrap_async(
             elif op == "rerank":
                 active_mapper = _rerank_response_without_output
         try:
-            fields = _safe_response_fields(active_mapper, result)
+            fields = active_mapper(result)
+        except Exception as exc:
+            # The output and response fields are lost; the call is failed only if the response
+            # says so.
+            try:
+                handle.report_error(exc)
+            except Exception:
+                pass
+            fields: dict[str, Any] = {"attributes": {_CAPTURE_TRUNCATED_ATTRIBUTE: True}}
+            if op == "responses":
+                try:
+                    fields["error"] = _response_error(result)
+                except Exception:
+                    pass
         except BaseException as exc:
             end(
                 error=exc,
