@@ -30,15 +30,13 @@ The tuple's options are merged over options passed to `telemetryDevPlugin()`. Ke
 
 ### Project plugin file
 
-Use a plugin file when you need an option that is a function, such as `mask`. The plugin file and the package dependency go in the same opencode config directory: `.opencode/` for one project, or `~/.config/opencode/` for all projects. Add the package to `package.json` in that directory:
+Use a plugin file when you need an option that is a function, such as `mask`. The plugin file and the package dependency go in the same opencode config directory: `.opencode/` for one project, or `~/.config/opencode/` for all projects. Install the package with `--prefix`, so that npm adds it to the `package.json` in that directory and not to the project's own. For one project, from the project root:
 
-```json
-{
-  "dependencies": {
-    "@telemetry-dev/opencode": "^0.2.2"
-  }
-}
+```sh
+npm install --prefix .opencode @telemetry-dev/opencode
 ```
+
+For all projects, use `--prefix ~/.config/opencode`.
 
 Then create `plugins/telemetry-dev.ts` in the same directory, for example `.opencode/plugins/telemetry-dev.ts`:
 

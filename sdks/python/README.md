@@ -160,7 +160,7 @@ metadata, identifiers, resource attributes, or events written directly through r
 | `sampler` | OTel environment configuration | OTel `Sampler` that overrides environment settings. Session roots use its root policy. Real parents keep their sampling decisions. |
 | `on_error` | `None` | Receives internal SDK errors; repeated instrumentation failures from one stream may be coalesced into one report. The SDK never raises them into application code. A series of failed exports, for example during an ingest outage, is one report to `on_error` and the `telemetry_dev` logger. After an export reaches the ingest, the next failure is a new report. A `flush()` or `shutdown()` that `on_error` calls during an export returns at once, before it sends anything, and runs on a new thread, because a batch processor or the metric reader holds a lock during its export that the call needs; the thread waits for that export to end. With `export_mode="immediate"` the span and log exports hold no lock, so the call starts at once, but it still returns before it sends anything: in a serverless handler, call `flush()` after the work, outside `on_error`. The process does not wait for a deferred flush before it exits; the shutdown at exit sends what is left, unless `disable_atexit=True`, where the application must call `shutdown()`. After a deferred `shutdown()`, the client is already gone, and the process waits for the shutdown before it exits; if its thread cannot start, it runs when the process exits, unless the process is already exiting. |
 | `disable_atexit` | `False` | Skip the automatic atexit shutdown. |
-| `timeout` | `10.0` | Timeout of each OTLP HTTP request in seconds. A batch split into several requests gives each request this timeout. |
+| `timeout` | `10.0` | Timeout of each OTLP HTTP export request in seconds. No wait before a retry starts after it, but a request whose connection fails is sent again at once with the same limit, so an ingest that does not answer can take up to twice this time. The limit applies to each wait for the server, so a response that keeps arriving can also take longer. A batch split into several requests gives each request this timeout. |
 | `span_exporter`, `log_exporter`, `metric_reader` | `None` | Test seams / offline mode; any of them enables the client without an API key. |
 
 Each export request is at most 16 MiB, the ingest's limit, so a larger batch is sent in several
@@ -500,8 +500,8 @@ your_tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter))
 ```
 
 `create_telemetry_span_exporter` takes `api_key`, `base_url`, and `timeout`, in seconds (default
-`10.0`). The timeout covers each export request with its retries, also each request of a batch
-that is split.
+`10.0`). The timeout works as the `timeout` option of `init` describes, also for each request of a
+batch that is split.
 
 `TelemetrySpanProcessor` remains available from the package root for compatibility:
 
@@ -519,7 +519,7 @@ from telemetry_dev import TelemetrySpanProcessor
 | `max_queue_size` | `2048` | BatchSpanProcessor queue size. |
 | `max_queue_bytes` | `67108864` (64 MiB) | Maximum size of the queued spans, counting each character of their string attribute values as one byte. A span is still queued when the queue is empty. Spans over the bound are dropped and reported to `on_error`. |
 | `max_stream_bytes` | `67108864` (64 MiB) | Maximum output that provider integrations keep, across the process, for streams that have not ended (UTF-8 bytes of JSON). Each stream keeps at most `MAX_RECORD_BYTES` (16 MiB); while no other stream holds bytes in it, not even the few bytes a started stream holds before any output, a stream may grow to 16 MiB even past this bound. The bound is process-wide, so the span processor started last sets it. `None` selects the default; other values that are not non-negative integers or `math.inf` are reported to `on_error`, and the processor exports nothing. Output past either bound is not kept, and its span gets `telemetry.dev.capture.truncated`. On Python 3.10 and 3.11, each streamed text buffer can also hold up to 100,000 recent deltas as separate strings, several MB that the bound does not count. |
-| `export_timeout_millis` | `30000` | Passed to BatchSpanProcessor, which does not apply it. Each request of the telemetry.dev exporter times out after 10 seconds. |
+| `export_timeout_millis` | `30000` | Passed to BatchSpanProcessor, which does not apply it. The telemetry.dev exporter applies a 10-second `timeout` to each request, as the `init` option describes. |
 | `span_filter` | `None` | Export predicate `Callable[[ReadableSpan], bool]`; failures export the span. |
 | `metrics` | `True` | Auto-record GenAI duration/token histograms for exported spans when an API key is available. |
 | `service_name` | `OTEL_SERVICE_NAME` or `unknown_service` | `service.name` on the metrics resource. |
