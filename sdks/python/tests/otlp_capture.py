@@ -52,21 +52,23 @@ class CaptureServer:
 @contextmanager
 def otlp_capture_server() -> Generator[CaptureServer]:
     captured: list[CapturedRequest] = []
+    # Concurrent GETs take the next reply under this lock, so two cannot both pop the last ones.
+    replies_lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             length = int(self.headers.get("content-length") or 0)
             body = self.rfile.read(length)
-            captured.append(
-                CapturedRequest(
-                    # self.path collapses a leading "//" (gh-87389); keep the raw target.
-                    path=self.requestline.split(" ")[1],
-                    headers={key.lower(): value for key, value in self.headers.items()},
-                    body=body,
-                )
+            request = CapturedRequest(
+                # self.path collapses a leading "//" (gh-87389); keep the raw target.
+                path=self.requestline.split(" ")[1],
+                headers={key.lower(): value for key, value in self.headers.items()},
+                body=body,
             )
+            captured.append(request)
             time.sleep(capture.post_delay)
-            self.send_response(capture.path_status.get(captured[-1].path, capture.status))
+            # Not captured[-1]: requests to other paths can arrive on other threads meanwhile.
+            self.send_response(capture.path_status.get(request.path, capture.status))
             self.send_header("content-type", "application/x-protobuf")
             self.send_header("content-length", "0")
             self.end_headers()
@@ -81,9 +83,10 @@ def otlp_capture_server() -> Generator[CaptureServer]:
                 )
             )
             time.sleep(delay)
-            status, reply = (
-                capture.replies[0] if len(capture.replies) == 1 else capture.replies.pop(0)
-            )
+            with replies_lock:
+                status, reply = (
+                    capture.replies[0] if len(capture.replies) == 1 else capture.replies.pop(0)
+                )
             body = json.dumps(reply).encode()
             self.send_response(status)
             self.send_header("content-type", "application/json")

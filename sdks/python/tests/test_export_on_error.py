@@ -8,7 +8,6 @@ import subprocess
 import sys
 import threading
 import time
-import traceback
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -616,21 +615,6 @@ def test_batched_logs_past_the_queue_bound_are_dropped_and_reported(
     telemetry_dev.shutdown()
 
 
-def _export_state(
-    ingest: Any, client: telemetry_dev.Client, reports: Sequence[BaseException]
-) -> str:
-    """The state of the exports, for the message of a wait that timed out."""
-    frames = sys._current_frames()
-    stacks = "\n".join(
-        f"{thread.name}:\n{''.join(traceback.format_stack(frames[thread.ident]))}"
-        for thread in threading.enumerate()
-        if thread.ident in frames
-    )
-    paths = [request.path for request in ingest.requests]
-    is_global = telemetry_dev.get_client() is client
-    return f"requests={paths} reports={list(reports)!r} global={is_global}\n{stacks}"
-
-
 def _wait_until(condition: Callable[[], bool], seconds: float = 10) -> bool:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -647,15 +631,11 @@ def test_an_on_error_that_flushes_during_an_export_does_not_hang_and_flushes_aft
     reports: list[BaseException] = []
 
     def on_error(error: BaseException) -> None:
-        reports.append(error)
-        if telemetry_dev.get_client() is not client:
-            # Keeps a report that comes after this row ended from reaching the next row's
-            # client through the global functions.
-            return
         # The SDK calls this inside the export, while the batch processor or the metric reader
         # holds its export lock. The span gives the metric reader new data to export, as other
         # threads can at any time. Its trace export fails too, so that a trace export that reaches
         # the ingest does not end the series of failed exports before the deferred flush.
+        reports.append(error)
         ingest.path_status["/v1/traces"] = 400
         telemetry_dev.start_span("chat", type="generation", model="m", provider="p").end()
         telemetry_dev.flush(timeout_s=2)
@@ -665,7 +645,7 @@ def test_an_on_error_that_flushes_during_an_export_does_not_hang_and_flushes_aft
             ingest.path_status["/v1/metrics"] = 400
         else:
             ingest.status = 400
-        client = telemetry_dev.init(
+        telemetry_dev.init(
             api_key="td_live_test",
             base_url=ingest.url,
             log_level="silent",
@@ -705,10 +685,6 @@ def test_an_on_error_that_shuts_down_during_an_export_ends_the_client_without_ha
 
     def on_error(error: BaseException) -> None:
         reports.append(error)
-        if telemetry_dev.get_client() is not client:
-            # Keeps a report that comes after this row ended from reaching the next row's
-            # client through the global functions.
-            return
         if kind == "metric":
             # New metric data, which only the shutdown sends. Its trace export fails too, so
             # that it continues the series of failed exports.
@@ -739,7 +715,7 @@ def test_an_on_error_that_shuts_down_during_an_export_ends_the_client_without_ha
             threading.Thread(
                 target=telemetry_dev.flush, kwargs={"timeout_s": 3}, daemon=True
             ).start()
-        assert _wait_until(lambda: len(reports) == 1), _export_state(ingest, client, reports)
+        assert _wait_until(lambda: len(reports) == 1)
         assert telemetry_dev.get_client() is None
         # The deferred shutdown runs once the export ends. It sends the queued logs and the
         # metrics, and in the metric row also the metrics of the span that on_error ended.
@@ -899,8 +875,6 @@ def test_an_on_error_that_flushes_or_shuts_down_a_tracer_provider_during_an_expo
     reports: list[BaseException] = []
     raised: list[BaseException] = []
     byo_provider = TracerProvider(shutdown_on_exit=False)
-    client: telemetry_dev.Client | None = None
-    skipped: list[BaseException] = []
 
     def end_chat_span() -> None:
         if owner == "global":
@@ -912,11 +886,6 @@ def test_an_on_error_that_flushes_or_shuts_down_a_tracer_provider_during_an_expo
 
     def on_error(error: BaseException) -> None:
         reports.append(error)
-        if owner == "global" and telemetry_dev.get_client() is not client:
-            # Keeps a report that comes after this row ended from reaching the next row's
-            # client through the global functions.
-            skipped.append(error)
-            return
         # The span gives the deferred call new data to send. Its trace export fails too, so that
         # it continues the series of failed exports.
         ingest.path_status["/v1/traces"] = 400
@@ -943,7 +912,7 @@ def test_an_on_error_that_flushes_or_shuts_down_a_tracer_provider_during_an_expo
         if owner == "global":
             monkeypatch.setattr(trace, "_TRACER_PROVIDER", None)
             monkeypatch.setattr(trace, "_TRACER_PROVIDER_SET_ONCE", Once())
-            client = telemetry_dev.init(
+            stamping = telemetry_dev.init(
                 api_key="td_test",
                 base_url=ingest.url,
                 register_global=True,
@@ -951,8 +920,7 @@ def test_an_on_error_that_flushes_or_shuts_down_a_tracer_provider_during_an_expo
                 disable_atexit=True,
                 timeout=1.0,
                 on_error=on_error,
-            )
-            stamping = client.processor
+            ).processor
         else:
             byo_provider.add_span_processor(
                 TelemetrySpanProcessor(
@@ -975,7 +943,6 @@ def test_an_on_error_that_flushes_or_shuts_down_a_tracer_provider_during_an_expo
         threading.Thread(target=flush, daemon=True).start()
         assert flushed.wait(10)
         assert len(reports) == 1
-        assert skipped == []
         assert raised == []
         if call == "shutdown":
             # The deferred shutdown ran once the export ended.
