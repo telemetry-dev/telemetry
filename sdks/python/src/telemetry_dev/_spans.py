@@ -29,6 +29,7 @@ from ._context import (
     traceparent_of,
     with_session_parent,
 )
+from ._process_lock import ProcessLock
 from ._prompts import prompt_attributes
 from ._semconv import (
     ATTR_AGENT_ID,
@@ -114,7 +115,7 @@ class _SpanState:
 
 _SPAN_STATES: WeakKeyDictionary[Span, _SpanState] = WeakKeyDictionary()
 _OUTPUT_CHUNK_STATES: WeakValueDictionary[tuple[int, int], _SpanState] = WeakValueDictionary()
-_OUTPUT_CHUNK_STATES_LOCK = threading.Lock()
+_OUTPUT_CHUNK_STATES_LOCK = ProcessLock(threading.Lock)
 
 
 def _span_key(span: Any) -> tuple[int, int]:
@@ -123,7 +124,7 @@ def _span_key(span: Any) -> tuple[int, int]:
 
 
 def output_chunk_aggregate(span: Any) -> tuple[int, float, float, float, tuple[int, ...]] | None:
-    with _OUTPUT_CHUNK_STATES_LOCK:
+    with _OUTPUT_CHUNK_STATES_LOCK():
         state = _OUTPUT_CHUNK_STATES.pop(_span_key(span), None)
         if (
             state is None
@@ -528,7 +529,7 @@ class SpanHandle:
             now = time.perf_counter() * 1000 if timestamp_ms is None else float(timestamp_ms)
             if not math.isfinite(now):
                 return self
-            with _OUTPUT_CHUNK_STATES_LOCK:
+            with _OUTPUT_CHUNK_STATES_LOCK():
                 if not self._recording():
                     return self
                 previous = self._state.output_chunk_last_ms
@@ -625,7 +626,7 @@ class SpanHandle:
             attributes=attributes,
             error=error,
         )
-        with _OUTPUT_CHUNK_STATES_LOCK:
+        with _OUTPUT_CHUNK_STATES_LOCK():
             if self._ended:
                 return
             self._ended = True

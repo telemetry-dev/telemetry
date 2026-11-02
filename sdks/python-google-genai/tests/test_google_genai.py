@@ -8,8 +8,12 @@ from __future__ import annotations
 import copy
 import gc
 import json
+import os
+import signal
+import threading
+import time
 import weakref
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -2743,3 +2747,68 @@ def test_stream_state_drops_over_budget_afc_history_but_still_folds_turn(
         "total_tokens": 45,
     }
     assert fields["output"] == [{"role": "model", "parts": [{"text": "call"}]}]
+
+
+def _lock_and_take(name: str) -> tuple[Callable[[], Any], Callable[[], object]]:
+    """A lock that a thread can hold at a fork: how to get it, and a call that takes it."""
+    if name == "install":
+        return lambda: google_genai_instrumentation._install_lock, uninstrument_google_genai
+    tracker = google_genai_instrumentation._VideoOperationTracker()
+    return tracker._lock, lambda: tracker.take(object(), "operations/1")
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+@pytest.mark.parametrize("name", ["install", "video operations"])
+def test_a_forked_child_does_not_wait_for_a_lock_that_a_thread_of_the_parent_held(
+    name: str,
+) -> None:
+    lock_of, take = _lock_and_take(name)
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with lock_of():
+            held.set()
+            release.wait()
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    try:
+        assert held.wait(10)
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                # The holder thread does not exist here, so this must not wait for it.
+                take()
+                code = 0
+            finally:
+                # The child must not return into pytest.
+                os._exit(code)
+    finally:
+        release.set()
+    holder.join(10)
+    # A child that waits for the lock fails the test instead of hanging the suite.
+    deadline = time.monotonic() + 10
+    while (waited := os.waitpid(pid, os.WNOHANG)) == (0, 0):
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pytest.fail("The forked process did not end in 10 s")
+        time.sleep(0.01)
+    assert os.waitstatus_to_exitcode(waited[1]) == 0
+
+
+def test_a_wrapped_client_registers_no_fork_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    # os.register_at_fork keeps each hook for good, so a hook for each wrapped client would grow
+    # without bound in an app that wraps a client for each request.
+    hooks: list[dict[str, object]] = []
+
+    def register_at_fork(**hook: object) -> None:
+        hooks.append(hook)
+
+    monkeypatch.setattr(os, "register_at_fork", register_at_fork)
+    for _ in range(3):
+        client, _transport = client_with_transport([happy_payload()])
+        wrap_google_genai(client)
+    assert hooks == []

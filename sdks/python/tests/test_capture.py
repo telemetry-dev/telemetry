@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import gc
 import json
 import os
@@ -235,24 +237,38 @@ def test_a_stream_cannot_take_room_that_another_stream_took_after_it_measured(
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+@pytest.mark.parametrize(
+    ("hooks", "in_block"),
+    [(True, False), (False, False), (True, True)],
+    ids=["hooks", "no hooks", "in the locked block"],
+)
 def test_a_forked_child_does_not_count_the_bytes_of_its_parents_streams(
-    stream_bound: int,
+    stream_bound: int, hooks: bool, in_block: bool
 ) -> None:
     parent = CaptureBudget.for_stream()
     assert parent.accept(_text(4_000)) is True
-    pid = os.fork()
-    if pid == 0:
-        code = 1
-        try:
-            child = CaptureBudget.for_stream()
-            room = child.max_bytes
-            assert child.accept(_text(3_000)) is True
-            # A stream of the parent that ends in the child gives back nothing there.
-            parent.release()
-            other = CaptureBudget.for_stream()
-            code = 0 if room == MAX_RECORD_BYTES and other.max_bytes == stream_bound - 3_000 else 2
-        finally:
-            os._exit(code)
+    budget = telemetry_dev._capture.stream_budget
+    # A signal handler can fork inside the locked block, and the child goes on from the handler
+    # without leaving the block.
+    block = budget._locked() if in_block else contextlib.nullcontext()  # pyright: ignore[reportPrivateUsage]
+    with block:
+        # fork() of the C library runs no os.register_at_fork hook, as C code that forks; PyDLL
+        # keeps the GIL across the call, so the child has it.
+        pid = os.fork() if hooks else ctypes.PyDLL(None).fork()
+        if pid == 0:
+            code = 1
+            try:
+                child = CaptureBudget.for_stream()
+                room = child.max_bytes
+                assert child.accept(_text(3_000)) is True
+                # A stream of the parent that ends in the child gives back nothing there.
+                parent.release()
+                other = CaptureBudget.for_stream()
+                code = (
+                    0 if room == MAX_RECORD_BYTES and other.max_bytes == stream_bound - 3_000 else 2
+                )
+            finally:
+                os._exit(code)
     deadline = time.monotonic() + 10
     while (waited := os.waitpid(pid, os.WNOHANG)) == (0, 0):
         if time.monotonic() > deadline:

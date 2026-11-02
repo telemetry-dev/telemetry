@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
+import os
 import re
 import threading
 import time
@@ -30,6 +31,22 @@ _DROPIN_WRAPPERS: dict[str, tuple[Any, Callable[..., Any]]] = {}
 _PENDING_CLOSE_TASKS: set[asyncio.Future[Any]] = set()
 _installed = False
 _install_lock = threading.Lock()
+
+
+def _reset_install_lock_in_child() -> None:
+    """A thread of the parent can hold the lock at a fork, and only this thread exists here."""
+    global _install_lock
+    _install_lock = threading.Lock()
+
+
+# A hook is enough: a fork that runs no hooks, as uWSGI's fork of its workers by default,
+# starts from its master, which serves no requests. os.register_at_fork cannot remove a hook,
+# and importlib.reload runs this module again with the same globals, so the hook of the first
+# run stays. Windows has no fork.
+if hasattr(os, "register_at_fork") and "_install_fork_hook" not in globals():
+    _install_fork_hook = True
+    os.register_at_fork(after_in_child=_reset_install_lock_in_child)
+
 _OMIT = object()
 # The core applies max_attribute_length after the mask. More choices, or more responses items
 # and rejected parts tracked for truncation, than this are not kept.

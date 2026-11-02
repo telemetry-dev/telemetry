@@ -3,8 +3,11 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import os
 import random
+import signal
 import sys
+import threading
 import time
 import types
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mapping, Sequence
@@ -4314,3 +4317,44 @@ def test_stream_keeps_message_start_one_hour_split_when_an_iteration_leaves_it_o
     )
 
     assert a["anthropic.usage.cache_creation.ephemeral_1h_input_tokens"] == 10
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_forked_child_does_not_wait_for_an_install_lock_that_a_thread_of_the_parent_held() -> (
+    None
+):
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        # A private name: the test must hold the real install lock across the fork.
+        with telemetry_dev_anthropic._install_lock:  # pyright: ignore[reportPrivateUsage]
+            held.set()
+            release.wait()
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    try:
+        assert held.wait(10)
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                # The holder thread does not exist here, so this must not wait for it.
+                uninstrument_anthropic()
+                code = 0
+            finally:
+                # The child must not return into pytest.
+                os._exit(code)
+    finally:
+        release.set()
+    holder.join(10)
+    # A child that waits for the lock fails the test instead of hanging the suite.
+    deadline = time.monotonic() + 10
+    while (waited := os.waitpid(pid, os.WNOHANG)) == (0, 0):
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pytest.fail("The forked process did not end in 10 s")
+        time.sleep(0.01)
+    assert os.waitstatus_to_exitcode(waited[1]) == 0

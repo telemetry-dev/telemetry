@@ -28,6 +28,7 @@ from opentelemetry.trace import INVALID_SPAN_CONTEXT, NonRecordingSpan, set_span
 
 from ._config import report_error
 from ._export import ExportFailures, exporting
+from ._process_lock import ProcessLock
 from ._semconv import (
     ATTR_ERROR_TYPE,
     ATTR_TIME_TO_FIRST_CHUNK,
@@ -75,7 +76,7 @@ class _ChunkAggregate:
 class OutputChunkAggregation:
     def __init__(self) -> None:
         self._values: dict[tuple[tuple[str, Any], ...], _ChunkAggregate] = {}
-        self._lock = threading.Lock()
+        self._lock = ProcessLock(threading.Lock)
         self._collection_start = time.time_ns()
 
     def add(
@@ -84,7 +85,7 @@ class OutputChunkAggregation:
         aggregate: tuple[int, float, float, float, tuple[int, ...]],
     ) -> None:
         key = tuple(sorted(attributes.items()))
-        with self._lock:
+        with self._lock():
             if key not in self._values and len(self._values) >= _MAX_CHUNK_ATTRIBUTE_SETS - 1:
                 key = (("otel.metric.overflow", True),)
             count, total, minimum, maximum, buckets = aggregate
@@ -100,7 +101,7 @@ class OutputChunkAggregation:
                 existing.buckets[index] += value
 
     def drain_points(self) -> tuple[HistogramDataPoint, ...]:
-        with self._lock:
+        with self._lock():
             values, self._values = self._values, {}
             now = time.time_ns()
             start, self._collection_start = self._collection_start, now
@@ -222,7 +223,7 @@ class MetricsRecorder:
         self._on_error = on_error
         self._output_chunks = output_chunks
         self._custom_reader_limitation_reported = False
-        self._custom_reader_limitation_lock = threading.Lock()
+        self._custom_reader_limitation_lock = ProcessLock(threading.Lock)
         self._duration = meter.create_histogram(
             "gen_ai.client.operation.duration",
             unit="s",
@@ -256,7 +257,7 @@ class MetricsRecorder:
                     if self._output_chunks is not None:
                         self._output_chunks.add(metric_attrs, chunk_aggregate)
                     else:
-                        with self._custom_reader_limitation_lock:
+                        with self._custom_reader_limitation_lock():
                             should_report = not self._custom_reader_limitation_reported
                             self._custom_reader_limitation_reported = True
                         if should_report:

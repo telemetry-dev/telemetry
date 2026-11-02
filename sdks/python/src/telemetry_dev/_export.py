@@ -18,6 +18,7 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
 from ._config import logger, report_error
+from ._process_lock import ProcessLock
 from ._serialize import TRUNCATION_MARKER, truncate, utf16_length
 
 # The largest OTLP request the exporters send. The ingest rejects a body over 16 MiB after gzip
@@ -361,7 +362,7 @@ class ExportQueueBudget:
         self._max_size = max_size
         self._label = label
         self._on_error = on_error
-        self._lock = threading.Lock()
+        self._lock = ProcessLock(threading.Lock)
         self._count = 0
         self._size = 0
         self._reported = False
@@ -371,14 +372,13 @@ class ExportQueueBudget:
             os.register_at_fork(after_in_child=lambda: (method := reset()) and method())
 
     def _reset(self) -> None:
-        self._lock = threading.Lock()
         self._count = 0
         self._size = 0
         self._reported = False
 
     def admit(self, record: Any) -> bool:
         size = _record_size(record)
-        with self._lock:
+        with self._lock():
             full = self._count >= self._max_count or (
                 self._count > 0 and self._size + size > self._max_size
             )
@@ -399,7 +399,7 @@ class ExportQueueBudget:
 
     def release(self, records: Sequence[Any]) -> None:
         size = sum(_record_size(record) for record in records)
-        with self._lock:
+        with self._lock():
             self._count = max(self._count - len(records), 0)
             self._size = max(self._size - size, 0)
 
@@ -441,17 +441,16 @@ def exporting() -> Generator[None]:
         _export_state.depth -= 1
 
 
-# The keys of the work items whose thread has not finished.
-_pending_lock = threading.Lock()
-_pending: set[object] = set()
+# The keys of the work items whose thread has not finished, each with the process of its thread.
+# A fork that runs no hooks, as uWSGI's fork of its workers by default, copies the keys but not
+# the threads, so a key of another process does not count.
+_pending_lock = ProcessLock(threading.Lock)
+_pending: dict[object, int] = {}
 
 
 def _reset_pending_in_child() -> None:
-    """Drops the keys of the parent: the child has none of their threads, so they would make it
-    skip each later work item with the same key. A thread of the parent can hold the lock, and
-    only this thread exists here."""
-    global _pending_lock
-    _pending_lock = threading.Lock()
+    """Drops the keys of the parent, which no longer count in the child, so that it does not
+    keep them."""
     _pending.clear()
 
 
@@ -480,17 +479,22 @@ def after_export(key: object, work: Callable[[], object], *, shutdown: bool = Fa
     """
     if not getattr(_export_state, "depth", 0):
         return False
-    with _pending_lock:
-        if key in _pending:
+    pid = os.getpid()
+    with _pending_lock():
+        if _pending.get(key) == pid:
             return True
-        _pending.add(key)
+        _pending[key] = pid
+
+    def discard() -> None:
+        with _pending_lock():
+            if _pending.get(key) == pid:
+                del _pending[key]
 
     def run() -> None:
         try:
             work()
         finally:
-            with _pending_lock:
-                _pending.discard(key)
+            discard()
 
     try:
         # Set explicitly: a new thread inherits daemon from the export thread, which is a daemon.
@@ -504,8 +508,7 @@ def after_export(key: object, work: Callable[[], object], *, shutdown: bool = Fa
             )
             atexit.register(run)
         else:
-            with _pending_lock:
-                _pending.discard(key)
+            discard()
             logger.warning("telemetry-dev: could not start a thread for a flush")
     return True
 
@@ -522,11 +525,11 @@ class ExportFailures:
 
     def __init__(self, on_error: Callable[[BaseException], None] | None) -> None:
         self._on_error = on_error
-        self._lock = threading.Lock()
+        self._lock = ProcessLock(threading.Lock)
         self._reported = False
 
     def report(self, message: str, exc: BaseException) -> None:
-        with self._lock:
+        with self._lock():
             if self._reported:
                 return
             self._reported = True
@@ -536,7 +539,7 @@ class ExportFailures:
 
     def clear(self) -> None:
         """Records that an export reached the ingest, so that report() sends the next failure."""
-        with self._lock:
+        with self._lock():
             self._reported = False
 
 

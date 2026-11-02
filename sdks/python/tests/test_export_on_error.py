@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # pyright: reportPrivateUsage=false
 import atexit
+import ctypes
 import os
 import random
 import signal
@@ -23,6 +24,7 @@ from opentelemetry.sdk._logs.export import (
     LogRecordExporter,
     LogRecordExportResult,
 )
+from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import (
     Gauge,
     Metric,
@@ -38,12 +40,19 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, Sp
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.sdk.trace.sampling import Decision, Sampler, SamplingResult
 from opentelemetry.sdk.util.instrumentation import InstrumentationScope
+from opentelemetry.trace import INVALID_SPAN_CONTEXT, NonRecordingSpan
 from opentelemetry.util._once import Once
 from opentelemetry.util.types import AttributeValue
 
 import telemetry_dev
+import telemetry_dev._client as client_module
+import telemetry_dev._export as export_module
+import telemetry_dev._prompts as prompts_module
+import telemetry_dev._spans as spans_module
+from telemetry_dev._capture import CaptureBudget, stream_budget
 from telemetry_dev._export import (
     ExportFailures,
+    ExportQueueBudget,
     ReportingLogExporter,
     ReportingSpanExporter,
     _log_bound,
@@ -52,7 +61,12 @@ from telemetry_dev._export import (
     after_export,
     exporting,
 )
-from telemetry_dev._metrics import GuardedOTLPMetricExporter
+from telemetry_dev._metrics import (
+    GuardedOTLPMetricExporter,
+    MetricsRecorder,
+    OutputChunkAggregation,
+)
+from telemetry_dev._spans import output_chunk_aggregate
 from telemetry_dev.otel import TelemetrySpanProcessor
 from tests.otlp_capture import otlp_capture_server
 
@@ -1161,13 +1175,14 @@ def test_only_a_deferred_shutdown_holds_the_process_open(shutdown: bool, daemon:
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
-def test_a_forked_process_runs_the_work_that_its_parent_has_pending() -> None:
+@pytest.mark.parametrize("hooks", [True, False], ids=["hooks", "no hooks"])
+def test_a_forked_process_runs_the_work_that_its_parent_has_pending(hooks: bool) -> None:
     key = object()
     release = threading.Event()
     with exporting():
         assert after_export(key, lambda: release.wait(10))
     ran = threading.Event()
-    pid = os.fork()
+    pid = os.fork() if hooks else _fork_without_hooks()
     if pid == 0:
         code = 1
         try:
@@ -1180,6 +1195,120 @@ def test_a_forked_process_runs_the_work_that_its_parent_has_pending() -> None:
             os._exit(code)
     release.set()
     # A fork hook that deadlocks the child fails the test instead of hanging the suite.
+    deadline = time.monotonic() + 10
+    while (waited := os.waitpid(pid, os.WNOHANG)) == (0, 0):
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pytest.fail("The forked process did not end in 10 s")
+        time.sleep(0.01)
+    assert os.waitstatus_to_exitcode(waited[1]) == 0
+
+
+def _fork_without_hooks() -> int:
+    """fork() of the C library, as C code that forks calls it: no os.register_at_fork hook runs.
+    PyDLL keeps the GIL across the call, so the child has it."""
+    return ctypes.PyDLL(None).fork()
+
+
+_SDK_LOCKS = (
+    "client",
+    "export queue budget",
+    "export failures",
+    "after export",
+    "output chunk states",
+    "output chunk aggregation",
+    "custom reader report",
+    "stream budget",
+)
+
+
+def _sdk_lock(name: str) -> tuple[Callable[[], Any], Callable[[], object]]:
+    """A lock that a thread can hold at a fork: how to get it, and a call that takes it."""
+    if name == "client":
+        return client_module._lock, lambda: telemetry_dev.init(enabled=False)
+    if name == "export queue budget":
+        budget = ExportQueueBudget(10, 1_000, "span", None)
+        return budget._lock, lambda: budget.release([])
+    if name == "export failures":
+        failures = ExportFailures(None)
+        return failures._lock, failures.clear
+    if name == "after export":
+        return export_module._pending_lock, _after_export_in_an_export
+    if name == "output chunk states":
+        return spans_module._OUTPUT_CHUNK_STATES_LOCK, lambda: output_chunk_aggregate(
+            NonRecordingSpan(INVALID_SPAN_CONTEXT)
+        )
+    if name == "output chunk aggregation":
+        aggregation = OutputChunkAggregation()
+        return aggregation._lock, aggregation.drain_points
+    if name == "prompt cache":
+        return prompts_module._cache_lock, lambda: _take(prompts_module._cache_lock())
+    if name == "stream budget":
+        return stream_budget._lock, _reserve_in_a_stream
+    assert name == "custom reader report"
+    recorder = MetricsRecorder(MeterProvider().get_meter("test"))
+    lock = recorder._custom_reader_limitation_lock
+    return lock, lambda: _take(lock())
+
+
+def _after_export_in_an_export() -> None:
+    with exporting():
+        after_export(object(), lambda: None)
+
+
+def _reserve_in_a_stream() -> None:
+    budget = CaptureBudget.for_stream()
+    assert budget.reserve_bytes(1)
+    budget.release()
+
+
+def _take(lock: Any) -> None:
+    with lock:
+        pass
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+@pytest.mark.parametrize(
+    ("name", "hooks"),
+    [
+        pytest.param(name, hooks, id=f"{name}, {'hooks' if hooks else 'no hooks'}")
+        for name in _SDK_LOCKS
+        for hooks in (True, False)
+    ]
+    # With hooks, the fork waits for the thread that holds the lock of the prompt cache.
+    + [pytest.param("prompt cache", False, id="prompt cache, no hooks")],
+)
+def test_a_forked_child_does_not_wait_for_a_lock_that_a_thread_of_the_parent_held(
+    name: str, hooks: bool
+) -> None:
+    lock_of, take = _sdk_lock(name)
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with lock_of():
+            held.set()
+            release.wait()
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    try:
+        assert held.wait(10)
+        pid = os.fork() if hooks else _fork_without_hooks()
+        if pid == 0:
+            code = 1
+            try:
+                # The child has the lock as the holder left it, but not the holder.
+                take()
+                code = 0
+            finally:
+                # The child must not return into pytest.
+                os._exit(code)
+    finally:
+        release.set()
+    holder.join(10)
+    # A child that waits for the lock fails the test instead of hanging the suite.
     deadline = time.monotonic() + 10
     while (waited := os.waitpid(pid, os.WNOHANG)) == (0, 0):
         if time.monotonic() > deadline:

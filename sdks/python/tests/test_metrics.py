@@ -235,7 +235,8 @@ def test_builtin_exporter_merges_exact_output_chunk_histogram(
 
             recorder = threading.Thread(target=handle.record_output_chunk, args=(timestamps[-1],))
             closer = threading.Thread(target=close)
-            monkeypatch.setattr(span_module, "_OUTPUT_CHUNK_STATES_LOCK", ObservedLock())
+            observed = ObservedLock()
+            monkeypatch.setattr(span_module, "_OUTPUT_CHUNK_STATES_LOCK", lambda: observed)
             monkeypatch.setattr(span_module, "bisect_left", paused_bucket)
             try:
                 recorder.start()

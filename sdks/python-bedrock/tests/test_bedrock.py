@@ -4,6 +4,10 @@ import copy
 import gc
 import io
 import json
+import os
+import signal
+import threading
+import time
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any, cast
@@ -18,6 +22,7 @@ from botocore.response import StreamingBody
 from botocore.stub import Stubber
 from conftest import STREAM_LIMIT
 
+import telemetry_dev_bedrock._instrument as bedrock_instrument
 import telemetry_dev_bedrock._streams as bedrock_streams
 from telemetry_dev_bedrock import instrument_bedrock, uninstrument_bedrock, wrap_bedrock
 
@@ -2481,3 +2486,44 @@ def test_fail_open_without_init(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_api_call(client, [{"output": {"message": {"content": []}}}], monkeypatch)
     wrap_bedrock(client)
     assert client.converse(modelId="m", messages=[]) == {"output": {"message": {"content": []}}}  # type: ignore[attr-defined]
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_forked_child_does_not_wait_for_an_install_lock_that_a_thread_of_the_parent_held() -> (
+    None
+):
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        # A private name: the test must hold the real install lock across the fork.
+        with bedrock_instrument._install_lock:  # pyright: ignore[reportPrivateUsage]
+            held.set()
+            release.wait()
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    try:
+        assert held.wait(10)
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                # The holder thread does not exist here, so this must not wait for it.
+                uninstrument_bedrock()
+                code = 0
+            finally:
+                # The child must not return into pytest.
+                os._exit(code)
+    finally:
+        release.set()
+    holder.join(10)
+    # A child that waits for the lock fails the test instead of hanging the suite.
+    deadline = time.monotonic() + 10
+    while (waited := os.waitpid(pid, os.WNOHANG)) == (0, 0):
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pytest.fail("The forked process did not end in 10 s")
+        time.sleep(0.01)
+    assert os.waitstatus_to_exitcode(waited[1]) == 0
