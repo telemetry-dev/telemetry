@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.3](https://github.com/telemetry-dev/telemetry/compare/openrouter-v0.2.2...openrouter-v0.2.3) (2026-11-03)
+
+
+### Bug Fixes
+
+* **sdk:** keep up to 16 MiB of each stream within a shared stream bound ([#172](https://github.com/telemetry-dev/telemetry/issues/172)) ([7f4f695](https://github.com/telemetry-dev/telemetry/commit/7f4f695edaee07503ca043ac49a6bbbc58784bfc))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/otel bumped to 0.2.1
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.2.3
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.2.3
+
 ## [0.2.2](https://github.com/telemetry-dev/telemetry/compare/openrouter-v0.2.1...openrouter-v0.2.2) (2026-10-30)
 
 

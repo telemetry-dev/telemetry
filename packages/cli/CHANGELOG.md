@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.6...cli-v0.1.7) (2026-11-03)
+
+
+### Features
+
+* **cli:** make first-run hints runnable and announce newer versions ([#187](https://github.com/telemetry-dev/telemetry/issues/187)) ([0f314b7](https://github.com/telemetry-dev/telemetry/commit/0f314b7f7c357a155a77f00bf23a19d89674996d))
+
+
+### Bug Fixes
+
+* **cli:** count the characters of a cut payload in code points ([#181](https://github.com/telemetry-dev/telemetry/issues/181)) ([5eb751d](https://github.com/telemetry-dev/telemetry/commit/5eb751d487906a09e0cf58bfc4c17a13064334e5))
+
+
+### Performance Improvements
+
+* **cli:** shorten deep failure paths without measuring each drop ([#147](https://github.com/telemetry-dev/telemetry/issues/147)) ([ee260e5](https://github.com/telemetry-dev/telemetry/commit/ee260e5f9741964ea63813538799fb819bed87cf))
+
 ## [0.1.6](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.5...cli-v0.1.6) (2026-10-31)
 
 

@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.3.3](https://github.com/telemetry-dev/telemetry/compare/python-v0.3.2...python-v0.3.3) (2026-11-03)
+
+
+### Bug Fixes
+
+* **sdk-python:** batch streamed deltas before writing them to StringIO ([#185](https://github.com/telemetry-dev/telemetry/issues/185)) ([1d71068](https://github.com/telemetry-dev/telemetry/commit/1d7106869cbad45208a0b484392ad4a4cc692e70))
+* **sdk-python:** keep module locks usable in a forked child ([#184](https://github.com/telemetry-dev/telemetry/issues/184)) ([771a256](https://github.com/telemetry-dev/telemetry/commit/771a2566465ea868b21a48f8ae4e748f6742078f))
+* **sdk-python:** match the split rules of the typescript exporter and skip the measuring encode ([#174](https://github.com/telemetry-dev/telemetry/issues/174)) ([b264694](https://github.com/telemetry-dev/telemetry/commit/b264694404f586afa6900a854dc118d0c565a7e2)), closes [#149](https://github.com/telemetry-dev/telemetry/issues/149) [#150](https://github.com/telemetry-dev/telemetry/issues/150) [#151](https://github.com/telemetry-dev/telemetry/issues/151)
+* **sdk-python:** recover prompt fetches and the cache lock in forked children ([#159](https://github.com/telemetry-dev/telemetry/issues/159)) ([1cfb936](https://github.com/telemetry-dev/telemetry/commit/1cfb936b24d8b38afe62b9699679bc600cb01069))
+* **sdk-python:** run a flush or shutdown from on_error after the export ([#152](https://github.com/telemetry-dev/telemetry/issues/152)) ([19ee0b1](https://github.com/telemetry-dev/telemetry/commit/19ee0b1aa36973b30db652d8e98396f358a8611b))
+* **sdk-python:** wait at exit for a shutdown deferred from on_error ([#165](https://github.com/telemetry-dev/telemetry/issues/165)) ([35ca801](https://github.com/telemetry-dev/telemetry/commit/35ca801a2b07c5ef1db6316064512bac90c9095d)), closes [#171](https://github.com/telemetry-dev/telemetry/issues/171)
+* **sdk-python:** wait for prompt fetches on per-call locks so forks cannot hang ([#167](https://github.com/telemetry-dev/telemetry/issues/167)) ([9ec46de](https://github.com/telemetry-dev/telemetry/commit/9ec46ded237d982d6d5514180f4632faab979901)), closes [#158](https://github.com/telemetry-dev/telemetry/issues/158)
+* **sdk:** find the comment of the action on the old pages of a long pull request ([#157](https://github.com/telemetry-dev/telemetry/issues/157)) ([4791ba4](https://github.com/telemetry-dev/telemetry/commit/4791ba4e0779e8dcf826a43718e29a5937586095))
+* **sdk:** keep every prompt variable when their JSON is too long ([#142](https://github.com/telemetry-dev/telemetry/issues/142)) ([ca0b86c](https://github.com/telemetry-dev/telemetry/commit/ca0b86c8592807071c7c97942a2b28f7e0a6ae8e))
+* **sdk:** keep up to 16 MiB of each stream within a shared stream bound ([#172](https://github.com/telemetry-dev/telemetry/issues/172)) ([7f4f695](https://github.com/telemetry-dev/telemetry/commit/7f4f695edaee07503ca043ac49a6bbbc58784bfc))
+* **sdk:** name failed runs in the experiment result and suggest spanId for feedback ([#163](https://github.com/telemetry-dev/telemetry/issues/163)) ([3046a72](https://github.com/telemetry-dev/telemetry/commit/3046a72db1a27461388f9c24e1ad269897c5cada))
+* **sdk:** say runs, not items, in the failed count of an experiment with more runs per item ([b2dfaf7](https://github.com/telemetry-dev/telemetry/commit/b2dfaf7ddffcbdb861448dcccda4fcb773d550fe))
+* **sdk:** say runs, not items, in the failed count of an experiment with more runs per item ([49f460a](https://github.com/telemetry-dev/telemetry/commit/49f460a89240365251ddc16e6e1d7e97f69c4ad8))
+* **sdk:** send each captured value whole ([#148](https://github.com/telemetry-dev/telemetry/issues/148)) ([b9e689a](https://github.com/telemetry-dev/telemetry/commit/b9e689a438aecc72436495d4d5d75b9ac847f90e))
+* **sdk:** write the CI mode and runs per item to the experiment results ([#168](https://github.com/telemetry-dev/telemetry/issues/168)) ([463f3a8](https://github.com/telemetry-dev/telemetry/commit/463f3a8f243374d82eab1ba1284aeee7e8a4debe)), closes [#161](https://github.com/telemetry-dev/telemetry/issues/161)
+
+
+### Documentation
+
+* **sdk:** correct the README lines left stale after [#164](https://github.com/telemetry-dev/telemetry/issues/164) ([#183](https://github.com/telemetry-dev/telemetry/issues/183)) ([c5fb9d7](https://github.com/telemetry-dev/telemetry/commit/c5fb9d7ce2fbda59dd32e49bd86ac3dfed944eac)), closes [#166](https://github.com/telemetry-dev/telemetry/issues/166)
+* **sdk:** correct the READMEs that no longer match the SDKs ([#164](https://github.com/telemetry-dev/telemetry/issues/164)) ([acb45f5](https://github.com/telemetry-dev/telemetry/commit/acb45f501bf60dd5ecefaff6a8f5769bf0cd51fa))
+
 ## [0.3.2](https://github.com/telemetry-dev/telemetry/compare/python-v0.3.1...python-v0.3.2) (2026-10-30)
 
 

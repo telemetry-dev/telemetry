@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.3](https://github.com/telemetry-dev/telemetry/compare/bedrock-v0.2.2...bedrock-v0.2.3) (2026-11-03)
+
+
+### Bug Fixes
+
+* **sdk:** keep up to 16 MiB of each stream within a shared stream bound ([#172](https://github.com/telemetry-dev/telemetry/issues/172)) ([7f4f695](https://github.com/telemetry-dev/telemetry/commit/7f4f695edaee07503ca043ac49a6bbbc58784bfc))
+* **sdk:** report and flag typescript output lost to a mapping failure ([#188](https://github.com/telemetry-dev/telemetry/issues/188)) ([7f44f08](https://github.com/telemetry-dev/telemetry/commit/7f44f08781819bc093f07c618753e469cca307b8))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.2.3
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.2.3
+
 ## [0.2.2](https://github.com/telemetry-dev/telemetry/compare/bedrock-v0.2.1...bedrock-v0.2.2) (2026-10-30)
 
 
