@@ -1,3 +1,5 @@
+import { BIN } from "./invocation.ts";
+
 /** Exit codes, documented in the README. */
 export const EXIT = {
   ok: 0,
@@ -70,8 +72,8 @@ export const usageError = (message: string, details: Omit<ErrorDetails, "exitCod
 
 export const payloadsNotAllowed = () =>
   new CliError(
-    'This sign-in can\'t read captured prompts and outputs. Run `telemetry login`, check "Also read captured prompts, outputs, and tool arguments", and select Allow.',
-    { exitCode: EXIT.auth, code: "payloads_not_allowed", hint: "telemetry login" },
+    `This sign-in can't read captured prompts and outputs. Run ${BIN} login, check "Also read captured prompts, outputs, and tool arguments", and select Allow.`,
+    { exitCode: EXIT.auth, code: "payloads_not_allowed", hint: `${BIN} login` },
   );
 
 /**
@@ -88,15 +90,15 @@ export const toolError = (text: string, meta: unknown): CliError => {
   switch (error?.code) {
     case "access_denied":
       return new CliError(
-        "Your account no longer has access to this workspace. Run `telemetry login` and choose a workspace you belong to.",
-        { exitCode: EXIT.auth, code: "access_denied", hint: "telemetry login" },
+        `Your account no longer has access to this workspace. Run ${BIN} login and choose a workspace you belong to.`,
+        { exitCode: EXIT.auth, code: "access_denied", hint: `${BIN} login` },
       );
     case "payloads_not_allowed":
       return payloadsNotAllowed();
     case "project_not_found":
       return usageError(
-        "That project isn't in this workspace; it may have been deleted. Run `telemetry projects` to list the projects, and `telemetry use <name>` to change the default.",
-        { code: "project_not_found", hint: "telemetry projects" },
+        `That project isn't in this workspace; it may have been deleted. Run ${BIN} projects to list the projects, and ${BIN} use <name> to change the default.`,
+        { code: "project_not_found", hint: `${BIN} projects` },
       );
     case "invalid_cursor":
       return usageError(
@@ -123,10 +125,10 @@ export const toolError = (text: string, meta: unknown): CliError => {
 };
 
 export const notSignedIn = () =>
-  new CliError("You're not signed in. Run `telemetry login` first.", {
+  new CliError(`You're not signed in. Run ${BIN} login first.`, {
     exitCode: EXIT.auth,
     code: "not_signed_in",
-    hint: "telemetry login",
+    hint: `${BIN} login`,
   });
 
 // Each is a refresh or authorization the server refused for good.
@@ -150,14 +152,43 @@ const TIMEOUT_CODES = new Set([
   "UND_ERR_BODY_TIMEOUT",
 ]);
 
-export const translateError = (error: unknown, authErrors: AuthErrors): never => {
+const PROXY_VARIABLES = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"];
+
+/**
+ * Node's fetch ignores proxy variables unless NODE_USE_ENV_PROXY=1 or --use-env-proxy
+ * was set at startup, which Node.js 22.21 and 24.0 added (Node.js docs, "Enterprise
+ * Network Configuration"), so behind a proxy the CLI connects directly and fails.
+ */
+const proxyNote = () => {
+  if (!PROXY_VARIABLES.some((name) => process.env[name])) return "";
+
+  const [major = 0, minor = 0] = process.versions.node.split(".").map(Number);
+  const supported = major >= 24 || (major === 22 && minor >= 21);
+  const enabled =
+    process.env.NODE_USE_ENV_PROXY === "1" ||
+    process.execArgv.includes("--use-env-proxy") ||
+    (process.env.NODE_OPTIONS ?? "").split(/\s+/).includes("--use-env-proxy");
+
+  if (!supported) {
+    return ` A proxy is set, but Node.js ${process.versions.node} ignores it. Node.js 22.21+ or 24+ uses it with NODE_USE_ENV_PROXY=1 set.`;
+  }
+
+  return enabled ? "" : " A proxy is set, but Node.js uses it only with NODE_USE_ENV_PROXY=1 set.";
+};
+
+/**
+ * A failed request to `server` as a CliError: a refused sign-in, an unreachable or slow
+ * server, or anything else, named by the server's host.
+ */
+export const translateError = (error: unknown, authErrors: AuthErrors, server: string): never => {
   if (error instanceof CliError) throw error;
 
   if (authErrors.some((type) => error instanceof type)) {
-    throw new CliError(
-      "Your sign-in has expired or was disconnected. Run `telemetry login` again.",
-      { exitCode: EXIT.auth, code: "sign_in_expired", hint: "telemetry login" },
-    );
+    throw new CliError(`Your sign-in has expired or was disconnected. Run ${BIN} login again.`, {
+      exitCode: EXIT.auth,
+      code: "sign_in_expired",
+      hint: `${BIN} login`,
+    });
   }
 
   // The network error sits at the bottom of a chain: the SDK wraps fetch's
@@ -178,9 +209,11 @@ export const translateError = (error: unknown, authErrors: AuthErrors): never =>
     chain.findLast((link): link is Error => link instanceof Error && link.message !== "")
       ?.message ?? String(error);
 
+  const host = new URL(server).host;
+
   if (network) {
     throw new CliError(
-      `Couldn't reach telemetry.dev (${network}). Check your connection and try again.`,
+      `Couldn't reach ${host} (${network}). Check your connection and try again.${proxyNote()}`,
       { code: "unreachable", retryable: true },
     );
   }
@@ -192,11 +225,11 @@ export const translateError = (error: unknown, authErrors: AuthErrors): never =>
         link instanceof Error && (link.name === "TimeoutError" || link.name === "AbortError"),
     )
   ) {
-    throw new CliError("telemetry.dev took too long to answer. Try again shortly.", {
+    throw new CliError(`${host} took too long to answer. Try again shortly.${proxyNote()}`, {
       code: "timeout",
       retryable: true,
     });
   }
 
-  throw new CliError(`telemetry.dev request failed: ${message}`, { code: "request_failed" });
+  throw new CliError(`${host} request failed: ${message}`, { code: "request_failed" });
 };

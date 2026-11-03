@@ -60,6 +60,45 @@ const CONTROL = new RegExp(
 /** Captured text, safe to print: escape sequences and control characters removed. */
 export const clean = (text: string) => stripVTControlCharacters(text).replace(CONTROL, "");
 
+// A leading `=` is quoted too: zsh expands `=name` to a command's path.
+const POSIX_PLAIN = /^[\w@%+:,./-][\w@%+=:,./-]*$/;
+// PowerShell reads a leading @ as splatting and a comma as an array separator.
+const WINDOWS_PLAIN = /^[\w+=:./-]+$/;
+// cmd expands %name% inside double quotes, PowerShell expands $ and ` inside them and
+// also ends quoted text at a typographic quote, both end it at ", and Windows argument
+// parsing reads a backslash before the closing quote as a literal quote. No quoting
+// keeps these as typed in both shells.
+const WINDOWS_UNQUOTABLE = /["%$`\u201C-\u201E]|\\$/;
+
+/**
+ * `arg` quoted for the shell it will be pasted into, so a printed command runs as shown:
+ * a POSIX shell, or on Windows both cmd.exe and PowerShell, which share double quotes.
+ * Undefined on Windows for an argument neither quoting keeps as typed.
+ */
+export const shellQuote = (arg: string): string | undefined => {
+  if (process.platform !== "win32") {
+    return POSIX_PLAIN.test(arg) ? arg : `'${arg.replaceAll("'", `'\\''`)}'`;
+  }
+
+  if (WINDOWS_PLAIN.test(arg)) return arg;
+
+  return WINDOWS_UNQUOTABLE.test(arg) ? undefined : `"${arg}"`;
+};
+
+/**
+ * Where to paste the address the browser ended on in `login --finish`, quoted, since
+ * the address holds `&`, which every shell reads as the end of a command.
+ */
+// "<address>" has none of the characters WINDOWS_UNQUOTABLE rejects.
+export const ADDRESS = shellQuote("<address>")!;
+
+/** `args` quoted and joined, or undefined when one of them can't be quoted. */
+export const shellWords = (args: readonly string[]) => {
+  const quoted = args.map(shellQuote);
+
+  return quoted.every((arg) => arg !== undefined) ? quoted.join(" ") : undefined;
+};
+
 /** Captured text on one line, for a table cell. */
 export const oneLine = (text: string) => clean(text.replace(/\s+/g, " ")).trim();
 

@@ -10,13 +10,14 @@ The CLI signs in to the same read-only API that the telemetry.dev MCP server giv
 npm install --global @telemetry-dev/cli
 ```
 
-Or run it without installing:
+Node.js 20 or later is required. The CLI doesn't update itself; to update it, run `npm install --global @telemetry-dev/cli@latest`. It tells you when a newer version is out: see [Updates](#updates).
+
+To try it without installing, start each command with `npx @telemetry-dev/cli` instead of `telemetry`. The CLI's own hints then use the same prefix.
 
 ```sh
 npx @telemetry-dev/cli login
+npx @telemetry-dev/cli traces
 ```
-
-Node.js 20 or later is required.
 
 ## Sign in
 
@@ -26,13 +27,15 @@ telemetry login
 
 `login` opens your browser. Choose a workspace and select **Allow**. To let the CLI read captured prompts, outputs, and tool arguments, also check **Also read captured prompts, outputs, and tool arguments**. Without that permission, every command except `payload` works.
 
-Over SSH, in a container, or anywhere without a browser, run `telemetry login --no-browser`. Open the printed link on any device. After you select **Allow**, the browser tries to load an address that starts with `http://127.0.0.1`. The page doesn't load. Copy the whole address and paste it into the terminal.
+Over SSH, in a container, or anywhere without a browser, run `telemetry login --no-browser`. Open the printed link on any device. After you select **Allow**, the browser tries to load an address that starts with `http://127.0.0.1`. The page doesn't load. Copy the whole address and paste it into the terminal. `telemetry login` takes a pasted address too, for when the browser doesn't open or you sign in on another device.
 
 In a shell with no terminal to paste into, such as an agent's, `telemetry login --no-browser` prints the link and exits. After you select **Allow**, finish the sign-in with the address the browser ended on:
 
 ```sh
 telemetry login --finish 'http://127.0.0.1:53124/callback?code=…'
 ```
+
+On Windows, use double quotes instead, which cmd.exe and PowerShell both read. The commands the CLI prints use them there.
 
 A script or agent can run `telemetry login --json` instead. It never opens a browser or waits. It prints the link to pass on to a person, then exits:
 
@@ -44,7 +47,7 @@ A script or agent can run `telemetry login --json` instead. It never opens a bro
 }
 ```
 
-`telemetry login --finish '<address>' --json` then prints the sign-in, with the same fields as `telemetry status --json` and `"status": "signed_in"`. When the workspace has exactly one project, it becomes the default. `project` is `null` otherwise, and also when the projects couldn't be loaded.
+`telemetry login --finish '<address>' --json` then prints the sign-in, with the same fields as `telemetry status --json` and `"status": "signed_in"`. The default project stays when the chosen workspace still has it. Otherwise, when the workspace has exactly one project, it becomes the default. `project` is `null` in any other case, and also when the projects couldn't be loaded.
 
 A sign-in covers one workspace. To read another workspace, run `telemetry login` again and choose it. The new sign-in replaces the old one, and the CLI asks telemetry.dev to revoke the old one.
 
@@ -61,13 +64,13 @@ telemetry usage --range 30d --by user
 telemetry payload <trace-id> <span-id> --field output
 ```
 
-Run `telemetry <command> --help` to see each command's options and examples.
+Run `telemetry <command> --help` to see each command's options and examples. Options go after the command: `telemetry traces --json`, not `telemetry --json traces`.
 
-In human output, `telemetry trace` shows a summary above the span tree. It lists up to 5 of the failed spans where failures began, with their path. It also lists up to 5 of the operations that ran more than once, with their wall time, which counts overlapping calls once. When they list results, `traces` and `sessions` end with a likely next command on stderr. `trace` ends with the `payload` command that reads the full error, when a span where a failure began has an error message and the sign-in can read payloads.
+In human output, `telemetry trace` shows a summary above the span tree. It lists up to 5 of the failed spans where failures began, with their path. It also lists up to 5 of the operations that ran more than once, with their wall time, which counts overlapping calls once. In the span tree, each failed span has its id and error under it, for `telemetry payload`. When they list results, `traces` and `sessions` end with a likely next command on stderr. `trace` ends with the `payload` command that reads the full error, when a span where a failure began has an error message and the sign-in can read payloads.
 
 A command reads its project from `--project <name|id>`. Without that option, it uses `TELEMETRY_DEV_PROJECT`, then the default that you set with `telemetry use`. If the workspace has only one project, the command uses it.
 
-List commands return 20 results by default. Use `--limit` to return from 1 to 50 results. When more results are available, the command prints the same command with `--cursor` for the next page. Keep the other options as they are when you pass `--cursor`. Only `--limit` may change between pages.
+List commands return 20 results by default. Use `--limit` to return from 1 to 50 results. When more results are available, the command prints the same command with `--cursor` for the next page. On Windows, when an option holds text that no quoting keeps as typed, such as `%` or `$`, it prints only the `--cursor` to add. Keep the other options as they are when you pass `--cursor`. Only `--limit` may change between pages.
 
 ### Time windows
 
@@ -121,10 +124,10 @@ Captured text comes from your users, models, and tools. telemetry.dev removes AN
 | 4         | You are not signed in, the sign-in expired, or access is denied |
 | 130       | Interrupted with Ctrl-C                                         |
 
-With `--json`, an error is one line of JSON on stderr, and stdout stays empty. Ctrl-C exits with 130 and no JSON, and `status --json` reports a missing sign-in as data on stdout with exit code 4.
+With `--json`, an error is one line of JSON on stderr, and stdout stays empty. Ctrl-C exits with 130 and no JSON, and `status --json` reports a missing sign-in as data on stdout with exit code 4. `status` checks a saved sign-in with telemetry.dev, so one that expired, was revoked, or lost access to the workspace is reported the same way, with `"signed_in": false`. When the check itself fails, for example offline or while telemetry.dev can't renew the sign-in, `status` still reports the saved sign-in and says on stderr that it couldn't check it. With `--json`, `"sign_in_verified": false` says the same.
 
 ```text
-{"error":{"code":"not_signed_in","message":"You're not signed in. Run `telemetry login` first.","hint":"telemetry login","retryable":false,"exit_code":4,"cli_version":"0.1.0"}}
+{"error":{"code":"not_signed_in","message":"You're not signed in. Run telemetry login first.","hint":"telemetry login","retryable":false,"exit_code":4,"cli_version":"0.1.0"}}
 ```
 
 Branch on `code`, not on `message`, whose wording can change. `hint` is a command to run next, when there is one. `telemetry login` needs a person at a browser, so an agent should run `telemetry login --json` and pass the link on rather than run `telemetry login`. `retryable` is true when running the same command again may succeed. New codes may be added, and existing codes keep their meaning.
@@ -158,11 +161,26 @@ Branch on `code`, not on `message`, whose wording can change. `hint` is a comman
 
 ## Configuration
 
-| Variable                   | Default                   | Purpose                                                                    |
-| -------------------------- | ------------------------- | -------------------------------------------------------------------------- |
-| `TELEMETRY_DEV_PROJECT`    | none                      | The project to read when you don't pass `--project`                        |
-| `TELEMETRY_DEV_URL`        | `https://telemetry.dev`   | The telemetry.dev deployment to sign in to                                 |
-| `TELEMETRY_DEV_CONFIG_DIR` | `~/.config/telemetry-dev` | Where the sign-in is saved. The default follows `XDG_CONFIG_HOME` when set |
-| `NO_COLOR`                 | none                      | Turns off color. `--no-color` does the same                                |
+| Variable                        | Default                   | Purpose                                                                               |
+| ------------------------------- | ------------------------- | ------------------------------------------------------------------------------------- |
+| `TELEMETRY_DEV_PROJECT`         | none                      | The project to read when you don't pass `--project`                                   |
+| `TELEMETRY_DEV_URL`             | `https://telemetry.dev`   | The telemetry.dev deployment to sign in to                                            |
+| `TELEMETRY_DEV_CONFIG_DIR`      | `~/.config/telemetry-dev` | Where the sign-in is saved. The default follows `XDG_CONFIG_HOME` when set            |
+| `NO_COLOR`                      | none                      | Turns off color. `--no-color` does the same                                           |
+| `TELEMETRY_DEV_NO_UPDATE_CHECK` | none                      | Any value turns off the check for a newer version. `NO_UPDATE_NOTIFIER` does the same |
 
 The sign-in is saved in `session.json`, which only your user can read. A sign-in to another deployment through `TELEMETRY_DEV_URL` gets its own file next to it. The file holds a refresh token, so keep it private. `telemetry logout` revokes the token at telemetry.dev and removes it from the file, and says so when the server doesn't confirm the revocation. `telemetry logout --json` prints `{"was_signed_in": true, "revoked": false}` in that case; `revoked` is `null` when there was no sign-in. To disconnect the CLI from your account entirely, open account settings at telemetry.dev.
+
+## Updates
+
+When you run the CLI on a terminal, it checks npm for a newer version at most once a day. If one is out, it prints a line on stderr after the command's output, with the command that updates the way you installed it:
+
+```text
+telemetry 0.2.0 is available (you have 0.1.6). Update: npm install --global @telemetry-dev/cli@latest
+```
+
+The check never delays a command. It runs while the command does, and when the command finishes first, the next run checks again. It reads the CLI's `latest` tag from the npm registry, or from `npm_config_registry` when that is set, so npm sees your IP address and the package name. telemetry.dev isn't involved. The answer is saved in `update-check.json` next to the sign-in.
+
+There is no check with `--json`, when stdout or stderr isn't a terminal, in CI (`CI` is set), for a project that has the CLI as a dependency, or when `TELEMETRY_DEV_NO_UPDATE_CHECK` or `NO_UPDATE_NOTIFIER` is set. `telemetry status --json` reports `cli_version` and `latest_cli_version`, the latest version the last check found. `latest_cli_version` is `null` before the first check, when checks are off, and when the last check found a version older than this CLI, as after an update.
+
+Separately, every request the CLI sends to telemetry.dev names the CLI and its version, as MCP clients do, so telemetry.dev can tell which versions are in use.

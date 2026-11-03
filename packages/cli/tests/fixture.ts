@@ -535,7 +535,8 @@ const resolveWindow = (args: Record<string, unknown>, defaultMs: number | null) 
 const server = () => {
   const mcp = new McpServer({ name: "telemetry.dev fixture", version: "1.0.0" });
   const tool = (name: string, handler: (args: Record<string, unknown>) => unknown) =>
-    mcp.registerTool(name, { inputSchema: loose }, (args: Record<string, unknown>) => {
+    mcp.registerTool(name, { inputSchema: loose }, async (args: Record<string, unknown>) => {
+      await beforeTool.wait;
       calls.push({ tool: name, args });
       const value = serverState.removedFromWorkspace
         ? new ToolFailure("Not a member of this workspace", "access_denied")
@@ -582,15 +583,21 @@ const server = () => {
     }
 
     const window = resolveWindow(args, null);
+    const found = serverState.empty ? { traces: [], next_cursor: null } : traces();
 
-    return window instanceof ToolFailure ? window : { ...traces(), window };
+    return window instanceof ToolFailure ? window : { ...found, window };
   });
   tool("search_sessions", (args) => {
     if (!serverState.windows) return sessions();
 
     const window = resolveWindow(args, Number(args.range_hours ?? 24) * UNIT_MS.h);
 
-    return window instanceof ToolFailure ? window : { ...sessions(), window };
+    return window instanceof ToolFailure
+      ? window
+      : {
+          ...(serverState.empty ? { ...sessions(), sessions: [], next_cursor: null } : sessions()),
+          window,
+        };
   });
   tool("get_trace", (args) =>
     Object.hasOwn(TRACE_DETAILS, String(args.trace_id))
@@ -687,15 +694,31 @@ export const serverState = {
   windows: true,
   /** search_traces takes agent and tool; false acts as a server with windows from before them. */
   agentAndTool: true,
+  /** search_traces and search_sessions find nothing, as in a project nothing was sent to yet. */
+  empty: false,
 };
 
 /**
  * Runs before the token endpoint answers a refresh, to act as another CLI process or a
- * server that rotates tokens. "accept" or "refuse" overrides the usual check.
+ * server that rotates tokens. "accept" or "refuse" overrides the usual check;
+ * "unavailable" answers 503, as a server in an outage would.
  */
 export const beforeRefresh: {
-  run?: (refreshToken: string) => Promise<"accept" | "refuse" | undefined>;
+  run?: (refreshToken: string) => Promise<"accept" | "refuse" | "unavailable" | undefined>;
 } = {};
+
+/** Every tool waits for this first, so a command can outlast the CLI's update check. */
+export const beforeTool: { wait?: Promise<unknown> } = {};
+
+/** The npm registry's dist-tags for the CLI, which the fixture also serves. */
+export const registry = {
+  latest: undefined as string | undefined,
+  /** Takes the request and never answers, as a stalled connection wouldn't. */
+  hang: false,
+  requests: 0,
+  onRequest: undefined as (() => void) | undefined,
+  onAnswer: undefined as (() => void) | undefined,
+};
 
 const handler = createMcpHandler(() => server(), { legacy: "stateless", responseMode: "json" });
 
@@ -731,6 +754,17 @@ export const startFixture = async (port = 0) => {
 
   const http = createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", origin);
+
+    if (url.pathname === "/-/package/@telemetry-dev%2fcli/dist-tags") {
+      registry.requests += 1;
+      registry.onRequest?.();
+
+      if (registry.hang) return;
+
+      json(response, 200, { latest: registry.latest });
+
+      return registry.onAnswer?.();
+    }
 
     if (url.pathname === "/.well-known/oauth-protected-resource/mcp") {
       return json(response, 200, { resource: `${origin}/mcp`, authorization_servers: [origin] });
@@ -784,6 +818,10 @@ export const startFixture = async (port = 0) => {
         form.get("grant_type") === "refresh_token"
           ? await beforeRefresh.run?.(form.get("refresh_token") ?? "")
           : undefined;
+
+      if (verdict === "unavailable") {
+        return response.writeHead(503, { "Content-Type": "text/plain" }).end("Service Unavailable");
+      }
 
       if (
         form.get("grant_type") === "refresh_token" &&
