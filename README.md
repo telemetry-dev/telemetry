@@ -176,7 +176,8 @@ The Claude API can also send server-side spans through a Console destination. Re
 [`@telemetry-dev/cli`](packages/cli) reads traces, sessions, logs, and usage from a terminal, a script, or an agent's shell. It uses the same read-only access as the telemetry.dev MCP server, so it works where an MCP client isn't available.
 
 ```sh
-npx @telemetry-dev/cli login
+npm install --global @telemetry-dev/cli
+telemetry login
 ```
 
 ## Development

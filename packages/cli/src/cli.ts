@@ -20,7 +20,9 @@ import {
   useCommand,
 } from "./commands.ts";
 import { CliError, type ErrorCode, EXIT, usageError } from "./errors.ts";
-import { clean, disableColor, SHOW_CURSOR, style } from "./terminal.ts";
+import { BIN } from "./invocation.ts";
+import { clean, disableColor, SHOW_CURSOR, shellQuote, shellWords, style } from "./terminal.ts";
+import { finishUpdateCheck, startUpdateCheck } from "./update.ts";
 
 type Option = {
   readonly type: "string" | "boolean";
@@ -44,7 +46,7 @@ const project: Option = {
   type: "string",
   short: "p",
   value: "name|id",
-  description: "Project to read (default: telemetry use)",
+  description: `Project to read (default: ${BIN} use)`,
 };
 const limit: Option = {
   type: "string",
@@ -71,7 +73,7 @@ const until: Option = {
 const COMMANDS: Readonly<Record<string, Command>> = {
   login: {
     summary: "Sign in with your browser",
-    usage: "telemetry login [--no-browser | --finish <address>] [--json]",
+    usage: `${BIN} login [--no-browser | --finish <address>] [--json]`,
     options: {
       "no-browser": {
         type: "boolean",
@@ -89,45 +91,45 @@ const COMMANDS: Readonly<Record<string, Command>> = {
       },
     },
     examples: [
-      "telemetry login",
-      "telemetry login --no-browser   # over SSH, in a container, or from an agent's shell",
-      "telemetry login --finish 'http://127.0.0.1:53124/callback?code=…'",
-      "telemetry login --json         # a script passes the link on, then runs --finish",
+      `${BIN} login`,
+      `${BIN} login --no-browser   # over SSH, in a container, or from an agent's shell`,
+      `${BIN} login --finish ${shellQuote("http://127.0.0.1:53124/callback?code=…")}`,
+      `${BIN} login --json         # a script passes the link on, then runs --finish`,
     ],
     run: loginCommand,
   },
   logout: {
     summary: "Sign out on this machine",
-    usage: "telemetry logout [--json]",
+    usage: `${BIN} logout [--json]`,
     options: { json },
-    examples: ["telemetry logout"],
+    examples: [`${BIN} logout`],
     run: logoutCommand,
   },
   status: {
     summary: "Show who you're signed in as",
-    usage: "telemetry status [--json]",
+    usage: `${BIN} status [--json]`,
     options: { json },
-    examples: ["telemetry status", "telemetry status --json"],
+    examples: [`${BIN} status`, `${BIN} status --json`],
     run: statusCommand,
   },
   projects: {
     summary: "List the workspace's projects",
-    usage: "telemetry projects [--json]",
+    usage: `${BIN} projects [--json]`,
     options: { json },
-    examples: ["telemetry projects"],
+    examples: [`${BIN} projects`],
     run: projectsCommand,
   },
   use: {
     summary: "Set the default project",
-    usage: "telemetry use <name|id>",
+    usage: `${BIN} use <name|id>`,
     arguments: 1,
     options: { json },
-    examples: ["telemetry use support-bot"],
+    examples: [`${BIN} use support-bot`],
     run: useCommand,
   },
   traces: {
     summary: "Find traces, newest first",
-    usage: "telemetry traces [options]",
+    usage: `${BIN} traces [options]`,
     options: {
       errors: { type: "boolean", description: "Only traces that failed" },
       name: { type: "string", value: "text", description: "Trace name contains this text" },
@@ -161,25 +163,25 @@ const COMMANDS: Readonly<Record<string, Command>> = {
       json,
     },
     examples: [
-      "telemetry traces --errors --since 2h",
-      "telemetry traces --name checkout --env production",
-      "telemetry traces --model gpt-5 --since 2026-10-29 --until 2026-10-30",
-      "telemetry traces --tool search_docs --errors --since 1d",
-      "telemetry traces --session conv_8f2 --json",
+      `${BIN} traces --errors --since 2h`,
+      `${BIN} traces --name checkout --env production`,
+      `${BIN} traces --model gpt-5 --since 2026-10-29 --until 2026-10-30`,
+      `${BIN} traces --tool search_docs --errors --since 1d`,
+      `${BIN} traces --session conv_8f2 --json`,
     ],
     run: tracesCommand,
   },
   trace: {
     summary: "Show a trace's spans, timeline, and logs",
-    usage: "telemetry trace <trace-id> [options]",
+    usage: `${BIN} trace <trace-id> [options]`,
     arguments: 1,
     options: { project, json },
-    examples: ["telemetry trace 4bf92f3577b34da6a3ce929d0e0e4736"],
+    examples: [`${BIN} trace 4bf92f3577b34da6a3ce929d0e0e4736`],
     run: traceCommand,
   },
   sessions: {
     summary: "Find sessions by the start of their latest trace, newest first",
-    usage: "telemetry sessions [options]",
+    usage: `${BIN} sessions [options]`,
     options: {
       range: {
         type: "string",
@@ -203,14 +205,14 @@ const COMMANDS: Readonly<Record<string, Command>> = {
       json,
     },
     examples: [
-      "telemetry sessions --range 7d --errors",
-      "telemetry sessions --agent support-bot --since 2026-10-29T09:00",
+      `${BIN} sessions --range 7d --errors`,
+      `${BIN} sessions --agent support-bot --since 2026-10-29T09:00`,
     ],
     run: sessionsCommand,
   },
   logs: {
     summary: "List recent logs, newest first",
-    usage: "telemetry logs [options]",
+    usage: `${BIN} logs [options]`,
     options: {
       level: {
         type: "string",
@@ -226,15 +228,15 @@ const COMMANDS: Readonly<Record<string, Command>> = {
       json,
     },
     examples: [
-      "telemetry logs --level error",
-      "telemetry logs --level warn --since 30m",
-      "telemetry logs --range 30d --json",
+      `${BIN} logs --level error`,
+      `${BIN} logs --level warn --since 30m`,
+      `${BIN} logs --range 30d --json`,
     ],
     run: logsCommand,
   },
   usage: {
     summary: "Summarize requests, errors, latency, tokens, and cost",
-    usage: "telemetry usage [options]",
+    usage: `${BIN} usage [options]`,
     options: {
       range: {
         type: "string",
@@ -249,12 +251,12 @@ const COMMANDS: Readonly<Record<string, Command>> = {
       project,
       json,
     },
-    examples: ["telemetry usage", "telemetry usage --range 30d --by user"],
+    examples: [`${BIN} usage`, `${BIN} usage --range 30d --by user`],
     run: usageCommand,
   },
   payload: {
     summary: "Print a span's captured input and output",
-    usage: "telemetry payload <trace-id> <span-id> [options]",
+    usage: `${BIN} payload <trace-id> <span-id> [options]`,
     arguments: 2,
     options: {
       field: {
@@ -266,8 +268,8 @@ const COMMANDS: Readonly<Record<string, Command>> = {
       json,
     },
     examples: [
-      "telemetry payload 4bf92f35… 00f067aa…",
-      "telemetry payload 4bf92f35… 00f067aa… --field output > answer.txt",
+      `${BIN} payload 4bf92f35… 00f067aa…`,
+      `${BIN} payload 4bf92f35… 00f067aa… --field output > answer.txt`,
     ],
     run: payloadCommand,
   },
@@ -275,7 +277,7 @@ const COMMANDS: Readonly<Record<string, Command>> = {
 
 const GLOBAL: Readonly<Record<string, Option>> = {
   help: { type: "boolean", short: "h", description: "Show help" },
-  version: { type: "boolean", description: "Print the version" },
+  version: { type: "boolean", short: "v", description: "Print the version" },
   "no-color": { type: "boolean", description: "Print without color" },
 };
 
@@ -299,7 +301,7 @@ const topHelp = () => {
     `${style.bold("telemetry")} ${style.dim(VERSION)}  ${TAGLINE}`,
     "",
     style.bold("Usage"),
-    "  telemetry <command> [options]",
+    `  ${BIN} <command> [options]`,
     "",
     style.bold("Commands"),
     ...names.map((name) => `  ${name.padEnd(width)}  ${style.dim(COMMANDS[name]!.summary)}`),
@@ -308,12 +310,13 @@ const topHelp = () => {
     ...optionLines(GLOBAL),
     "",
     style.bold("Environment"),
-    `  TELEMETRY_DEV_PROJECT     ${style.dim("Project to read when --project is not given")}`,
-    `  TELEMETRY_DEV_URL         ${style.dim("telemetry.dev deployment (default https://telemetry.dev)")}`,
-    `  TELEMETRY_DEV_CONFIG_DIR  ${style.dim("Where the sign-in is kept (default ~/.config/telemetry-dev)")}`,
-    `  NO_COLOR                  ${style.dim("Print without color")}`,
+    `  TELEMETRY_DEV_PROJECT          ${style.dim("Project to read when --project is not given")}`,
+    `  TELEMETRY_DEV_URL              ${style.dim("telemetry.dev deployment (default https://telemetry.dev)")}`,
+    `  TELEMETRY_DEV_CONFIG_DIR       ${style.dim("Where the sign-in is kept (default ~/.config/telemetry-dev)")}`,
+    `  NO_COLOR                       ${style.dim("Print without color")}`,
+    `  TELEMETRY_DEV_NO_UPDATE_CHECK  ${style.dim("Don't check npm for a newer version")}`,
     "",
-    `Run ${style.bold("telemetry <command> --help")} for a command's options and examples.`,
+    `Run ${style.bold(`${BIN} <command> --help`)} for a command's options and examples.`,
   ].join("\n");
 };
 
@@ -360,6 +363,16 @@ const closest = (input: string, names: readonly string[]) => {
 const commandNamed = (name: string | undefined) =>
   name !== undefined && Object.hasOwn(COMMANDS, name) ? COMMANDS[name] : undefined;
 
+/** Whether some command reads `arg` as an option followed by its value, as in `--name x`. */
+const takesValue = (arg: string | undefined) =>
+  Object.values(COMMANDS).some((command) =>
+    Object.entries(command.options).some(
+      ([name, option]) =>
+        option.type === "string" &&
+        (arg === `--${name}` || (option.short !== undefined && arg === `-${option.short}`)),
+    ),
+  );
+
 // Arguments after `--` are values, never options.
 const optionArgs = (argv: readonly string[]) => {
   const end = argv.indexOf("--");
@@ -378,7 +391,8 @@ const main = async (argv: readonly string[]) => {
   const name = first === -1 || argv[first]!.startsWith("-") ? undefined : argv[first];
 
   if (name === undefined) {
-    if (argv.includes("--version")) return void process.stdout.write(`${VERSION}\n`);
+    if (argv.includes("--version") || argv.includes("-v"))
+      return void process.stdout.write(`${VERSION}\n`);
 
     if (argv.includes("--help") || argv.includes("-h")) {
       return void process.stdout.write(`${topHelp()}\n`);
@@ -386,7 +400,27 @@ const main = async (argv: readonly string[]) => {
 
     const unknown = argv.find((arg) => arg !== "--no-color");
 
-    if (unknown !== undefined) throw usageError(`Unknown option ${unknown}. Run telemetry --help.`);
+    // As in `telemetry --json traces`. With one command named, it moves to the front;
+    // with several, or one right after an option that takes a value, a name may be that
+    // value, so no order is guessed.
+    const named = optionArgs(argv).filter((arg) => commandNamed(arg));
+
+    if (named.length > 0) {
+      const at = argv.indexOf(named[0]!);
+      const reordered =
+        named.length === 1 && !takesValue(argv[at - 1])
+          ? shellWords([argv[at]!, ...argv.slice(0, at), ...argv.slice(at + 1)])
+          : undefined;
+
+      throw usageError(
+        reordered
+          ? `Put the command before its options: ${BIN} ${reordered}`
+          : `Put the command before its options, as in ${BIN} traces --json.`,
+        reordered ? { hint: `${BIN} ${reordered}` } : {},
+      );
+    }
+
+    if (unknown !== undefined) throw usageError(`Unknown option ${unknown}. Run ${BIN} --help.`);
 
     // A script or agent that runs `telemetry` alone gets the reference, not the welcome.
     return process.stdout.isTTY ? home() : void process.stdout.write(`${topHelp()}\n`);
@@ -400,9 +434,9 @@ const main = async (argv: readonly string[]) => {
     const command = commandNamed(topic);
 
     if (!command) {
-      throw usageError(`Unknown command "${topic}". Run telemetry --help.`, {
+      throw usageError(`Unknown command "${topic}". Run ${BIN} --help.`, {
         code: "unknown_command",
-        hint: "telemetry --help",
+        hint: `${BIN} --help`,
       });
     }
 
@@ -415,8 +449,8 @@ const main = async (argv: readonly string[]) => {
     const suggestion = closest(name, Object.keys(COMMANDS));
 
     throw usageError(
-      `Unknown command "${name}".${suggestion ? ` Did you mean \`telemetry ${suggestion}\`?` : ""} Run telemetry --help.`,
-      { code: "unknown_command", hint: "telemetry --help" },
+      `Unknown command "${name}".${suggestion ? ` Did you mean ${BIN} ${suggestion}?` : ""} Run ${BIN} --help.`,
+      { code: "unknown_command", hint: `${BIN} --help` },
     );
   }
 
@@ -440,16 +474,16 @@ const main = async (argv: readonly string[]) => {
   } catch (error) {
     const message = error instanceof Error ? error.message.split("\n")[0] : String(error);
 
-    throw usageError(`${message} Run \`telemetry ${name} --help\`.`, {
-      hint: `telemetry ${name} --help`,
+    throw usageError(`${message} Run ${BIN} ${name} --help.`, {
+      hint: `${BIN} ${name} --help`,
     });
   }
 
   const extra = parsed.positionals[command.arguments ?? 0];
 
   if (extra !== undefined) {
-    throw usageError(`Unexpected argument "${extra}". Run \`telemetry ${name} --help\`.`, {
-      hint: `telemetry ${name} --help`,
+    throw usageError(`Unexpected argument "${extra}". Run ${BIN} ${name} --help.`, {
+      hint: `${BIN} ${name} --help`,
     });
   }
 
@@ -514,4 +548,6 @@ process.stdout.on("error", (error: NodeJS.ErrnoException) => {
   throw error;
 });
 
+startUpdateCheck(jsonOutput);
 await main(process.argv.slice(2)).catch(fail);
+await finishUpdateCheck();

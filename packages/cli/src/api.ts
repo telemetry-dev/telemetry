@@ -69,7 +69,7 @@ export class Api {
     ).catch(async (error: unknown) => {
       const { OAuthError, UnauthorizedError } = await import("@modelcontextprotocol/client");
 
-      return translateError(error, [OAuthError, UnauthorizedError]);
+      return translateError(error, [OAuthError, UnauthorizedError], this.session.server);
     });
 
     const text = result.content.find((block) => block.type === "text")?.text ?? "";

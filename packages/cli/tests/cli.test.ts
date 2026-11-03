@@ -1,6 +1,16 @@
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { type AddressInfo, createServer } from "node:net";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,9 +19,11 @@ import { fileURLToPath } from "node:url";
 
 import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
 
+import { VERSION } from "../src/api.ts";
 import { type Session, sessionFile, updateSession } from "../src/session.ts";
 import {
   beforeRefresh,
+  beforeTool,
   calls,
   EMAIL,
   logs,
@@ -21,6 +33,7 @@ import {
   QUIET_TRACE_ID,
   QUIET_TRACE_URL,
   REFRESH_TOKEN,
+  registry,
   serverState,
   startFixture,
   TOKEN,
@@ -63,6 +76,14 @@ beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), "telemetry-cli-"));
   calls.length = 0;
   delete beforeRefresh.run;
+  delete beforeTool.wait;
+  Object.assign(registry, {
+    latest: undefined,
+    hang: false,
+    requests: 0,
+    onRequest: undefined,
+    onAnswer: undefined,
+  });
   Object.assign(serverState, {
     failProjects: false,
     removedFromWorkspace: false,
@@ -70,16 +91,17 @@ beforeEach(async () => {
     traceUrl: QUIET_TRACE_URL,
     windows: true,
     agentAndTool: true,
+    empty: false,
   });
 
   return () => rm(home, { recursive: true, force: true });
 });
 
-const runWith = (env: Record<string, string>, ...args: string[]) =>
+const runScript = (script: string | string[], env: Record<string, string>, ...args: string[]) =>
   new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
     execFile(
       process.execPath,
-      [CLI, ...args],
+      [...[script].flat(), ...args],
       {
         env: {
           PATH: process.env.PATH,
@@ -93,6 +115,8 @@ const runWith = (env: Record<string, string>, ...args: string[]) =>
       (error, stdout, stderr) => resolve({ code: error ? Number(error.code) : 0, stdout, stderr }),
     );
   });
+
+const runWith = (env: Record<string, string>, ...args: string[]) => runScript(CLI, env, ...args);
 
 const run = (...args: string[]) => runWith({}, ...args);
 
@@ -162,6 +186,83 @@ test("commands exit 4 when signed out, and status reports it", async () => {
   const status = await run("status", "--json");
   expect(status.code).toBe(4);
   expect(JSON.parse(status.stdout)).toMatchObject({ signed_in: false });
+
+  // A saved sign-in the server no longer accepts, with no refresh token to renew it.
+  await writeFile(
+    sessionPath(),
+    JSON.stringify({
+      server: fixture.url,
+      client: { client_id: "fixture-client" },
+      tokens: { access_token: "revoked", token_type: "Bearer" },
+      email: EMAIL,
+    }),
+    { mode: 0o600 },
+  );
+
+  const refused = await run("status");
+  expect(refused.code).toBe(4);
+  expect(refused.stdout).toContain("Your sign-in has expired or was disconnected.");
+  expect(refused.stdout).not.toContain("Signed in");
+  expect(JSON.parse((await run("status", "--json")).stdout)).toMatchObject({
+    signed_in: false,
+    email: EMAIL,
+  });
+
+  // One that can't be checked, here for want of a server, is still reported as saved.
+  const closed = await closedServer();
+  await writeFile(
+    join(home, sessionFile(closed)),
+    JSON.stringify({ server: closed, tokens: { access_token: TOKEN, token_type: "Bearer" } }),
+  );
+  const unchecked = await runWith({ TELEMETRY_DEV_URL: closed }, "status");
+  expect(unchecked.code).toBe(0);
+  expect(unchecked.stdout).toContain("Signed in");
+  expect(unchecked.stderr).toContain(
+    `Couldn't check the sign-in: Couldn't reach ${new URL(closed).host} (ECONNREFUSED).`,
+  );
+  expect(
+    JSON.parse((await runWith({ TELEMETRY_DEV_URL: closed }, "status", "--json")).stdout),
+  ).toMatchObject({ signed_in: true, sign_in_verified: false });
+
+  // A refresh the server can't answer, here an outage, isn't a refused sign-in either.
+  await writeFile(
+    sessionPath(),
+    JSON.stringify({
+      server: fixture.url,
+      client: { client_id: "fixture-client" },
+      tokens: { access_token: "expired", token_type: "Bearer", refresh_token: REFRESH_TOKEN },
+      email: EMAIL,
+    }),
+    { mode: 0o600 },
+  );
+  beforeRefresh.run = async () => "unavailable";
+  const outage = await run("status");
+  expect(outage.code).toBe(0);
+  expect(outage.stdout).toContain("Signed in");
+  expect(outage.stderr).toContain(
+    `Couldn't check the sign-in: Couldn't renew the sign-in with ${new URL(fixture.url).host}.`,
+  );
+  expect(JSON.parse((await run("status", "--json")).stdout)).toMatchObject({
+    signed_in: true,
+    sign_in_verified: false,
+  });
+  expect((await run("traces")).code).toBe(1);
+
+  // Tokens another authorization server issued can't be renewed here, outage or not.
+  const session = JSON.parse(await readFile(sessionPath(), "utf8")) as Session;
+  await writeFile(
+    sessionPath(),
+    JSON.stringify({ ...session, tokens: { ...session.tokens, issuer: "https://elsewhere.test" } }),
+    { mode: 0o600 },
+  );
+  expect((await run("status")).code).toBe(4);
+
+  delete beforeRefresh.run;
+  await writeFile(sessionPath(), JSON.stringify(session), { mode: 0o600 });
+  expect(JSON.parse((await run("status", "--json")).stdout)).toMatchObject({
+    signed_in: true,
+    sign_in_verified: true,
+  });
 });
 
 test("payload --field prints the whole text across pages", async () => {
@@ -201,6 +302,10 @@ test("trace leads with where the run failed and which calls repeated, counting p
   // The request that failed, under the tool that made it, under the agent.
   expect(lines).toContain(
     "  invoke_agent researcher › execute_tool fetch_page › GET /page  TimeoutError: Request timed out after 700 ms",
+  );
+  // Each failed span's id is in the tree, where payload can take it from.
+  expect(lines.filter((line) => /^\s*[│ ]*\s+span \S+/.test(line))).toEqual(
+    expect.arrayContaining([expect.stringMatching(/span t2: .*700 ms/)]),
   );
   expect(lines.indexOf("Errors (1)")).toBeGreaterThan(0);
   expect(lines.indexOf("Repeated (1)")).toBeGreaterThan(lines.indexOf("Errors (1)"));
@@ -330,6 +435,34 @@ test("a mistyped command suggests the closest one and exits 2", async () => {
   const result = await run("tarces");
   expect(result.code).toBe(2);
   expect(result.stderr).toContain("telemetry traces");
+
+  // Options before the command get the command moved to the front, ready to run.
+  const reordered = await run("-p", "my bot", "traces", "--errors");
+  expect(reordered.code).toBe(2);
+  expect(reordered.stderr).toContain(
+    "Put the command before its options: telemetry traces -p 'my bot' --errors",
+  );
+  expect(JSON.parse((await run("--json", "traces")).stderr).error).toMatchObject({
+    code: "invalid_arguments",
+    hint: "telemetry traces --json",
+  });
+
+  // With two command names, one could be an option's value, so no order is guessed.
+  for (const unsure of [await run("--name", "logs", "traces"), await run("--name", "trace")]) {
+    expect(unsure.stderr).toContain("Put the command before its options, as in telemetry traces");
+    expect(unsure.stderr).not.toContain("--name");
+  }
+
+  // Commands in messages paste as they are: in a POSIX shell, backticks would run them.
+  for (const message of [await run("traces"), await run("traces", "--bogus")]) {
+    expect(message.stderr).not.toContain("`");
+  }
+});
+
+test("-v prints the version, like --version", async () => {
+  for (const flag of ["-v", "--version"]) {
+    expect(await run(flag)).toMatchObject({ code: 0, stdout: `${VERSION}\n` });
+  }
 });
 
 test("input that isn't valid exits 2 before calling telemetry.dev, even from a script", async () => {
@@ -400,6 +533,21 @@ test("with --json, an error is one JSON line on stderr with a code to branch on,
       ),
     ),
   ).toMatchObject({ exit: 1, code: "unreachable", retryable: true });
+
+  // The error names the deployment it couldn't reach, and a proxy that Node.js ignores.
+  const unreachable = (env: Record<string, string>) =>
+    runWith({ TELEMETRY_DEV_URL: closed, ...env }, "traces", "--project", PROJECTS[0]!.id);
+  const host = new URL(closed).host;
+  const proxied = await unreachable({ HTTPS_PROXY: "http://proxy.example.test:8080" });
+  expect(proxied.stderr).toContain(`Couldn't reach ${host} (ECONNREFUSED).`);
+  expect(proxied.stderr).toContain("NODE_USE_ENV_PROXY=1");
+  expect((await unreachable({})).stderr).not.toContain("proxy");
+  const enabled = await unreachable({
+    HTTPS_PROXY: "http://proxy.example.test:8080",
+    NODE_USE_ENV_PROXY: "1",
+  });
+  expect(enabled.stderr).toContain(`Couldn't reach ${host}`);
+  expect(enabled.stderr).not.toContain("proxy");
 
   // After `--`, --json is a value, so the error stays the line a person reads.
   const value = await run("use", "--", "--json");
@@ -856,6 +1004,7 @@ test("a shell without a terminal signs in with --no-browser, then --finish, keep
       server: fixture.url,
       client: { client_id: "fixture-client" },
       tokens: { access_token: TOKEN, token_type: "Bearer", refresh_token: "previous-refresh" },
+      project: { id: PROJECTS[1].id, name: "eval-runner" },
     }),
     { mode: 0o600 },
   );
@@ -887,8 +1036,13 @@ test("a shell without a terminal signs in with --no-browser, then --finish, keep
   expect(finished.stderr).toContain("eval-runner");
   expect(finished.stderr).not.toMatch(CONTROL);
 
+  // The workspace has two projects, so only the previous default can say which to keep.
   const session = await savedSession();
-  expect(session).toMatchObject({ email: EMAIL, tokens: { refresh_token: REFRESH_TOKEN } });
+  expect(session).toMatchObject({
+    email: EMAIL,
+    tokens: { refresh_token: REFRESH_TOKEN },
+    project: { id: PROJECTS[1].id },
+  });
   expect(session.pending).toBeUndefined();
 
   // The sign-in it replaced no longer works at the server.
@@ -901,6 +1055,433 @@ test("a shell without a terminal signs in with --no-browser, then --finish, keep
 
   const again = await run("login", "--finish", address);
   expect(again.code).toBe(4);
+});
+
+test("a browser sign-in also takes the pasted address, for a browser that never opened or is on another device", async () => {
+  // Openers that open nothing, as when xdg-open is missing or has no browser to hand to.
+  const bin = await mkdtemp(join(tmpdir(), "telemetry-cli-bin-"));
+  for (const name of ["open", "xdg-open"]) {
+    await writeFile(join(bin, name), "#!/bin/sh\n", { mode: 0o755 });
+  }
+
+  // `login` on a terminal, once its paste prompt is up.
+  const prompted = async (...args: string[]) => {
+    const child = spawn(
+      process.execPath,
+      ["--import", "data:text/javascript,process.stdin.isTTY=true", CLI, "login", ...args],
+      {
+        env: {
+          PATH: `${bin}:${process.env.PATH}`,
+          HOME: home,
+          TELEMETRY_DEV_URL: fixture.url,
+          TELEMETRY_DEV_CONFIG_DIR: home,
+          NO_COLOR: "1",
+          DISPLAY: ":0",
+        },
+      },
+    );
+    const output = { stderr: "" };
+    child.stderr.on("data", (chunk: Buffer) => {
+      output.stderr += chunk.toString();
+    });
+    const exited = new Promise<number | null>((resolve) => child.on("exit", resolve));
+
+    for (let waited = 0; !output.stderr.includes("paste its address here"); waited += 25) {
+      if (waited > 4000) {
+        child.kill();
+        throw new Error(`no paste prompt:\n${output.stderr}`);
+      }
+      await sleep(25);
+    }
+
+    const link = output.stderr.match(/http:\/\/127\.0\.0\.1:\d+\/authorize\?\S+/)![0];
+
+    return { child, output, exited, link };
+  };
+
+  try {
+    const pasted = await prompted();
+    expect(pasted.output.stderr).toContain("Opening your browser");
+
+    // Approved on a device that can't reach this machine's loopback address.
+    const approved = await fetch(pasted.link, { redirect: "manual" });
+    pasted.child.stdin.end(`${approved.headers.get("location")}\n`);
+    expect(await pasted.exited).toBe(0);
+    expect(pasted.output.stderr).toContain(`Signed in as ${EMAIL}`);
+    expect(await savedSession()).toMatchObject({ tokens: { refresh_token: REFRESH_TOKEN } });
+
+    // Ctrl-D only ends the prompt; the browser on this machine still finishes.
+    const closed = await prompted();
+    closed.child.stdin.end();
+    await sleep(100);
+    await fetch(closed.link);
+    expect(await closed.exited).toBe(0);
+    expect(closed.output.stderr).toContain(`Signed in as ${EMAIL}`);
+
+    // Without a browser, Ctrl-D leaves nothing to wait for.
+    const cancelled = await prompted("--no-browser");
+    cancelled.child.stdin.end();
+    expect(await cancelled.exited).toBe(4);
+    expect(cancelled.output.stderr).toContain("error Sign-in was cancelled.");
+    expect(cancelled.output.stderr).not.toContain("    at ");
+  } finally {
+    await rm(bin, { recursive: true, force: true });
+  }
+});
+
+// Windows as far as the CLI can tell; Node's path module was already chosen at startup.
+const WINDOWS = [
+  "--import",
+  "data:text/javascript,Object.defineProperty(process,'platform',{value:'win32'})",
+];
+
+test("on Windows, printed commands use the double quotes cmd.exe and PowerShell share, or aren't printed", async () => {
+  const windows = (...args: string[]) => runScript([...WINDOWS, CLI], {}, ...args);
+
+  const started = await windows("login", "--no-browser");
+  expect(started.stderr).toContain(`  telemetry login --finish "<address>"`);
+  expect(JSON.parse((await windows("login", "--json")).stdout).next).toBe(
+    `telemetry login --finish "<address>"`,
+  );
+
+  await signIn(PROJECTS[0]);
+  const spaced = await windows("traces", "--name", "support answer");
+  expect(spaced.code).toBe(0);
+  expect(spaced.stderr).toMatch(/More: telemetry traces --name "support answer" --cursor=\S+/);
+
+  // cmd.exe expands %name% even in quotes, and a backslash before the closing quote
+  // escapes it, so only the cursor is printed for these.
+  for (const name of ["100%done%", "build\\"]) {
+    const unquotable = await windows("traces", "--name", name);
+    expect(unquotable.code).toBe(0);
+    expect(unquotable.stderr).not.toContain("More: telemetry");
+    expect(unquotable.stderr).toMatch(/More: run the same command with --cursor=\S+/);
+  }
+});
+
+test("started by npx, every next step runs through npx, since npx leaves no telemetry on PATH", async () => {
+  // Where npx unpacks a package, with the bin linked the way npx links it.
+  const bin = join(home, ".npm", "_npx", "ce03004f394ebab2", "node_modules", ".bin");
+  await mkdir(bin, { recursive: true });
+  await symlink(CLI, join(bin, "telemetry.ts"));
+  const npx = (...args: string[]) => runScript(join(bin, "telemetry.ts"), {}, ...args);
+
+  // A default project deleted since, which the new sign-in must not keep.
+  await writeFile(
+    sessionPath(),
+    JSON.stringify({
+      server: fixture.url,
+      project: { id: "0f0e0d0c-0b0a-4908-8706-050403020100", name: "deleted" },
+    }),
+    { mode: 0o600 },
+  );
+
+  const started = await npx("login", "--no-browser");
+  expect(started.stderr).toContain("  npx @telemetry-dev/cli login --finish '<address>'");
+
+  const link = started.stderr.match(/http:\/\/127\.0\.0\.1:\d+\/authorize\?\S+/)![0];
+  const approved = await fetch(link, { redirect: "manual" });
+  const finished = await npx("login", "--finish", approved.headers.get("location")!);
+  expect(finished.code).toBe(0);
+  expect(finished.stderr).toContain("Choose a default: npx @telemetry-dev/cli use support-bot");
+  expect(finished.stderr).toContain(
+    "To run it as telemetry, install it: npm install --global @telemetry-dev/cli",
+  );
+  expect(finished.stderr).not.toMatch(/(?<!-)telemetry (use|login|traces)/);
+
+  expect((await npx("traces", "--bogus")).stderr).toContain(
+    "Run npx @telemetry-dev/cli traces --help.",
+  );
+
+  const unset = await npx("traces", "--json");
+  expect(JSON.parse(unset.stderr).error).toMatchObject({
+    code: "project_required",
+    hint: "npx @telemetry-dev/cli projects",
+  });
+});
+
+// A person's terminal: the CLI checks for updates only when its output is read on one.
+const TERMINAL = [
+  "--import",
+  "data:text/javascript,process.stdout.isTTY=process.stderr.isTTY=true;process.stdout.columns=200",
+];
+
+const NEWER = `${Number(VERSION.split(".")[0]) + 1}.0.0`;
+const NOTICE = `telemetry ${NEWER} is available (you have ${VERSION}).`;
+
+const updateCheckPath = () => join(home, "update-check.json");
+
+/** The CLI started from `script` on a terminal, asking the fixture for npm's dist-tags. */
+const onTerminal = (script: string, env: Record<string, string>, ...args: string[]) =>
+  runScript([...TERMINAL, script], { npm_config_registry: `${fixture.url}/`, ...env }, ...args);
+
+/** A link to the CLI where a package manager would start it from. */
+const installedAt = async (...path: string[]) => {
+  const script = join(home, ...path);
+  await mkdir(join(script, ".."), { recursive: true });
+  await symlink(CLI, script);
+
+  return script;
+};
+
+const checkedToday = (latest: string) =>
+  writeFile(updateCheckPath(), JSON.stringify({ latest, checked_at: new Date().toISOString() }), {
+    mode: 0o600,
+  });
+
+test("on a terminal, a newer CLI on npm is announced after the output with the update for how it was installed, and npm is asked once a day", async () => {
+  await signIn(PROJECTS[0]);
+  registry.latest = NEWER;
+
+  // telemetry.dev answers after npm, as it does for a command that waits on a query.
+  beforeTool.wait = new Promise<void>((resolve) => {
+    registry.onAnswer = resolve;
+  });
+
+  const first = await onTerminal(CLI, {}, "traces");
+  expect(first.code).toBe(0);
+  expect(first.stdout).toContain("triage classify ticket");
+  expect(
+    first.stderr.endsWith(`\n${NOTICE} Update: npm install --global @telemetry-dev/cli@latest\n`),
+  ).toBe(true);
+  expect((await stat(updateCheckPath())).mode & 0o777).toBe(0o600);
+
+  // Within the day, npm isn't asked again, even by a command that gives it time to answer.
+  beforeTool.wait = Promise.race([
+    new Promise<void>((resolve) => {
+      registry.onRequest = resolve;
+    }),
+    sleep(500),
+  ]);
+  expect((await onTerminal(CLI, {}, "traces")).stderr).toContain(NOTICE);
+  expect(registry.requests).toBe(1);
+  delete beforeTool.wait;
+
+  // The day's answer is saved, so a command that ends at once still says it.
+  const status = await onTerminal(CLI, {}, "status");
+  expect(status.stderr).toContain(NOTICE);
+  expect(registry.requests).toBe(1);
+
+  // Runner paths are the ones npx, pnpm dlx with its cache moved, Yarn's dlx, and bunx
+  // use. npm's global folder can have any prefix, with Windows' shim next to it.
+  const PKG = ["node_modules", "@telemetry-dev", "cli", "cli.ts"];
+  await mkdir(join(home, "npm-global"), { recursive: true });
+  await writeFile(join(home, "npm-global", "telemetry.cmd"), "");
+  const updates: [string[], string][] = [
+    [
+      [".npm", "_npx", "ce03004f394ebab2", "node_modules", ".bin", "telemetry.ts"],
+      "Run npx @telemetry-dev/cli@latest, or install it: npm install --global @telemetry-dev/cli",
+    ],
+    [
+      [
+        "cache",
+        "dlx",
+        "c2d73a85dbd5d3bd60e628be629939cd",
+        "mw15n7mj-nzn",
+        "node_modules",
+        ".bin",
+        "telemetry.ts",
+      ],
+      "Run pnpm dlx @telemetry-dev/cli@latest, or install it: pnpm add --global @telemetry-dev/cli",
+    ],
+    [
+      ["xfs-768a7bf7", "dlx-32213", ".yarn", "cache", "cli.zip", ...PKG],
+      "Run yarn dlx @telemetry-dev/cli@latest, or install it: npm install --global @telemetry-dev/cli",
+    ],
+    [
+      ["bunx-501-@telemetry-dev", "cli@latest", ...PKG],
+      "Run bunx @telemetry-dev/cli@latest, or install it: bun add --global @telemetry-dev/cli",
+    ],
+    [
+      ["pnpm", "global", "v11", "a1", ...PKG],
+      "Update: pnpm add --global @telemetry-dev/cli@latest",
+    ],
+    [["npm-global", ...PKG], "Update: npm install --global @telemetry-dev/cli@latest"],
+    [[".npm-global", "lib", ...PKG], "Update: npm install --global @telemetry-dev/cli@latest"],
+    [
+      [".volta", "tools", "image", "packages", "@telemetry-dev", "cli", "lib", ...PKG],
+      "Update: volta install @telemetry-dev/cli@latest",
+    ],
+    [
+      ["AppData", "Local", "Volta", "tools", "image", "packages", "@telemetry-dev", "cli", ...PKG],
+      "Update: volta install @telemetry-dev/cli@latest",
+    ],
+    [
+      [".my-pnpm", "global", "v11", "a".repeat(64), ...PKG],
+      "Update: pnpm add --global @telemetry-dev/cli@latest",
+    ],
+    [[".bun", "install", "global", ...PKG], "Update: bun add --global @telemetry-dev/cli@latest"],
+    [
+      ["AppData", "Local", "Yarn", "Data", "global", ...PKG],
+      "Update: yarn global add @telemetry-dev/cli@latest",
+    ],
+  ];
+
+  for (const [path, update] of updates) {
+    expect((await onTerminal(await installedAt(...path), {}, "status")).stderr).toContain(
+      `${NOTICE} ${update}`,
+    );
+  }
+
+  // A project's lockfile pins its version, so it neither asks npm nor says anything:
+  // also in a folder named like npm's global one, bunx's, or pnpm dlx's, and from Yarn's
+  // Plug'n'Play cache, which has no package.json next to its node_modules.
+  await rm(updateCheckPath());
+
+  for (const [project, ...path] of [
+    ["lib", ...PKG],
+    ["bunx-demo", "node_modules", ".bin", "telemetry.ts"],
+    ["dlx", "apps", "web", "node_modules", ".bin", "telemetry.ts"],
+  ] as const) {
+    await mkdir(join(home, project), { recursive: true });
+    await writeFile(join(home, project, "package.json"), "{}");
+    const dependency = await onTerminal(await installedAt(project, ...path), {}, "status");
+    expect(dependency.stderr).not.toContain("is available");
+  }
+
+  const pnp = [".yarn", "berry", "cache", "@telemetry-dev-cli-npm-0.1.6-abc-10c0.zip", ...PKG];
+  expect((await onTerminal(await installedAt(...pnp), {}, "status")).stderr).not.toContain(
+    "is available",
+  );
+
+  expect(registry.requests).toBe(1);
+
+  // Agents read the saved answer from status --json, which never asks npm itself.
+  await checkedToday(NEWER);
+  expect(JSON.parse((await run("status", "--json")).stdout)).toMatchObject({
+    cli_version: VERSION,
+    latest_cli_version: NEWER,
+  });
+  expect(
+    JSON.parse((await runWith({ TELEMETRY_DEV_NO_UPDATE_CHECK: "1" }, "status", "--json")).stdout),
+  ).toMatchObject({ cli_version: VERSION, latest_cli_version: null });
+  // An answer from before this CLI was updated is older than it, so not the latest.
+  await checkedToday("0.0.1");
+  expect(JSON.parse((await run("status", "--json")).stdout)).toMatchObject({
+    latest_cli_version: null,
+  });
+  expect(registry.requests).toBe(1);
+});
+
+test("the update check never delays a command, and stays out of --json, pipes, CI, and when turned off", async () => {
+  await signIn(PROJECTS[0]);
+  registry.latest = NEWER;
+  registry.hang = true;
+
+  // The command finishes while npm's answer is still owed.
+  beforeTool.wait = new Promise<void>((resolve) => {
+    registry.onRequest = resolve;
+  });
+  const started = Date.now();
+  const stalled = await onTerminal(CLI, {}, "traces");
+  expect(stalled.code).toBe(0);
+  expect(Date.now() - started).toBeLessThan(3000);
+  expect(stalled.stderr).not.toContain("is available");
+  await expect(stat(updateCheckPath())).rejects.toThrow();
+  delete beforeTool.wait;
+
+  // With an answer saved that a person on a terminal would be shown:
+  await checkedToday(NEWER);
+  registry.requests = 0;
+
+  for (const quiet of [
+    await onTerminal(CLI, {}, "status", "--json"),
+    await runWith({ npm_config_registry: `${fixture.url}/` }, "status"),
+    await onTerminal(CLI, { CI: "true" }, "status"),
+    await onTerminal(CLI, { TELEMETRY_DEV_NO_UPDATE_CHECK: "1" }, "status"),
+    await onTerminal(CLI, { NO_UPDATE_NOTIFIER: "1" }, "status"),
+  ]) {
+    expect(quiet.code).toBe(0);
+    expect(quiet.stderr).not.toContain("is available");
+  }
+
+  // A day-old answer is asked again.
+  await writeFile(
+    updateCheckPath(),
+    JSON.stringify({
+      latest: NEWER,
+      checked_at: new Date(Date.now() - 25 * 3600_000).toISOString(),
+    }),
+  );
+  registry.hang = false;
+  beforeTool.wait = new Promise<void>((resolve) => {
+    registry.onAnswer = resolve;
+  });
+  await onTerminal(CLI, {}, "traces");
+  expect(registry.requests).toBe(1);
+});
+
+test("npm's answer is announced only when it is a newer stable version, and never reaches the terminal as given", async () => {
+  await signIn(PROJECTS[0]);
+
+  for (const latest of [`${NEWER}-rc.1`, "0.0.1", VERSION, `${NEWER}\u001b]52;c;aGk=\u0007`]) {
+    await rm(updateCheckPath(), { force: true });
+    registry.latest = latest;
+    beforeTool.wait = new Promise<void>((resolve) => {
+      registry.onAnswer = resolve;
+    });
+
+    const result = await onTerminal(CLI, {}, "traces");
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("is available");
+    expect(result.stderr).not.toContain("]52;");
+  }
+
+  // A corrupt saved answer is asked again and replaced.
+  await writeFile(updateCheckPath(), "{not json");
+  registry.latest = NEWER;
+  beforeTool.wait = new Promise<void>((resolve) => {
+    registry.onAnswer = resolve;
+  });
+  expect((await onTerminal(CLI, {}, "traces")).stderr).toContain(NOTICE);
+  expect(JSON.parse(await readFile(updateCheckPath(), "utf8"))).toMatchObject({ latest: NEWER });
+});
+
+test("right after sign-in, the next step fits what the workspace has: a project to choose, or traces to send", async () => {
+  // With several projects and no default, the welcome leads with choosing one.
+  await signIn();
+  const welcome = await onTerminal(CLI, { TELEMETRY_DEV_NO_UPDATE_CHECK: "1" });
+  expect(welcome.code).toBe(0);
+  expect(welcome.stdout).toContain(
+    "No default project. To set one: telemetry projects, then telemetry use <name>",
+  );
+  // TELEMETRY_DEV_PROJECT picks one for every command, so there is nothing to choose.
+  expect(
+    (
+      await onTerminal(CLI, {
+        TELEMETRY_DEV_NO_UPDATE_CHECK: "1",
+        TELEMETRY_DEV_PROJECT: PROJECTS[1].name,
+      })
+    ).stdout,
+  ).not.toContain("No default project");
+
+  await signIn(PROJECTS[0]);
+  expect((await onTerminal(CLI, { TELEMETRY_DEV_NO_UPDATE_CHECK: "1" })).stdout).not.toContain(
+    "No default project",
+  );
+
+  // A project no traces were sent to yet points at setting up the SDK.
+  serverState.empty = true;
+  const first = await run("traces");
+  expect(first.code).toBe(0);
+  expect(first.stderr).toContain(
+    "No traces in support-bot outside experiments, which --env experiment lists. To send some, see https://telemetry.dev/docs/quickstart",
+  );
+
+  // A search that was narrowed found nothing for its own reasons.
+  for (const narrowed of [["--errors"], ["--name", "checkout"], ["--since", "2h"]]) {
+    const result = await run("traces", ...narrowed);
+    expect(result.stderr).toContain("No traces match");
+    expect(result.stderr).not.toContain("quickstart");
+  }
+
+  // An empty sessions search suggests only windows wider than the one it searched.
+  const widen = async (...range: string[]) => (await run("sessions", ...range)).stderr.trim();
+  expect(await widen()).toBe("No sessions match. Widen the window with --range 7d or --range 30d.");
+  expect(await widen("--range", "7d")).toBe(
+    "No sessions match. Widen the window with --range 30d.",
+  );
+  expect(await widen("--range", "30d")).toBe("No sessions match.");
 });
 
 test("login --json prints the link without opening a browser or waiting, and --finish --json prints the sign-in", async () => {

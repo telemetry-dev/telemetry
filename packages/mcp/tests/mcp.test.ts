@@ -164,7 +164,7 @@ test("propagates baggage only when enabled", async () => {
 test("works through the official v2 client and server connection lifecycle", async () => {
   const spans = setup();
   const [clientRaw, serverRaw] = InMemoryTransport.createLinkedPair();
-  const client = new Client({ name: "test-client", version: "1.0.0" });
+  const client = new Client({ name: "test-client", version: "3.2.1" });
   const server = new McpServer({ name: "test-server", version: "1.0.0" });
   let preexistingCalls = 0;
   serverRaw.onmessage = function (message) {
@@ -192,6 +192,13 @@ test("works through the official v2 client and server connection lifecycle", asy
   expect(
     toolSpans.every((span) => typeof span.attributes["mcp.protocol.version"] === "string"),
   ).toBe(true);
+  // The client's own info, on both sides, never the server's.
+  for (const span of toolSpans) {
+    expect(span.attributes).toMatchObject({
+      "mcp.client.name": "test-client",
+      "mcp.client.version": "3.2.1",
+    });
+  }
   expect(preexistingCalls).toBe(1);
 
   await client.close();
@@ -232,6 +239,8 @@ test("completes responses before a per-request HTTP transport closes", async () 
           _meta: {
             "io.modelcontextprotocol/protocolVersion": "2026-07-28",
             "io.modelcontextprotocol/clientCapabilities": {},
+            // Self-reported, so an overlong name is cut.
+            "io.modelcontextprotocol/clientInfo": { name: "c".repeat(500), version: "0.1.7" },
           },
         },
       }),
@@ -246,6 +255,8 @@ test("completes responses before a per-request HTTP transport closes", async () 
   });
   const [span] = await exported(spans, 1);
   expect(span?.attributes["mcp.method.name"]).toBe("tools/list");
+  expect(span?.attributes["mcp.client.name"]).toBe("c".repeat(128));
+  expect(span?.attributes["mcp.client.version"]).toBe("0.1.7");
   expect(span?.attributes["error.type"]).toBeUndefined();
   expect(span?.status.code).toBe(SpanStatusCode.UNSET);
   await handler.close();

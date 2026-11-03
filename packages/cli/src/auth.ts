@@ -13,8 +13,9 @@ import type {
 } from "@modelcontextprotocol/client";
 
 import { CliError, EXIT, translateError } from "./errors.ts";
+import { BIN } from "./invocation.ts";
 import { loadSession, mcpUrl, type Session, updateSession } from "./session.ts";
-import { oneLine } from "./terminal.ts";
+import { ADDRESS, oneLine } from "./terminal.ts";
 
 export const PAYLOADS_SCOPE = "telemetry:payloads";
 
@@ -186,9 +187,33 @@ export class SessionAuthProvider implements OAuthClientProvider {
   }
 
   redirectToAuthorization(url: URL) {
+    // The SDK drops a refused refresh token through invalidateCredentials before it asks
+    // for a new authorization, but keeps one whose refresh got no answer, such as a
+    // network error or a 5xx. It also skips, without dropping them, tokens another
+    // issuer stamped. telemetry.dev sends no insufficient_scope challenge, the SDK's
+    // other reason to reauthorize with a refresh token in hand.
+    if (!this.#login && this.session.tokens?.refresh_token && this.#tokensFromIssuer()) {
+      throw new CliError(
+        `Couldn't renew the sign-in with ${new URL(this.session.server).host}. Try again shortly.`,
+        { code: "server_error", retryable: true },
+      );
+    }
+
     if (!this.#login) throw sessionExpired();
 
     this.#login.open(url);
+  }
+
+  // Compared as the SDK compares them, allowing one trailing slash of difference. A
+  // stamp or issuer that isn't known yet can't rule the tokens out.
+  #tokensFromIssuer() {
+    const stamped = this.session.tokens?.issuer;
+    const issuer = this.session.discovery?.authorizationServerMetadata?.issuer;
+    const bare = (url: string) => url.replace(/\/$/, "");
+
+    return (
+      typeof stamped !== "string" || typeof issuer !== "string" || bare(stamped) === bare(issuer)
+    );
   }
 
   saveCodeVerifier(verifier: string) {
@@ -264,10 +289,10 @@ export class SessionAuthProvider implements OAuthClientProvider {
 }
 
 const sessionExpired = () =>
-  new CliError("Your sign-in has expired or was disconnected. Run `telemetry login` again.", {
+  new CliError(`Your sign-in has expired or was disconnected. Run ${BIN} login again.`, {
     exitCode: EXIT.auth,
     code: "sign_in_expired",
-    hint: "telemetry login",
+    hint: `${BIN} login`,
   });
 
 export const grantedScopes = (session: Session) =>
@@ -400,11 +425,27 @@ const readPastedCallback = async (state: string, signal: AbortSignal): Promise<C
   // Readline swallows Ctrl-C unless something listens; hand it to the process handler.
   prompt.on("SIGINT", () => process.kill(process.pid, "SIGINT"));
 
+  // Readline rejects a question for Ctrl-D on a terminal, but not when stdin ends.
+  const ended = new Promise<never>((_, reject) => {
+    prompt.once("close", () => reject(new Error("stdin ended")));
+  });
+  ended.catch(() => {});
+
   try {
     for (;;) {
+      const question = prompt.question(
+        "If the page after Allow doesn't load, paste its address here: ",
+        { signal },
+      );
       const answer = (
-        await prompt.question("If the page after Allow doesn't load, paste its address here: ", {
-          signal,
+        await Promise.race([question, ended]).catch((error: unknown) => {
+          if (signal.aborted) throw error;
+
+          throw new CliError("Sign-in was cancelled.", {
+            exitCode: EXIT.auth,
+            code: "sign_in_failed",
+            hint: `${BIN} login`,
+          });
         })
       ).trim();
 
@@ -481,16 +522,16 @@ const authorize = async (
     if (error instanceof OAuthError) {
       throw new CliError(
         error.code === "invalid_grant"
-          ? "That sign-in link was already used or has expired. Run `telemetry login` again."
+          ? `That sign-in link was already used or has expired. Run ${BIN} login again.`
           : `Sign-in failed: ${oneLine(error.message).slice(0, 300)}`,
-        { exitCode: EXIT.auth, code: "sign_in_failed", hint: "telemetry login" },
+        { exitCode: EXIT.auth, code: "sign_in_failed", hint: `${BIN} login` },
       );
     }
 
     if (error instanceof IssuerMismatchError || error instanceof AuthorizationServerMismatchError) {
       throw new CliError(
-        "The sign-in answer came from a different authorization server than this sign-in started with. Run `telemetry login` again.",
-        { exitCode: EXIT.auth, code: "sign_in_failed", hint: "telemetry login" },
+        `The sign-in answer came from a different authorization server than this sign-in started with. Run ${BIN} login again.`,
+        { exitCode: EXIT.auth, code: "sign_in_failed", hint: `${BIN} login` },
       );
     }
 
@@ -499,11 +540,11 @@ const authorize = async (
       throw new CliError(`Sign-in failed: ${oneLine(error.message).slice(0, 300)}`, {
         exitCode: EXIT.auth,
         code: "sign_in_failed",
-        hint: "telemetry login",
+        hint: `${BIN} login`,
       });
     }
 
-    return translateError(error, []);
+    return translateError(error, [], provider.session.server);
   }
 };
 
@@ -516,7 +557,7 @@ const redeem = async (provider: SessionAuthProvider, params: URLSearchParams) =>
       error === "access_denied"
         ? "Sign-in was cancelled in the browser."
         : `Sign-in failed: ${oneLine(params.get("error_description") ?? error)}.`,
-      { exitCode: EXIT.auth, code: "sign_in_failed", hint: "telemetry login" },
+      { exitCode: EXIT.auth, code: "sign_in_failed", hint: `${BIN} login` },
     );
   }
 
@@ -524,8 +565,8 @@ const redeem = async (provider: SessionAuthProvider, params: URLSearchParams) =>
 
   if (!code) {
     throw new CliError(
-      "The browser returned without an authorization code. Run `telemetry login` again.",
-      { exitCode: EXIT.auth, code: "sign_in_failed", hint: "telemetry login" },
+      `The browser returned without an authorization code. Run ${BIN} login again.`,
+      { exitCode: EXIT.auth, code: "sign_in_failed", hint: `${BIN} login` },
     );
   }
 
@@ -597,15 +638,15 @@ export const login = async ({
 
     if (finish.trim() === "") {
       throw new CliError(
-        "Pass the address the browser ended on: telemetry login --finish '<address>'",
+        `Pass the address the browser ended on: ${BIN} login --finish ${ADDRESS}`,
         EXIT.usage,
       );
     }
 
     if (!pending) {
       throw new CliError(
-        "No sign-in is waiting to finish. Run `telemetry login --no-browser` to start one.",
-        { exitCode: EXIT.auth, code: "no_pending_sign_in", hint: "telemetry login --no-browser" },
+        `No sign-in is waiting to finish. Run ${BIN} login --no-browser to start one.`,
+        { exitCode: EXIT.auth, code: "no_pending_sign_in", hint: `${BIN} login --no-browser` },
       );
     }
 
@@ -677,21 +718,25 @@ export const login = async ({
         timeout = setTimeout(
           () =>
             reject(
-              new CliError(
-                "Sign-in timed out after 10 minutes. Run `telemetry login` to try again.",
-                { exitCode: EXIT.auth, code: "sign_in_failed", hint: "telemetry login" },
-              ),
+              new CliError(`Sign-in timed out after 10 minutes. Run ${BIN} login to try again.`, {
+                exitCode: EXIT.auth,
+                code: "sign_in_failed",
+                hint: `${BIN} login`,
+              }),
             ),
           LOGIN_TIMEOUT_MS,
         );
       }),
     ];
 
-    if (!useBrowser) {
+    // Also with a browser: one that never opened, such as xdg-open missing or failing,
+    // or a person who signed in on another device, leaves only the pasted address.
+    if (process.stdin.isTTY) {
       const pasted = readPastedCallback(state, abort.signal).then(({ params }) => params);
       // The prompt rejects when it is aborted after the browser answered first.
       pasted.catch(() => {});
-      waits.push(pasted);
+      // A prompt closed with Ctrl-D only stops asking while a browser can still answer.
+      waits.push(useBrowser ? pasted.catch(() => new Promise<never>(() => {})) : pasted);
     }
 
     return { status: "signed-in", session: await redeem(provider, await Promise.race(waits)) };

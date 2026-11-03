@@ -1,6 +1,7 @@
-import { Api } from "./api.ts";
+import { Api, VERSION } from "./api.ts";
 import { grantedScopes, login, logout, PAYLOADS_SCOPE } from "./auth.ts";
 import { CliError, EXIT, notSignedIn, payloadsNotAllowed, usageError } from "./errors.ts";
+import { BIN, INSTALL } from "./invocation.ts";
 import { printMark } from "./mark.ts";
 import {
   DEFAULT_SERVER,
@@ -11,6 +12,7 @@ import {
   updateSession,
 } from "./session.ts";
 import {
+  ADDRESS,
   type Cell,
   clean,
   type Column,
@@ -28,9 +30,12 @@ import {
   outputWidth,
   type Paint,
   reportStatus,
+  shellQuote,
+  shellWords,
   style,
   table,
 } from "./terminal.ts";
+import { cachedLatestVersion } from "./update.ts";
 import type {
   LogList,
   PayloadPage,
@@ -125,14 +130,14 @@ const matchProject = (projects: ProjectList["projects"], wanted: string): Projec
 
   if (byName.length > 1) {
     throw usageError(
-      `Several projects are named "${wanted}". Pass its id instead: telemetry projects`,
-      { code: "project_ambiguous", hint: "telemetry projects" },
+      `Several projects are named "${wanted}". Pass its id instead: ${BIN} projects`,
+      { code: "project_ambiguous", hint: `${BIN} projects` },
     );
   }
 
   throw usageError(`No project "${wanted}" in this workspace. Projects: ${names || "none"}.`, {
     code: "project_not_found",
-    hint: "telemetry projects",
+    hint: `${BIN} projects`,
   });
 };
 
@@ -155,13 +160,13 @@ const resolveProject = async (api: Api, context: Context): Promise<Project> => {
   if (projects.length === 1) return toProject(projects[0]!);
 
   if (projects.length === 0)
-    throw new CliError("This workspace has no projects yet. Create one at telemetry.dev.", {
+    throw new CliError(`This workspace has no projects yet. Create one at ${api.session.server}`, {
       code: "no_projects",
     });
 
   throw usageError(
-    `Choose a project with --project <name>, or set a default with \`telemetry use <name>\`. Projects: ${projectNames(projects)}.`,
-    { code: "project_required", hint: "telemetry projects" },
+    `Choose a project with --project <name>, or set a default with ${BIN} use <name>. Projects: ${projectNames(projects)}.`,
+    { code: "project_required", hint: `${BIN} projects` },
   );
 };
 
@@ -380,18 +385,11 @@ const noteCapped = (context: Context, window: Window | undefined) => {
 };
 
 /**
- * `arg` quoted for a POSIX shell, so a suggested command runs as shown when pasted. A
- * leading `=` is quoted too: zsh expands `=name` to a command's path.
- */
-const shellQuote = (arg: string) =>
-  /^[\w@%+:,./-][\w@%+=:,./-]*$/.test(arg) ? arg : `'${arg.replaceAll("'", `'\\''`)}'`;
-
-/**
- * A telemetry command to suggest, quoted for a POSIX shell, that keeps this command's
+ * A telemetry command to suggest, quoted for this shell, that keeps this command's
  * project so it reads the same one when pasted. Option values are joined with `=`, so a
- * value starting with `-` isn't read as an option. Undefined when an id starts with `-`
- * or a value holds characters the terminal line can't show as they are, since the
- * printed command would then name something else.
+ * value starting with `-` isn't read as an option. Undefined when an id starts with `-`,
+ * a value holds characters the terminal line can't show as they are, or the shell has
+ * no quoting for one, since the printed command would then name something else.
  */
 const suggestion = (
   context: Context,
@@ -407,14 +405,15 @@ const suggestion = (
 
   if (!Object.values(values).every(shown)) return undefined;
 
-  return [
-    "telemetry",
+  const args = [
     command,
     ...ids,
     ...Object.entries(values).map(([name, value]) => `--${name}=${value}`),
-  ]
-    .map(shellQuote)
-    .join(" ");
+  ];
+
+  const words = shellWords(args);
+
+  return words === undefined ? undefined : `${BIN} ${words}`;
 };
 
 const labelled = (label: string, command: string | undefined) =>
@@ -448,9 +447,13 @@ const nextPage = (context: Context, cursor: string | null) => {
   }
 
   // A cursor is base64url, which can start with `-`.
-  const command = [...kept, `--cursor=${cursor}`].map((arg) => shellQuote(clean(arg))).join(" ");
+  const command = shellWords([...kept, `--cursor=${cursor}`].map(clean));
 
-  return `More: telemetry ${command}`;
+  // Still say there is more when no quoting keeps the command as typed. The cursor is
+  // plain base64url, so it reads the same in every shell.
+  return command === undefined
+    ? `More: run the same command with --cursor=${clean(cursor)}`
+    : `More: ${BIN} ${command}`;
 };
 
 const statusCell = (status: string): Cell =>
@@ -472,8 +475,9 @@ export async function home() {
   out();
 
   if (!signedIn) {
-    out(`Get started: ${style.bold("telemetry login")}`);
-    out(style.dim("Then run telemetry --help to see every command."));
+    out(`Get started: ${style.bold(`${BIN} login`)}`);
+    out(style.dim(`Then run ${BIN} --help to see every command.`));
+    if (INSTALL) out(style.dim(`To run it as telemetry, install it: ${INSTALL}`));
     out();
 
     return;
@@ -484,12 +488,20 @@ export async function home() {
   out(`${who}${project}`);
   out();
 
+  // TELEMETRY_DEV_PROJECT, when set, picks the project for every command.
+  if (!session.project && !process.env.TELEMETRY_DEV_PROJECT?.trim()) {
+    out(
+      `No default project. To set one: ${style.bold(`${BIN} projects`)}, then ${style.bold(`${BIN} use <name>`)}`,
+    );
+    out();
+  }
+
   const suggestions: [string, string][] = [
-    ["telemetry traces --errors", "Recent failed runs"],
-    ["telemetry trace <id>", "A run's spans, timing, and logs"],
-    ["telemetry sessions", "Conversations and agent runs"],
-    ["telemetry usage", "Requests, tokens, and cost"],
-    ["telemetry logs --level error", "Recent error logs"],
+    [`${BIN} traces --errors`, "Recent failed runs"],
+    [`${BIN} trace <id>`, "A run's spans, timing, and logs"],
+    [`${BIN} sessions`, "Conversations and agent runs"],
+    [`${BIN} usage`, "Requests, tokens, and cost"],
+    [`${BIN} logs --level error`, "Recent error logs"],
   ];
 
   const width = Math.max(...suggestions.map(([command]) => command.length));
@@ -497,7 +509,8 @@ export async function home() {
   for (const [command, summary] of suggestions)
     out(`  ${command.padEnd(width)}  ${style.dim(summary)}`);
   out();
-  out(style.dim("Run telemetry --help for every command."));
+  out(style.dim(`Run ${BIN} --help for every command.`));
+  if (INSTALL) out(style.dim(`To run it as telemetry, install it: ${INSTALL}`));
   out();
 }
 
@@ -550,7 +563,7 @@ export async function loginCommand(context: Context) {
       printJson({
         status: "pending",
         authorization_url: authorizationUrl,
-        next: "telemetry login --finish '<address>'",
+        next: `${BIN} login --finish ${ADDRESS}`,
       });
 
       return;
@@ -560,7 +573,7 @@ export async function loginCommand(context: Context) {
       "After you select Allow, the browser opens an http://127.0.0.1 address that doesn't load. Copy the whole address and run:",
     );
     note();
-    note(`  telemetry login --finish '<address>'`);
+    note(`  ${BIN} login --finish ${ADDRESS}`);
 
     return;
   }
@@ -585,15 +598,20 @@ export async function loginCommand(context: Context) {
     await api.close();
   }
 
-  if (projects?.length === 1) {
-    const project = toProject(projects[0]!);
+  // Signing in again, such as after the sign-in expired, keeps the default project when
+  // the chosen workspace still has it.
+  const kept = projects?.find(({ id }) => id === session.project?.id);
+  const chosen = kept ?? (projects?.length === 1 ? projects[0] : undefined);
+
+  if (chosen) {
+    const project = toProject(chosen);
 
     signedIn.project = project;
     await updateSession(signedIn.server, (saved) => ({ ...saved, project }));
   }
 
   if (asJson) {
-    printJson({ status: "signed_in", ...sessionJson(signedIn) });
+    printJson({ status: "signed_in", ...(await sessionJson(signedIn)) });
 
     return;
   }
@@ -606,7 +624,7 @@ export async function loginCommand(context: Context) {
   if (!grantedScopes(signedIn).has(PAYLOADS_SCOPE)) {
     note(
       style.dim(
-        "  Captured prompts and outputs stay hidden. Sign in again and allow them to use `telemetry payload`.",
+        `  Captured prompts and outputs stay hidden. Sign in again and allow them to use ${BIN} payload.`,
         stream,
       ),
     );
@@ -614,22 +632,22 @@ export async function loginCommand(context: Context) {
 
   if (lookupFailure) {
     note(style.dim(`  Couldn't load your projects: ${oneLine(lookupFailure.message)}`, stream));
-    note(style.dim("  Run telemetry projects to list them.", stream));
+    note(style.dim(`  Run ${BIN} projects to list them.`, stream));
   } else if (signedIn.project) {
     note(`  Project ${style.bold(signedIn.project.name, stream)}`);
     note();
-    note(
-      `Try ${style.bold("telemetry traces", stream)} or ${style.bold("telemetry usage", stream)}.`,
-    );
+    note(`Try ${style.bold(`${BIN} traces`, stream)} or ${style.bold(`${BIN} usage`, stream)}.`);
   } else if (projects && projects.length > 1) {
     note(`  ${projects.length} projects: ${projectNames(projects)}`);
     note();
     note(
-      `Choose a default: ${style.bold(`telemetry use ${shellQuote(toProject(projects[0]!).name)}`, stream)}`,
+      `Choose a default: ${style.bold(`${BIN} use ${shellQuote(toProject(projects[0]!).name) ?? "<name>"}`, stream)}`,
     );
   } else {
-    note("  This workspace has no projects yet. Create one at telemetry.dev.");
+    note(`  This workspace has no projects yet. Create one at ${signedIn.server}`);
   }
+
+  if (INSTALL) note(style.dim(`To run it as telemetry, install it: ${INSTALL}`, stream));
 }
 
 export async function logoutCommand(context: Context) {
@@ -662,19 +680,23 @@ export async function logoutCommand(context: Context) {
   if (!revoked)
     note(
       style.dim(
-        "The server didn't confirm the sign-out, so the sign-in may still work elsewhere. To end it, disconnect the CLI in account settings at telemetry.dev.",
+        `The server didn't confirm the sign-out, so the sign-in may still work elsewhere. To end it, disconnect the CLI in account settings at ${session.server}.`,
         process.stderr,
       ),
     );
 }
 
-/** What `status --json` and `login --json` say about a sign-in. */
-const sessionJson = (session: Session) => ({
+/** What `status --json` and `login --json` say about a sign-in and this CLI. */
+const sessionJson = async (session: Session) => ({
   signed_in: Boolean(session.tokens),
+  // Whether telemetry.dev confirmed signed_in, rather than only the saved sign-in.
+  sign_in_verified: true,
   server: session.server,
   email: session.email ?? null,
   project: session.project ?? null,
   payloads_allowed: grantedScopes(session).has(PAYLOADS_SCOPE),
+  cli_version: VERSION,
+  latest_cli_version: await cachedLatestVersion(),
 });
 
 export async function statusCommand(context: Context) {
@@ -682,25 +704,58 @@ export async function statusCommand(context: Context) {
   const session = await loadSession(server);
   const scopes = grantedScopes(session);
 
+  // Saved tokens can have expired, been revoked, or belong to a workspace the account
+  // left, so one call checks them. A failure for another reason, such as no network,
+  // leaves the sign-in reported as saved.
+  let refused: CliError | undefined;
+  let unchecked: CliError | undefined;
+
+  if (session.tokens) {
+    const api = new Api(session);
+
+    try {
+      await api.call<ProjectList>("list_projects", {}, "Checking sign-in");
+    } catch (error) {
+      if (!(error instanceof CliError)) throw error;
+
+      if (error.exitCode === EXIT.auth) refused = error;
+      else unchecked = error;
+    } finally {
+      await api.close();
+    }
+  }
+
+  const signedIn = Boolean(session.tokens) && !refused;
+
   if (json(context)) {
-    printJson(sessionJson(session));
+    printJson({
+      ...(await sessionJson(session)),
+      signed_in: signedIn,
+      sign_in_verified: !unchecked,
+    });
+  } else if (refused) {
+    out(refused.message);
   } else if (session.tokens) {
     out(
       `${style.green("✓")} Signed in${session.email ? ` as ${style.bold(oneLine(session.email))}` : ""}`,
     );
     out(
-      `  Project   ${session.project ? oneLine(session.project.name) : style.dim("none set · telemetry use <name>")}`,
+      `  Project   ${session.project ? oneLine(session.project.name) : style.dim(`none set · ${BIN} use <name>`)}`,
     );
     out(
       `  Payloads  ${scopes.has(PAYLOADS_SCOPE) ? "allowed" : style.dim("not allowed · sign in again to allow")}`,
     );
 
     if (server !== DEFAULT_SERVER) out(`  Server    ${server}`);
+
+    if (unchecked) {
+      note(style.dim(`Couldn't check the sign-in: ${oneLine(unchecked.message)}`, process.stderr));
+    }
   } else {
-    out(`Not signed in. Run ${style.bold("telemetry login")}.`);
+    out(`Not signed in. Run ${style.bold(`${BIN} login`)}.`);
   }
 
-  if (!session.tokens) process.exitCode = EXIT.auth;
+  if (!signedIn) process.exitCode = EXIT.auth;
 }
 
 export async function projectsCommand(context: Context) {
@@ -735,7 +790,7 @@ export async function projectsCommand(context: Context) {
 export async function useCommand(context: Context) {
   const wanted = context.positionals[0];
 
-  if (!wanted) throw usageError("Name the project to use: telemetry use <name|id>");
+  if (!wanted) throw usageError(`Name the project to use: ${BIN} use <name|id>`);
 
   await withApi(async (api, session) => {
     const { projects } = await api.call<ProjectList>("list_projects", {}, "Finding project");
@@ -750,6 +805,8 @@ export async function useCommand(context: Context) {
     );
   });
 }
+
+const QUICKSTART_URL = "https://telemetry.dev/docs/quickstart";
 
 // A server from before windows would ignore these, so the result must have a window. A server
 // with windows but without agent and tool refuses those two (refusedArguments).
@@ -800,10 +857,21 @@ export async function tracesCommand(context: Context) {
     if (json(context)) return printJson(page);
 
     if (page.traces.length === 0) {
+      const narrowed =
+        window.flags.length > 0 ||
+        sentFilters.length > 0 ||
+        ["name", "env", "session", "user", "cursor"].some((name) => string(context, name)) ||
+        context.values.errors === true;
+
+      // Right after sign-in, the first traces command often finds a project with no
+      // traces sent yet, and the next step is setting up the SDK, not a wider search.
+      // Without --env, telemetry.dev leaves out experiment runs, which may be all there is.
       nothing(
-        window.flags.length > 0 && page.window
-          ? `No traces match ${windowText(page.window)}.`
-          : "No traces match.",
+        !narrowed
+          ? `No traces in ${project.name} outside experiments, which --env experiment lists. To send some, see ${QUICKSTART_URL}`
+          : window.flags.length > 0 && page.window
+            ? `No traces match ${windowText(page.window)}.`
+            : "No traces match.",
       );
 
       return noteCapped(context, page.window);
@@ -848,8 +916,19 @@ export async function tracesCommand(context: Context) {
   });
 }
 
+const RANGE_HOURS = { "24h": 24, "72h": 72, "7d": 168, "30d": 720 } as const;
+
+/** A hint naming only the --range values wider than this search's, default 24h. */
+const widerRanges = (range: string | undefined) => {
+  const hours = RANGE_HOURS[(range ?? "24h") as keyof typeof RANGE_HOURS];
+  const wider = (["7d", "30d"] as const)
+    .filter((name) => RANGE_HOURS[name] > hours)
+    .map((name) => `--range ${name}`);
+
+  return wider.length === 0 ? "" : ` Widen the window with ${wider.join(" or ")}.`;
+};
+
 export async function sessionsCommand(context: Context) {
-  const RANGE = { "24h": 24, "72h": 72, "7d": 168, "30d": 720 } as const;
   const window = timeWindow(context);
 
   await withApi(async (api) => {
@@ -859,7 +938,7 @@ export async function sessionsCommand(context: Context) {
       "search_sessions",
       {
         project_id: project.id,
-        range_hours: choice(context, "range", RANGE),
+        range_hours: choice(context, "range", RANGE_HOURS),
         ...window.args,
         contains: string(context, "contains"),
         agent: string(context, "agent"),
@@ -880,9 +959,7 @@ export async function sessionsCommand(context: Context) {
       nothing(
         window.flags.length > 0 && page.window
           ? `No sessions match ${windowText(page.window)}.`
-          : string(context, "range") === "30d"
-            ? "No sessions match."
-            : "No sessions match. Widen the window with --range 7d or --range 30d.",
+          : `No sessions match.${widerRanges(string(context, "range"))}`,
       );
 
       return noteCapped(context, page.window);
@@ -1019,7 +1096,7 @@ const levelPaint = (level: string): Paint =>
 export async function traceCommand(context: Context) {
   const traceId = context.positionals[0];
 
-  if (!traceId) throw usageError("Name the trace to show: telemetry trace <trace-id>");
+  if (!traceId) throw usageError(`Name the trace to show: ${BIN} trace <trace-id>`);
 
   await withApi(async (api, session) => {
     const project = await resolveProject(api, context);
@@ -1387,9 +1464,11 @@ function renderTrace(page: TraceDetailPage, spans: readonly Span[], logs: TraceD
           : `+${formatDuration(offset)}`,
     ]);
 
-    if (failedSpan && span.error) {
+    // The span id leads, so it survives a cut line: `payload` needs it to read the error.
+    if (failedSpan) {
       const guide = prefix.replace(/├─ $/, "│  ").replace(/└─ $/, "   ");
-      errors.set(rows.length - 1, `${guide}   ${oneLine(span.error)}`);
+      const error = span.error ? `: ${oneLine(span.error)}` : "";
+      errors.set(rows.length - 1, `${guide}   span ${oneLine(span.id)}${error}`);
     }
   }
 
@@ -1697,7 +1776,7 @@ export async function payloadCommand(context: Context) {
 
   if (!traceId || !spanId) {
     throw usageError(
-      "Name the span: telemetry payload <trace-id> <span-id>. Span ids are in `telemetry trace <trace-id> --json`.",
+      `Name the span: ${BIN} payload <trace-id> <span-id>. ${BIN} trace <trace-id> shows the id of each failed span, and --json shows every span's.`,
     );
   }
 
