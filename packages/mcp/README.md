@@ -60,6 +60,8 @@ await server.connect(transport);
 
 `instrumentMcpTransport(transport)` mutates and returns the same transport and is idempotent.
 
+Request spans also carry `mcp.client.name` and `mcp.client.version`, from the `clientInfo` the client reports, each cut to 128 characters. Since protocol 2026-07-28, every request carries it. On older protocol versions, only `initialize` does, and later requests on the same transport reuse it. The OpenTelemetry MCP conventions don't define these two attributes yet.
+
 ## Payload capture
 
 Tool arguments and successful tool results are not captured by default. Enable them with `instrumentMcpTransport(transport, { capturePayloads: true })`. Core `@telemetry-dev/sdk` capture and masking settings still apply.

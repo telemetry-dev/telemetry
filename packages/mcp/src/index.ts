@@ -71,6 +71,11 @@ interface RequestSpanAttributes extends Record<string, string> {
   "mcp.method.name": string;
 }
 
+interface ClientInfo {
+  name?: string;
+  version?: string;
+}
+
 interface InjectedRequest extends JsonRecord {
   params: JsonRecord;
 }
@@ -79,6 +84,11 @@ const INSTRUMENTED = new WeakSet<object>();
 const PROTOCOL_VERSIONS = new WeakMap<object, string>();
 const CALLER_ERROR_CODES = new Set([-32700, -32600, -32601, -32602, -32002, -32021, -32022]);
 const PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion";
+const CLIENT_INFO_META_KEY = "io.modelcontextprotocol/clientInfo";
+const CLIENT_INFOS = new WeakMap<object, ClientInfo>();
+// clientInfo is self-reported by the peer, so its values are bounded before they
+// become attributes.
+const MAX_CLIENT_INFO_LENGTH = 128;
 
 function asRecord(value: unknown): JsonRecord | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -183,6 +193,41 @@ function responseProtocolVersion(
   return PROTOCOL_VERSIONS.get(transport) ?? transport.protocolVersion;
 }
 
+function toClientInfo(value: JsonValue | undefined): ClientInfo | undefined {
+  const record = asRecord(value);
+  const bounded = (field: JsonValue | undefined) =>
+    typeof field === "string" && field !== "" ? field.slice(0, MAX_CLIENT_INFO_LENGTH) : undefined;
+  const name = bounded(record?.name);
+  const version = bounded(record?.version);
+
+  if (name === undefined && version === undefined) return undefined;
+
+  return { ...(name !== undefined && { name }), ...(version !== undefined && { version }) };
+}
+
+/**
+ * The calling client's name and version: from each request's _meta since protocol
+ * 2026-07-28, else from initialize, which is the only legacy request that carries it.
+ */
+function clientInfo(
+  transport: InstrumentableTransport,
+  message: ParsedMessage,
+): ClientInfo | undefined {
+  const modern = toClientInfo(message.meta?.[CLIENT_INFO_META_KEY]);
+
+  if (modern !== undefined) return modern;
+
+  if (message.method === "initialize") {
+    const legacy = toClientInfo(message.params?.clientInfo);
+
+    if (legacy !== undefined) CLIENT_INFOS.set(transport, legacy);
+
+    return legacy;
+  }
+
+  return CLIENT_INFOS.get(transport);
+}
+
 function requestAttributes(
   transport: InstrumentableTransport,
   message: ParsedMessage,
@@ -202,6 +247,11 @@ function requestAttributes(
   const version = protocolVersion(transport, message);
 
   if (version !== undefined) attributes["mcp.protocol.version"] = version;
+  const client = clientInfo(transport, message);
+
+  if (client?.name !== undefined) attributes["mcp.client.name"] = client.name;
+
+  if (client?.version !== undefined) attributes["mcp.client.version"] = client.version;
   const target = targetFor(method, message.params);
 
   if (method === "tools/call" && target !== undefined) attributes["gen_ai.tool.name"] = target;
