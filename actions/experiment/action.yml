@@ -19,7 +19,7 @@ inputs:
     description: Pass marks, as name=value pairs that commas or new lines separate, for example `correctness=0.9`. A pass rate is 0 to 1. They win over the minScores of the script for the same name.
     required: false
   api-key:
-    description: A telemetry.dev API key with the datasets:read and experiments:write scopes. Default the TELEMETRY_DEV_API_KEY variable of the job.
+    description: A telemetry.dev API key with the datasets:read and experiments:write scopes (Run experiments) and, for the traces of the items, Send telemetry. Default the TELEMETRY_DEV_API_KEY variable of the job.
     required: false
   base-url:
     description: The telemetry.dev API. Default https://api.telemetry.dev.
