@@ -268,6 +268,7 @@ export class ConverseStreamState implements StreamState {
   private responseModel: string | undefined;
   private error: Error | undefined;
   private errorFields: SpanFields | undefined;
+  outputRecorded = false;
 
   feed<T>(event: T): void {
     if (!isRecord(event)) return;
@@ -378,6 +379,7 @@ export class ConverseStreamState implements StreamState {
       this.blocks.set(index, block);
     }
 
+    this.outputRecorded = true;
     const stop = isRecord(event.messageStop) ? event.messageStop : undefined;
 
     if (stop) this.stopReason = stringValue(stop.stopReason) ?? this.stopReason;

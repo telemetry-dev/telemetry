@@ -46,6 +46,7 @@ export interface OpHandler {
     t0: number,
     input: JsonRecord,
     options: BedrockInstrumentationOptions,
+    reportError: (cause: unknown) => void,
   ): JsonValue | object;
 }
 
@@ -74,6 +75,7 @@ export function createInstrumentedSend(
     const spanName = safe(() => handler.spanName(input)) ?? name ?? "bedrock";
     const fields = safe(() => handler.requestFields(input, options)) ?? {};
     const span = startRequestSpan(spanName, { type: spanType, ...fields });
+    const reportError = createSpanErrorReporter(span);
     const callbackIndex = rawRest.findIndex((arg) => arg instanceof Function);
 
     if (callbackIndex !== -1) {
@@ -93,9 +95,9 @@ export function createInstrumentedSend(
         let nextData: JsonValue | object = asJsonValue(rawData);
 
         try {
-          nextData = handler.onResult(asJsonValue(rawData), span, t0, input, options);
-        } catch {
-          endSpan(span, awsMetadataFields(metadataOf(rawData)));
+          nextData = handler.onResult(asJsonValue(rawData), span, t0, input, options, reportError);
+        } catch (cause) {
+          endUnmappedSpan(span, rawData, cause, reportError);
         }
 
         callback(asJsonValue(rawError), asJsonValue(nextData));
@@ -121,9 +123,9 @@ export function createInstrumentedSend(
     return Promise.resolve(result).then(
       (resolved) => {
         try {
-          return handler.onResult(asJsonValue(resolved), span, t0, input, options);
-        } catch {
-          endSpan(span, awsMetadataFields(metadataOf(resolved)));
+          return handler.onResult(asJsonValue(resolved), span, t0, input, options, reportError);
+        } catch (cause) {
+          endUnmappedSpan(span, resolved, cause, reportError);
 
           return resolved;
         }
@@ -151,6 +153,56 @@ export function safe<T>(fn: () => T): T | undefined {
     return fn();
   } catch {
     return undefined;
+  }
+}
+
+// reportError is optional on SpanHandle, so older cores without it still work.
+function reportSpanError(span: SpanHandle, cause: unknown): void {
+  try {
+    span.reportError?.(cause);
+  } catch {
+    return;
+  }
+}
+
+// One report per stream or call: a mapper that fails on one event likely fails on each one after it.
+function createSpanErrorReporter(span: SpanHandle): (cause: unknown) => void {
+  let reported = false;
+
+  return (cause) => {
+    if (reported) return;
+    reported = true;
+    reportSpanError(span, cause);
+  };
+}
+
+// The call succeeded, so the span is not failed; its output and response fields are lost.
+function endUnmappedSpan<T>(
+  span: SpanHandle,
+  response: T,
+  cause: unknown,
+  reportError: (cause: unknown) => void,
+): void {
+  reportError(cause);
+  const metadata = safe(() => awsMetadataFields(metadataOf(response)));
+  endSpan(span, mergeFields(metadata, { attributes: { [CAPTURE_TRUNCATED_ATTRIBUTE]: true } }));
+}
+
+/**
+ * A stream response's own fields. When they fail to map, the stream still records its output
+ * from its events.
+ */
+export function streamResponseFields<T>(
+  response: T,
+  reportError: (cause: unknown) => void,
+  fields: () => SpanFields,
+): SpanFields {
+  try {
+    return fields();
+  } catch (cause) {
+    reportError(cause);
+
+    return safe(() => awsMetadataFields(metadataOf(response))) ?? {};
   }
 }
 
@@ -337,26 +389,35 @@ export function arrayValue<T, TValue = unknown>(value: TValue): T[] | undefined 
   return Array.isArray(value) ? (value as T[]) : undefined;
 }
 
-export function bytesToString<T>(value: T): string | undefined {
+/** Decodes UTF-8 bytes; with `fatal`, bytes that are not UTF-8 throw instead of decoding lossily. */
+export function bytesToString<T>(value: T, fatal = false): string | undefined {
   const raw: unknown = value;
 
   if (String(raw) === raw) return raw;
 
-  if (raw instanceof Uint8Array) return new TextDecoder().decode(raw);
+  const decoder = new TextDecoder("utf-8", { fatal });
+
+  if (raw instanceof Uint8Array) return decoder.decode(raw);
 
   if (ArrayBuffer.isView(raw)) {
-    return new TextDecoder().decode(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength));
+    return decoder.decode(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength));
   }
 }
 
-export function parseJson<T>(value: T): JsonValue {
-  const text = bytesToString(value);
+/**
+ * Returns undefined for a value that is not text or bytes, or is not valid JSON. With `strict`,
+ * bytes that are not UTF-8 and non-blank text that is not valid JSON throw instead.
+ */
+export function parseJson<T>(value: T, strict = false): JsonValue {
+  const text = bytesToString(value, strict);
 
   if (text === undefined) return undefined;
 
   try {
     return asJsonValue(JSON.parse(text));
-  } catch {
+  } catch (cause) {
+    if (strict && text.trim()) throw cause;
+
     return undefined;
   }
 }
@@ -411,13 +472,39 @@ export interface StreamState {
   readonly retention: StreamRetention;
   /** Whether the exported output itself was cut; defaults to the retention flag. */
   outputTruncated?(): boolean;
+  /**
+   * feed() sets it once the output of the event is kept, so a failure after it loses only
+   * metadata. A state that does not set it has every failure count as lost output.
+   */
+  outputRecorded?: boolean;
+  /** Set when kept metadata is lost: it flags the capture without cutting the output. */
+  metadataLost?: boolean;
+  /** Called after the retention is cut when an event failed before its output was kept. */
+  outputLost?(): void;
+  /** The stream that feeds the state sets it, for failures that feed() handles itself. */
+  reportError?: (cause: unknown) => void;
 }
 
-function finishStream(state: StreamState, span: SpanHandle, partial: boolean): SpanFields {
-  const fields = state.finish(partial);
+function finishStream(
+  state: StreamState,
+  span: SpanHandle,
+  partial: boolean,
+  reportError: (cause: unknown) => void,
+): SpanFields {
+  let fields: SpanFields;
+
+  try {
+    fields = state.finish(partial);
+  } catch (cause) {
+    // The output that the stream kept is lost.
+    reportError(cause);
+    state.retention.truncated = true;
+    fields = {};
+  }
+
   const interrupted = partial || fields.error !== undefined;
 
-  if (!interrupted && !state.retention.truncated) return fields;
+  if (!interrupted && !state.retention.truncated && !state.metadataLost) return fields;
 
   fields.attributes = { ...fields.attributes, [CAPTURE_TRUNCATED_ATTRIBUTE]: true };
   const outputTruncated = state.outputTruncated?.() ?? state.retention.truncated;
@@ -435,6 +522,7 @@ export function wrapAsyncIterable<T>(
   span: SpanHandle,
   t0: number,
   baseFields: SpanFields,
+  reportError: (cause: unknown) => void,
   trackOutputChunks = true,
 ): T {
   if (!iterable || !isAsyncIterable(iterable)) {
@@ -443,6 +531,7 @@ export function wrapAsyncIterable<T>(
     return iterable;
   }
 
+  state.reportError = reportError;
   let ended = false;
   let first = false;
   const unregisterToken = {};
@@ -473,10 +562,30 @@ export function wrapAsyncIterable<T>(
           updateSpan(span, { timeToFirstChunkMs: receivedAt - t0 });
         }
 
-        const stateHasOutput = safe(() => state.feed(event));
+        state.outputRecorded = false;
+        let stateHasOutput: boolean | void | undefined;
 
-        if (trackOutputChunks && (stateHasOutput ?? bedrockEventHasOutput(event))) {
-          safe(() => span.recordOutputChunk?.(receivedAt));
+        try {
+          stateHasOutput = state.feed(event);
+        } catch (cause) {
+          reportError(cause);
+
+          if (!state.outputRecorded) {
+            // The event may have carried output that is now lost. The cut retention keeps no
+            // later output, so the output stays a prefix of the stream.
+            state.retention.truncated = true;
+            state.outputLost?.();
+          }
+        }
+
+        // Chunk timing must not reach the caller. When feed() failed, the fallback reads the
+        // event again and can fail the same way, which feed() reported.
+        try {
+          if (trackOutputChunks && (stateHasOutput ?? bedrockEventHasOutput(event))) {
+            span.recordOutputChunk?.(receivedAt);
+          }
+        } catch {
+          // Instrumentation must never throw into caller code.
         }
 
         yield event;
@@ -485,16 +594,18 @@ export function wrapAsyncIterable<T>(
       completed = true;
     } catch (error) {
       endOnce(
-        mergeFields(finishStream(state, span, true), awsMetadataFields(metadataOf(error)), {
-          error: asError(error),
-        }),
+        mergeFields(
+          finishStream(state, span, true, reportError),
+          awsMetadataFields(metadataOf(error)),
+          { error: asError(error) },
+        ),
       );
       throw error;
     } finally {
       try {
-        if (!ended) endOnce(finishStream(state, span, !completed));
+        if (!ended) endOnce(finishStream(state, span, !completed, reportError));
       } finally {
-        // Also when finishing the stream state throws before the span could end.
+        // Also when finishing the stream throws before the span could end.
         state.retention.release();
       }
     }
@@ -508,7 +619,7 @@ export function wrapAsyncIterable<T>(
     }
   }
 
-  const finishAbandoned = () => endOnce(safe(() => finishStream(state, span, true)));
+  const finishAbandoned = () => endOnce(safe(() => finishStream(state, span, true, reportError)));
   // A caller may keep only the iterator, so once one exists the wrapper is not watched.
   wrapped[Symbol.asyncIterator] = () => {
     const iterator = generator();

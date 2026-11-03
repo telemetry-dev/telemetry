@@ -11,8 +11,9 @@ import {
 import type { Attributes } from "@opentelemetry/api";
 import { SamplingDecision } from "@opentelemetry/sdk-trace-base";
 import { MAX_RECORD_BYTES } from "@telemetry-dev/sdk";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 
+import { AgentStreamState } from "../src/agent-handlers.ts";
 import {
   instrumentBedrockAgents,
   uninstrumentBedrockAgents,
@@ -32,6 +33,7 @@ import {
 afterEach(async () => {
   await teardown();
   uninstrumentBedrockAgents();
+  vi.restoreAllMocks();
 });
 
 test("InvokeAgent aggregates trace usage and return control", async () => {
@@ -581,6 +583,164 @@ test("masked InvokeAgent withholds text when a chunk after the metadata bound is
   expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
   expect(seen.some((value) => value.includes("Complete answer"))).toBe(false);
 });
+
+function mapperBroke(): never {
+  throw Object.assign(new Error("mapper broke"), { name: "MapperError" });
+}
+
+const COMPLETE = { chunk: { bytes: new TextEncoder().encode("Complete answer") } };
+const AFTER = { chunk: { bytes: new TextEncoder().encode(" after") } };
+const UNDECODABLE = { chunk: { bytes: new Uint8Array([0xff]) } };
+// "café ok" split inside the é.
+const CAFE = new TextEncoder().encode("café ok");
+
+const failingTrace = () => ({
+  trace: {
+    trace: {
+      get failureTrace() {
+        return mapperBroke();
+      },
+    },
+  },
+});
+
+test.each([
+  {
+    name: "a text event",
+    events: [COMPLETE, UNDECODABLE, AFTER],
+    kept: "Complete answer",
+    cut: true,
+    reported: ["TypeError"],
+  },
+  {
+    // The last text event: a later text event would be rejected, which withholds the output
+    // from a mask on its own.
+    name: "a masked text event",
+    masked: true,
+    events: [COMPLETE, UNDECODABLE],
+    kept: undefined,
+    cut: true,
+    reported: ["TypeError"],
+  },
+  {
+    name: "a trace summary",
+    events: [COMPLETE, failingTrace(), AFTER],
+    kept: "Complete answer after",
+    cut: false,
+    reported: ["MapperError"],
+  },
+  {
+    // The captured trace content is lost, as a trace dropped by the bound is, but no text is:
+    // it is kept, also from a mask.
+    name: "masked trace content",
+    masked: true,
+    captureAgentTrace: true,
+    events: [COMPLETE, failingTrace(), AFTER],
+    kept: "Complete answer after",
+    cut: true,
+    reported: ["MapperError"],
+  },
+  {
+    // A character split between two chunks is decoded whole.
+    name: "a character split between text events",
+    events: [{ chunk: { bytes: CAFE.subarray(0, 4) } }, { chunk: { bytes: CAFE.subarray(4) } }],
+    kept: "café ok",
+    cut: false,
+    reported: [],
+  },
+  {
+    // The stream ends inside the é, so that character is lost.
+    name: "text that ends inside a character",
+    events: [COMPLETE, { chunk: { bytes: CAFE.subarray(0, 4) } }],
+    kept: "Complete answercaf",
+    cut: true,
+    reported: ["TypeError"],
+  },
+  {
+    // The file metadata is lost, as files dropped by the bound are, but no text is.
+    name: "output-file metadata",
+    events: [
+      COMPLETE,
+      {
+        files: {
+          files: [
+            {
+              get name() {
+                return mapperBroke();
+              },
+              type: "text/plain",
+            },
+          ],
+        },
+      },
+      AFTER,
+    ],
+    kept: "Complete answer after",
+    cut: true,
+    reported: ["MapperError"],
+  },
+  {
+    name: "the stream end",
+    fail: () => vi.spyOn(AgentStreamState.prototype, "finish").mockImplementation(mapperBroke),
+    events: [COMPLETE],
+    kept: undefined,
+    cut: true,
+    reported: ["MapperError"],
+  },
+  {
+    // The response's own session ID fails before the text event does, and the stream reports
+    // once; its output is still recorded from its events.
+    name: "the response fields and a text event",
+    sessionId: {
+      toString: mapperBroke,
+    },
+    events: [COMPLETE, UNDECODABLE],
+    kept: "Complete answer",
+    cut: true,
+    reported: ["MapperError"],
+  },
+])(
+  "an InvokeAgent mapping failure in $name is reported once and flags only lost output",
+  async ({ masked, captureAgentTrace, fail, sessionId, events, kept, cut, reported }) => {
+    fail?.();
+    const errors: Error[] = [];
+
+    const spans = setup({
+      onError: (error) => errors.push(error),
+      ...(masked ? { mask: (value) => value } : {}),
+    });
+
+    const client = wrapBedrockAgents(
+      new FakeClient([
+        {
+          completion: streamOf(events),
+          sessionId: sessionId ?? "sess-1",
+          $metadata: { requestId: "agent-req" },
+        },
+      ]),
+      { captureAgentTrace },
+    );
+
+    const response = (await client.send(
+      new InvokeAgentCommand({ agentId: "agent-1", agentAliasId: "a", sessionId: "s" }),
+    )) as { completion: AsyncIterable<unknown> };
+
+    expect(await collect(response.completion)).toHaveLength(events.length);
+
+    expect(errors.map((error) => error.name)).toEqual(reported);
+    const [span] = spans.getFinishedSpans();
+    expect(span.attributes["gen_ai.response.id"]).toBe("agent-req");
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(cut ? true : undefined);
+
+    if (kept === undefined) {
+      expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+    } else {
+      // A lost text event keeps no later text, so the output is a prefix of the stream; a lost
+      // trace loses no text.
+      expect(jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content).toBe(kept);
+    }
+  },
+);
 
 test("masked InvokeAgent keeps complete return control after the text bound", async () => {
   const returnControl = { invocationId: "inv-after-bound" };

@@ -2128,6 +2128,8 @@ def test_masked_agent_stream_withholds_text_only_when_text_was_rejected(
 _COMPLETE = {"chunk": {"bytes": b"Complete answer"}}
 _AFTER = {"chunk": {"bytes": b" after"}}
 _UNDECODABLE = {"chunk": {"bytes": b"\xff"}}
+# "café ok" split inside the é.
+_CAFE = "café ok".encode()
 
 
 @pytest.mark.parametrize(
@@ -2163,8 +2165,34 @@ _UNDECODABLE = {"chunk": {"bytes": b"\xff"}}
             ValueError,
         ),
         ([_COMPLETE], (bedrock_streams.AgentStreamState, "finish"), False, None, True, ValueError),
+        # A character split between two chunks is decoded whole.
+        (
+            [{"chunk": {"bytes": _CAFE[:4]}}, {"chunk": {"bytes": _CAFE[4:]}}],
+            None,
+            False,
+            "café ok",
+            False,
+            None,
+        ),
+        # The stream ends inside the é, so that character is lost.
+        (
+            [_COMPLETE, {"chunk": {"bytes": _CAFE[:4]}}],
+            None,
+            False,
+            "Complete answercaf",
+            True,
+            UnicodeDecodeError,
+        ),
     ],
-    ids=["text", "masked-text", "trace-summary", "masked-trace-content", "end"],
+    ids=[
+        "text",
+        "masked-text",
+        "trace-summary",
+        "masked-trace-content",
+        "end",
+        "split-character",
+        "ends-inside-character",
+    ],
 )
 def test_an_agent_stream_mapping_failure_is_reported_and_flags_only_lost_output(
     make: Any,
@@ -2174,7 +2202,7 @@ def test_an_agent_stream_mapping_failure_is_reported_and_flags_only_lost_output(
     masked: bool,
     kept: str | None,
     cut: bool,
-    reported: type[BaseException],
+    reported: type[BaseException] | None,
 ) -> None:
     if failing is not None:
 
@@ -2199,7 +2227,9 @@ def test_an_agent_stream_mapping_failure_is_reported_and_flags_only_lost_output(
     )
     assert list(response["completion"]) == events
 
-    assert [type(error) for error in _instrumentation_errors(errors)] == [reported]
+    assert [type(error) for error in _instrumentation_errors(errors)] == (
+        [reported] if reported else []
+    )
     span = memory.span_exporter.get_finished_spans()[0]
     assert span.attributes.get("telemetry.dev.capture.truncated") is (True if cut else None)
     if kept is None:

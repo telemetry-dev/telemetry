@@ -58,9 +58,13 @@ const LEGACY_CAPTURE_POLICY: NonNullable<SpanHandle["capturePolicy"]> = {
 const usageCollectorModels = new WeakSet<object>();
 const AlsCtor = loadAls();
 
-const afcUsageStore = AlsCtor
-  ? new AlsCtor<{ usage?: SpanFields["usage"]; toolUsePromptTokens?: number }>()
-  : undefined;
+interface AfcUsage {
+  usage?: SpanFields["usage"];
+  toolUsePromptTokens?: number;
+  reportError: (cause: unknown) => void;
+}
+
+const afcUsageStore = AlsCtor ? new AlsCtor<AfcUsage>() : undefined;
 
 type WrappedFunction = ((...args: unknown[]) => unknown) & {
   [WRAPPED]?: true;
@@ -78,6 +82,13 @@ interface RequestMapping {
   /** Captured fields that were cut to the retention bound. */
   cut?: Array<"input" | "systemInstructions">;
 }
+
+// `reportError` takes a failure the mapper recovers from, such as one candidate it cannot read.
+type ResponseMapper = (
+  response: unknown,
+  masked?: boolean,
+  reportError?: (cause: unknown) => void,
+) => SpanFields;
 
 interface VideoOperationTracker {
   operations: WeakSet<object>;
@@ -346,7 +357,7 @@ const CAPTURE_MAX_ITEMS = 1_000;
 // so each is capped instead. Gemini's longest is 25 characters.
 const FINISH_REASON_MAX_LENGTH = 128;
 
-function candidateOutput(response: UnknownRecord) {
+function candidateOutput(response: UnknownRecord, reportError: (cause: unknown) => void) {
   if (!captureEnabled("output")) return { value: undefined, truncated: false, contentCut: false };
   const all = asArray(response.candidates);
   let projectionFailed = false;
@@ -360,8 +371,9 @@ function candidateOutput(response: UnknownRecord) {
       return content
         ? { content: { role: ownField(content, "role"), parts: ownField(content, "parts") } }
         : {};
-    } catch {
+    } catch (cause) {
       projectionFailed = true;
+      reportError(cause);
 
       return {};
     }
@@ -485,12 +497,17 @@ function projectStructure(value: unknown, shape: StructureShape): unknown {
 }
 
 /** `metadataContent` keeps response metadata whole instead of its structure. */
-function responseAttributes(response: UnknownRecord, metadataContent: boolean) {
-  const metadata = (value: unknown, shape: StructureShape) =>
+function structureOf(metadataContent: boolean) {
+  return (value: unknown, shape: StructureShape) =>
     metadataContent ? value : projectStructure(value, shape);
+}
 
+function promptFeedbackAttributes(
+  response: UnknownRecord,
+  metadataContent: boolean,
+): Record<string, AttributeValue> {
+  const metadata = structureOf(metadataContent);
   const attributes: Record<string, AttributeValue> = {};
-  const candidates = asArray(response.candidates) ?? [];
   const promptFeedback = asRecord(response.promptFeedback);
   const blockReason = readString(promptFeedback?.blockReason);
 
@@ -509,18 +526,20 @@ function responseAttributes(response: UnknownRecord, metadataContent: boolean) {
     );
   }
 
-  const finishReasons = candidates
-    .map((candidate) => readString(asRecord(candidate)?.finishReason))
-    .filter((reason): reason is string => reason !== undefined);
+  return attributes;
+}
 
-  if (finishReasons.length > 1) attributes["gen_ai.response.finish_reasons"] = finishReasons;
+function toolUsePromptTokens(response: UnknownRecord): number | undefined {
+  return readNumber(asRecord(response.usageMetadata)?.toolUsePromptTokenCount);
+}
 
-  const usageMetadata = asRecord(response.usageMetadata);
-  const toolUsePromptTokens = readNumber(usageMetadata?.toolUsePromptTokenCount);
-
-  if (toolUsePromptTokens !== undefined) {
-    attributes["google_genai.usage.tool_use_prompt_tokens"] = toolUsePromptTokens;
-  }
+/** Safety ratings of each candidate, and grounding and URL-context metadata of the first. */
+function candidateMetadataAttributes(
+  candidates: unknown[],
+  metadataContent: boolean,
+): Record<string, AttributeValue> {
+  const metadata = structureOf(metadataContent);
+  const attributes: Record<string, AttributeValue> = {};
 
   const safetyEntries = candidates
     .map((candidate, index) => {
@@ -558,6 +577,27 @@ function responseAttributes(response: UnknownRecord, metadataContent: boolean) {
     );
   }
 
+  return attributes;
+}
+
+/** `metadataContent` keeps response metadata whole instead of its structure. */
+function responseAttributes(response: UnknownRecord, metadataContent: boolean) {
+  const attributes = promptFeedbackAttributes(response, metadataContent);
+  const candidates = asArray(response.candidates) ?? [];
+
+  const finishReasons = candidates
+    .map((candidate) => readString(asRecord(candidate)?.finishReason))
+    .filter((reason): reason is string => reason !== undefined);
+
+  if (finishReasons.length > 1) attributes["gen_ai.response.finish_reasons"] = finishReasons;
+
+  const toolUseTokens = toolUsePromptTokens(response);
+
+  if (toolUseTokens !== undefined) {
+    attributes["google_genai.usage.tool_use_prompt_tokens"] = toolUseTokens;
+  }
+
+  Object.assign(attributes, candidateMetadataAttributes(candidates, metadataContent));
   const afcHistory = asArray(response.automaticFunctionCallingHistory);
 
   if (afcHistory && afcHistory.length > 0)
@@ -610,7 +650,11 @@ function generateRequestFields(params: UnknownRecord): RequestMapping {
   return { name: `chat ${model ?? "unknown"}`, fields, cut };
 }
 
-function generateResponseFields(response: unknown, masked = false): SpanFields {
+function generateResponseFields(
+  response: unknown,
+  masked = false,
+  reportError: (cause: unknown) => void = () => undefined,
+): SpanFields {
   const record = asRecord(response) ?? {};
   const candidates = asArray(record.candidates) ?? [];
 
@@ -620,7 +664,7 @@ function generateResponseFields(response: unknown, masked = false): SpanFields {
 
   const attributes = responseAttributes(record, captureEnabled("output") && !masked);
   const afcHistory = asArray(record.automaticFunctionCallingHistory);
-  const output = candidateOutput(record);
+  const output = candidateOutput(record, reportError);
 
   const fields: SpanFields = {
     responseModel: readString(record.modelVersion),
@@ -968,14 +1012,38 @@ function startRequestSpan(request: RequestMapping, provider: string): SpanHandle
   return startSpan(request.name, fields);
 }
 
+// Cores older than reportError drop the failure. A failing onError must not reach the caller.
+function reportSpanError(span: SpanHandle, cause: unknown): void {
+  try {
+    span.reportError?.(cause);
+  } catch {
+    return;
+  }
+}
+
+// One report per stream or call: a mapper that fails on one chunk likely fails on each later one.
+function createSpanErrorReporter(span: SpanHandle): (cause: unknown) => void {
+  let reported = false;
+
+  return (cause) => {
+    if (reported) return;
+    reported = true;
+    reportSpanError(span, cause);
+  };
+}
+
 function safeResponseFields(
   mapResponse: (response: unknown) => SpanFields,
   response: unknown,
+  reportError: (cause: unknown) => void,
 ): SpanFields {
   try {
     return mapResponse(response);
-  } catch {
-    return {};
+  } catch (cause) {
+    reportError(cause);
+
+    // The call succeeded, so it is not failed; its output and response fields are lost.
+    return { attributes: { "telemetry.dev.capture.truncated": true } };
   }
 }
 
@@ -1005,21 +1073,22 @@ function installInternalUsageCollector(models: UnknownRecord | undefined): void 
     const result = original.apply(this, args);
 
     const recordUsage = (response: unknown) => {
+      const store = afcUsageStore?.getStore();
+
+      if (!store) return response;
+
       try {
-        const store = afcUsageStore?.getStore();
         const usageMetadata = asRecord(response)?.usageMetadata;
+        store.usage = sumUsage(store.usage, usageFromMetadata(asRecord(usageMetadata)));
+        const toolUsePromptTokens = readNumber(asRecord(usageMetadata)?.toolUsePromptTokenCount);
 
-        if (store) {
-          store.usage = sumUsage(store.usage, usageFromMetadata(asRecord(usageMetadata)));
-          const toolUsePromptTokens = readNumber(asRecord(usageMetadata)?.toolUsePromptTokenCount);
-
-          if (toolUsePromptTokens !== undefined) {
-            store.toolUsePromptTokens =
-              (readNumber(store.toolUsePromptTokens) ?? 0) + toolUsePromptTokens;
-          }
+        if (toolUsePromptTokens !== undefined) {
+          store.toolUsePromptTokens =
+            (readNumber(store.toolUsePromptTokens) ?? 0) + toolUsePromptTokens;
         }
-      } catch {
-        // Telemetry-only AFC usage collection must fail open.
+      } catch (cause) {
+        // The turn's usage is lost, so the call's usage is undercounted; its output is not cut.
+        store.reportError(cause);
       }
 
       return response;
@@ -1034,7 +1103,7 @@ function installInternalUsageCollector(models: UnknownRecord | undefined): void 
 function wrapUnary(
   original: (...args: unknown[]) => unknown,
   mapRequest: (params: UnknownRecord) => RequestMapping,
-  mapResponse: (response: unknown, masked?: boolean) => SpanFields,
+  mapResponse: ResponseMapper,
   provider: string,
   fallback: RequestFallback,
   models?: UnknownRecord,
@@ -1047,16 +1116,19 @@ function wrapUnary(
     const span = startRequestSpan(request, provider);
     const end = endOnce(span);
     const usageStore = afcUsageStore;
+    // The call reports once, whether an AFC turn or the response fails to map.
+    const reportError = createSpanErrorReporter(span);
 
-    const internalUsage: { usage?: SpanFields["usage"]; toolUsePromptTokens?: number } | undefined =
-      usageStore && shouldAggregateAfcUsage(params) ? {} : undefined;
+    const internalUsage: AfcUsage | undefined =
+      usageStore && shouldAggregateAfcUsage(params) ? { reportError } : undefined;
 
     if (internalUsage) installInternalUsageCollector(models);
 
     const finishResponse = (response: unknown) => {
       const fields = safeResponseFields(
-        (value) => mapResponse(value, capturesWithMask(span)),
+        (value) => mapResponse(value, capturesWithMask(span), reportError),
         response,
+        reportError,
       );
 
       if (internalUsage?.usage) fields.usage = internalUsage.usage;
@@ -1236,13 +1308,24 @@ class StreamAggregator {
   private afcCaptureTruncated = false;
   // The reconstructed AFC history holds a cut value, such as a folded model-output prefix.
   private afcInputIncomplete = false;
+  // A chunk failed to map on its output path. No later output is kept, also after an AFC turn
+  // resets the output capture, so the output stays a prefix of the stream.
+  private outputLost = false;
+  // Response content outside the output was lost: metadata kept whole (metadataContent) or the
+  // AFC history. It flags the capture without cutting the output or withholding it from a mask.
+  private metadataLost = false;
 
   constructor(
     private readonly requestInput: unknown,
     // The request input was cut to the retention bound, so history seeded from it is incomplete.
     private readonly requestInputCut: boolean,
     private readonly masked: boolean,
+    private readonly reportError: (cause: unknown) => void,
   ) {}
+
+  private get metadataContent(): boolean {
+    return captureEnabled("output") && !this.masked;
+  }
 
   private currentCandidates(): unknown[] {
     return [...this.candidates.entries()]
@@ -1284,7 +1367,7 @@ class StreamAggregator {
     this.priorOutput = [];
     this.outputCapture.bytes = 2;
     this.outputCaptureEntries = 0;
-    this.outputCaptureTruncated = false;
+    this.outputCaptureTruncated = this.outputLost;
   }
 
   private currentOutput(forInput = false): unknown[] {
@@ -1383,6 +1466,36 @@ class StreamAggregator {
   }
 
   recordChunk(chunk: unknown): void {
+    try {
+      this.recordChunkOutput(chunk);
+    } catch (cause) {
+      // Usage, metadata and the AFC history are guarded where they are recorded. Any other
+      // failure, such as one in the response ID, model version, a candidate, its role, parts or
+      // finish reason, may stop the chunk before some of its parts, or those of a later
+      // candidate, are recorded. Parts recorded before it are kept.
+      this.outputLost = true;
+      this.outputCaptureTruncated = true;
+      this.reportError(cause);
+    }
+  }
+
+  // Lost metadata is not output, so the output stays whole. Kept whole it is response content,
+  // so its loss flags the capture. Only its structure holds no response content, so the loss is
+  // reported only.
+  private loseMetadata(cause: unknown): void {
+    if (this.metadataContent) this.metadataLost = true;
+    this.reportError(cause);
+  }
+
+  // The history is the only record of the tool calls and their results, so its loss flags the
+  // capture, also with a mask configured. It is not output, so the output is not cut; the
+  // history kept before, if any, is exported, and a later one that maps replaces it.
+  private loseAfcHistory(cause: unknown): void {
+    this.metadataLost = true;
+    this.reportError(cause);
+  }
+
+  private recordChunkOutput(chunk: unknown): void {
     const record = asRecord(chunk) ?? {};
     const nextResponseId = readString(record.responseId);
 
@@ -1395,14 +1508,18 @@ class StreamAggregator {
 
     if (nextResponseModel) this.responseModel = nextResponseModel;
 
-    const afcHistory = asArray(record.automaticFunctionCallingHistory);
+    try {
+      const afcHistory = asArray(record.automaticFunctionCallingHistory);
 
-    if (afcHistory && afcHistory.length > 0) {
-      this.automaticFunctionCalling = true;
+      if (afcHistory && afcHistory.length > 0) {
+        this.automaticFunctionCalling = true;
 
-      if (this.candidates.size === 0) this.resetOutputCapture();
+        if (this.candidates.size === 0) this.resetOutputCapture();
 
-      if (captureEnabled("input")) this.replaceAfcHistory(afcHistory);
+        if (captureEnabled("input")) this.replaceAfcHistory(afcHistory);
+      }
+    } catch (cause) {
+      this.loseAfcHistory(cause);
     }
 
     const capturesContent = captureEnabled("input") || captureEnabled("output");
@@ -1415,14 +1532,21 @@ class StreamAggregator {
       const content = capturesContent ? asRecord(candidateRecord.content) : undefined;
 
       if (content && hasFunctionResponse(content)) {
-        const capture = boundedTelemetryCapture(copyContent(content));
-        const capturedContent = asRecord(capture.value);
+        let capture: ReturnType<typeof boundedTelemetryCapture> | undefined;
+
+        try {
+          capture = boundedTelemetryCapture(copyContent(content));
+        } catch (cause) {
+          this.loseAfcHistory(cause);
+        }
+
+        const capturedContent = asRecord(capture?.value);
         this.foldTurn(true);
 
         const appended =
           capturedContent !== undefined && this.appendAfcHistory(copyContent(capturedContent));
 
-        if (capture.truncated && captureEnabled("input")) {
+        if (capture?.truncated && captureEnabled("input")) {
           this.afcCaptureTruncated = true;
 
           if (appended) this.afcInputIncomplete = true;
@@ -1495,21 +1619,36 @@ class StreamAggregator {
       if (finishReason) state.finishReason = finishReason.slice(0, FINISH_REASON_MAX_LENGTH);
     }
 
-    const chunkUsage = usageFromMetadata(record.usageMetadata);
+    try {
+      const chunkUsage = usageFromMetadata(record.usageMetadata);
 
-    if (chunkUsage) this.usage = chunkUsage;
+      if (chunkUsage) this.usage = chunkUsage;
+      const toolUseTokens = toolUsePromptTokens(record);
 
-    const chunkAttributes = responseAttributes(
-      rejected.size > 0
-        ? { ...record, candidates: candidates.filter((candidate) => !rejected.has(candidate)) }
-        : record,
-      captureEnabled("output") && !this.masked,
-    );
+      if (toolUseTokens !== undefined)
+        this.attributes["google_genai.usage.tool_use_prompt_tokens"] = toolUseTokens;
+    } catch (cause) {
+      // Only the chunk's usage is lost; the output is whole.
+      this.reportError(cause);
+    }
 
-    // A chunk can repeat an index, so its own list would keep uncapped reasons; finish() builds
-    // the list from the capped per-index state instead.
-    delete chunkAttributes["gen_ai.response.finish_reasons"];
-    Object.assign(this.attributes, chunkAttributes);
+    try {
+      Object.assign(
+        this.attributes,
+        candidateMetadataAttributes(
+          candidates.filter((candidate) => !rejected.has(candidate)),
+          this.metadataContent,
+        ),
+      );
+    } catch (cause) {
+      this.loseMetadata(cause);
+    }
+
+    try {
+      Object.assign(this.attributes, promptFeedbackAttributes(record, this.metadataContent));
+    } catch (cause) {
+      this.loseMetadata(cause);
+    }
   }
 
   finish(): SpanFields {
@@ -1536,7 +1675,12 @@ class StreamAggregator {
 
     if (finishReasons.length > 1) attributes["gen_ai.response.finish_reasons"] = finishReasons;
 
-    if (this.afcCaptureTruncated || (captureEnabled("output") && this.outputCaptureTruncated)) {
+    if (
+      this.afcCaptureTruncated ||
+      this.outputLost ||
+      this.metadataLost ||
+      (captureEnabled("output") && this.outputCaptureTruncated)
+    ) {
       attributes["telemetry.dev.capture.truncated"] = true;
     }
 
@@ -1561,40 +1705,50 @@ function createObservedStream(
 ): AsyncGenerator<unknown> {
   const iterator = source[Symbol.asyncIterator]();
   const masked = (span.capturePolicy ?? LEGACY_CAPTURE_POLICY).mask;
-  const aggregator = new StreamAggregator(requestInput, requestInputCut, masked);
+  const reportError = createSpanErrorReporter(span);
+  const aggregator = new StreamAggregator(requestInput, requestInputCut, masked, reportError);
   let sawFirst = false;
   let ended = false;
 
   const recordChunk = (chunk: unknown, receivedAt: number): void => {
-    if (chunkHasOutput(chunk)) span.recordOutputChunk?.(receivedAt);
+    try {
+      if (chunkHasOutput(chunk)) span.recordOutputChunk?.(receivedAt);
+    } catch (cause) {
+      // Only the chunk's timing is lost; the chunk is still recorded.
+      reportError(cause);
+    }
 
     if (!sawFirst) {
       sawFirst = true;
-      const record = asRecord(chunk) ?? {};
-      span.update({
-        timeToFirstChunkMs: Date.now() - startedAt,
-        responseId: readString(record.responseId),
-        responseModel: readString(record.modelVersion),
-      });
+
+      try {
+        const record = asRecord(chunk) ?? {};
+        span.update({
+          timeToFirstChunkMs: Date.now() - startedAt,
+          responseId: readString(record.responseId),
+          responseModel: readString(record.modelVersion),
+        });
+      } catch (cause) {
+        // Only the first-chunk timing and IDs are lost; the chunk is still recorded.
+        reportError(cause);
+      }
     }
 
-    try {
-      aggregator.recordChunk(chunk);
-    } catch {
-      // Telemetry mapping must not affect stream delivery.
-    }
+    aggregator.recordChunk(chunk);
   };
 
   // `completed` is true only when the source stream reached its end.
   const finish = (error?: unknown, completed = false): void => {
     if (ended) return;
     ended = true;
-    let finalFields: SpanFields = {};
+    let finalFields: SpanFields;
 
     try {
       finalFields = aggregator.finish();
-    } catch {
-      finalFields = {};
+    } catch (cause) {
+      // The output that the stream kept is lost.
+      reportError(cause);
+      finalFields = { attributes: { "telemetry.dev.capture.truncated": true } };
     }
 
     const interrupted = !completed || error !== undefined;
@@ -1764,7 +1918,7 @@ function patchModelsMethod(
   models: UnknownRecord,
   key: string,
   mapRequest: (params: UnknownRecord) => RequestMapping,
-  mapResponse: (response: unknown, masked?: boolean) => SpanFields,
+  mapResponse: ResponseMapper,
   provider: string,
   fallback: RequestFallback,
   streaming = false,
@@ -1833,7 +1987,11 @@ function patchOperationsMethod(
         else if (record) tracker.operations.add(record);
       } catch {}
 
-      const fields = safeResponseFields((value) => mediaResponseFields(value, "video"), response);
+      const fields = safeResponseFields(
+        (value) => mediaResponseFields(value, "video"),
+        response,
+        (cause) => reportSpanError(span, cause),
+      );
       end(fields);
 
       return response;

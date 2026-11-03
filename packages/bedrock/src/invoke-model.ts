@@ -3,6 +3,7 @@ import type { SpanFields } from "@telemetry-dev/sdk";
 import {
   arrayValue,
   awsMetadataFields,
+  bytesToString,
   isRecord,
   mergeFields,
   modeledStreamError,
@@ -47,18 +48,24 @@ export function invokeModelRequestFields(input: JsonRecord): SpanFields {
 
 export function invokeModelResponseFields(input: JsonRecord, output: JsonValue): SpanFields {
   const model = stringValue(input.modelId);
-  const body = isRecord(output) ? parseBody(output.body, output.contentType) : undefined;
+  // A JSON body that fails to decode lost its output, so it fails here; a body whose content type
+  // is not JSON is not captured.
+  const body = isRecord(output) ? parseBody(output.body, output.contentType, true) : undefined;
   const metadata = isRecord(output) ? output.$metadata : undefined;
 
   return mergeFields(awsMetadataFields(metadata), nativeResponseFields(model, body, metadata));
 }
 
-export function parseBody<TBody, TContentType>(body: TBody, contentType: TContentType): JsonValue {
+export function parseBody<TBody, TContentType>(
+  body: TBody,
+  contentType: TContentType,
+  strict = false,
+): JsonValue {
   const type = stringValue(contentType) ?? "application/json";
 
   if (!type.includes("json")) return undefined;
 
-  return parseJson(body);
+  return parseJson(body, strict);
 }
 
 function nativeSamplingFields<T>(model: string | undefined, body: T): SpanFields {
@@ -291,6 +298,8 @@ export class InvokeModelStreamState implements StreamState {
   private finishReason: string | undefined;
   private error: Error | undefined;
   private errorFields: SpanFields | undefined;
+  outputRecorded = false;
+  reportError?: (cause: unknown) => void;
   feed<T>(event: T): boolean {
     if (!isRecord(event)) return false;
     const streamError = modeledStreamError(event);
@@ -303,18 +312,30 @@ export class InvokeModelStreamState implements StreamState {
     }
 
     const chunk = isRecord(event.chunk) ? event.chunk : undefined;
-    const parsed = parseJson(chunk?.bytes);
+    const text = bytesToString(chunk?.bytes, true);
 
-    if (parsed === undefined) {
-      const raw = chunk?.bytes;
+    if (text === undefined) return false;
+    let parsed: JsonValue;
 
-      return (typeof raw === "string" || raw instanceof Uint8Array) && raw.length > 0;
+    try {
+      parsed = JSON.parse(text) as JsonValue;
+    } catch (cause) {
+      // A blank chunk carries no output.
+      if (!text.trim()) return false;
+      // The chunk's output is lost. Handled here, not thrown, so the chunk-timing fallback does
+      // not parse it again; the cut retention keeps no later chunk.
+      this.retention.truncated = true;
+      this.reportError?.(cause);
+
+      return true;
     }
 
     if (this.retention.accept(parsed)) {
       this.chunks.push(parsed);
       this.text += textFromProviderChunk(parsed);
     }
+
+    this.outputRecorded = true;
 
     if (isRecord(parsed)) {
       const delta = isRecord(parsed.delta) ? parsed.delta : undefined;

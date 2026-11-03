@@ -7,6 +7,7 @@ import {
   InvokeModelWithResponseStreamCommand,
   type ConverseCommandInput,
 } from "@aws-sdk/client-bedrock-runtime";
+import { SpanStatusCode } from "@opentelemetry/api";
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
 import { afterEach, expect, test, vi } from "vitest";
@@ -14,6 +15,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { type ChatMessage, getPrompt, MAX_RECORD_BYTES, type MaskFn } from "@telemetry-dev/sdk";
 import * as telemetrySdk from "@telemetry-dev/sdk";
 
+import { ConverseStreamState } from "../src/converse.ts";
 import { instrumentBedrock, uninstrumentBedrock, wrapBedrock } from "../src/index.ts";
 import {
   FakeClient,
@@ -636,6 +638,58 @@ test("InvokeModel captures provider-native bodies and embedding spans", async ()
   expect(embedding.attributes["gen_ai.usage.input_tokens"]).toBe(6);
 });
 
+test.each([
+  {
+    name: "not JSON",
+    contentType: "application/json",
+    body: '{"completion": "cut',
+    reported: ["SyntaxError"],
+  },
+  {
+    name: "not UTF-8",
+    contentType: "application/json",
+    body: [0x7b, 0xff, 0x7d],
+    reported: ["TypeError"],
+  },
+  { name: "untyped and not JSON", contentType: undefined, body: "cut", reported: ["SyntaxError"] },
+  { name: "blank", contentType: "application/json", body: "\n", reported: [] },
+  { name: "not JSON-typed", contentType: "text/plain", body: "plain text", reported: [] },
+])(
+  "an InvokeModel body that is $name records no output",
+  async ({ contentType, body, reported }) => {
+    const errors: Error[] = [];
+    const spans = setup({ onError: (error) => errors.push(error) });
+
+    const response = {
+      body: typeof body === "string" ? new TextEncoder().encode(body) : new Uint8Array(body),
+      contentType,
+      $metadata: { requestId: "invoke-1" },
+    };
+
+    const client = wrapBedrock(new FakeClient([response]));
+
+    await expect(
+      client.send(
+        new InvokeModelCommand({
+          modelId: "anthropic.claude-3-haiku",
+          contentType: "application/json",
+          body: bytes({ messages: [], max_tokens: 10 }),
+        }),
+      ),
+    ).resolves.toBe(response);
+
+    expect(errors.map((error) => error.name)).toEqual(reported);
+    const [span] = spans.getFinishedSpans();
+    expect(span.attributes["gen_ai.response.id"]).toBe("invoke-1");
+    expect(span.status.code).not.toBe(SpanStatusCode.ERROR);
+    expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+    // A JSON body that fails to decode lost its output; a blank or non-JSON body has none.
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(
+      reported.length > 0 ? true : undefined,
+    );
+  },
+);
+
 test.each(["absent", "compaction", "at-bound", "bounded"])(
   "Claude InvokeModel usage: %s",
   async (kind) => {
@@ -1005,6 +1059,209 @@ test("InvokeModelWithResponseStream parses each payload once and delivers malfor
   });
 });
 
+function mapperBroke(): never {
+  throw Object.assign(new Error("mapper broke"), { name: "MapperError" });
+}
+
+const converseDelta = (text: string) => ({
+  contentBlockDelta: { contentBlockIndex: 0, delta: { text } },
+});
+
+const invokeChunk = (text: string) => ({ chunk: { bytes: bytes({ completion: text }) } });
+
+const rawChunk = (raw: string | number[]) => ({
+  chunk: { bytes: typeof raw === "string" ? new TextEncoder().encode(raw) : new Uint8Array(raw) },
+});
+
+test.each([
+  {
+    name: "a Converse delta",
+    operation: "converse",
+    events: [
+      { messageStart: { role: "assistant" } },
+      converseDelta("Hello"),
+      // The chunk-timing fallback reads the delta again and fails the same way.
+      {
+        contentBlockDelta: {
+          contentBlockIndex: 0,
+          get delta() {
+            return mapperBroke();
+          },
+        },
+      },
+      converseDelta(" after"),
+      { messageStop: { stopReason: "end_turn" } },
+    ],
+    kept: "Hello",
+    cut: true,
+    reported: ["MapperError"],
+  },
+  {
+    name: "a masked Converse delta",
+    operation: "converse",
+    masked: true,
+    events: [
+      { messageStart: { role: "assistant" } },
+      converseDelta("Hello"),
+      {
+        contentBlockDelta: {
+          contentBlockIndex: 0,
+          get delta() {
+            return mapperBroke();
+          },
+        },
+      },
+      { messageStop: { stopReason: "end_turn" } },
+    ],
+    kept: undefined,
+    cut: true,
+    reported: ["MapperError"],
+  },
+  {
+    // The usage comes before more text, so a usage failure that cut the output would show.
+    name: "Converse usage",
+    operation: "converse",
+    events: [
+      { messageStart: { role: "assistant" } },
+      converseDelta("Hello"),
+      {
+        metadata: {
+          get usage() {
+            return mapperBroke();
+          },
+        },
+      },
+      converseDelta(" world"),
+      { messageStop: { stopReason: "end_turn" } },
+    ],
+    kept: "Hello world",
+    cut: false,
+    reported: ["MapperError"],
+  },
+  {
+    name: "the Converse stream end",
+    operation: "converse",
+    fail: () => vi.spyOn(ConverseStreamState.prototype, "finish").mockImplementation(mapperBroke),
+    events: [
+      { messageStart: { role: "assistant" } },
+      converseDelta("Hello"),
+      { messageStop: { stopReason: "end_turn" } },
+    ],
+    kept: undefined,
+    cut: true,
+    reported: ["MapperError"],
+  },
+  {
+    name: "an InvokeModel chunk that is not UTF-8",
+    operation: "invoke",
+    events: [invokeChunk("Hello"), rawChunk([0xff]), invokeChunk(" after")],
+    kept: "Hello",
+    cut: true,
+    reported: ["TypeError"],
+  },
+  {
+    // The later undecodable chunk fails too, and the stream reports once.
+    name: "an InvokeModel chunk that is not JSON",
+    operation: "invoke",
+    events: [
+      invokeChunk("Hello"),
+      rawChunk('{"completion": "lost'),
+      invokeChunk(" after"),
+      rawChunk([0xff]),
+    ],
+    kept: "Hello",
+    cut: true,
+    reported: ["SyntaxError"],
+  },
+  {
+    // The usage comes before more text, so a usage failure that cut the output would show.
+    name: "InvokeModel usage",
+    operation: "invoke",
+    fail: () => {
+      const parse = JSON.parse;
+
+      // Not enumerable, so only the usage mapping reads it, after the chunk's output is kept.
+      vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+        const value = parse(text, reviver);
+
+        if (value && typeof value === "object" && Object.hasOwn(value, "usage")) {
+          Object.defineProperty(value, "usage", { get: mapperBroke, enumerable: false });
+        }
+
+        return value;
+      });
+    },
+    events: [
+      { chunk: { bytes: bytes({ completion: "Hello", usage: { output_tokens: 1 } }) } },
+      invokeChunk(" world"),
+    ],
+    kept: "Hello world",
+    cut: false,
+    reported: ["MapperError"],
+  },
+  {
+    // A blank chunk carries no output, so it is neither lost nor flagged.
+    name: "a blank InvokeModel chunk",
+    operation: "invoke",
+    events: [invokeChunk("Hello"), rawChunk("\n"), invokeChunk(" after")],
+    kept: "Hello after",
+    cut: false,
+    reported: [],
+  },
+])(
+  "a stream mapping failure in $name is reported once and flags only lost output",
+  async ({ operation, masked, fail, events, kept, cut, reported }) => {
+    fail?.();
+    const errors: Error[] = [];
+    const spans = setup({
+      onError: (error) => errors.push(error),
+      ...(masked ? { mask: (value) => value } : {}),
+    });
+    const metadata = { requestId: "req-1" };
+
+    const client = wrapBedrock(
+      new FakeClient([
+        operation === "converse"
+          ? { stream: streamOf(events), $metadata: metadata }
+          : { body: streamOf(events), $metadata: metadata },
+      ]),
+    );
+
+    const stream =
+      operation === "converse"
+        ? (
+            (await client.send(
+              new ConverseStreamCommand({ modelId: "anthropic.claude", messages: [] }),
+            )) as { stream: AsyncIterable<unknown> }
+          ).stream
+        : (
+            (await client.send(
+              new InvokeModelWithResponseStreamCommand({
+                modelId: "anthropic.claude-3-haiku",
+                contentType: "application/json",
+                body: bytes({ messages: [], max_tokens: 10 }),
+              }),
+            )) as { body: AsyncIterable<unknown> }
+          ).body;
+
+    // Mapping failures never reach the caller's loop.
+    expect(await collect(stream)).toHaveLength(events.length);
+
+    expect(errors.map((error) => error.name)).toEqual(reported);
+    const [span] = spans.getFinishedSpans();
+    expect(span.attributes["gen_ai.response.id"]).toBe("req-1");
+    expect(span.status.code).not.toBe(SpanStatusCode.ERROR);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(cut ? true : undefined);
+
+    if (kept === undefined) {
+      expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+    } else {
+      // Text after a lost delta or chunk is not kept, so the output is a prefix of the stream.
+      expect(jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content).toBe(kept);
+    }
+  },
+);
+
 test("InvokeModelWithResponseStream captures Titan token counts and Cohere generations", async () => {
   const spans = setup();
 
@@ -1229,6 +1486,52 @@ test("callback-style send creates a span while returning undefined", () => {
   expect(span.attributes["gen_ai.response.id"]).toBe("callback-1");
   expect(jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content).toBe("ok");
 });
+
+test.each(["promise", "callback"])(
+  "a Converse response that fails to map keeps the AWS metadata and is flagged (%s)",
+  async (form) => {
+    const errors: Error[] = [];
+    const spans = setup({ onError: (error) => errors.push(error) });
+
+    const response = {
+      output: { message: { role: "assistant", content: [{ text: "Hello" }] } },
+      get usage() {
+        return mapperBroke();
+      },
+      $metadata: { requestId: "req-1", httpStatusCode: 200 },
+    };
+
+    const command = new ConverseCommand({ modelId: "m", messages: [] });
+
+    if (form === "promise") {
+      await expect(wrapBedrock(new FakeClient([response])).send(command)).resolves.toBe(response);
+    } else {
+      let received: unknown;
+
+      wrapBedrock({
+        send<TCommand>(_command: TCommand, ...rest: unknown[]): undefined {
+          const callback = rest.find(
+            (arg): arg is (cause: unknown, data?: unknown) => void => arg instanceof Function,
+          );
+
+          callback?.(undefined, response);
+        },
+      }).send(command, <TError, TData>(_err: TError, data?: TData) => {
+        received = data;
+      });
+      expect(received).toBe(response);
+    }
+
+    expect(errors.map((error) => error.name)).toEqual(["MapperError"]);
+    const [span] = spans.getFinishedSpans();
+    // The call succeeded, so the span is not failed, but its output and response fields are lost.
+    expect(span.status.code).not.toBe(SpanStatusCode.ERROR);
+    expect(span.attributes["gen_ai.response.id"]).toBe("req-1");
+    expect(span.attributes["aws.http.status_code"]).toBe(200);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+  },
+);
 
 test("global instrumentation patches the real client once and restores its inherited send", async () => {
   const spans = setup();
