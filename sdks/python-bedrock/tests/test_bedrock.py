@@ -2324,6 +2324,33 @@ def _invoke_chunk(text: str) -> dict[str, Any]:
             True,
             json.JSONDecodeError,
         ),
+        # A chunk timing or first-chunk update that fails loses only that timing.
+        (
+            "converse_stream",
+            (telemetry_dev.SpanHandle, "record_output_chunk", None),
+            [
+                {"messageStart": {"role": "assistant"}},
+                _converse_delta("Hello"),
+                _converse_delta(" world"),
+                {"messageStop": {"stopReason": "end_turn"}},
+            ],
+            "Hello world",
+            False,
+            ValueError,
+        ),
+        (
+            "converse_stream",
+            (telemetry_dev.SpanHandle, "update", 1),
+            [
+                {"messageStart": {"role": "assistant"}},
+                _converse_delta("Hello"),
+                _converse_delta(" world"),
+                {"messageStop": {"stopReason": "end_turn"}},
+            ],
+            "Hello world",
+            False,
+            ValueError,
+        ),
         (
             "invoke_model_with_response_stream",
             None,
@@ -2341,6 +2368,8 @@ def _invoke_chunk(text: str) -> dict[str, Any]:
         "invoke-undecodable",
         "invoke-unparsable",
         "invoke-not-json",
+        "converse-chunk-timing",
+        "converse-first-chunk",
         "invoke-blank",
     ],
 )
@@ -2359,12 +2388,12 @@ def test_a_runtime_stream_mapping_failure_is_reported_and_flags_only_lost_output
         original = getattr(owner, name)
         calls = 0
 
-        def fail(*args: Any) -> Any:
+        def fail(*args: Any, **kwargs: Any) -> Any:
             nonlocal calls
             calls += 1
             if failing_call is None or calls == failing_call:
                 raise ValueError("mapper broke")
-            return original(*args)
+            return original(*args, **kwargs)
 
         monkeypatch.setattr(owner, name, fail)
     errors: list[BaseException] = []

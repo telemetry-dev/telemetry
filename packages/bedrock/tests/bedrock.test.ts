@@ -1073,6 +1073,27 @@ const rawChunk = (raw: string | number[]) => ({
   chunk: { bytes: typeof raw === "string" ? new TextEncoder().encode(raw) : new Uint8Array(raw) },
 });
 
+// Makes a method of each started span throw on the calls `fails` selects.
+function failSpanMethod(method: "update" | "recordOutputChunk", fails: (call: number) => boolean) {
+  const startSpan = telemetrySdk.startSpan;
+
+  vi.spyOn(telemetrySdk, "startSpan").mockImplementation((...args) => {
+    const span = startSpan(...args);
+    const original = span[method].bind(span) as (...rest: unknown[]) => unknown;
+    let calls = 0;
+
+    vi.spyOn(span, method).mockImplementation(((...rest: unknown[]) => {
+      calls += 1;
+
+      if (fails(calls)) return mapperBroke();
+
+      return original(...rest);
+    }) as never);
+
+    return span;
+  });
+}
+
 test.each([
   {
     name: "a Converse delta",
@@ -1194,6 +1215,36 @@ test.each([
     events: [
       { chunk: { bytes: bytes({ completion: "Hello", usage: { output_tokens: 1 } }) } },
       invokeChunk(" world"),
+    ],
+    kept: "Hello world",
+    cut: false,
+    reported: ["MapperError"],
+  },
+  {
+    // A failed chunk timing loses only that timing.
+    name: "the Converse chunk timing",
+    operation: "converse",
+    fail: () => failSpanMethod("recordOutputChunk", () => true),
+    events: [
+      { messageStart: { role: "assistant" } },
+      converseDelta("Hello"),
+      converseDelta(" world"),
+      { messageStop: { stopReason: "end_turn" } },
+    ],
+    kept: "Hello world",
+    cut: false,
+    reported: ["MapperError"],
+  },
+  {
+    // The stream's only update is the time to first chunk.
+    name: "the Converse first-chunk update",
+    operation: "converse",
+    fail: () => failSpanMethod("update", () => true),
+    events: [
+      { messageStart: { role: "assistant" } },
+      converseDelta("Hello"),
+      converseDelta(" world"),
+      { messageStop: { stopReason: "end_turn" } },
     ],
     kept: "Hello world",
     cut: false,

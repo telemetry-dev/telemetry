@@ -277,14 +277,6 @@ export function endSpan(span: SpanHandle, fields?: SpanFields): void {
   }
 }
 
-export function updateSpan(span: SpanHandle, fields: SpanFields): void {
-  try {
-    span.update(fields);
-  } catch {
-    // Instrumentation must never throw into caller code.
-  }
-}
-
 export function metadataOf<T>(value: T): JsonValue {
   if (!isRecord(value)) return undefined;
 
@@ -559,7 +551,11 @@ export function wrapAsyncIterable<T>(
 
         if (!first) {
           first = true;
-          updateSpan(span, { timeToFirstChunkMs: receivedAt - t0 });
+          try {
+            span.update({ timeToFirstChunkMs: receivedAt - t0 });
+          } catch (cause) {
+            reportError(cause);
+          }
         }
 
         state.outputRecorded = false;
@@ -578,14 +574,14 @@ export function wrapAsyncIterable<T>(
           }
         }
 
-        // Chunk timing must not reach the caller. When feed() failed, the fallback reads the
-        // event again and can fail the same way, which feed() reported.
+        // Chunk timing must not reach the caller. A failure loses only the timing; when feed()
+        // already failed, the fallback can fail the same way and the reporter drops the repeat.
         try {
           if (trackOutputChunks && (stateHasOutput ?? bedrockEventHasOutput(event))) {
             span.recordOutputChunk?.(receivedAt);
           }
-        } catch {
-          // Instrumentation must never throw into caller code.
+        } catch (cause) {
+          reportError(cause);
         }
 
         yield event;
