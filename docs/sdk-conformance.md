@@ -302,10 +302,14 @@ An experiment run sends these requests in this sequence:
    succeeded, `scores`. Python sends a lone surrogate of an output or an error as U+FFFD. Each run
    gets its own deep copy of the item, so a task that changes its input does not change the next
    run. The posts go one at a time, in order. A post or a page fetch that fails stops the run: no
-   item starts after it. When the running items end, the SDK sends the request of step 4, sends its
-   failure to `onError` / `on_error`, and fails with the first error. The server then ends the
-   experiment with the item runs that it has, or fails it when it has none. Python does the same
-   after `KeyboardInterrupt` and cancellation.
+   item starts after it. So does an OTLP export of the telemetry client that the ingest refused
+   with 401 since an export last reached it, when the client sends with the API key and base URL
+   of the run. The error is then `invalid_api_key` (status 401), and its message is
+   `The API key was not accepted, so no more items run: <export error>`.
+   When the running items end, the SDK sends the request of step 4, sends its failure to
+   `onError` / `on_error`, and fails with the first error. The server then ends the experiment with
+   the item runs that it has, or fails it when it has none. Python does the same after
+   `KeyboardInterrupt` and cancellation.
 4. `POST /v1/experiments/{id}/complete`, after `flush()`.
 5. `GET /v1/experiments/{id}`, after 1, 2, 4, and then each 5 seconds, until the `status` is
    `completed`, `failed`, or `stopped`, for 30 minutes at most (`timeout`).
