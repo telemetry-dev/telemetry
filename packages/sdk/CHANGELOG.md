@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.4](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.2.3...sdk-v0.2.4) (2026-11-03)
+
+
+### Bug Fixes
+
+* **sdk:** name why exports fail and stop experiments on a revoked key ([#193](https://github.com/telemetry-dev/telemetry/issues/193)) ([012b778](https://github.com/telemetry-dev/telemetry/commit/012b7785c347c35f39bc05a43ba20b3e189fa2be))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/otel bumped to 0.2.2
+
 ## [0.2.3](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.2.2...sdk-v0.2.3) (2026-11-03)
 
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.4](https://github.com/telemetry-dev/telemetry/compare/bedrock-v0.2.3...bedrock-v0.2.4) (2026-11-03)
+
+
+### Bug Fixes
+
+* **sdk-bedrock:** report a failure in stream chunk timing and the first-chunk update ([#190](https://github.com/telemetry-dev/telemetry/issues/190)) ([214999f](https://github.com/telemetry-dev/telemetry/commit/214999fe5bb8dfcb8cfee37a3503255fb45e3794))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.2.4
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.2.4
+
 ## [0.2.3](https://github.com/telemetry-dev/telemetry/compare/bedrock-v0.2.2...bedrock-v0.2.3) (2026-11-03)
 
 
