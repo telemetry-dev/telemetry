@@ -12,7 +12,7 @@ npm install --global @telemetry-dev/cli
 
 Node.js 20 or later is required. The CLI doesn't update itself; to update it, run `npm install --global @telemetry-dev/cli@latest`. It tells you when a newer version is out: see [Updates](#updates).
 
-To try it without installing, start each command with `npx @telemetry-dev/cli` instead of `telemetry`. The CLI's own hints then use the same prefix.
+To try it without installing, start each command with `npx @telemetry-dev/cli` instead of `telemetry`. The CLI's own hints then use the same prefix, and the same goes for `pnpm dlx`, `yarn dlx`, and `bunx`.
 
 ```sh
 npx @telemetry-dev/cli login

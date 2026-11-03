@@ -1262,37 +1262,88 @@ test("on a terminal, a newer CLI on npm is announced after the output with the u
   expect(status.stderr).toContain(NOTICE);
   expect(registry.requests).toBe(1);
 
-  const npx = await onTerminal(
-    await installedAt(".npm", "_npx", "ce03004f394ebab2", "node_modules", ".bin", "telemetry.ts"),
-    {},
-    "status",
-  );
-  expect(npx.stderr).toContain(
-    `${NOTICE} Run npx @telemetry-dev/cli@latest, or install it: npm install --global @telemetry-dev/cli`,
-  );
+  // Runner paths are the ones npx, pnpm dlx with its cache moved, Yarn's dlx, and bunx
+  // use. npm's global folder can have any prefix, with Windows' shim next to it.
+  const PKG = ["node_modules", "@telemetry-dev", "cli", "cli.ts"];
+  await mkdir(join(home, "npm-global"), { recursive: true });
+  await writeFile(join(home, "npm-global", "telemetry.cmd"), "");
+  const updates: [string[], string][] = [
+    [
+      [".npm", "_npx", "ce03004f394ebab2", "node_modules", ".bin", "telemetry.ts"],
+      "Run npx @telemetry-dev/cli@latest, or install it: npm install --global @telemetry-dev/cli",
+    ],
+    [
+      [
+        "cache",
+        "dlx",
+        "c2d73a85dbd5d3bd60e628be629939cd",
+        "mw15n7mj-nzn",
+        "node_modules",
+        ".bin",
+        "telemetry.ts",
+      ],
+      "Run pnpm dlx @telemetry-dev/cli@latest, or install it: pnpm add --global @telemetry-dev/cli",
+    ],
+    [
+      ["xfs-768a7bf7", "dlx-32213", ".yarn", "cache", "cli.zip", ...PKG],
+      "Run yarn dlx @telemetry-dev/cli@latest, or install it: npm install --global @telemetry-dev/cli",
+    ],
+    [
+      ["bunx-501-@telemetry-dev", "cli@latest", ...PKG],
+      "Run bunx @telemetry-dev/cli@latest, or install it: bun add --global @telemetry-dev/cli",
+    ],
+    [
+      ["pnpm", "global", "v11", "a1", ...PKG],
+      "Update: pnpm add --global @telemetry-dev/cli@latest",
+    ],
+    [["npm-global", ...PKG], "Update: npm install --global @telemetry-dev/cli@latest"],
+    [[".npm-global", "lib", ...PKG], "Update: npm install --global @telemetry-dev/cli@latest"],
+    [
+      [".volta", "tools", "image", "packages", "@telemetry-dev", "cli", "lib", ...PKG],
+      "Update: volta install @telemetry-dev/cli@latest",
+    ],
+    [
+      ["AppData", "Local", "Volta", "tools", "image", "packages", "@telemetry-dev", "cli", ...PKG],
+      "Update: volta install @telemetry-dev/cli@latest",
+    ],
+    [
+      [".my-pnpm", "global", "v11", "a".repeat(64), ...PKG],
+      "Update: pnpm add --global @telemetry-dev/cli@latest",
+    ],
+    [[".bun", "install", "global", ...PKG], "Update: bun add --global @telemetry-dev/cli@latest"],
+    [
+      ["AppData", "Local", "Yarn", "Data", "global", ...PKG],
+      "Update: yarn global add @telemetry-dev/cli@latest",
+    ],
+  ];
 
-  const pnpm = await onTerminal(
-    await installedAt(
-      "pnpm",
-      "global",
-      "v11",
-      "a1",
-      "node_modules",
-      "@telemetry-dev",
-      "cli",
-      "cli.ts",
-    ),
-    {},
-    "status",
-  );
-  expect(pnpm.stderr).toContain(`${NOTICE} Update: pnpm add --global @telemetry-dev/cli@latest`);
+  for (const [path, update] of updates) {
+    expect((await onTerminal(await installedAt(...path), {}, "status")).stderr).toContain(
+      `${NOTICE} ${update}`,
+    );
+  }
 
-  // A project's lockfile pins its version, so it neither asks npm nor says anything,
-  // also in a project folder named like npm's global one.
+  // A project's lockfile pins its version, so it neither asks npm nor says anything:
+  // also in a folder named like npm's global one, bunx's, or pnpm dlx's, and from Yarn's
+  // Plug'n'Play cache, which has no package.json next to its node_modules.
   await rm(updateCheckPath());
-  const dependency = await installedAt("nodejs", "node_modules", ".bin", "telemetry.ts");
-  await writeFile(join(home, "nodejs", "package.json"), "{}");
-  expect((await onTerminal(dependency, {}, "status")).stderr).not.toContain("is available");
+
+  for (const [project, ...path] of [
+    ["lib", ...PKG],
+    ["bunx-demo", "node_modules", ".bin", "telemetry.ts"],
+    ["dlx", "apps", "web", "node_modules", ".bin", "telemetry.ts"],
+  ] as const) {
+    await mkdir(join(home, project), { recursive: true });
+    await writeFile(join(home, project, "package.json"), "{}");
+    const dependency = await onTerminal(await installedAt(project, ...path), {}, "status");
+    expect(dependency.stderr).not.toContain("is available");
+  }
+
+  const pnp = [".yarn", "berry", "cache", "@telemetry-dev-cli-npm-0.1.6-abc-10c0.zip", ...PKG];
+  expect((await onTerminal(await installedAt(...pnp), {}, "status")).stderr).not.toContain(
+    "is available",
+  );
+
   expect(registry.requests).toBe(1);
 
   // Agents read the saved answer from status --json, which never asks npm itself.
