@@ -190,6 +190,25 @@ test("tool spans capture input/output under tool call keys", async () => {
   expect(span.attributes["gen_ai.input.messages"]).toBeUndefined();
 });
 
+test("an agent or a tool span without a name field takes the name of the span, as in Python", async () => {
+  const { spans } = setup();
+  startSpan("turn", { type: "agent" }).end();
+  startSpan("lookup", { type: "tool" }).end();
+  startSpan("step").end();
+  // A span named after its operation names no agent or tool.
+  startSpan("invoke_agent", { type: "agent" }).end();
+  startSpan("execute_tool lookup", { type: "tool" }).end();
+  await flush();
+  const [agent, tool, step, unnamedAgent, unnamedTool] = spans.getFinishedSpans();
+  expect(agent!.attributes["gen_ai.agent.name"]).toBe("turn");
+  expect(tool!.attributes["gen_ai.tool.name"]).toBe("lookup");
+  expect(tool!.attributes["gen_ai.agent.name"]).toBeUndefined();
+  expect(step!.attributes["gen_ai.agent.name"]).toBeUndefined();
+  expect(step!.attributes["gen_ai.tool.name"]).toBeUndefined();
+  expect(unnamedAgent!.attributes["gen_ai.agent.name"]).toBeUndefined();
+  expect(unnamedTool!.attributes["gen_ai.tool.name"]).toBeUndefined();
+});
+
 test("agent fields map and update() applies later fields", async () => {
   const { spans } = setup();
   const handle = startSpan("agent-run", { type: "agent", agentName: "support" });

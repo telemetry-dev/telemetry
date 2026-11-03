@@ -70,17 +70,18 @@ changes of each release.
 | `command`           | A shell command that runs the eval script, for example `uv run python evals/reply_eval.py` or `pnpm eval`.                                                                                                                                                                                                            |
 | `dataset`           | The dataset to run on. The action puts it in `TELEMETRY_DEV_EXPERIMENT_DATASET`. When the script also names a dataset, the two must be the same.                                                                                                                                                                      |
 | `min-scores`        | Pass marks, as `name=value` pairs that commas or new lines separate. A pass rate is 0 to 1, and a mean is on the scale of its score. The action puts them in `TELEMETRY_DEV_EXPERIMENT_MIN_SCORES`, and they win over the `minScores` of the script for the same name.                                                |
-| `api-key`           | A telemetry.dev API key with the `datasets:read` and `experiments:write` scopes, for all environments or for `experiment`. Default: the `TELEMETRY_DEV_API_KEY` variable of the job.                                                                                                                                  |
+| `api-key`           | A telemetry.dev API key with the `datasets:read` and `experiments:write` scopes (Run experiments) and, for the traces of the items, Send telemetry. Default: the `TELEMETRY_DEV_API_KEY` variable of the job.                                                                                                         |
 | `base-url`          | The telemetry.dev API. Default: `https://api.telemetry.dev`.                                                                                                                                                                                                                                                          |
 | `working-directory` | The directory that the script or the command runs in. Default: `.`.                                                                                                                                                                                                                                                   |
 | `comment`           | `true` or `false`. Set to `false` to write the job summary only. Another value gets a warning and counts as `true`. Default: `true`.                                                                                                                                                                                  |
 | `github-token`      | The token that writes the comment. Default: `github.token`, which needs the `pull-requests: write` permission. When it is empty on a pull request, the action writes no comment and logs a warning.                                                                                                                   |
 
 The action sets `TELEMETRY_DEV_ENVIRONMENT` to `experiment` when the job does not set it, so the
-traces of the items stay out of your production pages. Thus the key must be for all environments
-or for `experiment`. A key for another environment, for example your production key, cannot send
-the traces of the items: the experiment then completes with its outputs, but with no traces and no
-cost. `CI` is `true` in GitHub Actions, thus the SDK runs in CI mode: it records the repository,
+traces of the items stay out of your production pages. A key with Run experiments sends the
+`experiment` environment even when it is for another environment, but it needs Send telemetry for
+the traces of the items. Without it, the experiment completes with its outputs, but with no traces
+and no cost, and the job summary says that the runs have no traces, with the reason of the ingest.
+`CI` is `true` in GitHub Actions, thus the SDK runs in CI mode: it records the repository,
 the commit, the run, and the pull request with the experiment, and it exits with an error when the
 check fails.
 

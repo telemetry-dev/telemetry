@@ -396,12 +396,20 @@ test("report.mjs writes the summary, posts it on the pull request, and sets the 
 
 test("report.mjs fails the job for a failed experiment before the last, when the script exits with 0", async () => {
   // The lines of an SDK that writes the CI mode.
-  const failed = { ...result, ci: true, runsPerItem: 1 };
+  const failed = { ...result, ci: true, runsPerItem: 1, traced: true };
   const passed = { ...failed, name: "reply-short", checkStatus: "passed", itemsFailed: 0 };
   const stopped = { ...passed, name: "reply-stopped", status: "stopped", checkStatus: null };
-  // A failed check and a stopped experiment of a script that runs with the CI mode off.
-  const notInCi = { ...result, name: "reply-local", ci: false, runsPerItem: 3 };
-  const stoppedNotInCi = { ...stopped, name: "reply-local-stopped", ci: false };
+  // A failed check of a script that runs with the CI mode off, and without a telemetry client.
+  const notInCi = { ...result, name: "reply-local", ci: false, runsPerItem: 3, traced: false };
+  // A stopped experiment whose traces the ingest refused.
+  const stoppedNotInCi = {
+    ...stopped,
+    name: "reply-local-stopped",
+    ci: false,
+    traced: false,
+    tracesError:
+      "telemetry.dev trace ingest failed: 403 This project does not accept telemetry. Turn on Accept telemetry in its settings.",
+  };
 
   const failedFirst = await report({ EXPERIMENT_EXIT_CODE: "0", INPUT_COMMENT: "false" }, [
     failed,
@@ -427,17 +435,33 @@ test("report.mjs fails the job for a failed experiment before the last, when the
   expect(failedFirst.outputs["check-status"]).toBe("passed");
   expect(failedFirst.summary).not.toContain("runs each");
   expect(failedFirst.summary).not.toContain("does not fail the job");
+  expect(failedFirst.summary).not.toContain("no traces");
   expect(olderSdk.code).toBe(0);
   expect(olderSdk.stdout).not.toContain("::error");
   expect(olderSdk.summary).not.toContain("does not fail the job");
+  expect(olderSdk.summary).not.toContain("no traces");
   expect(allPassed.code).toBe(0);
   expect(allPassed.outputs["check-status"]).toBe("passed");
   expect(offCi.code).toBe(0);
   expect(offCi.stdout).not.toContain("::error");
   expect(offCi.summary).toContain(
     "Check failed. 40 items, 3 runs each: 118 of 120 runs completed, 2 failed.\n\n" +
-      "The CI mode of this experiment was off, thus it does not fail the job.",
+      "The CI mode of this experiment was off, thus it does not fail the job.\n\n" +
+      "The runs have no traces: the items have no trace to open, and Cost leaves out the model " +
+      "calls of your code. No telemetry client sent them: before the experiment runs, call " +
+      '`init({ environment: "experiment" })` in TypeScript, or `init(environment="experiment")` ' +
+      "in Python, with an API key.",
   );
+  // A refusal names the reason of the ingest in place of the init() advice.
+  expect(offCi.summary).toContain(
+    "Cost leaves out the model calls of your code. The ingest refused them:\n\n" +
+      // Escaped, as the action escapes all text from the API.
+      "> telemetry\\.dev trace ingest failed\\: 403 This project does not accept telemetry\\. Turn " +
+      "on Accept telemetry in its settings\\.",
+  );
+  // Only the note without a reason gives the init() advice, in TypeScript and in Python.
+  expect(offCi.summary.match(/init\(/g)).toHaveLength(2);
+  expect(offCi.summary.match(/no traces/g)).toHaveLength(2);
 });
 
 /** The body of the comment that the action posts for the result. */

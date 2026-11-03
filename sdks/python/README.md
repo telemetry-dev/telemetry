@@ -74,6 +74,11 @@ initialization. Explicit and propagated session IDs take precedence, and valid p
 context is preserved. The generated session ends when the client is shut down or replaced; a
 later `init()` generates a new ID. It is not persisted across processes.
 
+The root spans of a session join one trace for each API key, and the trace keeps the environment
+of its first turn. When one key sends turns of the same session id from two environments, the
+later turns show under the first environment, or get a 403 when the key may not send that
+environment. Use a key for each environment, or give each environment its own session ids.
+
 ## API reference
 
 | Name | Description |
@@ -388,10 +393,16 @@ result = telemetry_dev.run_experiment(
   it when it got none.
 - The key needs Run experiments in its Access on the API keys page (the `datasets:read` and
   `experiments:write` scopes). `run_experiment` uses the same
-  API key and base URL as `get_prompt`, or its own `api_key` and `base_url`. With
-  `environment="experiment"`, the key of the telemetry client must be for all environments or for
-  `experiment`: a key for another environment cannot send the traces of the items, and the items
-  then have no trace and no cost.
+  API key and base URL as `get_prompt`, or its own `api_key` and `base_url`.
+- The items send their traces with the key of the telemetry client, which needs Send telemetry. A
+  key for one environment also sends the `experiment` environment when it has Run experiments.
+  Without a client, without Send telemetry, with a key for another environment and no Run
+  experiments, or when Accept telemetry is off in the project settings, the items have no trace
+  and no cost. The export error says why, and the job summary of the experiment action says that
+  the runs have no traces, with the reason of the ingest.
+- When the ingest refuses a trace export because the key is not valid (401), for example after
+  the key was revoked or its project was deleted, and the client sends with the key and the base
+  URL of the run, `run_experiment` starts no more items and raises `ExperimentError` with `invalid_api_key`.
 
 The outputs, the exceptions of failed tasks, the scorer reasons, and `metadata` go to telemetry.dev
 and stay with the experiment, because they are its result. `capture_output`, `mask`, and the
@@ -435,6 +446,8 @@ telemetry_dev.score(
 ```
 
 - Give `trace_id`, `session_id`, or the two, and a `span_id` of the trace for a score on one span.
+  With a `trace_id`, the score belongs to that trace and shows in the session of the trace, even
+  when the `session_id` names another session.
   Give `value`, `label`, or the two. `user_feedback` takes the value 1 for up or 0 for down, and
   no label. A pass/fail score has the label `pass` with the value 1, or `fail` with 0.
 - Like the telemetry functions, `score` never raises. It returns the id of the score, or `None`

@@ -2,6 +2,7 @@ import { type Context, trace } from "@opentelemetry/api";
 import {
   activeContext,
   diag,
+  type IngestError,
   jsonAttr,
   PROPAGATED_KEY,
   propagatedFromContext,
@@ -296,7 +297,12 @@ export async function runExperiment(options: RunExperimentOptions): Promise<Expe
   // The action skips the check of a result with the CI mode off, and counts the items from runs.
   writeResult(
     env,
-    { ...(body as Record<string, unknown>), ci: run.inCi, runsPerItem: run.runsPerItem },
+    {
+      ...(body as Record<string, unknown>),
+      ci: run.inCi,
+      runsPerItem: run.runsPerItem,
+      ...traces(),
+    },
     api.onError,
   );
   console.log(describe(result, run.runsPerItem));
@@ -535,6 +541,21 @@ async function runItems(
 
   const worker = async () => {
     while (failure === undefined) {
+      const rejected = keyRejected(api);
+
+      if (rejected) {
+        failure = {
+          error: new ExperimentError(
+            "invalid_api_key",
+            `The API key was not accepted, so no more items run: ${rejected.message}`,
+            rejected.status,
+            { cause: rejected },
+          ),
+        };
+
+        return;
+      }
+
       const next = await runs.next().catch((error: unknown) => {
         failure ??= { error };
 
@@ -564,6 +585,39 @@ async function runItems(
 
     throw failure.error;
   }
+}
+
+/**
+ * The refusal of an export of the client with 401 since an export last reached the ingest, when
+ * the client sends with the key of the run to the same server. The key then stopped working, for
+ * example because it was revoked or its project was deleted, and the API will refuse the results
+ * of the items too.
+ */
+function keyRejected(api: Authed): IngestError | undefined {
+  const core = currentClient().core;
+  const rejected = core?.failures.rejected;
+
+  return rejected?.status === 401 &&
+    core?.config.apiKey === api.apiKey &&
+    core.config.baseUrl === api.baseUrl
+    ? rejected
+    : undefined;
+}
+
+/**
+ * For the results line of the experiment action: `traced` is false without an enabled client, or
+ * when the ingest refused an export of the client with 401 or 403 since an export last reached
+ * it, and `tracesError` then gives its reason. Exports that failed for another reason, such as an
+ * outage, are not counted.
+ */
+function traces(): { traced: boolean; tracesError?: string } {
+  const core = currentClient().core;
+
+  if (core === undefined) return { traced: false };
+
+  const rejected = core.failures.rejected;
+
+  return rejected ? { traced: false, tracesError: rejected.message } : { traced: true };
 }
 
 /** Collects item results and posts them in order, one post at a time. */

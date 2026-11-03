@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import copy
+import json
 import math
 import os
 import threading
@@ -11,6 +12,7 @@ from contextlib import contextmanager
 from enum import Enum
 from typing import Any, TypeVar, cast
 
+import requests
 from opentelemetry.exporter.otlp.proto.common._log_encoder import encode_logs
 from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
 from opentelemetry.sdk._logs.export import LogRecordExporter, LogRecordExportResult
@@ -434,11 +436,74 @@ _export_state = threading.local()
 @contextmanager
 def exporting() -> Generator[None]:
     """Marks the current thread as inside an export of this SDK while the block runs."""
+    if not getattr(_export_state, "depth", 0):
+        _export_state.refused = None
     _export_state.depth = getattr(_export_state, "depth", 0) + 1
     try:
         yield
     finally:
         _export_state.depth -= 1
+
+
+class IngestError(RuntimeError):
+    """A failed export, with the HTTP status that the ingest answered."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def otlp_session() -> requests.Session:
+    """A session for an OTLP exporter of this SDK. It keeps the last response of an export that
+    the ingest refused, so that the failure names the reason that the ingest gave. The OTLP
+    exporter sends on the thread of the export, thus the response is kept for that thread."""
+    session = requests.Session()
+    session.hooks["response"].append(_keep_refused)
+    return session
+
+
+def _keep_refused(response: requests.Response, *args: Any, **kwargs: Any) -> None:
+    _export_state.refused = None if response.ok else response
+
+
+def export_error(label: str) -> RuntimeError:
+    """The error of a failed export of this thread: the status and the message of the response
+    that the ingest refused it with, when there was one."""
+    response: requests.Response | None = getattr(_export_state, "refused", None)
+    if response is None:
+        return RuntimeError(f"OTLP {label} export failed (check the API key and ingest URL)")
+    reason = _status_message(response)
+    return IngestError(
+        f"telemetry.dev {_LABELS.get(label, label)} ingest failed: {response.status_code}"
+        + (f" {reason}" if reason else ""),
+        response.status_code,
+    )
+
+
+# The labels of the TypeScript transport, so that both SDKs report a failure the same way.
+_LABELS = {"span": "trace"}
+
+
+def _status_message(response: requests.Response) -> str | None:
+    """The message of the JSON or protobuf Status of an OTLP error response, as the telemetry.dev
+    ingest sends it, such as "This API key cannot send telemetry. Create a key with Send
+    telemetry access." None for another content type, or a body that cannot be read."""
+    content_type = response.headers.get("content-type", "")
+    try:
+        # The exporter has read the whole body; a cut could split the Status.
+        body = response.content
+        if "json" in content_type:
+            message = json.loads(body).get("message")
+        elif "protobuf" in content_type:
+            # Imported here, so that a protobuf stack that cannot load it loses only the message.
+            from google.rpc.status_pb2 import Status
+
+            message = Status.FromString(body).message
+        else:
+            return None
+    except Exception:
+        return None
+    return message.strip() or None if isinstance(message, str) else None
 
 
 # The keys of the work items whose thread has not finished, each with the process of its thread.
@@ -527,9 +592,18 @@ class ExportFailures:
         self._on_error = on_error
         self._lock = ProcessLock(threading.Lock)
         self._reported = False
+        self._rejected: IngestError | None = None
+
+    @property
+    def rejected(self) -> IngestError | None:
+        """The last export that the ingest refused with 401 (the API key is not valid) or 403
+        (the key cannot send telemetry) since an export reached the ingest."""
+        return self._rejected
 
     def report(self, message: str, exc: BaseException) -> None:
         with self._lock():
+            if isinstance(exc, IngestError) and exc.status in (401, 403):
+                self._rejected = exc
             if self._reported:
                 return
             self._reported = True
@@ -541,6 +615,7 @@ class ExportFailures:
         """Records that an export reached the ingest, so that report() sends the next failure."""
         with self._lock():
             self._reported = False
+            self._rejected = None
 
 
 class ReportingSpanExporter(SpanExporter):
@@ -577,10 +652,7 @@ class ReportingSpanExporter(SpanExporter):
                 # Every record was dropped: the export did not fail, and the series goes on.
                 return SpanExportResult.SUCCESS
             if result is SpanExportResult.FAILURE:
-                self._failures.report(
-                    "span export failed",
-                    RuntimeError("OTLP span export failed (check the API key and ingest URL)"),
-                )
+                self._failures.report("span export failed", export_error("span"))
             else:
                 self._failures.clear()
             return result
@@ -625,10 +697,7 @@ class ReportingLogExporter(LogRecordExporter):
                 # Every record was dropped: the export did not fail, and the series goes on.
                 return LogRecordExportResult.SUCCESS
             if result is LogRecordExportResult.FAILURE:
-                self._failures.report(
-                    "log export failed",
-                    RuntimeError("OTLP log export failed (check the API key and ingest URL)"),
-                )
+                self._failures.report("log export failed", export_error("log"))
             else:
                 self._failures.clear()
             return result

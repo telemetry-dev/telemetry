@@ -3,6 +3,7 @@ from __future__ import annotations
 # pyright: reportPrivateUsage=false
 import atexit
 import ctypes
+import json
 import os
 import random
 import signal
@@ -11,9 +12,11 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
+from google.rpc.status_pb2 import Status
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.common._log_encoder import encode_logs
 from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
@@ -375,10 +378,100 @@ def test_an_ingest_outage_is_one_report_until_an_export_reaches_the_ingest_again
         telemetry_dev.shutdown()
 
     assert len(errors) == 2
-    assert "span export failed" in str(errors[0])
-    assert "log export failed" in str(errors[1])
+    assert str(errors[0]) == "telemetry.dev trace ingest failed: 503"
+    assert str(errors[1]) == "telemetry.dev log ingest failed: 503"
     logged = [record for record in caplog.records if record.name == "telemetry_dev"]
     assert len(logged) == 2
+
+
+_NO_TELEMETRY = "This API key cannot send telemetry. Create a key with Send telemetry access."
+
+
+@pytest.mark.parametrize(
+    ("status", "content_type", "body", "message", "rejected"),
+    [
+        (
+            403,
+            "application/x-protobuf",
+            Status(code=7, message=_NO_TELEMETRY).SerializeToString(),
+            f"telemetry.dev trace ingest failed: 403 {_NO_TELEMETRY}",
+            403,
+        ),
+        (
+            401,
+            "application/json",
+            json.dumps({"code": 16, "message": "API key was not accepted"}).encode(),
+            "telemetry.dev trace ingest failed: 401 API key was not accepted",
+            401,
+        ),
+        # Bytes that read as a protobuf Status, from a proxy that answers with text.
+        (400, "text/plain", b"\x12\x04oops", "telemetry.dev trace ingest failed: 400", None),
+    ],
+)
+def test_a_refused_export_reports_the_message_of_the_ingest(
+    status: int, content_type: str, body: bytes, message: str, rejected: int | None
+) -> None:
+    errors: list[BaseException] = []
+
+    with otlp_capture_server() as ingest:
+        ingest.status = status
+        ingest.error_type = content_type
+        ingest.error_body = body
+        client = telemetry_dev.init(
+            api_key="[REDACTED:api-key]",
+            base_url=ingest.url,
+            export_mode="immediate",
+            log_level="silent",
+            disable_atexit=True,
+            on_error=errors.append,
+        )
+        telemetry_dev.start_span("step").end()
+        telemetry_dev.flush()
+        assert [str(error) for error in errors] == [message]
+        failures = client.export_failures
+        assert (failures.rejected and failures.rejected.status) == rejected
+
+        # An export that reaches the ingest ends the rejection.
+        ingest.status = 200
+        telemetry_dev.start_span("step").end()
+        telemetry_dev.flush()
+        assert failures.rejected is None
+        telemetry_dev.shutdown()
+
+
+def test_an_export_with_no_response_does_not_report_an_earlier_refusal_of_its_thread() -> None:
+    errors: list[BaseException] = []
+
+    with otlp_capture_server() as ingest:
+        ingest.path_status["/v1/traces"] = 401
+        client = telemetry_dev.init(
+            api_key="[REDACTED:api-key]",
+            base_url=ingest.url,
+            log_level="silent",
+            disable_atexit=True,
+            timeout=0.5,
+            on_error=errors.append,
+        )
+        # A flush exports on the thread that calls it. The span exports run on one thread, and the
+        # log export on another.
+        with ThreadPoolExecutor(1) as span_thread:
+            telemetry_dev.start_span("refused").end()
+            span_thread.submit(telemetry_dev.flush).result()
+            # A log reaches the ingest on another thread, which ends the refusal.
+            telemetry_dev.log("reaches the ingest")
+            telemetry_dev.flush()
+            assert client.export_failures.rejected is None
+            # The next span export on the span thread gets no response before its timeout.
+            ingest.post_delay = 1.0
+            telemetry_dev.start_span("times out").end()
+            span_thread.submit(telemetry_dev.flush).result()
+            ingest.post_delay = 0
+        telemetry_dev.shutdown()
+
+    assert str(errors[0]) == "telemetry.dev trace ingest failed: 401"
+    # The generic message, or the timeout itself from the exporter versions that raise it.
+    assert len(errors) == 2
+    assert "401" not in str(errors[1])
 
 
 def test_a_failure_during_a_slow_report_on_another_thread_is_quiet_and_does_not_wait() -> None:
@@ -430,7 +523,7 @@ def test_an_outage_that_stops_byo_traces_and_metrics_is_one_report() -> None:
 
     assert sorted(request.path for request in ingest.requests) == ["/v1/metrics", "/v1/traces"]
     assert len(errors) == 1
-    assert "span export failed" in str(errors[0])
+    assert str(errors[0]) == "telemetry.dev trace ingest failed: 400"
 
 
 _MAX_BODY_BYTES = 16 * 1024 * 1024
@@ -714,7 +807,9 @@ def test_a_split_batch_stops_at_its_first_failed_request(kind: str) -> None:
         telemetry_dev.shutdown()
 
         assert len(ingest.requests_for("/v1/traces" if kind == "span" else "/v1/logs")) == 1
-        assert len([error for error in errors if f"{kind} export failed" in str(error)]) == 1
+        label = "trace" if kind == "span" else kind
+        failed = f"telemetry.dev {label} ingest failed: 400"
+        assert len([error for error in errors if failed in str(error)]) == 1
 
 
 @pytest.mark.parametrize("kind", ["span", "log"])
@@ -745,7 +840,9 @@ def test_a_batch_whose_only_record_is_dropped_does_not_end_a_failure_series(kind
 
         assert len(ingest.requests_for("/v1/traces" if kind == "span" else "/v1/logs")) == 2
         assert any("exceeds max export size, dropped" in str(error) for error in errors)
-        assert len([error for error in errors if f"{kind} export failed" in str(error)]) == 1
+        label = "trace" if kind == "span" else kind
+        failed = f"telemetry.dev {label} ingest failed: 400"
+        assert len([error for error in errors if failed in str(error)]) == 1
 
     # The processors ignore an export's result, so check that the drop alone does not fail.
     spans = InMemorySpanExporter()

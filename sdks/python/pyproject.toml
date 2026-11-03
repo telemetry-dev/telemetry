@@ -22,6 +22,12 @@ dependencies = [
   "opentelemetry-api>=1.39.0,<2",
   "opentelemetry-sdk>=1.39.0,<2",
   "opentelemetry-exporter-otlp-proto-http>=1.39.0,<2",
+  # The OTLP exporter sends with requests, and the ingest answers a refused export with a
+  # google.rpc.Status. The exporter requires both; the SDK reads the Status of the response.
+  # 1.63.1 is the first release that imports with protobuf 5, which opentelemetry-proto needs.
+  # The requests floor of the exporter, 2.7, does not import on Python 3.10; 2.28 does.
+  "googleapis-common-protos>=1.63.1,<2",
+  "requests>=2.28,<3",
   "rfc8785>=0.1.4",
 ]
 

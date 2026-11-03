@@ -24,6 +24,7 @@ import {
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
+  createExportFailures,
   createMetricExporter,
   createLogExporter,
   createTraceExporter,
@@ -184,6 +185,96 @@ test("reports retry-after values beyond the local cap", async () => {
   expect(code).toBe(ExportResultCode.FAILED);
   expect(calls).toHaveLength(1);
   expect(String(errors[0])).toContain("retry-after 60 exceeds 2s retry cap");
+});
+
+/** A google.rpc.Status with a code and a message, as the ingest encodes it for protobuf. */
+function protobufStatus(code: number, message: string): Uint8Array {
+  const text = new TextEncoder().encode(message);
+  const varint = (value: number) => {
+    const bytes = [];
+
+    for (; value >= 0x80; value >>>= 7) bytes.push((value & 0x7f) | 0x80);
+    bytes.push(value);
+
+    return bytes;
+  };
+
+  return new Uint8Array([0x08, ...varint(code), 0x12, ...varint(text.length), ...text]);
+}
+
+const PROTOBUF = { "content-type": "application/x-protobuf" };
+const NO_TELEMETRY = "This API key cannot send telemetry. Create a key with Send telemetry access.";
+// Over 127 bytes, so that its length takes two bytes.
+const LONG_MESSAGE = `API key was not accepted. ${"x".repeat(120)}`;
+
+test.each([
+  {
+    name: "a 403 with a protobuf Status",
+    response: () =>
+      new Response(protobufStatus(7, NO_TELEMETRY), { status: 403, headers: PROTOBUF }),
+    message: `telemetry.dev trace ingest failed: 403 ${NO_TELEMETRY}`,
+    rejected: 403,
+  },
+  {
+    name: "a 401 with a protobuf Status of a long message",
+    response: () =>
+      new Response(protobufStatus(16, LONG_MESSAGE), { status: 401, headers: PROTOBUF }),
+    message: `telemetry.dev trace ingest failed: 401 ${LONG_MESSAGE}`,
+    rejected: 401,
+  },
+  {
+    name: "a 403 with a Status in a body that does not end",
+    // Only the first 4096 bytes are read; the rest of the body is not waited for.
+    response: () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            const status = protobufStatus(7, NO_TELEMETRY);
+            const padded = new Uint8Array(5000);
+            padded.set(status);
+            // Zero padding after the Status; the message is read before it.
+            controller.enqueue(padded);
+          },
+        }),
+        { status: 403, headers: PROTOBUF },
+      ),
+    message: `telemetry.dev trace ingest failed: 403 ${NO_TELEMETRY}`,
+    rejected: 403,
+  },
+  {
+    name: "a 401 with a JSON Status",
+    response: () =>
+      Response.json({ code: 16, message: "API key was not accepted" }, { status: 401 }),
+    message: "telemetry.dev trace ingest failed: 401 API key was not accepted",
+    rejected: 401,
+  },
+  {
+    name: "a 400 with a body of another type",
+    // Bytes that read as a protobuf Status, from a proxy that answers with text.
+    response: () =>
+      new Response("\x12\x04oops", { status: 400, headers: { "content-type": "text/plain" } }),
+    message: "telemetry.dev trace ingest failed: 400",
+    rejected: undefined,
+  },
+])("$name reports the message of the ingest", async ({ response, message, rejected }) => {
+  const errors: Error[] = [];
+  const failures = createExportFailures((error) => errors.push(error));
+  let reached = false;
+  const fetchImpl: typeof fetch = () =>
+    Promise.resolve(reached ? new Response(null, { status: 200 }) : response());
+  const exporter = createTraceExporter(
+    { url: "https://ingest.example/v1/traces", headers: otlpHeaders("td_live_x") },
+    { fetchImpl, failures },
+  );
+
+  expect(await exportSpans(exporter, makeSpans(1))).toBe(ExportResultCode.FAILED);
+  expect(errors.map((error) => error.message)).toEqual([message]);
+  expect(failures.rejected?.status).toBe(rejected);
+
+  // An export that reaches the ingest ends the rejection.
+  reached = true;
+  expect(await exportSpans(exporter, makeSpans(1))).toBe(ExportResultCode.SUCCESS);
+  expect(failures.rejected).toBeUndefined();
 });
 
 describe("retry-after", () => {
