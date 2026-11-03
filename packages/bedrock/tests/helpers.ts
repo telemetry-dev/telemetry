@@ -6,7 +6,13 @@ import {
 } from "@opentelemetry/sdk-trace-base";
 import { HttpResponse } from "@smithy/protocol-http";
 
-import { init, shutdown, StreamCapture, type MaskFn } from "@telemetry-dev/sdk";
+import {
+  init,
+  shutdown,
+  StreamCapture,
+  type MaskFn,
+  type TelemetryOptions,
+} from "@telemetry-dev/sdk";
 
 // Most tests reach the stream bound at 48 KiB: another stream holds a byte, and setup sizes the
 // shared bound to leave a stream these tests start 48 KiB.
@@ -21,6 +27,7 @@ export function setup(
     captureInput?: boolean;
     captureOutput?: boolean;
     batch?: { maxStreamBytes?: number };
+    onError?: TelemetryOptions["onError"];
   } = {},
 ): InMemorySpanExporter {
   const spans = new InMemorySpanExporter();

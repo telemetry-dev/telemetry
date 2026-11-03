@@ -9,7 +9,6 @@ import {
   arrayValue,
   awsMetadataFields,
   basenameArn,
-  bytesToString,
   captureMaskedBeforeStart,
   isRecord,
   mergeFields,
@@ -73,6 +72,12 @@ export class AgentStreamState implements StreamState {
   private errorFields: SpanFields | undefined;
   private citationCount = 0;
   private readonly outputFiles: unknown[] = [];
+  outputRecorded = false;
+  metadataLost = false;
+  reportError?: (cause: unknown) => void;
+  // AWS does not document that a chunk ends on a character boundary, so the text is decoded as
+  // one stream. Bytes that are not UTF-8 still throw.
+  private readonly decoder = new TextDecoder("utf-8", { fatal: true });
   // Metadata bypasses the capture flags and the mask, so trace and file content is filtered here,
   // and a mask that cannot see it withholds it.
   private readonly contentCapture: AgentTraceCapture = {
@@ -98,26 +103,16 @@ export class AgentStreamState implements StreamState {
     const chunk = isRecord(raw.chunk) ? raw.chunk : undefined;
     const bytes = chunk?.bytes;
 
-    const piece = bytes === undefined ? undefined : bytesToString(bytes);
+    const piece =
+      typeof bytes === "string"
+        ? bytes
+        : ArrayBuffer.isView(bytes)
+          ? this.decoder.decode(bytes, { stream: true })
+          : undefined;
 
     if (piece) {
       if (this.retention.accept(piece)) this.text += piece;
       else this.textRejected = true;
-    }
-
-    const attribution = isRecord(chunk?.attribution) ? chunk.attribution : undefined;
-    const citations = arrayValue<unknown>(attribution?.citations);
-
-    if (citations) this.citationCount += citations.length;
-
-    const files = isRecord(raw.files) ? arrayValue<JsonValue>(raw.files.files) : undefined;
-
-    const sanitizedFiles = files?.map((file) =>
-      sanitizeOutputFile(file, this.contentCapture.output),
-    );
-
-    if (sanitizedFiles && this.retention.accept(sanitizedFiles)) {
-      this.outputFiles.push(...sanitizedFiles);
     }
 
     const returnControl = isRecord(raw.returnControl) ? raw.returnControl : undefined;
@@ -138,13 +133,44 @@ export class AgentStreamState implements StreamState {
       }
     }
 
+    this.outputRecorded = true;
+    const attribution = isRecord(chunk?.attribution) ? chunk.attribution : undefined;
+    const citations = arrayValue<unknown>(attribution?.citations);
+
+    if (citations) this.citationCount += citations.length;
+
+    const files = isRecord(raw.files) ? arrayValue<JsonValue>(raw.files.files) : undefined;
+
+    if (files) {
+      let sanitizedFiles: JsonValue[];
+
+      try {
+        sanitizedFiles = files.map((file) => sanitizeOutputFile(file, this.contentCapture.output));
+      } catch (cause) {
+        // The file metadata is lost, as files dropped by the bound are, but no text is.
+        this.metadataLost = true;
+        throw cause;
+      }
+
+      if (this.retention.accept(sanitizedFiles)) this.outputFiles.push(...sanitizedFiles);
+    }
+
     const traceEvent = isRecord(raw.trace) ? raw.trace : undefined;
 
     if (traceEvent) {
       this.traceEventCount += 1;
 
       if (this.options.captureAgentTrace) {
-        const retained = projectTrace(traceEvent, TRACE_PART, this.contentCapture);
+        let retained: JsonValue;
+
+        try {
+          retained = projectTrace(traceEvent, TRACE_PART, this.contentCapture);
+        } catch (cause) {
+          // The trace content is lost, as a trace dropped by the bound is, but no text is, so
+          // later text is still kept.
+          this.metadataLost = true;
+          throw cause;
+        }
 
         if (this.retention.accept(retained)) this.traces.push(retained);
       }
@@ -178,6 +204,11 @@ export class AgentStreamState implements StreamState {
     }
   }
 
+  outputLost(): void {
+    // The lost event may have carried text. Return control still replaces it.
+    this.textRejected = true;
+  }
+
   outputTruncated(): boolean {
     // Return control replaces the text output and is retained whole when it fits its bound.
     if (this.returnControl !== undefined) return false;
@@ -185,7 +216,19 @@ export class AgentStreamState implements StreamState {
     return this.textRejected || this.returnControlRejected;
   }
 
-  finish(): SpanFields {
+  finish(partial: boolean): SpanFields {
+    // A stream cut short may stop inside a character; that is already an incomplete capture.
+    if (!partial) {
+      try {
+        this.decoder.decode();
+      } catch (cause) {
+        // The stream ended inside a character, so its last text is lost.
+        this.reportError?.(cause);
+        this.textRejected = true;
+        this.retention.truncated = true;
+      }
+    }
+
     const metadata = omitUndefined({
       trace_event_count: this.traceEventCount || undefined,
       failure: this.failed ? true : undefined,

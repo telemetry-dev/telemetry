@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import threading
@@ -561,6 +562,9 @@ class AgentStreamState(StreamState):
         self.budget = stream_capture_budget()
         self.capture_trace = capture_trace
         self.text_fragments = _DeltaBuffer()
+        # AWS does not document that a chunk ends on a character boundary, so the text is
+        # decoded as one stream. Bytes that are not UTF-8 still raise.
+        self._decoder = codecs.getincrementaldecoder("utf-8")()
         # Trace metadata shares the budget but does not make the text incomplete.
         self.text_rejected = False
         self.usage: dict[str, int] = {}
@@ -587,7 +591,7 @@ class AgentStreamState(StreamState):
             return
         chunk = event.get("chunk") if isinstance(event.get("chunk"), dict) else {}
         raw = chunk.get("bytes")
-        piece = bytes(raw).decode("utf-8") if isinstance(raw, bytes | bytearray) else raw
+        piece = self._decoder.decode(bytes(raw)) if isinstance(raw, bytes | bytearray) else raw
         if isinstance(piece, str) and piece:
             if self.budget.accept(piece):
                 self.text_fragments.write(piece)
@@ -625,7 +629,15 @@ class AgentStreamState(StreamState):
             self._collect_trace(trace)
 
     def finish(self, *, partial: bool) -> dict[str, Any]:
-        del partial
+        # A stream cut short may stop inside a character; that is already an incomplete capture.
+        if not partial:
+            try:
+                self._decoder.decode(b"", final=True)
+            except UnicodeDecodeError as exc:
+                # The stream ended inside a character, so its last text is lost.
+                self.report_error(exc)
+                self.text_rejected = True
+                self.budget.truncated = True
         metadata = clean(
             {
                 "trace_event_count": self.trace_count or None,

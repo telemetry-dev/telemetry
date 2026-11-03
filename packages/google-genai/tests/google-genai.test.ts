@@ -144,6 +144,7 @@ function setupSpans(
     captureOutput?: boolean;
     mask?: (value: unknown, context: { key: string }) => unknown;
     maxAttributeLength?: number;
+    onError?: (cause: Error) => void;
     sampler?: Sampler;
     batch?: { maxStreamBytes?: number };
   } = {},
@@ -1488,6 +1489,277 @@ test("streaming mid-stream error records error status with partial output", asyn
   ]);
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
 });
+
+function throwingGetter(message: string, enumerable = true): PropertyDescriptor {
+  return {
+    enumerable,
+    get() {
+      throw new Error(message);
+    },
+  };
+}
+
+// A parts array that reads as its parts by index, as the chunk timing does, but whose iteration
+// fails after it yields `kept`.
+function partsThatBreak(kept: object[]): object[] {
+  const parts = [...kept, { text: "x" }];
+  Object.defineProperty(parts, Symbol.iterator, {
+    *value() {
+      yield* kept;
+      throw new Error("parts broke");
+    },
+  });
+
+  return parts;
+}
+
+type StreamBreak =
+  | "parts"
+  | "function-call"
+  | "function-response"
+  | "candidate-metadata"
+  | "prompt-feedback"
+  | "usage"
+  | "afc-history"
+  | "chunk-timing"
+  | "first-chunk"
+  | "end"
+  | "parts-uncaptured"
+  | "parts-then-usage";
+
+const STREAMED_HISTORY = [
+  { role: "user", parts: [{ text: "Weather?" }] },
+  { role: "model", parts: [{ functionCall: { name: "lookup", args: {} } }] },
+  { role: "user", parts: [{ functionResponse: { name: "lookup", response: { ok: true } } }] },
+];
+
+test.each<{
+  failure: StreamBreak;
+  masked: boolean;
+  kept: string | undefined;
+  flagged: boolean;
+  reported: string;
+}>([
+  // The part after the failure is not kept, nor the next chunk, so the output is a prefix.
+  { failure: "parts", masked: false, kept: "ab", flagged: true, reported: "parts broke" },
+  { failure: "parts", masked: true, kept: undefined, flagged: true, reported: "parts broke" },
+  // Without a mask the metadata is kept whole, as response content, so its loss is flagged; a
+  // mask keeps only its structure, whose loss is not.
+  {
+    failure: "candidate-metadata",
+    masked: false,
+    kept: "abc",
+    flagged: true,
+    reported: "metadata broke",
+  },
+  {
+    failure: "candidate-metadata",
+    masked: true,
+    kept: "abc",
+    flagged: false,
+    reported: "metadata broke",
+  },
+  {
+    failure: "prompt-feedback",
+    masked: false,
+    kept: "abc",
+    flagged: true,
+    reported: "feedback broke",
+  },
+  // Each chunk fails, and the stream reports once.
+  { failure: "usage", masked: false, kept: "abc", flagged: false, reported: "usage broke" },
+  // The history is the only record of the tool calls, so its loss is flagged, also with a mask.
+  // It is not output, so the answer is whole, and the history that mapped before is kept.
+  { failure: "afc-history", masked: false, kept: "abc", flagged: true, reported: "history broke" },
+  { failure: "afc-history", masked: true, kept: "abc", flagged: true, reported: "history broke" },
+  { failure: "chunk-timing", masked: false, kept: "abc", flagged: false, reported: "timing broke" },
+  { failure: "first-chunk", masked: false, kept: "abc", flagged: false, reported: "update broke" },
+  { failure: "end", masked: false, kept: undefined, flagged: true, reported: "end broke" },
+  // A failure in an earlier AFC turn keeps no output after it, also once the next turn starts.
+  {
+    failure: "function-call",
+    masked: false,
+    kept: undefined,
+    flagged: true,
+    reported: "parts broke",
+  },
+  // The function response is lost from the rebuilt history, which is flagged; the answer is whole.
+  {
+    failure: "function-response",
+    masked: false,
+    kept: "abc",
+    flagged: true,
+    reported: "response copy broke",
+  },
+  // Without output capture the output is not exported, but its loss is still flagged.
+  {
+    failure: "parts-uncaptured",
+    masked: false,
+    kept: undefined,
+    flagged: true,
+    reported: "parts broke",
+  },
+  // The usage of the next chunk fails too, and the stream reports only the first failure.
+  {
+    failure: "parts-then-usage",
+    masked: false,
+    kept: "ab",
+    flagged: true,
+    reported: "parts broke",
+  },
+])(
+  "a stream whose $failure fails to map reports it and flags only lost content, masked $masked",
+  async ({ failure, masked, kept, flagged, reported }) => {
+    const errors: Error[] = [];
+
+    const spans = setupSpans({
+      onError: (cause) => errors.push(cause),
+      ...(masked ? { mask: (value: unknown) => value } : {}),
+      ...(failure === "parts-uncaptured" ? { captureOutput: false } : {}),
+    });
+
+    const chunks = ["a", "b", "c"].map((text, index) => ({
+      responseId: "resp-1",
+      candidates: [
+        {
+          index: 0,
+          content: { role: "model", parts: [{ text }] as object[] },
+          ...(index === 2 ? { finishReason: "STOP" } : {}),
+        },
+      ],
+      usageMetadata: { promptTokenCount: 3, candidatesTokenCount: index + 1 },
+    }));
+
+    // An AFC turn before the answer: a function call, then its response.
+    const turns =
+      failure === "function-call" || failure === "function-response"
+        ? [
+            { functionCall: { name: "lookup", args: {} } },
+            { functionResponse: { name: "lookup", response: { ok: true } } },
+          ].map((part, index) => ({
+            responseId: index === 0 ? "turn-1" : undefined,
+            candidates: [
+              {
+                index: 0,
+                content: { role: index === 0 ? "model" : "user", parts: [part] as object[] },
+              },
+            ],
+          }))
+        : [];
+
+    if (failure === "parts" || failure === "parts-uncaptured" || failure === "parts-then-usage")
+      chunks[1]!.candidates[0]!.content.parts = partsThatBreak([{ text: "b" }]);
+
+    if (failure === "function-call") turns[0]!.candidates[0]!.content.parts = partsThatBreak([]);
+
+    if (failure === "function-response")
+      Object.defineProperty(
+        turns[1]!.candidates[0]!.content.parts[0],
+        "extra",
+        throwingGetter("response copy broke"),
+      );
+
+    if (failure === "parts-then-usage")
+      Object.defineProperty(chunks[2], "usageMetadata", throwingGetter("usage broke"));
+
+    if (failure === "candidate-metadata")
+      Object.defineProperty(
+        chunks[1]!.candidates[0],
+        "safetyRatings",
+        throwingGetter("metadata broke"),
+      );
+
+    if (failure === "prompt-feedback")
+      Object.defineProperty(chunks[1], "promptFeedback", throwingGetter("feedback broke"));
+
+    if (failure === "afc-history") {
+      Object.assign(chunks[0]!, { automaticFunctionCallingHistory: STREAMED_HISTORY });
+      Object.defineProperty(
+        chunks[2],
+        "automaticFunctionCallingHistory",
+        throwingGetter("history broke"),
+      );
+    }
+
+    for (const chunk of chunks) {
+      if (failure === "usage")
+        Object.defineProperty(chunk, "usageMetadata", throwingGetter("usage broke"));
+
+      // Not enumerable, so only the chunk timing reads it.
+      if (failure === "chunk-timing")
+        Object.defineProperty(
+          chunk.candidates[0]!.content.parts[0],
+          "inlineData",
+          throwingGetter("timing broke", false),
+        );
+    }
+
+    if (failure === "first-chunk") {
+      const startSpan = telemetrySdk.startSpan;
+      vi.spyOn(telemetrySdk, "startSpan").mockImplementation((...args) => {
+        const span = startSpan(...args);
+        const update = span.update.bind(span);
+        let calls = 0;
+        vi.spyOn(span, "update").mockImplementation((fields) => {
+          calls += 1;
+
+          if (calls === 1) throw new Error("update broke");
+
+          return update(fields);
+        });
+
+        return span;
+      });
+    }
+
+    let ending = false;
+
+    if (failure === "end") {
+      const captureEnabled = telemetrySdk.captureEnabled;
+      vi.spyOn(telemetrySdk, "captureEnabled").mockImplementation((...args) => {
+        if (ending) throw new Error("end broke");
+
+        return captureEnabled(...args);
+      });
+    }
+
+    const client = wrapGoogleGenAI({
+      models: {
+        async *generateContentStream(_params: unknown) {
+          yield* turns;
+          yield* chunks;
+          ending = true;
+        },
+      },
+    });
+
+    const stream = await Promise.resolve(
+      client.models.generateContentStream({ model: "gemini", contents: "Weather?" }),
+    );
+    const received: unknown[] = [];
+
+    for await (const chunk of stream) received.push(chunk);
+
+    expect(received).toHaveLength(turns.length + 3);
+    received.forEach((chunk, index) => expect(chunk).toBe([...turns, ...chunks][index]));
+    const span = await exportedSpan(spans);
+    expect(errors.map((cause) => cause.message)).toEqual([reported]);
+    expect(span.status.code).toBe(SPAN_STATUS_UNSET);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(flagged ? true : undefined);
+
+    if (kept === undefined) expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+    else
+      expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+        { role: "model", parts: [{ text: kept }] },
+      ]);
+
+    if (failure === "afc-history")
+      expect(messagesAttr(span, "gen_ai.input.messages")).toEqual(STREAMED_HISTORY);
+
+    if (failure === "function-response")
+      expect(messagesAttr(span, "gen_ai.input.messages")).toEqual(STREAMED_HISTORY.slice(0, 2));
+  },
+);
 
 test.each<{ partialArgs: JsonValue[] }>([
   { partialArgs: [{ jsonPath: "$.enabled", boolValue: false }] },
@@ -2884,38 +3156,125 @@ test("double wrapGoogleGenAI emits one span per call", async () => {
   expect((await finishedSpans(spans, 2)).length).toBe(2);
 });
 
-test("wrapped calls fail open when telemetry mapping throws", async () => {
-  const spans = setupSpans();
+test.each<{ operation: string; reported: string; flagged: boolean }>([
+  { operation: "generate", reported: "response broke", flagged: true },
+  // Two candidates cannot be read and are left out of the output; the call reports once.
+  { operation: "generate-candidates", reported: "candidate broke", flagged: true },
+  // An AFC turn and the response fail to map, and the call reports once.
+  { operation: "generate-afc", reported: "afc usage broke", flagged: true },
+  // Only the usage of an AFC turn is lost, so the output is whole.
+  { operation: "afc-turn-usage", reported: "afc usage broke", flagged: false },
+  { operation: "embed", reported: "response broke", flagged: true },
+  { operation: "video-done", reported: "response broke", flagged: true },
+  // A polled operation ends on its own span.
+  { operation: "video-polled", reported: "response broke", flagged: true },
+])(
+  "a $operation call fails open when telemetry mapping throws, reports it, and flags lost output",
+  async ({ operation, reported, flagged }) => {
+    const errors: Error[] = [];
+    const spans = setupSpans({ onError: (cause) => errors.push(cause) });
 
-  const response = {
-    text: "ok",
-    get candidates() {
-      throw new Error("response mapper failed");
-    },
-  };
+    const turn = Object.defineProperty(
+      { candidates: [{ content: { role: "model", parts: [{ functionCall: { name: "f" } }] } }] },
+      "usageMetadata",
+      throwingGetter("afc usage broke"),
+    );
 
-  const client = wrapGoogleGenAI({
-    models: {
-      generateContent(_params: any) {
-        return response;
+    const answer = {
+      candidates: [{ content: { role: "model", parts: [{ text: "Sunny." }] } }],
+      usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 3 },
+    };
+
+    const submitted = { name: "operations/video", done: false };
+
+    const response = {
+      generate: { text: "ok" },
+      "generate-candidates": {
+        candidates: [
+          Object.defineProperty({}, "content", throwingGetter("candidate broke")),
+          { content: { role: "model", parts: [{ text: "Sunny." }] } },
+          Object.defineProperty({}, "content", throwingGetter("second candidate broke")),
+        ],
       },
-    },
-  });
+      "generate-afc": answer,
+      "afc-turn-usage": answer,
+      embed: {},
+      "video-done": { name: submitted.name, done: true },
+      "video-polled": { name: submitted.name, done: true },
+    }[operation]!;
 
-  const params = {
-    model: "gemini-2.5-flash",
-    contents: "hi",
-    get config() {
-      throw new Error("request mapper failed");
-    },
-  };
+    const broken = {
+      generate: "candidates",
+      "generate-afc": "candidates",
+      embed: "embeddings",
+      "video-done": "response",
+      "video-polled": "response",
+    }[operation];
 
-  const result = client.models.generateContent(params);
-  expect(result).toBe(response);
-  const span = await exportedSpan(spans);
-  expect(span.name).toBe("chat gemini-2.5-flash");
-  expect(span.status.code).toBe(SPAN_STATUS_UNSET);
-});
+    if (broken) Object.defineProperty(response, broken, throwingGetter("response broke"));
+    const turns = [turn, response];
+
+    const client = wrapGoogleGenAI({
+      models: {
+        generateContentInternal: (_params: unknown) => turns.shift(),
+        generateContent(
+          this: { generateContentInternal: (params: unknown) => unknown },
+          params: unknown,
+        ) {
+          if (operation.startsWith("generate") && operation !== "generate-afc") return response;
+          this.generateContentInternal(params);
+
+          return this.generateContentInternal(params);
+        },
+        embedContent: (_params: unknown) => response,
+        generateVideos: (_params: unknown) => (operation === "video-polled" ? submitted : response),
+      },
+      operations: { get: (_params: unknown) => response },
+    });
+
+    let result: unknown;
+
+    if (operation === "embed") result = client.models.embedContent({ model: "gemini-embedding" });
+    else if (operation.startsWith("video")) {
+      result = client.models.generateVideos({ model: "veo" });
+
+      if (operation === "video-polled") result = client.operations.get({ operation: submitted });
+    } else {
+      const params = { model: "gemini-2.5-flash", contents: "Weather?" };
+
+      // The request mapping fails as well and falls back to the model name; it is not reported,
+      // since no span has started yet.
+      if (operation === "generate")
+        Object.defineProperty(params, "config", throwingGetter("request broke"));
+      else Object.assign(params, { config: { tools: [{ callTool: async () => [] }] } });
+      result = client.models.generateContent(params);
+    }
+
+    expect(result).toBe(response);
+    const exported = await finishedSpans(spans, operation === "video-polled" ? 2 : 1);
+    const span = exported.at(-1)!;
+    expect(errors.map((cause) => cause.message)).toEqual([reported]);
+    expect(span.status.code).toBe(SPAN_STATUS_UNSET);
+    expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(flagged ? true : undefined);
+
+    if (operation === "generate") expect(span.name).toBe("chat gemini-2.5-flash");
+
+    if (operation === "generate-candidates")
+      expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+        { role: "model", parts: [{ text: "Sunny." }] },
+      ]);
+    else if (operation === "afc-turn-usage") {
+      expect(messagesAttr(span, "gen_ai.output.messages")).toEqual([
+        { role: "model", parts: [{ text: "Sunny." }] },
+      ]);
+      // The turn's usage is lost, so the call's usage is undercounted.
+      expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(4);
+    } else expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
+
+    if (operation === "video-polled")
+      expect(exported[0]!.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+  },
+);
 
 test("wrapped calls fail open when telemetry is not initialized", async () => {
   const fake = createFakeFetch(
