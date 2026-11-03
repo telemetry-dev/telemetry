@@ -28,6 +28,7 @@ import {
   createTraceExporter,
   diag,
   DORMANT_INTERVAL_MS,
+  type ExportFailures,
   ExportQueueBudget,
   otlpHeaders,
   reportError,
@@ -61,6 +62,7 @@ export interface ClientCore {
   config: ResolvedConfig;
   tracer: Tracer;
   ensureLogger(): Logger | undefined;
+  failures: ExportFailures;
 }
 
 export interface ClientHandle extends TelemetryClient {
@@ -349,7 +351,7 @@ function initInner(options?: TelemetryOptions, overrides?: ClientOverrides): Tel
     },
   };
 
-  handle.core = { config, tracer, ensureLogger };
+  handle.core = { config, tracer, ensureLogger, failures };
   activeClient = handle;
 
   return handle;

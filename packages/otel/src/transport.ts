@@ -34,6 +34,11 @@ export interface ExportFailures {
   report(cause: unknown): void;
   /** Records that an export reached the ingest, so that report() sends the next failure. */
   clear(): void;
+  /**
+   * The last export that the ingest refused with 401 (the API key is not valid) or 403 (the key
+   * cannot send telemetry) since an export reached the ingest.
+   */
+  readonly rejected?: IngestError;
 }
 
 /**
@@ -42,15 +47,24 @@ export interface ExportFailures {
  */
 export function createExportFailures(onError?: (error: Error) => void): ExportFailures {
   let reported = false;
+  let rejected: IngestError | undefined;
 
   return {
     report(cause) {
+      if (cause instanceof IngestError && (cause.status === 401 || cause.status === 403)) {
+        rejected = cause;
+      }
+
       if (reported) return;
       reported = true;
       reportError(onError, cause);
     },
     clear() {
       reported = false;
+      rejected = undefined;
+    },
+    get rejected() {
+      return rejected;
     },
   };
 }
@@ -210,19 +224,25 @@ const cancelBody = async (res: Response) => {
   } catch {}
 };
 
-export const postOtlp = async ({
-  fetchImpl,
-  url,
-  headers,
-  body,
-  signal,
-}: {
+type OtlpPost = {
   fetchImpl: typeof fetch;
   url: string;
   headers: Record<string, string>;
   body: Uint8Array;
   signal?: AbortSignal;
-}) => {
+};
+
+/** Posts with retries, and returns the last response with its body cancelled. */
+export const postOtlp = async (post: OtlpPost) => {
+  const res = await postWithRetries(post);
+
+  await cancelBody(res);
+
+  return res;
+};
+
+/** Posts with retries. The body of the last response is left to the caller. */
+const postWithRetries = async ({ fetchImpl, url, headers, body, signal }: OtlpPost) => {
   for (let attempt = 0; ; attempt += 1) {
     let retryAfter: number | undefined;
 
@@ -242,8 +262,6 @@ export const postOtlp = async ({
         attempt === RETRY_DELAYS_MS.length ||
         (retryAfter !== undefined && retryAfter > MAX_RETRY_AFTER_MS)
       ) {
-        await cancelBody(res);
-
         return res;
       }
 
@@ -292,7 +310,7 @@ async function postSerialized(
     ? { ...target.headers, "content-encoding": contentEncoding }
     : target.headers;
 
-  const res = await postOtlp({
+  const res = await postWithRetries({
     fetchImpl: transport.fetchImpl,
     url: target.url,
     headers,
@@ -309,8 +327,127 @@ async function postSerialized(
         ? `; retry-after ${retryAfterHeader} exceeds ${MAX_RETRY_AFTER_MS / 1000}s retry cap`
         : "";
 
-    throw new Error(`telemetry.dev ${label} ingest failed: ${res.status}${retryDetail}`);
+    const reason = await statusMessage(res);
+
+    throw new IngestError(
+      `telemetry.dev ${label} ingest failed: ${res.status}${reason ? ` ${reason}` : ""}${retryDetail}`,
+      res.status,
+    );
+  } else {
+    await cancelBody(res);
   }
+}
+
+/** A failed export, with the HTTP status that the ingest answered. */
+export class IngestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "IngestError";
+  }
+}
+
+const MAX_ERROR_BODY_BYTES = 4096;
+
+/**
+ * The message of an OTLP error response: the `message` of its JSON or protobuf `Status`, as the
+ * telemetry.dev ingest sends it, such as "This API key cannot send telemetry. Create a key with
+ * Send telemetry access." Undefined for another content type, or a body that cannot be read.
+ */
+async function statusMessage(res: Response): Promise<string | undefined> {
+  try {
+    const type = res.headers.get("content-type") ?? "";
+    const parse = type.includes("json")
+      ? jsonStatusMessage
+      : type.includes("protobuf")
+        ? protobufStatusMessage
+        : undefined;
+
+    if (!parse) {
+      await cancelBody(res);
+
+      return undefined;
+    }
+
+    const message = parse(await readPrefix(res, MAX_ERROR_BODY_BYTES));
+
+    return message?.trim() || undefined;
+  } catch {
+    await cancelBody(res);
+
+    return undefined;
+  }
+}
+
+/** The first `max` bytes of the body. The rest is not downloaded: the body is cancelled. */
+async function readPrefix(res: Response, max: number): Promise<Uint8Array> {
+  const reader = res.body?.getReader();
+  const prefix = new Uint8Array(max);
+  let size = 0;
+
+  if (!reader) return prefix.subarray(0, 0);
+
+  try {
+    while (size < max) {
+      const { done, value } = await reader.read();
+
+      if (done) break;
+      const take = value.subarray(0, max - size);
+      prefix.set(take, size);
+      size += take.length;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  return prefix.subarray(0, size);
+}
+
+function jsonStatusMessage(bytes: Uint8Array): string | undefined {
+  const status: unknown = JSON.parse(new TextDecoder().decode(bytes));
+  const message = (status as { message?: unknown } | null)?.message;
+
+  return typeof message === "string" ? message : undefined;
+}
+
+/** Field 2 of google.rpc.Status, read with the protobuf wire format. */
+function protobufStatusMessage(bytes: Uint8Array): string | undefined {
+  let at = 0;
+
+  const varint = () => {
+    let value = 0;
+
+    for (let shift = 0; shift < 35; shift += 7) {
+      const byte = bytes[at++];
+
+      if (byte === undefined) throw new Error("truncated");
+      value += (byte & 0x7f) * 2 ** shift;
+
+      if (byte < 0x80) return value;
+    }
+
+    throw new Error("varint too long");
+  };
+
+  while (at < bytes.length) {
+    const tag = varint();
+    const wire = tag & 7;
+
+    if (wire === 0) varint();
+    else if (wire === 2) {
+      const length = varint();
+      const end = at + length;
+
+      if (end > bytes.length) return undefined;
+
+      if (tag >>> 3 === 2) return new TextDecoder().decode(bytes.subarray(at, end));
+      at = end;
+    } else return undefined;
+  }
+
+  return undefined;
 }
 
 const createExportLifecycle = (transport: Transport) => {

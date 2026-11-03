@@ -348,6 +348,85 @@ def test_a_failed_post_of_items_stops_new_items_completes_the_experiment_and_rai
     ]
 
 
+@pytest.mark.parametrize(
+    ("status", "key", "expected", "client_path"),
+    [
+        # A 401 for the key of the run stops new items. In immediate mode an item exports its
+        # trace when it ends, so the refusal arrives before the next item starts.
+        (401, "td_live_test", 1, ""),
+        # A 401 for another key does not stop the run.
+        (401, "td_live_other", 5, ""),
+        # A 403 does not stop the run.
+        (403, "td_live_test", 5, ""),
+        # A 401 from another server does not stop the run.
+        (401, "td_live_test", 5, "/staging"),
+    ],
+)
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_a_trace_export_refused_with_401_for_the_key_of_the_run_stops_new_items(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status: int,
+    key: str,
+    expected: int,
+    client_path: str,
+    asynchronous: bool,
+) -> None:
+    results = tmp_path / "results.jsonl"
+    monkeypatch.setenv("TELEMETRY_DEV_EXPERIMENT_RESULTS", str(results))
+    started = 0
+
+    def refuse(request: ApiRequest) -> Reply | None:
+        if request.path.endswith("/v1/traces"):
+            return answer_with(status, {"message": f"refused with {status}"})
+        return None
+
+    def task(item: ExperimentItem) -> str:
+        nonlocal started
+        started += 1
+        return "ok"
+
+    async def async_task(item: ExperimentItem) -> str:
+        return task(item)
+
+    with fake_api(items=[dataset_item(n) for n in range(1, 6)], override=refuse) as api:
+        telemetry_dev.init(
+            api_key=key,
+            base_url=api.url + client_path,
+            environment="experiment",
+            export_mode="immediate",
+            log_level="silent",
+            disable_atexit=True,
+        )
+        try:
+            outcome: object = run_both(
+                api, asynchronous, concurrency=1, task=async_task if asynchronous else task
+            )
+        except ExperimentError as error:
+            outcome = error
+        finally:
+            telemetry_dev.shutdown()
+
+    assert started == expected
+    if expected == 1:
+        assert isinstance(outcome, ExperimentError)
+        assert (outcome.code, outcome.status, str(outcome)) == (
+            "invalid_api_key",
+            401,
+            "The API key was not accepted, so no more items run: "
+            "telemetry.dev trace ingest failed: 401 refused with 401",
+        )
+        assert api.routes()[-1] == f"POST /v1/experiments/{EXPERIMENT_ID}/complete"
+    else:
+        assert not isinstance(outcome, BaseException)
+        # The action notes that the runs have no traces, with the reason of the ingest.
+        line = json.loads(results.read_text())
+        assert (line["traced"], line["tracesError"]) == (
+            False,
+            f"telemetry.dev trace ingest failed: {status} refused with {status}",
+        )
+
+
 def test_a_complete_that_fails_after_a_failed_run_goes_to_on_error(make: MakeClient) -> None:
     errors: list[BaseException] = []
     make(environment="experiment", on_error=errors.append)
@@ -864,7 +943,7 @@ def test_in_ci_mode_an_experiment_that_fails_raises_with_its_error(
 
 
 def test_in_github_actions_it_records_the_pull_request_its_head_commit_and_the_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, api: FakeApi
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, api: FakeApi, make: MakeClient
 ) -> None:
     event = tmp_path / "event.json"
     results = tmp_path / "results.jsonl"
@@ -893,7 +972,10 @@ def test_in_github_actions_it_records_the_pull_request_its_head_commit_and_the_r
     }.items():
         monkeypatch.setenv(name, value)
 
+    # With a client the runs send their traces; the second experiment runs without one.
+    make(environment="experiment")
     experiment(api, dataset=None, min_scores={"correctness": 0.5, "tone": 2})
+    telemetry_dev.shutdown()
 
     create = api.requests[1].body
     assert create["dataset"] == "support-golden"
@@ -911,12 +993,12 @@ def test_in_github_actions_it_records_the_pull_request_its_head_commit_and_the_r
     # for it, and counts its items from runsPerItem.
     experiment(api, ci=False, runs_per_item=2)
 
-    # The same line as the TypeScript SDK writes: the body, then ci and runsPerItem.
+    # The same line as the TypeScript SDK writes: the body, then ci, runsPerItem, and traced.
     assert results.read_text() == "".join(
         json.dumps(line, ensure_ascii=False, separators=(",", ":")) + "\n"
         for line in [
-            {**result(), "ci": True, "runsPerItem": 1},
-            {**result(), "ci": False, "runsPerItem": 2},
+            {**result(), "ci": True, "runsPerItem": 1, "traced": True},
+            {**result(), "ci": False, "runsPerItem": 2, "traced": False},
         ]
     )
     assert results.stat().st_mode & 0o777 == 0o600

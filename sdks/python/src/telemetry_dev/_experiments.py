@@ -621,6 +621,7 @@ def _run_items(api: Api, run: _Run, created: _Created, runs: _Runs) -> None:
     def worker() -> None:
         while not failures:
             try:
+                _check_key(api)
                 item = runs.next()
                 if item is None:
                     return
@@ -648,6 +649,7 @@ async def _run_items_async(api: Api, run: _Run, created: _Created, runs: _Runs) 
     async def worker() -> None:
         while not failures:
             try:
+                _check_key(api)
                 item = await asyncio.to_thread(runs.next)
                 if item is None:
                     return
@@ -659,6 +661,43 @@ async def _run_items_async(api: Api, run: _Run, created: _Created, runs: _Runs) 
     # gather runs each worker in its own task, with its own copy of the context.
     await asyncio.gather(*(worker() for _ in range(run.concurrency)))
     await asyncio.to_thread(_end_items, batch, runs, failures)
+
+
+def _check_key(api: Api) -> None:
+    """Raise when the ingest refused an export of the client with 401 since an export last
+    reached it, and the client sends with the key of the run to the same server. The key then
+    stopped working, for example because it was revoked or its project was deleted, and the API
+    will refuse the results of the items too."""
+    client = get_client()
+    if (
+        client is None
+        or client.config.api_key != api.api_key
+        or client.config.base_url != api.base_url
+    ):
+        return
+    rejected = client.export_failures.rejected
+    if rejected is not None and rejected.status == 401:
+        error = ExperimentError(
+            "invalid_api_key",
+            f"The API key was not accepted, so no more items run: {rejected}",
+            401,
+        )
+        error.__cause__ = rejected
+        raise error
+
+
+def _traces() -> dict[str, Any]:
+    """For the results line of the experiment action: ``traced`` is False without an enabled
+    client, or when the ingest refused an export of the client with 401 or 403 since an export
+    last reached it, and ``tracesError`` then gives its reason. Exports that failed for another
+    reason, such as an outage, are not counted."""
+    client = get_client()
+    if client is None or not client.enabled:
+        return {"traced": False}
+    rejected = client.export_failures.rejected
+    if rejected is not None:
+        return {"traced": False, "tracesError": str(rejected)}
+    return {"traced": True}
 
 
 def _end_items(batch: _Batch, runs: _Runs, failures: list[BaseException]) -> None:
@@ -899,7 +938,12 @@ def _finish(api: Api, run: _Run, created: _Created) -> ExperimentResult:
     _complete(api, created)
     result, body = _wait_for_result(api, created.id)
     # The action skips the check of a result with the CI mode off, and counts the items from runs.
-    line = {**cast("dict[str, Any]", body), "ci": run.in_ci, "runsPerItem": run.runs_per_item}
+    line = {
+        **cast("dict[str, Any]", body),
+        "ci": run.in_ci,
+        "runsPerItem": run.runs_per_item,
+        **_traces(),
+    }
     write_result(os.environ, line, api.on_error)
     print(_describe(result, run.runs_per_item), flush=True)
     if run.in_ci:

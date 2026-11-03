@@ -1,7 +1,9 @@
 // Writes the job summary of the experiment action, and the comment with the result on the pull
 // request. runExperiment and run_experiment add one line of JSON to the results file for each
 // experiment: the body of GET /v1/experiments/{id}, with `ci`, false when the CI mode was off, and
-// `runsPerItem`. Lines from SDKs before those fields have neither.
+// `runsPerItem`, and `traced`, false without a telemetry client or when the ingest refused its
+// exports (401 or 403), with `tracesError` for a refusal. Lines from SDKs before those fields do
+// not have them.
 import { createHash } from "node:crypto";
 import { appendFileSync, readFileSync } from "node:fs";
 
@@ -178,6 +180,25 @@ function render(experiments, code) {
 
     if (experiment.ci === false && checkFailure(experiment).length > 0) {
       lines.push("", "The CI mode of this experiment was off, thus it does not fail the job.");
+    }
+
+    if (experiment.traced === false) {
+      const missing =
+        "The runs have no traces: the items have no trace to open, and Cost leaves out the model calls of your code.";
+
+      if (typeof experiment.tracesError === "string" && experiment.tracesError !== "") {
+        lines.push(
+          "",
+          `${missing} The ingest refused them:`,
+          "",
+          `> ${text(experiment.tracesError)}`,
+        );
+      } else {
+        lines.push(
+          "",
+          `${missing} No telemetry client sent them: before the experiment runs, call \`init({ environment: "experiment" })\` in TypeScript, or \`init(environment="experiment")\` in Python, with an API key.`,
+        );
+      }
     }
 
     if (typeof experiment.error === "string" && experiment.error !== "") {

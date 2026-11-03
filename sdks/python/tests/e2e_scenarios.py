@@ -308,8 +308,9 @@ def main() -> int:
 
         # C13: continue the trace from a serialized W3C traceparent.
         start_span("background-job", parent=agent_traceparent).end()
-        # C20: a second root call of the same session joins the session trace.
-        start_span("follow-up-turn", type="agent", agent_name="support").end()
+        # C20: a second root call of the same session joins the session trace. With no agent_name,
+        # the agent takes the span name.
+        start_span("follow-up-turn", type="agent").end()
 
     # C10: log outside any span (standalone record, no trace correlation).
     log("outside spans", level="warn", event_name="e2e.outside")

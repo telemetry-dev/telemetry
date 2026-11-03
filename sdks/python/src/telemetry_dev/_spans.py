@@ -740,9 +740,12 @@ def start_span(
         )
         attrs = _fields_to_attributes(client, state, fields)
         initial: dict[str, otel_types.AttributeValue] = {ATTR_OPERATION: operation}
-        if operation == "execute_tool":
+        # A span named after its operation, such as "invoke_agent" or "invoke_agent AGENT123" from
+        # an integration that names it by id, names no agent or tool.
+        named = name != operation and not name.startswith(f"{operation} ")
+        if operation == "execute_tool" and named:
             initial[ATTR_TOOL_NAME] = name
-        elif operation == "invoke_agent":
+        elif operation == "invoke_agent" and named:
             initial[ATTR_AGENT_NAME] = name
         ctx = context_from_parent(parent)
         propagated = propagated_attributes(ctx)

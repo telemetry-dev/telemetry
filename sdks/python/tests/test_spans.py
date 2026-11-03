@@ -84,6 +84,14 @@ def test_agent_span_defaults_agent_name(memory: SimpleNamespace) -> None:
     assert a["gen_ai.agent.id"] == "agent-7"
 
 
+def test_a_span_named_after_its_operation_names_no_agent_or_tool(memory: SimpleNamespace) -> None:
+    telemetry_dev.start_span("invoke_agent AGENT123", type="agent").end()
+    telemetry_dev.start_span("execute_tool", type="tool").end()
+    agent, tool = (attrs(span) for span in memory.span_exporter.get_finished_spans())
+    assert "gen_ai.agent.name" not in agent
+    assert "gen_ai.tool.name" not in tool
+
+
 def test_full_field_mapping(memory: SimpleNamespace) -> None:
     telemetry_dev.start_span(
         "gen",

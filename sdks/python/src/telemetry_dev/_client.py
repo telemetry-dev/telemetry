@@ -50,6 +50,7 @@ from ._export import (
     ReportingLogExporter,
     ReportingSpanExporter,
     after_export,
+    otlp_session,
     resolve_byte_bound,
 )
 from ._metrics import (
@@ -156,6 +157,7 @@ class Client:
         self._logger_provider: LoggerProvider | None = None
         self._meter_provider: MeterProvider | None = None
         self._output_chunks: OutputChunkAggregation | None = None
+        self.export_failures: ExportFailures = ExportFailures(on_error)
 
         if not enabled:
             return
@@ -185,7 +187,7 @@ class Client:
             ),
         )
         self._tracer_provider.sampler = SessionSampler(self._tracer_provider.sampler)
-        failures = ExportFailures(on_error)
+        failures = self.export_failures
 
         # Without an api key (enabled via a test seam), never construct real network
         # exporters — they would POST to the ingest with a bogus Authorization header.
@@ -218,6 +220,7 @@ class Client:
                     headers=headers,
                     compression=Compression.Gzip,
                     timeout=timeout,
+                    session=otlp_session(),
                 ),
                 failures,
                 on_error,
@@ -242,6 +245,7 @@ class Client:
                     headers=headers,
                     compression=Compression.Gzip,
                     timeout=timeout,
+                    session=otlp_session(),
                 ),
                 failures,
                 on_error,

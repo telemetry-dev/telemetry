@@ -250,6 +250,14 @@ export function createSpanHandle(
 
   if (meta.scopedPrompt) dropPromptAttributes(attrs);
 
+  // An agent or a tool is named after its span unless a field names it, as in the Python SDK. A
+  // span named after its operation, such as "invoke_agent" or "invoke_agent AGENT123" from an
+  // integration that names it by id, names no agent or tool.
+  const spanName = options.name || name;
+  const typeOperation = SPAN_TYPE_OPERATIONS[meta.type];
+  const defaultName =
+    spanName === typeOperation || spanName.startsWith(`${typeOperation} `) ? undefined : spanName;
+
   const span = core.tracer.startSpan(
     name,
     {
@@ -258,6 +266,8 @@ export function createSpanHandle(
       links: options.links,
       attributes: {
         "gen_ai.operation.name": SPAN_TYPE_OPERATIONS[meta.type],
+        ...(meta.type === "agent" && defaultName ? { "gen_ai.agent.name": defaultName } : {}),
+        ...(meta.type === "tool" && defaultName ? { "gen_ai.tool.name": defaultName } : {}),
         ...propagatedFromContext(parentCtx),
         ...prompt,
         ...attrs,

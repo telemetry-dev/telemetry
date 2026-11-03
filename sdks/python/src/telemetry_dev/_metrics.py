@@ -27,7 +27,7 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import INVALID_SPAN_CONTEXT, NonRecordingSpan, set_span_in_context
 
 from ._config import report_error
-from ._export import ExportFailures, exporting
+from ._export import ExportFailures, export_error, exporting, otlp_session
 from ._process_lock import ProcessLock
 from ._semconv import (
     ATTR_ERROR_TYPE,
@@ -177,6 +177,7 @@ class GuardedOTLPMetricExporter(OTLPMetricExporter):
         failures: ExportFailures,
         **kwargs: Any,
     ) -> None:
+        kwargs.setdefault("session", otlp_session())
         super().__init__(*args, **kwargs)  # pyright: ignore[reportUnknownMemberType]
         self._td_failures = failures
         self.output_chunks: OutputChunkAggregation | None = None
@@ -201,10 +202,7 @@ class GuardedOTLPMetricExporter(OTLPMetricExporter):
                 self._td_failures.report("metric export failed", exc)
                 return MetricExportResult.FAILURE
             if result is MetricExportResult.FAILURE:
-                self._td_failures.report(
-                    "metric export failed",
-                    RuntimeError("OTLP metric export failed (check the API key and ingest URL)"),
-                )
+                self._td_failures.report("metric export failed", export_error("metric"))
             else:
                 self._td_failures.clear()
             return result

@@ -37,6 +37,9 @@ class CaptureServer:
     status: int = 200
     # The HTTP status of POST responses to one path, in place of status.
     path_status: dict[str, int] = field(default_factory=lambda: {})
+    # The content type and the body of POST responses with an error status.
+    error_type: str = "application/x-protobuf"
+    error_body: bytes = b""
     # The (status, JSON body) replies to GET requests, in order; the last one repeats.
     replies: list[tuple[int, object]] = field(default_factory=lambda: [])
     # Seconds that the server waits before it answers a GET request. The server reads it before the
@@ -85,10 +88,15 @@ def otlp_capture_server() -> Generator[CaptureServer]:
             captured.append(request)
             time.sleep(capture.post_delay)
             # Not captured[-1]: requests to other paths can arrive on other threads meanwhile.
-            self.send_response(capture.path_status.get(request.path, capture.status))
-            self.send_header("content-type", "application/x-protobuf")
-            self.send_header("content-length", "0")
+            status = capture.path_status.get(request.path, capture.status)
+            body = capture.error_body if status >= 400 else b""
+            self.send_response(status)
+            self.send_header(
+                "content-type", capture.error_type if status >= 400 else "application/x-protobuf"
+            )
+            self.send_header("content-length", str(len(body)))
             self.end_headers()
+            self.wfile.write(body)
 
         def do_GET(self) -> None:
             path = self.own_path()

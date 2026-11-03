@@ -189,7 +189,10 @@ def fake_api(**options: Any) -> Generator[FakeApi]:
                     path=target.path.removeprefix(prefix),
                     query=dict(parse_qsl(target.query)),
                     headers={key.lower(): value for key, value in self.headers.items()},
-                    body=json.loads(raw) if raw else None,
+                    # The OTLP exports of a client send protobuf.
+                    body=json.loads(raw)
+                    if raw and "json" in self.headers["content-type"]
+                    else None,
                 )
             )
             if isinstance(reply, Drop):

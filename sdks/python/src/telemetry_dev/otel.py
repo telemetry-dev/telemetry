@@ -28,6 +28,7 @@ from ._export import (
     ExportFailures,
     ReportingSpanExporter,
     after_export,
+    otlp_session,
     resolve_byte_bound,
 )
 from ._metrics import GuardedOTLPMetricExporter, MetricsRecorder, sdk_meter_provider
@@ -70,6 +71,7 @@ def _otlp_span_exporter(
         },
         compression=Compression.Gzip,
         timeout=timeout,
+        session=otlp_session(),
     )
 
 

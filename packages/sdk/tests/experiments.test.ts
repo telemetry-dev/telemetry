@@ -7,6 +7,8 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   type ExperimentItem,
   ExperimentError,
+  flush,
+  init,
   log,
   propagateAttributes,
   runExperiment,
@@ -513,6 +515,84 @@ test("a failed post of items stops new items, completes the experiment, and reje
   ]);
 });
 
+test.each<{ name: string; status: number; key: string; started: number; clientUrl?: string }>([
+  {
+    name: "a 401 for the key of the run stops new items",
+    status: 401,
+    key: "td_live_test",
+    started: 2,
+  },
+  {
+    name: "a 401 for another key does not stop the run",
+    status: 401,
+    key: "td_live_other",
+    started: 5,
+  },
+  { name: "a 403 does not stop the run", status: 403, key: "td_live_test", started: 5 },
+  {
+    name: "a 401 from another server does not stop the run",
+    status: 401,
+    key: "td_live_test",
+    started: 5,
+    clientUrl: "https://staging.ingest.test",
+  },
+])(
+  "a trace export refused with $status: $name",
+  async ({ status, key, started: expected, clientUrl }) => {
+    const results = join(mkdtempSync(join(tmpdir(), "experiment-")), "results.jsonl");
+    writeFileSync(results, "");
+    vi.stubEnv("TELEMETRY_DEV_EXPERIMENT_RESULTS", results);
+    const api = fakeApi({
+      items: Array.from({ length: 5 }, (_, index) => datasetItem(index + 1)),
+      override: (request) =>
+        request.url.pathname.startsWith("/v1/traces")
+          ? Response.json({ message: `refused with ${status}` }, { status })
+          : undefined,
+    });
+    init({
+      apiKey: key,
+      baseUrl: clientUrl ?? "https://ingest.test",
+      environment: "experiment",
+      exportMode: "immediate",
+      logLevel: "silent",
+      fetch: api.fetch,
+    });
+    let started = 0;
+
+    const outcome = await experiment(api, {
+      concurrency: 1,
+      task: async () => {
+        started += 1;
+        // Waits for the export of the trace of the item before, so that its refusal has arrived.
+        await flush();
+
+        return "ok";
+      },
+    }).catch((caught: unknown) => caught);
+
+    // The item that saw the refusal still ends; no item starts after it.
+    expect(started).toBe(expected);
+
+    if (expected === 2) {
+      expect(outcome).toBeInstanceOf(ExperimentError);
+      expect(outcome).toMatchObject({
+        code: "invalid_api_key",
+        status: 401,
+        message:
+          "The API key was not accepted, so no more items run: telemetry.dev trace ingest failed: 401 refused with 401",
+      });
+      expect(routes(api.requests).at(-1)).toBe(`POST /v1/experiments/${EXPERIMENT_ID}/complete`);
+    } else {
+      expect(outcome).not.toBeInstanceOf(Error);
+      // The action notes that the runs have no traces, with the reason of the ingest.
+      expect(JSON.parse(readFileSync(results, "utf8"))).toMatchObject({
+        traced: false,
+        tracesError: `telemetry.dev trace ingest failed: ${status} refused with ${status}`,
+      });
+    }
+  },
+);
+
 test("a complete that fails after a failed run goes to onError, and the run rejects with the first error", async () => {
   const errors: Error[] = [];
   setup({ environment: "experiment", onError: (error) => errors.push(error) });
@@ -976,7 +1056,10 @@ test("in GitHub Actions the experiment records the pull request, its head commit
   vi.stubEnv("TELEMETRY_DEV_EXPERIMENT_RESULTS", results);
   const api = fakeApi();
 
+  // With a client the runs send their traces; the second experiment runs without one.
+  setup({ environment: "experiment" });
   await experiment(api, { dataset: undefined, minScores: { correctness: 0.5, tone: 2 } });
+  await shutdown();
 
   expect(api.requests[1]!.body).toMatchObject({
     dataset: "support-golden",
@@ -997,8 +1080,8 @@ test("in GitHub Actions the experiment records the pull request, its head commit
   await experiment(fakeApi(), { ci: false, runsPerItem: 2 });
 
   expect(readFileSync(results, "utf8")).toBe(
-    `${JSON.stringify({ ...result(), ci: true, runsPerItem: 1 })}\n` +
-      `${JSON.stringify({ ...result(), ci: false, runsPerItem: 2 })}\n`,
+    `${JSON.stringify({ ...result(), ci: true, runsPerItem: 1, traced: true })}\n` +
+      `${JSON.stringify({ ...result(), ci: false, runsPerItem: 2, traced: false })}\n`,
   );
 });
 

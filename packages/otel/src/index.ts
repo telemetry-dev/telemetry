@@ -76,6 +76,7 @@ export {
   createMetricExporter,
   createTraceExporter,
   type ExportFailures,
+  IngestError,
   maybeGzip,
   otlpHeaders,
   type OtlpTarget,
