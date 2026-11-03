@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.3](https://github.com/telemetry-dev/telemetry/compare/mcp-v0.2.2...mcp-v0.2.3) (2026-11-03)
+
+
+### Features
+
+* **cli:** make first-run hints runnable and announce newer versions ([#187](https://github.com/telemetry-dev/telemetry/issues/187)) ([0f314b7](https://github.com/telemetry-dev/telemetry/commit/0f314b7f7c357a155a77f00bf23a19d89674996d))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.2.3
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.2.3
+
 ## [0.2.2](https://github.com/telemetry-dev/telemetry/compare/mcp-v0.2.1...mcp-v0.2.2) (2026-10-30)
 
 

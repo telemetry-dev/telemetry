@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.3](https://github.com/telemetry-dev/telemetry/compare/python-openrouter-v0.2.2...python-openrouter-v0.2.3) (2026-11-03)
+
+
+### Bug Fixes
+
+* **sdk-python:** batch streamed deltas before writing them to StringIO ([#185](https://github.com/telemetry-dev/telemetry/issues/185)) ([1d71068](https://github.com/telemetry-dev/telemetry/commit/1d7106869cbad45208a0b484392ad4a4cc692e70))
+* **sdk-python:** keep module locks usable in a forked child ([#184](https://github.com/telemetry-dev/telemetry/issues/184)) ([771a256](https://github.com/telemetry-dev/telemetry/commit/771a2566465ea868b21a48f8ae4e748f6742078f))
+* **sdk:** keep up to 16 MiB of each stream within a shared stream bound ([#172](https://github.com/telemetry-dev/telemetry/issues/172)) ([7f4f695](https://github.com/telemetry-dev/telemetry/commit/7f4f695edaee07503ca043ac49a6bbbc58784bfc))
+
 ## [0.2.2](https://github.com/telemetry-dev/telemetry/compare/python-openrouter-v0.2.1...python-openrouter-v0.2.2) (2026-10-30)
 
 

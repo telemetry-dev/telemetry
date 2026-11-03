@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.1](https://github.com/telemetry-dev/telemetry/compare/otel-v0.2.0...otel-v0.2.1) (2026-11-03)
+
+
+### Bug Fixes
+
+* **sdk-python:** match the split rules of the typescript exporter and skip the measuring encode ([#174](https://github.com/telemetry-dev/telemetry/issues/174)) ([b264694](https://github.com/telemetry-dev/telemetry/commit/b264694404f586afa6900a854dc118d0c565a7e2)), closes [#149](https://github.com/telemetry-dev/telemetry/issues/149) [#150](https://github.com/telemetry-dev/telemetry/issues/150) [#151](https://github.com/telemetry-dev/telemetry/issues/151)
+* **sdk:** keep up to 16 MiB of each stream within a shared stream bound ([#172](https://github.com/telemetry-dev/telemetry/issues/172)) ([7f4f695](https://github.com/telemetry-dev/telemetry/commit/7f4f695edaee07503ca043ac49a6bbbc58784bfc))
+* **sdk:** send each captured value whole ([#148](https://github.com/telemetry-dev/telemetry/issues/148)) ([b9e689a](https://github.com/telemetry-dev/telemetry/commit/b9e689a438aecc72436495d4d5d75b9ac847f90e))
+
 ## [0.2.0](https://github.com/telemetry-dev/telemetry/compare/otel-v0.1.7...otel-v0.2.0) (2026-10-29)
 
 

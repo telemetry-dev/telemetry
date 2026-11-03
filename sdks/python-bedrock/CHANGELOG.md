@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.3](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.2.2...python-bedrock-v0.2.3) (2026-11-03)
+
+
+### Bug Fixes
+
+* **sdk-python:** batch streamed deltas before writing them to StringIO ([#185](https://github.com/telemetry-dev/telemetry/issues/185)) ([1d71068](https://github.com/telemetry-dev/telemetry/commit/1d7106869cbad45208a0b484392ad4a4cc692e70))
+* **sdk-python:** keep module locks usable in a forked child ([#184](https://github.com/telemetry-dev/telemetry/issues/184)) ([771a256](https://github.com/telemetry-dev/telemetry/commit/771a2566465ea868b21a48f8ae4e748f6742078f))
+* **sdk-python:** report and flag output lost to a mapping failure ([#186](https://github.com/telemetry-dev/telemetry/issues/186)) ([f67b628](https://github.com/telemetry-dev/telemetry/commit/f67b6283af7e90b0c49fd144f1489fffa0b63abb))
+* **sdk:** keep up to 16 MiB of each stream within a shared stream bound ([#172](https://github.com/telemetry-dev/telemetry/issues/172)) ([7f4f695](https://github.com/telemetry-dev/telemetry/commit/7f4f695edaee07503ca043ac49a6bbbc58784bfc))
+* **sdk:** report and flag typescript output lost to a mapping failure ([#188](https://github.com/telemetry-dev/telemetry/issues/188)) ([7f44f08](https://github.com/telemetry-dev/telemetry/commit/7f44f08781819bc093f07c618753e469cca307b8))
+
+
+### Documentation
+
+* **sdk:** correct the READMEs that no longer match the SDKs ([#164](https://github.com/telemetry-dev/telemetry/issues/164)) ([acb45f5](https://github.com/telemetry-dev/telemetry/commit/acb45f501bf60dd5ecefaff6a8f5769bf0cd51fa))
+
 ## [0.2.2](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.2.1...python-bedrock-v0.2.2) (2026-10-30)
 
 
