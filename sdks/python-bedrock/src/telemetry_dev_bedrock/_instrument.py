@@ -181,8 +181,8 @@ def _call_with_span(
             if fields.keys() == {"time_to_first_chunk_ms"}:
                 try:
                     handle.update(**fields)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report_error(exc)
                 return
             end(**merge_fields(base_fields, fields))
 

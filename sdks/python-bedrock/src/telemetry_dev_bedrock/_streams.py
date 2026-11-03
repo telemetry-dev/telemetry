@@ -832,8 +832,9 @@ class InstrumentedEventStream:
                             self._state.text_rejected = True
                     state_has_output = None
                 if self._track_output_chunks:
-                    # Chunk timing must not reach the caller. When feed() failed, the fallback
-                    # reads the event again and can fail the same way, which feed() reported.
+                    # Chunk timing must not reach the caller. A failure loses only the timing;
+                    # when feed() already failed, the fallback can fail the same way and the
+                    # reporter drops the repeat.
                     try:
                         if (
                             state_has_output
@@ -843,8 +844,8 @@ class InstrumentedEventStream:
                             record_output_chunk = getattr(self._handle, "record_output_chunk", None)
                             if callable(record_output_chunk):
                                 record_output_chunk(received_at * 1000)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        self._report_error(exc)
                 yield event
             completed = True
         except GeneratorExit:
