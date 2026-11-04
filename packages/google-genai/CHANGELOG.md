@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.4](https://github.com/telemetry-dev/telemetry/compare/google-genai-v0.2.3...google-genai-v0.2.4) (2026-11-03)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.2.4
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.2.4
+
 ## [0.2.3](https://github.com/telemetry-dev/telemetry/compare/google-genai-v0.2.2...google-genai-v0.2.3) (2026-11-03)
 
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.4](https://github.com/telemetry-dev/telemetry/compare/python-v0.3.3...python-v0.3.4) (2026-11-03)
+
+
+### Bug Fixes
+
+* **sdk:** name why exports fail and stop experiments on a revoked key ([#193](https://github.com/telemetry-dev/telemetry/issues/193)) ([012b778](https://github.com/telemetry-dev/telemetry/commit/012b7785c347c35f39bc05a43ba20b3e189fa2be))
+
 ## [0.3.3](https://github.com/telemetry-dev/telemetry/compare/python-v0.3.2...python-v0.3.3) (2026-11-03)
 
 

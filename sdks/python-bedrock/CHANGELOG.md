@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.4](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.2.3...python-bedrock-v0.2.4) (2026-11-03)
+
+
+### Bug Fixes
+
+* **sdk-bedrock:** report a failure in stream chunk timing and the first-chunk update ([#190](https://github.com/telemetry-dev/telemetry/issues/190)) ([214999f](https://github.com/telemetry-dev/telemetry/commit/214999fe5bb8dfcb8cfee37a3503255fb45e3794))
+* **sdk:** name why exports fail and stop experiments on a revoked key ([#193](https://github.com/telemetry-dev/telemetry/issues/193)) ([012b778](https://github.com/telemetry-dev/telemetry/commit/012b7785c347c35f39bc05a43ba20b3e189fa2be))
+
 ## [0.2.3](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.2.2...python-bedrock-v0.2.3) (2026-11-03)
 
 

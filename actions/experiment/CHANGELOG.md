@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.2](https://github.com/telemetry-dev/telemetry/compare/experiment-action-v1.0.1...experiment-action-v1.0.2) (2026-11-03)
+
+
+### Bug Fixes
+
+* **sdk:** name why exports fail and stop experiments on a revoked key ([#193](https://github.com/telemetry-dev/telemetry/issues/193)) ([012b778](https://github.com/telemetry-dev/telemetry/commit/012b7785c347c35f39bc05a43ba20b3e189fa2be))
+
 ## [1.0.1](https://github.com/telemetry-dev/telemetry/compare/experiment-action-v1.0.0...experiment-action-v1.0.1) (2026-11-03)
 
 
