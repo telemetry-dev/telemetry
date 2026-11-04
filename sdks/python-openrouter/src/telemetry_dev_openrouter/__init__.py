@@ -30,7 +30,6 @@ _FINISH_REASON_MAX_LENGTH = 128
 _TERMINAL_RESPONSE_EVENTS = frozenset(
     {"response.completed", "response.failed", "response.incomplete"}
 )
-_OMIT = object()
 _ORIGINALS: list[tuple[type[Any], str, Any]] = []
 _installed = False
 _install_lock = threading.Lock()
@@ -711,15 +710,6 @@ def _ending_stream(end: Callable[..., None], release: Callable[[], None]) -> Cal
     return end_stream
 
 
-def _capture_masked(handle: telemetry_dev.SpanHandle) -> bool:
-    compatible = cast(Any, handle)
-    masked = getattr(compatible, "capture_masked", None)
-    if isinstance(masked, bool):
-        return masked
-    client = getattr(compatible, "_client", None)
-    return getattr(client, "mask", _OMIT) is not None if client is not None else True
-
-
 def _mark_capture_incomplete(fields: dict[str, Any], mask_output: bool) -> dict[str, Any]:
     fields["attributes"] = {**(fields.get("attributes") or {}), _CAPTURE_TRUNCATED_ATTRIBUTE: True}
     if mask_output:
@@ -842,7 +832,7 @@ class _InstrumentedStream:
         self._consume: Iterator[Any] | None = None
         self._in_next = False
         self._completed = False
-        self._mask_output_when_incomplete = _capture_masked(handle)
+        self._mask_output_when_incomplete = handle.capture_masked
         self._budget = _stream_capture_budget()
         # Bound to the budget, not self, so the callback adds no reference cycle.
         self._end_stream = _ending_stream(_end_once(handle), partial(_release_budget, self._budget))
@@ -928,9 +918,7 @@ class _InstrumentedStream:
             return True
         update = _record_chat_chunk(chunk, self._states, self._budget)
         if _chat_chunk_has_output(chunk):
-            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-            if callable(record_output_chunk):
-                record_output_chunk(received_at * 1000)
+            self._handle.record_output_chunk(received_at * 1000)
         if not self._saw_first:
             self._saw_first = True
             self._handle.update(
@@ -957,7 +945,7 @@ class _InstrumentedAsyncStream:
         self._consume: AsyncIterator[Any] | None = None
         self._in_next = False
         self._completed = False
-        self._mask_output_when_incomplete = _capture_masked(handle)
+        self._mask_output_when_incomplete = handle.capture_masked
         self._budget = _stream_capture_budget()
         # Bound to the budget, not self, so the callback adds no reference cycle.
         self._end_stream = _ending_stream(_end_once(handle), partial(_release_budget, self._budget))
@@ -1046,9 +1034,7 @@ class _InstrumentedAsyncStream:
             return True
         update = _record_chat_chunk(chunk, self._states, self._budget)
         if _chat_chunk_has_output(chunk):
-            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-            if callable(record_output_chunk):
-                record_output_chunk(received_at * 1000)
+            self._handle.record_output_chunk(received_at * 1000)
         if not self._saw_first:
             self._saw_first = True
             self._handle.update(
@@ -1584,7 +1570,7 @@ class _InstrumentedResponsesStream:
         # Bound to the state, not self, so the callback adds no reference cycle.
         self._end_stream = _ending_stream(_end_once(handle), self._state.release)
         self._ended = False
-        self._mask_output_when_incomplete = _capture_masked(handle)
+        self._mask_output_when_incomplete = handle.capture_masked
         self._consume: Iterator[Any] | None = None
         self._in_next = False
         _hook_response_close(inner, self._on_response_close)
@@ -1661,9 +1647,7 @@ class _InstrumentedResponsesStream:
         if self._ended:
             return
         if _response_event_has_output(event):
-            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-            if callable(record_output_chunk):
-                record_output_chunk(received_at * 1000)
+            self._handle.record_output_chunk(received_at * 1000)
         if not self._saw_first:
             self._saw_first = True
             self._handle.update(
@@ -1692,7 +1676,7 @@ class _InstrumentedAsyncResponsesStream:
         # Bound to the state, not self, so the callback adds no reference cycle.
         self._end_stream = _ending_stream(_end_once(handle), self._state.release)
         self._ended = False
-        self._mask_output_when_incomplete = _capture_masked(handle)
+        self._mask_output_when_incomplete = handle.capture_masked
         self._consume: AsyncIterator[Any] | None = None
         self._in_next = False
         _hook_response_close(inner, self._on_response_close)
@@ -1772,9 +1756,7 @@ class _InstrumentedAsyncResponsesStream:
         if self._ended:
             return
         if _response_event_has_output(event):
-            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-            if callable(record_output_chunk):
-                record_output_chunk(received_at * 1000)
+            self._handle.record_output_chunk(received_at * 1000)
         if not self._saw_first:
             self._saw_first = True
             self._handle.update(
