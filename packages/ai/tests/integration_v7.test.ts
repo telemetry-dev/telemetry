@@ -4092,28 +4092,37 @@ test("a step that ends without onStepStart gets a span that starts with the trac
   const integ = telemetryDev(baseOptions, overrides);
   const callId = "call-no-step-start";
 
-  integ.onStart?.({
-    callId,
-    operationId: "ai.generateText",
-    provider: "openai",
-    modelId: "gpt-4o",
-    messages: [{ role: "user", content: "hi" }],
-  });
-  integ.onStepEnd?.({
-    callId,
-    stepNumber: 0,
-    model,
-    text: "hello",
-    finishReason: "stop",
-    response: { id: "r-no-start", modelId: "gpt-4o" },
-    usage: { inputTokens: 2, outputTokens: 1 },
-  });
-  await integ.onEnd?.({
-    callId,
-    text: "hello",
-    finishReason: "stop",
-    usage: { inputTokens: 2, outputTokens: 1 },
-  });
+  // The step ends a second after the trace starts, so a step that started at its own end
+  // would not share the trace's start time.
+  vi.useFakeTimers({ toFake: ["Date"], now: 1_000 });
+
+  try {
+    integ.onStart?.({
+      callId,
+      operationId: "ai.generateText",
+      provider: "openai",
+      modelId: "gpt-4o",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    vi.setSystemTime(2_000);
+    integ.onStepEnd?.({
+      callId,
+      stepNumber: 0,
+      model,
+      text: "hello",
+      finishReason: "stop",
+      response: { id: "r-no-start", modelId: "gpt-4o" },
+      usage: { inputTokens: 2, outputTokens: 1 },
+    });
+    await integ.onEnd?.({
+      callId,
+      text: "hello",
+      finishReason: "stop",
+      usage: { inputTokens: 2, outputTokens: 1 },
+    });
+  } finally {
+    vi.useRealTimers();
+  }
 
   const spans = spanBatches[0]!;
   const root = spans.find((s) => s.kind === SpanKind.INTERNAL)!;
