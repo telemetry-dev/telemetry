@@ -232,7 +232,12 @@ type OtlpPost = {
   signal?: AbortSignal;
 };
 
-/** Posts with retries, and returns the last response with its body cancelled. */
+/**
+ * Posts with retries, and returns the last response with its body cancelled.
+ *
+ * @deprecated Nothing in the SDK calls it, and it will be removed in a future breaking release.
+ * Use `createTraceExporter`, `createLogExporter`, or `createMetricExporter` to send OTLP.
+ */
 export const postOtlp = async (post: OtlpPost) => {
   const res = await postWithRetries(post);
 
@@ -276,7 +281,7 @@ const postWithRetries = async ({ fetchImpl, url, headers, body, signal }: OtlpPo
 
 const GZIP_THRESHOLD_BYTES = 1024;
 
-export async function maybeGzip(
+async function gzipLargeBody(
   body: Uint8Array,
 ): Promise<{ body: Uint8Array; contentEncoding?: "gzip" }> {
   if (body.byteLength <= GZIP_THRESHOLD_BYTES || globalThis.CompressionStream === undefined) {
@@ -297,6 +302,12 @@ export async function maybeGzip(
   }
 }
 
+/**
+ * @deprecated The exporters already gzip a body over 1 KiB. This export will be removed in a
+ * future breaking release.
+ */
+export const maybeGzip = gzipLargeBody;
+
 async function postSerialized(
   body: Uint8Array,
   target: OtlpTarget,
@@ -304,7 +315,7 @@ async function postSerialized(
   label: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  const { body: finalBody, contentEncoding } = await maybeGzip(body);
+  const { body: finalBody, contentEncoding } = await gzipLargeBody(body);
 
   const headers = contentEncoding
     ? { ...target.headers, "content-encoding": contentEncoding }
