@@ -31,7 +31,11 @@ export interface GenerationEmitter {
   flush(spans: Span[]): Promise<void>;
 }
 
-/** Replaces span export or metric collection without changes to sampling and flush behavior. */
+/**
+ * Replaces span export or metric collection without changes to sampling and flush behavior.
+ * `sendSpans` receives each flushed batch of sampled spans, and an error it throws goes to
+ * `onError`. A function left out keeps exporting to telemetry.dev.
+ */
 export interface GenerationEmitterOverrides {
   sendSpans?: (spans: ReadableSpan[]) => Promise<void>;
   recordDuration?: (seconds: number, attributes: Attributes) => void;

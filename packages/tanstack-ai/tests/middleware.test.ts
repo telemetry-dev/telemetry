@@ -30,8 +30,6 @@ interface MetricRecord {
   attributes: Attributes;
 }
 
-// Inject a capturing transport via the otel.ts test seam: spans are captured as the real
-// ReadableSpans the emitter would serialize, and metric points are captured in-process.
 function makeCapture() {
   const spanBatches: ReadableSpan[][] = [];
   const metrics: MetricRecord[] = [];
