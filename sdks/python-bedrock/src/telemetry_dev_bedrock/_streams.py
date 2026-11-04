@@ -19,7 +19,6 @@ from ._messages import normalize_content_block
 
 # The core applies max_attribute_length after the mask.
 _CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated"
-_OMIT = object()
 
 
 def stream_capture_budget() -> telemetry_dev.CaptureBudget:
@@ -104,14 +103,6 @@ class _DeltaBuffer:
                 self._pending[:0] = pending
                 self._tail = tail + self._tail
             raise
-
-
-def capture_masked(handle: Any) -> bool:
-    masked = getattr(handle, "capture_masked", None)
-    if isinstance(masked, bool):
-        return masked
-    client = getattr(handle, "_client", None)
-    return getattr(client, "mask", _OMIT) is not None if client is not None else True
 
 
 def mark_capture_incomplete(fields: dict[str, Any], mask_output: bool) -> dict[str, Any]:
@@ -580,7 +571,7 @@ class AgentStreamState(StreamState):
         # Metadata bypasses the capture flags and the mask, so trace content is filtered here,
         # and a mask that cannot see it withholds it.
         client = telemetry_dev.get_client()
-        masked = client is None or getattr(client, "mask", _OMIT) is not None
+        masked = client is None or client.mask is not None
         self.trace_capture = {
             "input": client is not None and client.capture_input and not masked,
             "output": client is not None and client.capture_output and not masked,
@@ -792,7 +783,7 @@ class InstrumentedEventStream:
         state: StreamState,
         finish: Callable[[dict[str, Any]], None],
         started_at: float,
-        handle: Any,
+        handle: telemetry_dev.SpanHandle,
         report_error: Callable[[BaseException], None],
     ) -> None:
         self._stream = stream
@@ -803,7 +794,7 @@ class InstrumentedEventStream:
         self._ended = False
         self._first = False
         self._track_output_chunks = isinstance(state, ConverseStreamState | InvokeModelStreamState)
-        self._mask_output_when_incomplete = capture_masked(handle)
+        self._mask_output_when_incomplete = handle.capture_masked
         self._report_error = report_error
         state.report_error = self._report_error
 
@@ -841,9 +832,7 @@ class InstrumentedEventStream:
                             if state_has_output is not None
                             else _event_has_output(event)
                         ):
-                            record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-                            if callable(record_output_chunk):
-                                record_output_chunk(received_at * 1000)
+                            self._handle.record_output_chunk(received_at * 1000)
                     except Exception as exc:
                         self._report_error(exc)
                 yield event

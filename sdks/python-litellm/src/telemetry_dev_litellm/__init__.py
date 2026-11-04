@@ -47,7 +47,6 @@ if hasattr(os, "register_at_fork") and "_install_fork_hook" not in globals():
     _install_fork_hook = True
     os.register_at_fork(after_in_child=_reset_install_lock_in_child)
 
-_OMIT = object()
 # The core applies max_attribute_length after the mask. More choices, or more responses items
 # and rejected parts tracked for truncation, than this are not kept.
 _STREAM_CAPTURE_MAX_ITEMS = 1000
@@ -158,15 +157,6 @@ def _adopt_budget(
         return False
     stream.items_used = measured.items_used
     return True
-
-
-def _capture_masked(handle: telemetry_dev.SpanHandle) -> bool:
-    compatible = cast(Any, handle)
-    masked = getattr(compatible, "capture_masked", None)
-    if isinstance(masked, bool):
-        return masked
-    client = getattr(compatible, "_client", None)
-    return getattr(client, "mask", _OMIT) is not None if client is not None else True
 
 
 def _mark_capture_incomplete(fields: dict[str, Any], mask_output: bool) -> None:
@@ -908,7 +898,7 @@ class _InstrumentedStream:
         self._saw_first = False
         self._finished = False
         self._completed = False
-        self._mask_output_when_incomplete = _capture_masked(handle)
+        self._mask_output_when_incomplete = handle.capture_masked
         self._budget = _stream_capture_budget()
         self._response_id: str | None = None
         self._response_model: str | None = None
@@ -1063,9 +1053,7 @@ class _InstrumentedStream:
                 )
             if has_output:
                 self._saw_output = True
-                record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-                if callable(record_output_chunk):
-                    record_output_chunk(received_at * 1000)
+                self._handle.record_output_chunk(received_at * 1000)
         except Exception as exc:
             self._report(exc)
         # The chunk is kept before its metadata is read, so a failure in the metadata (ID,
@@ -1288,7 +1276,7 @@ class _InstrumentedResponsesStream:
         self._retained_item_count = 0
         self._truncated_key_count = 0
         self._truncation_overflow = False
-        self._mask_output_when_incomplete = _capture_masked(handle)
+        self._mask_output_when_incomplete = handle.capture_masked
         self._budget = _stream_capture_budget()
         self._charges: dict[object, tuple[int, int]] = {}
         self._annotation_charge_keys: dict[object, dict[int, object]] = {}

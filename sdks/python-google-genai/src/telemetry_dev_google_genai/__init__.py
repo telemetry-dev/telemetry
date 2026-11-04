@@ -65,7 +65,6 @@ _STREAM_CAPTURE_MAX_ITEMS = 1000
 # so each is capped instead. Gemini's longest is 25 characters.
 _FINISH_REASON_MAX_LENGTH = 128
 _CAPTURE_TRUNCATED_ATTRIBUTE = "telemetry.dev.capture.truncated"
-_OMIT = object()
 
 _BUILTIN_TOOL_FIELDS = (
     ("google_search", "googleSearch"),
@@ -992,21 +991,8 @@ def _ending_stream(end: Callable[..., None], state: _StreamState) -> Callable[..
     return end_stream
 
 
-def _capture_masked(handle: telemetry_dev.SpanHandle) -> bool:
-    compatible = cast(Any, handle)
-    masked = getattr(compatible, "capture_masked", None)
-    if isinstance(masked, bool):
-        return masked
-    client = getattr(compatible, "_client", None)
-    return getattr(client, "mask", _OMIT) is not None if client is not None else True
-
-
 def _capture_metadata_content(handle: telemetry_dev.SpanHandle) -> bool:
-    compatible = cast(Any, handle)
-    capture_output = getattr(compatible, "capture_output", None)
-    if not isinstance(capture_output, bool):
-        capture_output = getattr(getattr(compatible, "_state", None), "capture_output", False)
-    return capture_output is True and not _capture_masked(handle)
+    return handle.capture_output and not handle.capture_masked
 
 
 def _mark_stream_capture(
@@ -1368,7 +1354,7 @@ class _ObservedStream:
             # An AFC turn that fails to map reports through the stream, once per stream.
             afc_usage_state["report_error"] = self._state.report_error
         self._completed = False
-        self._mask_output_when_incomplete = _capture_masked(handle)
+        self._mask_output_when_incomplete = handle.capture_masked
 
     def _fields(self) -> dict[str, Any]:
         return _mark_stream_capture(
@@ -1429,9 +1415,7 @@ class _ObservedStream:
                 _AFC_USAGE_STATE.reset(token)
         try:
             if _chunk_has_output(chunk):
-                record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-                if callable(record_output_chunk):
-                    record_output_chunk(received_at * 1000)
+                self._handle.record_output_chunk(received_at * 1000)
         except Exception as exc:
             # Only the chunk's timing is lost; the chunk is still recorded.
             self._state.report_error(exc)
@@ -1468,7 +1452,7 @@ class _ObservedAsyncStream:
             # An AFC turn that fails to map reports through the stream, once per stream.
             afc_usage_state["report_error"] = self._state.report_error
         self._completed = False
-        self._mask_output_when_incomplete = _capture_masked(handle)
+        self._mask_output_when_incomplete = handle.capture_masked
 
     def _fields(self) -> dict[str, Any]:
         return _mark_stream_capture(
@@ -1532,9 +1516,7 @@ class _ObservedAsyncStream:
                 _AFC_USAGE_STATE.reset(token)
         try:
             if _chunk_has_output(chunk):
-                record_output_chunk = getattr(self._handle, "record_output_chunk", None)
-                if callable(record_output_chunk):
-                    record_output_chunk(received_at * 1000)
+                self._handle.record_output_chunk(received_at * 1000)
         except Exception as exc:
             # Only the chunk's timing is lost; the chunk is still recorded.
             self._state.report_error(exc)
