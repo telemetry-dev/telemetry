@@ -164,6 +164,37 @@ telemetryDev({ waitUntil: (p) => ctx.waitUntil(p) });
 - **Metrics:** `gen_ai.client.operation.duration` per iteration and tool call, and
   `gen_ai.client.token.usage` per iteration, both following the OTel GenAI semantic conventions.
 
+## Testing
+
+To check your telemetry in tests without a network, pass a second argument to `telemetryDev()`.
+`sendSpans` receives each flushed batch of sampled spans instead of posting it, and
+`recordDuration` and `recordTokens` receive each metric point instead of recording it.
+
+```ts
+import { telemetryDev } from "@telemetry-dev/tanstack-ai";
+
+const spanNames: string[] = [];
+const tokens: number[] = [];
+
+const telemetry = telemetryDev(
+  { apiKey: "td_live_test" },
+  {
+    sendSpans: async (batch) => {
+      spanNames.push(...batch.map((span) => span.name));
+    },
+    recordDuration: () => {},
+    recordTokens: (_type, count) => {
+      tokens.push(count);
+    },
+  },
+);
+```
+
+The middleware still needs an API key, or it does nothing; any non-empty value works. Each
+function you leave out keeps its default, so pass all three to keep the test offline. An error
+thrown by `sendSpans` goes to `onError`. Each span in a batch is an OpenTelemetry `ReadableSpan`, so
+a test can also read its `attributes` and `events`.
+
 ## Limitations
 
 - **TTFT:** time-to-first-chunk is not currently reported.

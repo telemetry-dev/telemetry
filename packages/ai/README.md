@@ -257,6 +257,38 @@ Alongside spans, each run emits structured logs (shown on the trace and the Logg
 Logs are emitted as OTLP span events on the owning span (sent on the same `/v1/traces` request), so
 they correlate to the turn/tool they describe.
 
+## Testing
+
+To check your telemetry in tests without a network, pass a second argument to `telemetryDev()`.
+`sendSpans` receives each flushed batch of sampled spans instead of posting it, and
+`recordDuration` and `recordTokens` receive each metric point instead of recording it. The media
+and batch wrappers, and the `/v6` entry, take the same object as their last argument.
+
+```ts
+import { telemetryDev } from "@telemetry-dev/ai-sdk";
+
+const spanNames: string[] = [];
+const tokens: number[] = [];
+
+const telemetry = telemetryDev(
+  { apiKey: "td_live_test" },
+  {
+    sendSpans: async (batch) => {
+      spanNames.push(...batch.map((span) => span.name));
+    },
+    recordDuration: () => {},
+    recordTokens: (_type, count) => {
+      tokens.push(count);
+    },
+  },
+);
+```
+
+The integration still needs an API key, or it does nothing; any non-empty value works. Each
+function you leave out keeps its default, so pass all three to keep the test offline. An error
+thrown by `sendSpans` goes to `onError`. Each span in a batch is an OpenTelemetry `ReadableSpan`, so
+a test can also read its `attributes` and `events`.
+
 ## Limitations
 
 On `ai@7` (root entry):
