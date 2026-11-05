@@ -16,15 +16,29 @@ import {
 } from "@telemetry-dev/sdk";
 import * as telemetrySdk from "@telemetry-dev/sdk";
 import Anthropic from "@anthropic-ai/sdk";
+import { VERSION } from "@anthropic-ai/sdk/version";
 import { createRequire } from "node:module";
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
-import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { instrumentAnthropic, uninstrumentAnthropic, wrapAnthropic } from "../src/index.ts";
 
 const SPAN_STATUS_UNSET = 0;
 const SPAN_STATUS_ERROR = 2;
+
+test("runs the compatibility suite against the selected Anthropic major", () => {
+  expect(VERSION).toBe(process.env.ANTHROPIC_SDK_VERSION === "0" ? "0.126.0" : "1.4.0");
+});
+
+test.each(["", "2"])("rejects unsupported Anthropic SDK selector %j", async (version) => {
+  vi.stubEnv("ANTHROPIC_SDK_VERSION", version);
+  vi.resetModules();
+
+  await expect(import("../vite.config.ts")).rejects.toThrow(
+    `Unsupported ANTHROPIC_SDK_VERSION: ${JSON.stringify(version)}`,
+  );
+});
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
@@ -294,6 +308,7 @@ afterEach(async () => {
   uninstrumentAnthropic();
   await shutdown();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 test.each([
@@ -373,9 +388,8 @@ test("messages.create maps request, response, usage, finish reason, provider, an
     max_tokens: 64,
     messages,
     system: "Be terse",
-    temperature: 0.7,
-    top_p: 0.9,
-    top_k: 40,
+    // The types of @anthropic-ai/sdk 1.x have no sampling fields; 0.x clients still send them.
+    ...({ temperature: 0.7, top_p: 0.9, top_k: 40 } as object),
     stop_sequences: ["END"],
   });
 
@@ -712,7 +726,9 @@ test("wrapAnthropic observes a CommonJS client subclass stream", async () => {
   const spans = setupSpans();
   const fake = createFakeFetch(namedSseResponse(streamEvents()));
   const require = createRequire(import.meta.url);
-  const CommonJsAnthropic = require("@anthropic-ai/sdk").default as typeof Anthropic;
+  // Node resolves require() itself, without the alias of the 0.x test run.
+  const sdk = process.env.ANTHROPIC_SDK_VERSION === "0" ? "anthropic-sdk-v0" : "@anthropic-ai/sdk";
+  const CommonJsAnthropic = require(sdk).default as typeof Anthropic;
 
   class CustomAnthropic extends CommonJsAnthropic {}
 
@@ -1415,6 +1431,242 @@ test("beta.messages.toolRunner records one generation span per model turn", asyn
     ["end_turn"],
   ]);
 });
+
+test("beta.messages.toolRunner with stream: true records one span per streamed turn", async () => {
+  const spans = setupSpans();
+  const toolTurn = betaStreamEvents([
+    { type: "tool_use", id: "toolu_1", name: "weather", input: {} },
+    [{ type: "input_json_delta", partial_json: '{"city":"Accra"}' }],
+  ]);
+  toolTurn[0] = {
+    type: "message_start",
+    message: messagePayload({ id: "msg_tool_turn", content: [], usage: { input_tokens: 5 } }),
+  };
+  toolTurn.at(-2)!.delta = { stop_reason: "tool_use" };
+  const fake = createFakeFetch(
+    namedSseResponse(toolTurn),
+    namedSseResponse(
+      betaStreamEvents([{ type: "text", text: "" }, [{ type: "text_delta", text: "Sunny." }]]),
+    ),
+  );
+  const client = clientWith(fake.fetch);
+
+  const runner = client.beta.messages.toolRunner({
+    model: "claude-opus-5",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Weather in Accra?" }],
+    tools: [
+      {
+        type: "custom",
+        name: "weather",
+        input_schema: { type: "object", properties: { city: { type: "string" } } },
+        run: () => "sunny",
+        parse: (input: unknown) => input,
+      },
+    ],
+    stream: true,
+  });
+
+  for await (const turn of runner) await collectStream(turn);
+
+  expect(fake.requests).toHaveLength(2);
+  const turns = await finishedSpans(spans, 2);
+  expect(turns.map((span) => span.attributes["gen_ai.response.id"])).toEqual([
+    "msg_tool_turn",
+    "msg_beta_stream",
+  ]);
+  expect(jsonAttr(turns[1]!, "gen_ai.output.messages")).toEqual([
+    { role: "assistant", content: [{ type: "text", text: "Sunny." }] },
+  ]);
+});
+
+// Threads arrived in @anthropic-ai/sdk 1.2. A thread hands the stream of create() to its own
+// parser through the request's response props, not through the promise that create() returns.
+describe.skipIf(!("thread" in new Anthropic({ apiKey: "test" }).beta.messages))(
+  "a beta message thread",
+  () => {
+    const params = { model: "claude-opus-5", max_tokens: 64 };
+
+    test("records the span of a streamed turn when the stream ends", async () => {
+      const spans = setupSpans();
+      const fake = createFakeFetch(
+        namedSseResponse(
+          betaStreamEvents([{ type: "text", text: "" }, [{ type: "text_delta", text: "Hi." }]]),
+        ),
+      );
+      const thread = clientWith(fake.fetch).beta.messages.thread(params);
+
+      const reply = await thread.stream([{ role: "user", content: "Hi" }]).finalMessage();
+
+      expect(reply.content).toMatchObject([{ type: "text", text: "Hi." }]);
+      const span = await exportedSpan(spans);
+      expect(span.attributes["gen_ai.response.id"]).toBe("msg_beta_stream");
+      expect(span.attributes["gen_ai.usage.output_tokens"]).toBe(2);
+      expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+    });
+
+    test("records the span of a turn sent without a stream", async () => {
+      const spans = setupSpans();
+      const fake = createFakeFetch(jsonResponse(messagePayload({ id: "msg_send" })));
+      const thread = clientWith(fake.fetch).beta.messages.thread(params);
+
+      const reply = await thread.send([{ role: "user", content: "Hi" }]);
+
+      expect(reply.content).toMatchObject([{ type: "text", text: "Hello." }]);
+      const span = await exportedSpan(spans);
+      expect(span.status.code).toBe(SPAN_STATUS_UNSET);
+      expect(span.attributes["gen_ai.response.id"]).toBe("msg_send");
+      expect(span.attributes["telemetry.dev.capture.truncated"]).toBeUndefined();
+    });
+
+    test("keeps the turn's stream when recording the span fails", async () => {
+      setupSpans();
+      const startSpan = telemetrySdk.startSpan;
+      vi.spyOn(telemetrySdk, "startSpan").mockImplementation((...args) => {
+        const span = startSpan(...args);
+        vi.spyOn(span, "recordOutputChunk").mockImplementation(() => {
+          throw new Error("span processor failed");
+        });
+
+        return span;
+      });
+      // One event for each chunk, so the body goes on after the span stops reading.
+      const { response } = countedSseResponse(
+        betaStreamEvents([
+          { type: "text", text: "" },
+          [
+            { type: "text_delta", text: "Hi." },
+            { type: "text_delta", text: " More." },
+          ],
+        ]),
+      );
+      const fake = createFakeFetch(response);
+      const thread = clientWith(fake.fetch).beta.messages.thread(params);
+
+      const reply = await thread.stream([{ role: "user", content: "Hi" }]).finalMessage();
+
+      expect(reply.content).toMatchObject([{ type: "text", text: "Hi. More." }]);
+    });
+
+    test("ends the span of a streamed turn whose listener throws as for an early stop", async () => {
+      const spans = setupSpans();
+      const { response } = countedSseResponse(
+        betaStreamEvents([
+          { type: "text", text: "" },
+          [
+            { type: "text_delta", text: "Hi." },
+            { type: "text_delta", text: " More." },
+          ],
+        ]),
+      );
+      const thread = clientWith(createFakeFetch(response).fetch).beta.messages.thread(params);
+      const stream = thread.stream([{ role: "user", content: "Hi" }]);
+      stream.on("streamEvent", (event) => {
+        if (event.type === "content_block_delta") throw new Error("listener failed");
+      });
+
+      await expect(stream.finalMessage()).rejects.toThrow("listener failed");
+
+      const span = await exportedSpan(spans);
+      expect(span.status.code).toBe(SPAN_STATUS_UNSET);
+      expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    });
+
+    test("records a refused attempt and its replay as separate spans", async () => {
+      const spans = setupSpans();
+      const reply = (id: string, text: string) =>
+        namedSseResponse(
+          betaStreamEvents([{ type: "text", text: "" }, [{ type: "text_delta", text }]]).map(
+            (event) =>
+              event.type === "message_start"
+                ? { ...event, message: { ...(event.message as JsonRecord), id } }
+                : event,
+          ),
+        );
+      const lost = new Response(
+        JSON.stringify({
+          type: "error",
+          error: {
+            type: "not_found_error",
+            message: "thread not found",
+            details: { error_code: "thread_not_found" },
+          },
+        }),
+        { status: 404, headers: { "content-type": "application/json" } },
+      );
+      const fake = createFakeFetch(reply("msg_t1", "One."), lost, reply("msg_t2", "Two."));
+      const thread = clientWith(fake.fetch).beta.messages.thread(params);
+
+      await thread.stream([{ role: "user", content: "One" }]).finalMessage();
+      await thread.stream([{ role: "user", content: "Two" }]).finalMessage();
+
+      expect(fake.requests).toHaveLength(3);
+      const turns = await finishedSpans(spans, 3);
+      expect(
+        turns.map((span) => [span.status.code, span.attributes["gen_ai.response.id"]]),
+      ).toEqual([
+        [SPAN_STATUS_UNSET, "msg_t1"],
+        [SPAN_STATUS_ERROR, undefined],
+        [SPAN_STATUS_UNSET, "msg_t2"],
+      ]);
+    });
+
+    test("keeps the URL of the response of a streamed turn", async () => {
+      setupSpans();
+      const response = namedSseResponse(
+        betaStreamEvents([{ type: "text", text: "" }, [{ type: "text_delta", text: "Hi." }]]),
+      );
+      Object.defineProperty(response, "url", { value: "https://api.anthropic.com/v1/messages" });
+      const thread = clientWith(createFakeFetch(response).fetch).beta.messages.thread(params);
+
+      const { response: received } = await thread
+        .stream([{ role: "user", content: "Hi" }])
+        .withResponse();
+
+      expect(received.url).toBe("https://api.anthropic.com/v1/messages");
+    });
+
+    test("records the error of a streamed turn that the API refuses", async () => {
+      const spans = setupSpans();
+      const fake = createFakeFetch(jsonErrorResponse(400, "bad turn"));
+      const thread = clientWith(fake.fetch).beta.messages.thread(params);
+
+      await expect(thread.stream([{ role: "user", content: "Hi" }]).finalMessage()).rejects.toThrow(
+        "bad turn",
+      );
+
+      const span = await exportedSpan(spans);
+      expect(span.status.code).toBe(SPAN_STATUS_ERROR);
+    });
+
+    test("ends the span of a streamed turn that the caller stops early", async () => {
+      const spans = setupSpans();
+      // The body sends the first delta and then waits, as a connection does for the next token.
+      const events = betaStreamEvents([
+        { type: "text", text: "" },
+        [{ type: "text_delta", text: "Hi." }],
+      ]).slice(0, 3);
+      const body = await namedSseResponse(events).text();
+      const stalled = new ReadableStream<Uint8Array>({
+        start: (controller) => controller.enqueue(new TextEncoder().encode(body)),
+      });
+      const response = new Response(stalled, { headers: { "content-type": "text/event-stream" } });
+      const thread = clientWith(createFakeFetch(response).fetch).beta.messages.thread(params);
+      const stream = thread.stream([{ role: "user", content: "Hi" }]);
+
+      for await (const event of stream) {
+        if (event.type === "content_block_delta") break;
+      }
+
+      const span = await exportedSpan(spans);
+      expect(span.status.code).toBe(SPAN_STATUS_UNSET);
+      expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
+        { role: "assistant", content: [{ type: "text", text: "Hi." }] },
+      ]);
+      expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
+    });
+  },
+);
 
 test("instrumentAnthropic covers beta.messages and uninstrumentAnthropic restores it", async () => {
   const spans = setupSpans();

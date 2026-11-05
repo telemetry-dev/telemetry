@@ -10,7 +10,7 @@ Docs: https://telemetry.dev/docs/integrations/anthropic
 pnpm add @telemetry-dev/sdk @telemetry-dev/anthropic @anthropic-ai/sdk
 ```
 
-Requires `@anthropic-ai/sdk` 0.110.0 or a later 0.x release, and `@telemetry-dev/sdk`, which needs Node.js 20.19.0 or later.
+Requires `@anthropic-ai/sdk` 0.110.0 or later, below 2, and `@telemetry-dev/sdk`, which needs Node.js 20.19.0 or later.
 
 Set `TELEMETRY_DEV_API_KEY` for telemetry export and `ANTHROPIC_API_KEY` for Anthropic.
 
@@ -58,9 +58,10 @@ Global instrumentation patches both the stable and beta `Messages.prototype.crea
 - `client.messages.parse(...)`, which routes through `create()`.
 - `client.beta.messages.create(...)`, `stream(...)`, and `parse(...)`.
 - `client.beta.messages.toolRunner(...)`: each model request in the tool loop records its own generation span.
+- `client.beta.messages.thread(...)` in `@anthropic-ai/sdk` 1.2 or later: each `send()`, `stream()`, and `toolRunner()` request records its own generation span. The server keeps the thread, so from the second request on, the span's input has only the new messages, with no system instructions or tool definitions. From 1.2, `toolRunner()` on an `Anthropic` client also runs over a thread by default; pass `thread: false` to it to send, and record, the full history, system instructions, and tools on each request. Clients for other platforms, such as Bedrock and Vertex, do not support threads.
 - Anthropic, Bedrock, Bedrock Mantle, and Vertex clients, including subclasses. Provider attributes are emitted as `anthropic`, `aws.bedrock` (Bedrock and Bedrock Mantle), or `gcp.vertex_ai`. `AnthropicAws` (Claude Platform on AWS) and `AnthropicFoundry` (Microsoft Foundry) serve the Anthropic API, so they are recorded as `anthropic`.
 
-Captured request fields include model, max tokens, temperature, top-p, stop sequences, system instructions, tools, and messages. Captured response fields include model, finish reason, content blocks, message id, and token usage including cache and thinking token details when Anthropic returns them.
+Captured request fields include model, max tokens, temperature and top-p (which only the types of `@anthropic-ai/sdk` 0.x have), stop sequences, system instructions, tools, and messages. Captured response fields include model, finish reason, content blocks, message id, and token usage including cache and thinking token details when Anthropic returns them.
 
 ## Streaming behavior
 
@@ -93,7 +94,7 @@ To use the native spans instead of this package, refer to [Claude SDK](https://t
 - `messages.countTokens`, `beta.messages.countTokens`, batches, and other non-Messages surfaces are not instrumented.
 - Wrapped calls preserve `withResponse()` and `asResponse()`.
 - If application code never consumes or closes a stream, the span cannot finish until the stream is finalized by the runtime.
-- Global instrumentation patches the ES module build of the `@anthropic-ai/sdk` copy this package resolves. Clients loaded through `require()` use the package's CommonJS build, which has separate classes. The Bedrock, Vertex, AWS, and Foundry client packages depend on `@anthropic-ai/sdk` 0.115.1 or newer, so a package manager can also install them a separate copy. Wrap those clients with `wrapAnthropic()`.
+- Global instrumentation patches the ES module build of the `@anthropic-ai/sdk` copy this package resolves. Clients loaded through `require()` use the package's CommonJS build, which has separate classes. The Bedrock, Vertex, AWS, and Foundry client packages depend on their own range of `@anthropic-ai/sdk`, so a package manager can also install them a separate copy. Wrap those clients with `wrapAnthropic()`.
 
 ## License
 

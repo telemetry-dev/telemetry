@@ -47,8 +47,9 @@
   "scripts": {
     "build": "pnpm exec vp pack",
     "dev": "pnpm exec vp pack --watch",
-    "test": "vp test",
+    "test": "cross-env ANTHROPIC_SDK_VERSION=1 vp test && cross-env ANTHROPIC_SDK_VERSION=0 vp test",
     "check": "vp check",
+    "check:v0": "tsc --project tsconfig.v0.json",
     "prepublishOnly": "vp run build"
   },
   "devDependencies": {
@@ -58,12 +59,14 @@
     "@opentelemetry/sdk-trace-base": "catalog:",
     "@telemetry-dev/sdk": "workspace:*",
     "@types/node": "catalog:",
+    "anthropic-sdk-v0": "npm:@anthropic-ai/sdk@0.126.0",
+    "cross-env": "catalog:",
     "typescript": "catalog:",
     "vite-plus": "catalog:",
     "vitest": "catalog:"
   },
   "peerDependencies": {
-    "@anthropic-ai/sdk": ">=0.110.0 <1",
+    "@anthropic-ai/sdk": ">=0.110.0 <2",
     "@telemetry-dev/sdk": "workspace:^"
   }
 }

@@ -437,10 +437,24 @@ function endOnce(span: SpanHandle): (fields?: SpanFields) => void {
   };
 }
 
+/** The fields of the response props of `@anthropic-ai/sdk` that the wrapper reads. */
+interface ResponseProps {
+  response: Response;
+  controller: AbortController;
+}
+
+/**
+ * The bytes of a streamed body that the span's copy may hold before the span reads them. The span
+ * reads as fast as the caller does unless its exporter stalls; past this bound the span stops
+ * reading and its output is truncated, and the caller's body goes on.
+ */
+const COPY_QUEUE_BYTES = 16 * 1024 * 1024;
+
 type TracedResult<T> = Promise<T> & {
   asResponse(): Promise<Response>;
   withResponse(): Promise<WrappedResponse<T>>;
   _thenUnwrap<U>(transform: (data: T, ...args: Value[]) => U): TracedResult<U>;
+  _responseProps?: () => Promise<ResponseProps>;
 };
 
 interface TracePromiseContext {
@@ -449,6 +463,11 @@ interface TracePromiseContext {
   startedAt: number;
   streaming: boolean;
   mapResponse: (response: Value) => SpanFields;
+  /**
+   * The client of the request, or undefined. `Stream.fromSSEResponse` reads only its logger, and
+   * logs to the console without one.
+   */
+  client: Value;
 }
 
 interface StreamLike<T> extends AsyncIterable<T> {
@@ -461,6 +480,7 @@ interface InnerAPIPromise {
   finally: Promise<Value>["finally"];
   asResponse?: () => Promise<Response>;
   _thenUnwrap?: <U>(transform: (data: Value, ...args: Value[]) => U) => InnerAPIPromise;
+  _responseProps?: () => Promise<ResponseProps>;
 }
 
 function mapRawResponse(response: Response): SpanFields {
@@ -496,6 +516,128 @@ function finalizeParsedValue(value: Value, ctx: TracePromiseContext): Value {
   return value;
 }
 
+/**
+ * Gives the body of a streamed response to the span as well. A message thread of
+ * `@anthropic-ai/sdk` 1.2 and later parses the stream of each turn from the response props of `create()`,
+ * and never awaits the promise that `create()` returns, so the span never saw the stream.
+ *
+ * The returned response copies each chunk to a second body as the caller reads it, and the span
+ * reads that second body, so it ends when the caller's stream ends, fails, or is aborted. The span
+ * reads with its own controller: a failure of the span must not abort the caller's request.
+ */
+function observeStreamedResponse(props: ResponseProps, ctx: TracePromiseContext): ResponseProps {
+  const body = props.response.body;
+
+  if (!body) {
+    ctx.end(mapRawResponse(props.response));
+
+    return props;
+  }
+
+  // The copy is best effort: once the span stops reading it, or a write to it fails, the caller's
+  // body goes on without it.
+  let copyOpen = true;
+  let copy: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const toCopy = (write: (controller: ReadableStreamDefaultController<Uint8Array>) => void) => {
+    if (!copyOpen || !copy) return;
+
+    try {
+      write(copy);
+    } catch {
+      copyOpen = false;
+    }
+  };
+  const closeCopy = (close: (controller: ReadableStreamDefaultController<Uint8Array>) => void) => {
+    toCopy(close);
+    copyOpen = false;
+  };
+  const observed = new ReadableStream<Uint8Array>(
+    {
+      start: (controller) => {
+        copy = controller;
+      },
+      cancel: () => {
+        copyOpen = false;
+      },
+    },
+    new ByteLengthQueuingStrategy({ highWaterMark: COPY_QUEUE_BYTES }),
+  );
+  const reader = body.getReader();
+  const signal = props.controller.signal;
+  const onAbort = () =>
+    closeCopy((controller) =>
+      controller.error(
+        signal.reason instanceof Error ? signal.reason : new Error("Request aborted"),
+      ),
+    );
+  signal.addEventListener("abort", onAbort, { once: true });
+
+  const read = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+
+      try {
+        chunk = await reader.read();
+      } catch (error) {
+        closeCopy((copyController) => copyController.error(error));
+        controller.error(error);
+
+        return;
+      }
+
+      if (chunk.done) {
+        signal.removeEventListener("abort", onAbort);
+        closeCopy((copyController) => copyController.close());
+        controller.close();
+
+        return;
+      }
+
+      toCopy((copyController) => {
+        copyController.enqueue(chunk.value);
+
+        if ((copyController.desiredSize ?? 0) <= 0) closeCopy((full) => full.close());
+      });
+      controller.enqueue(chunk.value);
+    },
+    // A caller that stops reading, such as for a listener that throws, cancels the body before
+    // the SDK aborts the request. The span then ends with what it read, as for an early stop.
+    cancel(reason) {
+      signal.removeEventListener("abort", onAbort);
+      closeCopy((copyController) => copyController.close());
+
+      return reader.cancel(reason);
+    },
+  });
+
+  const stream = finalizeParsedValue(
+    Stream.fromSSEResponse(
+      new Response(observed, props.response),
+      new AbortController(),
+      ctx.client as never,
+    ),
+    ctx,
+  );
+
+  if (isStreamLike(stream)) {
+    const iterator = stream[Symbol.asyncIterator]();
+    const drain = async () => {
+      while (!(await iterator.next()).done);
+    };
+    // The span records the error of the stream; the caller gets it from its own body.
+    drain().catch(() => undefined);
+  }
+
+  const response = new Response(read, props.response);
+  // The Response constructor takes no url or redirected; the caller and the SDK's logs read them.
+  Object.defineProperties(response, {
+    url: { value: props.response.url },
+    redirected: { value: props.response.redirected },
+  });
+
+  return { ...props, response };
+}
+
 function rejectMissing(method: string): Promise<never> {
   return Promise.reject(new TypeError(`wrapped result has no ${method}`));
 }
@@ -505,6 +647,7 @@ function makeTracedPromise<T>(inner: InnerAPIPromise, ctx: TracePromiseContext):
   const originalThen = source.then.bind(source);
   const originalAsResponse = source.asResponse?.bind(source);
   const originalThenUnwrap = source._thenUnwrap?.bind(source);
+  const originalResponseProps = source._responseProps?.bind(source);
 
   const handleError = (error: Value): never => {
     ctx.end({
@@ -549,6 +692,25 @@ function makeTracedPromise<T>(inner: InnerAPIPromise, ctx: TracePromiseContext):
       handleError,
     );
   };
+
+  if (originalResponseProps) {
+    // The body of a stream can be read only once, so each call gets the same props.
+    let props: Promise<ResponseProps> | undefined;
+
+    traced._responseProps = () =>
+      (props ??= originalResponseProps().then((value) => {
+        if (!ctx.streaming) return value;
+
+        try {
+          return observeStreamedResponse(value, ctx);
+        } catch (cause) {
+          reportSpanError(ctx.span, cause);
+          ctx.end({ attributes: { "telemetry.dev.capture.truncated": true } });
+
+          return value;
+        }
+      }, handleError));
+  }
 
   traced._thenUnwrap = <U>(transform: (data: T, ...args: Value[]) => U): TracedResult<U> => {
     if (!originalThenUnwrap) {
@@ -1236,6 +1398,7 @@ function wrapCreate<Fn extends AnyFunction>(
         startedAt,
         streaming,
         mapResponse,
+        client: asRecord(this)?._client,
       }) as OpaqueValue;
     } catch (error) {
       end({ error: error instanceof Error ? error : new Error(String(error)) });
@@ -1294,7 +1457,8 @@ export function wrapAnthropic<T extends AnthropicClient>(client: T): T {
   if (wrappedClients.has(client)) return client;
   const provider = providerForClient(client);
 
-  // beta.messages.stream(), parse(), and toolRunner() all route through beta.messages.create().
+  // beta.messages.stream(), parse(), toolRunner(), and thread() all route through
+  // beta.messages.create().
   for (const resource of [client.messages, client.beta?.messages]) {
     const messages = asRecord(resource);
 
