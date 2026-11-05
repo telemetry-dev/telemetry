@@ -35,7 +35,7 @@ Artifact names and versions are checked before upload. `.github/scripts/release-
 
 ## Experiment action
 
-The experiment action in `actions/experiment` has no package. Release Please gives it releases such as `experiment-action-v1.0.0`. The `tag-experiment-action` job of the `Release` workflow then moves the major tag, `experiment-action-v1`, to the release commit. The README of the action and the experiment page of telemetry.dev tell users to use the major tag. The job moves a major tag only forward on `main`, so a rerun of an earlier release does not move it back.
+The experiment action in `actions/experiment` has no package. Release Please gives it releases such as `experiment-action-v1.0.0`. The `tag-experiment-action` job of the `Release` workflow then moves the major tag, `experiment-action-v1`, to the release commit. The READMEs of the action and the SDKs, and the experiments page of the telemetry.dev docs, tell users to use the major tag. The job moves a major tag only forward on `main`, so a rerun of an earlier release does not move it back.
 
 A change that can break a workflow, for example a removed input or a changed output, must have a `feat!:` or `fix!:` commit. Release Please then gives the action a new major version, and `experiment-action-v1` stays at the last 1.x release. A `release_tag` retry does not apply to the action. If the job fails, re-run the failed job of the release run.
 
