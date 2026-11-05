@@ -4143,6 +4143,8 @@ test("a step that ends without onStepStart gets a span that starts with the trac
 type V7Integration = ReturnType<typeof telemetryDev>;
 
 const gateway = (modelId: string) => ({ provider: "gateway", modelId });
+const embedModel = gateway("openai/text-embedding-3-small");
+const rerankModel = gateway("cohere/rerank-v3.5");
 
 const evaluateInput = {
   ...gateway("openai/gpt-4o"),
@@ -4201,6 +4203,8 @@ const gatewayRuns = [
     finish: async (integ: V7Integration, callId: string) => {
       integ.onObjectStepEnd?.({
         callId,
+        stepNumber: 0,
+        ...gateway("openai/gpt-4o"),
         finishReason: "stop",
         response: { id: "r-gateway-object", modelId: "openai/gpt-4o" },
         usage: { inputTokens: 1, outputTokens: 1 },
@@ -4217,19 +4221,22 @@ const gatewayRuns = [
   {
     operation: "embed",
     start: (integ: V7Integration, callId: string) => {
-      const embedModel = gateway("openai/text-embedding-3-small");
       integ.onStart?.({ callId, operationId: "ai.embed", ...embedModel, value: "a" });
       integ.onEmbedStart?.({ callId, embedCallId: "e-gateway", ...embedModel });
     },
     finish: async (integ: V7Integration, callId: string) => {
-      integ.onEmbedEnd?.({ callId, embedCallId: "e-gateway", usage: { tokens: 1 } });
+      integ.onEmbedEnd?.({
+        callId,
+        embedCallId: "e-gateway",
+        ...embedModel,
+        usage: { tokens: 1 },
+      });
       await integ.onEnd?.({ callId, usage: { tokens: 1 } });
     },
   },
   {
     operation: "rerank",
     start: (integ: V7Integration, callId: string) => {
-      const rerankModel = gateway("cohere/rerank-v3.5");
       integ.onStart?.({
         callId,
         operationId: "ai.rerank",
@@ -4240,7 +4247,7 @@ const gatewayRuns = [
       integ.onRerankStart?.({ callId, ...rerankModel });
     },
     finish: async (integ: V7Integration, callId: string) => {
-      integ.onRerankEnd?.({ callId });
+      integ.onRerankEnd?.({ callId, ...rerankModel });
       await integ.onEnd?.({ callId, ranking: [{ index: 0, score: 1 }] });
     },
   },
@@ -4298,8 +4305,8 @@ test.each(gatewayRuns)(
   },
 );
 
-// A step that ends takes the root's provider, so only a step an error leaves open shows the label
-// from its own start event.
+// Each step end rewrites or keeps its own provider, so only a step an error leaves open shows the
+// label from its start event.
 test.each(gatewayRuns)(
   "ai@7 $operation relabels the gateway provider on a step an error leaves open",
   async ({ operation, start }) => {
