@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/pi",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Pi coding-agent telemetry integration for telemetry.dev.",
   "keywords": [
     "agents",

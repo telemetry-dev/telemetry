@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.3](https://github.com/telemetry-dev/telemetry/compare/ai-sdk-v0.2.2...ai-sdk-v0.2.3) (2026-11-05)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/otel bumped to 0.2.3
+
 ## [0.2.2](https://github.com/telemetry-dev/telemetry/compare/ai-sdk-v0.2.1...ai-sdk-v0.2.2) (2026-11-03)
 
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.5](https://github.com/telemetry-dev/telemetry/compare/pi-v0.2.4...pi-v0.2.5) (2026-11-05)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/sdk bumped to 0.2.5
+
 ## [0.2.4](https://github.com/telemetry-dev/telemetry/compare/pi-v0.2.3...pi-v0.2.4) (2026-11-03)
 
 

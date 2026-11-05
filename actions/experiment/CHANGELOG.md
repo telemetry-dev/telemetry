@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.3](https://github.com/telemetry-dev/telemetry/compare/experiment-action-v1.0.2...experiment-action-v1.0.3) (2026-11-05)
+
+
+### Bug Fixes
+
+* **sdk:** name why the experiment check failed in the action annotation ([#203](https://github.com/telemetry-dev/telemetry/issues/203)) ([997aec9](https://github.com/telemetry-dev/telemetry/commit/997aec97b166321fdc88db079ee0cbf405a25b90))
+
 ## [1.0.2](https://github.com/telemetry-dev/telemetry/compare/experiment-action-v1.0.1...experiment-action-v1.0.2) (2026-11-03)
 
 

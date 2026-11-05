@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.5](https://github.com/telemetry-dev/telemetry/compare/python-v0.3.4...python-v0.3.5) (2026-11-05)
+
+
+### Bug Fixes
+
+* **sdk:** give the check_failed error the numbers of the action annotation ([#207](https://github.com/telemetry-dev/telemetry/issues/207)) ([47e7669](https://github.com/telemetry-dev/telemetry/commit/47e76698fe59ece9b5915bf0964ef4d9d00bc954))
+
+
+### Documentation
+
+* **sdk:** point the conformance docs at the Rust ingest drivers ([#200](https://github.com/telemetry-dev/telemetry/issues/200)) ([2740170](https://github.com/telemetry-dev/telemetry/commit/27401701208427fee224bf07ab2d3d8b0d1f20db))
+
 ## [0.3.4](https://github.com/telemetry-dev/telemetry/compare/python-v0.3.3...python-v0.3.4) (2026-11-03)
 
 
