@@ -788,7 +788,24 @@ def test_in_ci_mode_a_failed_check_raises_with_the_result(monkeypatch: pytest.Mo
     )
 
 
-def test_in_ci_mode_a_check_that_failed_items_failed_names_their_count_and_a_mean_with_one_decimal(
+def _near_mark(
+    name: str, kind: str | None, value: float | None, min_score: float
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "kind": kind,
+        "value": value,
+        "passCount": 0,
+        "failCount": 0,
+        "baselineValue": None,
+        "delta": None,
+        "minScore": min_score,
+        "passed": False,
+        "itemsFailed": 5,
+    }
+
+
+def test_in_ci_mode_a_check_that_failed_items_failed_names_their_count_and_scores_under_marks(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("CI", "true")
@@ -849,6 +866,26 @@ def test_in_ci_mode_a_check_that_failed_items_failed_names_their_count_and_a_mea
                 "passed": True,
                 "itemsFailed": 5,
             },
+            # The error gives more decimals than the result lines, as the annotation of the action
+            # does, and more again while the value reads as the mark.
+            _near_mark("accuracy", "pass_fail", 0.8958, 0.9),
+            _near_mark("relevance", "number", 3.96, 4),
+            _near_mark("faithfulness", "number", 0.79996, 0.8),
+            # The float 4.0625 is exact: toFixed rounds the tie away from zero, not to even.
+            _near_mark("brevity", "number", 4.0625, 4.5),
+            # String() of JavaScript writes a number under 1e-6 with an exponent, as 2e-7.
+            _near_mark("cost", "number", 1e-7, 2e-7),
+            # 0.00155 rounds up to 0.002, over the mark, so it gets a fourth decimal.
+            _near_mark("tokens", "number", 0.00155, 0.0016),
+            _near_mark("groundedness", "pass_fail", 0.5, 0.57),
+            _near_mark("precision", "pass_fail", 43 / 48, 0.9),
+            _near_mark("clarity", "number", 3.9995, 4),
+            _near_mark("drift", "number", -1.0625, 0),
+            _near_mark("noise", "number", 1e-17, 2e-17),
+            # A score with no values has no kind, and a mark of 1 or less on it is a pass rate.
+            _near_mark("coverage", None, None, 0.9),
+            _near_mark("exact", None, None, 1),
+            _near_mark("helpfulness_unscored", None, None, 4),
         ],
     )
     with fake_api(results=[failed_items]) as api:
@@ -857,8 +894,22 @@ def test_in_ci_mode_a_check_that_failed_items_failed_names_their_count_and_a_mea
 
     assert caught.value.code == "check_failed"
     assert str(caught.value) == (
-        "The check of support-golden-v3 failed: 5 of 6 items failed; helpfulness is 4.3, "
-        f"under the pass mark 4.5. {EXPERIMENT_URL}"
+        "The check of support-golden-v3 failed: 5 of 6 items failed; "
+        "helpfulness is 4.35, under the pass mark 4.5; "
+        "accuracy is 89.58%, under the pass mark 90%; "
+        "relevance is 3.96, under the pass mark 4; "
+        "faithfulness is 0.79996, under the pass mark 0.8; "
+        "brevity is 4.063, under the pass mark 4.5; "
+        "cost is 0, under the pass mark 2e-7; "
+        "tokens is 0.0015, under the pass mark 0.0016; "
+        "groundedness is 50%, under the pass mark 57%; "
+        "precision is 89.58%, under the pass mark 90%; "
+        "clarity is 3.999, under the pass mark 4; "
+        "drift is -1.063, under the pass mark 0; "
+        "noise is 1e-17, under the pass mark 0; "
+        "coverage is no score, under the pass mark 90%; "
+        "exact is no score, under the pass mark 100%; "
+        f"helpfulness_unscored is no score, under the pass mark 4. {EXPERIMENT_URL}"
     )
     assert caught.value.result is not None
     assert caught.value.result.scores[0].items_failed == 5
@@ -869,6 +920,20 @@ def test_in_ci_mode_a_check_that_failed_items_failed_names_their_count_and_a_mea
         "  helpfulness: 4.3 (pass mark 4.5)\n"
         "  tone: 4.3\n"
         "  length: 12.0 (pass mark 10.0)\n"
+        "  accuracy: 90% (pass mark 90%)\n"
+        "  relevance: 4.0 (pass mark 4.0)\n"
+        "  faithfulness: 0.8 (pass mark 0.8)\n"
+        "  brevity: 4.1 (pass mark 4.5)\n"
+        "  cost: 0.0 (pass mark 0.0)\n"
+        "  tokens: 0.0 (pass mark 0.0)\n"
+        "  groundedness: 50% (pass mark 57%)\n"
+        "  precision: 90% (pass mark 90%)\n"
+        "  clarity: 4.0 (pass mark 4.0)\n"
+        "  drift: -1.1 (pass mark 0.0)\n"
+        "  noise: 0.0 (pass mark 0.0)\n"
+        "  coverage: no score (pass mark 0.9)\n"
+        "  exact: no score (pass mark 1.0)\n"
+        "  helpfulness_unscored: no score (pass mark 4.0)\n"
     )
 
     twice = result(checkStatus="failed", itemsTotal=4, itemsDone=4, itemsFailed=3)

@@ -877,7 +877,22 @@ test("in CI mode a failed check rejects with the result", async () => {
   expect(error.result?.scores[1]?.kind).toBeNull();
 });
 
-test("in CI mode a check that failed items failed names their count, and a mean with one decimal, in the log too", async () => {
+function nearMark(name: string, kind: string | null, value: number | null, minScore: number) {
+  return {
+    name,
+    kind,
+    value,
+    passCount: 0,
+    failCount: 0,
+    baselineValue: null,
+    delta: null,
+    minScore,
+    passed: false,
+    itemsFailed: 5,
+  };
+}
+
+test("in CI mode a check that failed items failed names their count, and each score under its mark with the decimals that tell them apart, which the log rounds", async () => {
   vi.stubEnv("CI", "true");
 
   const api = fakeApi({
@@ -938,6 +953,26 @@ test("in CI mode a check that failed items failed names their count, and a mean 
             passed: true,
             itemsFailed: 5,
           },
+          // The error gives more decimals than the result lines, as the annotation of the action
+          // does, and more again while the value reads as the mark.
+          nearMark("accuracy", "pass_fail", 0.8958, 0.9),
+          nearMark("relevance", "number", 3.96, 4),
+          nearMark("faithfulness", "number", 0.79996, 0.8),
+          // The float 4.0625 is exact: toFixed rounds the tie away from zero, not to even.
+          nearMark("brevity", "number", 4.0625, 4.5),
+          // String() of JavaScript writes a number under 1e-6 with an exponent.
+          nearMark("cost", "number", 1e-7, 2e-7),
+          // 0.00155 rounds up to 0.002, over the mark, so it gets a fourth decimal.
+          nearMark("tokens", "number", 0.00155, 0.0016),
+          nearMark("groundedness", "pass_fail", 0.5, 0.57),
+          nearMark("precision", "pass_fail", 43 / 48, 0.9),
+          nearMark("clarity", "number", 3.9995, 4),
+          nearMark("drift", "number", -1.0625, 0),
+          nearMark("noise", "number", 1e-17, 2e-17),
+          // A score with no values has no kind, and a mark of 1 or less on it is a pass rate.
+          nearMark("coverage", null, null, 0.9),
+          nearMark("exact", null, null, 1),
+          nearMark("helpfulness_unscored", null, null, 4),
         ],
       }),
     ],
@@ -949,7 +984,22 @@ test("in CI mode a check that failed items failed names their count, and a mean 
 
   expect(error.code).toBe("check_failed");
   expect(error.message).toBe(
-    `The check of support-golden-v3 failed: 5 of 6 items failed; helpfulness is 4.3, under the pass mark 4.5. ${URL_OF_EXPERIMENT}`,
+    "The check of support-golden-v3 failed: 5 of 6 items failed; " +
+      "helpfulness is 4.35, under the pass mark 4.5; " +
+      "accuracy is 89.58%, under the pass mark 90%; " +
+      "relevance is 3.96, under the pass mark 4; " +
+      "faithfulness is 0.79996, under the pass mark 0.8; " +
+      "brevity is 4.063, under the pass mark 4.5; " +
+      "cost is 0, under the pass mark 2e-7; " +
+      "tokens is 0.0015, under the pass mark 0.0016; " +
+      "groundedness is 50%, under the pass mark 57%; " +
+      "precision is 89.58%, under the pass mark 90%; " +
+      "clarity is 3.999, under the pass mark 4; " +
+      "drift is -1.063, under the pass mark 0; " +
+      "noise is 1e-17, under the pass mark 0; " +
+      "coverage is no score, under the pass mark 90%; " +
+      "exact is no score, under the pass mark 100%; " +
+      `helpfulness_unscored is no score, under the pass mark 4. ${URL_OF_EXPERIMENT}`,
   );
   expect(error.result?.scores[0]?.itemsFailed).toBe(5);
   expect(vi.mocked(console.log).mock.calls.at(-1)?.[0]).toBe(
@@ -960,6 +1010,20 @@ test("in CI mode a check that failed items failed names their count, and a mean 
       "  helpfulness: 4.3 (pass mark 4.5)",
       "  tone: 4.3",
       "  length: 12.0 (pass mark 10.0)",
+      "  accuracy: 90% (pass mark 90%)",
+      "  relevance: 4.0 (pass mark 4.0)",
+      "  faithfulness: 0.8 (pass mark 0.8)",
+      "  brevity: 4.1 (pass mark 4.5)",
+      "  cost: 0.0 (pass mark 0.0)",
+      "  tokens: 0.0 (pass mark 0.0)",
+      "  groundedness: 50% (pass mark 57%)",
+      "  precision: 90% (pass mark 90%)",
+      "  clarity: 4.0 (pass mark 4.0)",
+      "  drift: -1.1 (pass mark 0.0)",
+      "  noise: 0.0 (pass mark 0.0)",
+      "  coverage: no score (pass mark 0.9)",
+      "  exact: no score (pass mark 1.0)",
+      "  helpfulness_unscored: no score (pass mark 4.0)",
     ].join("\n"),
   );
 

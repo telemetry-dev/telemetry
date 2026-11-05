@@ -14,7 +14,8 @@ import urllib.parse
 from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
+from decimal import Context as DecimalContext
 from time import perf_counter
 from typing import Any, Literal, TypeAlias, TypeGuard, cast
 
@@ -1000,12 +1001,7 @@ def _check_result(result: ExperimentResult, runs_per_item: int) -> None:
         )
     if result.check_status != "failed":
         return
-    failed = [
-        f"{score.name} is {_format(score.kind, score.value)}, under the pass mark "
-        f"{_format(score.kind, score.min_score)}"
-        for score in result.scores
-        if score.passed is False
-    ]
+    failed = [_under_mark(score) for score in result.scores if score.passed is False]
     if result.items_failed > 0:
         failed.insert(0, _items_failed_text(result, runs_per_item))
     detail = f": {'; '.join(failed)}" if failed else ""
@@ -1023,6 +1019,60 @@ def _items_failed_text(result: ExperimentResult, runs_per_item: int) -> str:
     """
     unit = "runs" if runs_per_item > 1 else "items"
     return f"{result.items_failed} of {result.items_done} {unit} failed"
+
+
+def _under_mark(score: ExperimentScore) -> str:
+    """A score under its pass mark, with the numbers of the annotation of the action.
+
+    The mark has 10 decimals. The value has 2 decimals for a rate and 3 otherwise, and one more
+    while it rounds to the mark or above it, up to 17, so that a value just under the mark does not
+    read as the mark. A rate shows both as percents. A score with no kind had no values: a mark of
+    1 or less on it is a pass rate, as the action reads it.
+    """
+    rate = score.kind in _RATE_KINDS or (
+        score.kind is None and score.min_score is not None and score.min_score <= 1
+    )
+
+    def rounded(number: float, digits: int) -> float:
+        # float() first: a whole number from the JSON is an int, which JavaScript holds as a float.
+        return _js_fixed(float(number) * 100 if rate else float(number), digits)
+
+    def text(number: float) -> str:
+        return _js_string(number) + ("%" if rate else "")
+
+    mark = None if score.min_score is None else rounded(score.min_score, 10)
+    mark_text = "no score" if mark is None else text(mark)
+    if score.value is None:
+        return f"{score.name} is no score, under the pass mark {mark_text}"
+    digits = 2 if rate else 3
+    while mark is not None and digits < 17 and rounded(score.value, digits) >= mark:
+        digits += 1
+    return f"{score.name} is {text(rounded(score.value, digits))}, under the pass mark {mark_text}"
+
+
+def _js_fixed(number: float, digits: int) -> float:
+    # +number.toFixed(digits) of JavaScript: the exact value with a half rounded away from zero.
+    # The precision holds the 309 whole digits of the largest float and the decimals.
+    step = Decimal(1).scaleb(-digits)
+    return float(Decimal(number).quantize(step, ROUND_HALF_UP, DecimalContext(prec=400)))
+
+
+def _js_string(number: float) -> str:
+    """String(number) of JavaScript: the digits of repr(), with an exponent under 1e-6 and from
+    1e21 only, and no ".0" or "-0"."""
+    _, digit_tuple, exponent = Decimal(repr(abs(number))).normalize().as_tuple()
+    digits = "".join(map(str, digit_tuple))
+    point = len(digits) + int(exponent)
+    if len(digits) <= point <= 21:
+        text = digits + "0" * (point - len(digits))
+    elif 0 < point <= 21:
+        text = f"{digits[:point]}.{digits[point:]}"
+    elif -6 < point <= 0:
+        text = f"0.{'0' * -point}{digits}"
+    else:
+        mantissa = digits if len(digits) == 1 else f"{digits[0]}.{digits[1:]}"
+        text = f"{mantissa}e{'+' if point > 0 else '-'}{abs(point - 1)}"
+    return f"{'-' if number < 0 else ''}{text}"
 
 
 def _describe(result: ExperimentResult, runs_per_item: int) -> str:
