@@ -1019,7 +1019,8 @@ test("v6 exports session spans only when the configured sampler selects them", a
 });
 
 // The other ai@6 tests send hand-built events; this one runs generateText through the real ai@6
-// dispatcher, so a change in the events it sends or the hooks it calls shows up here.
+// dispatcher and checks the fields the integration reads from its events: the model, the prompt,
+// and the tool's arguments and result.
 test("a real ai@6 generateText run with a tool call records the root, both steps, and the tool", async () => {
   const { spanBatches, metrics, overrides } = makeCapture();
   let calls = 0;
@@ -1089,9 +1090,16 @@ test("a real ai@6 generateText run with a tool call records the root, both steps
   const steps = spans.filter((s) => s.kind === SpanKind.CLIENT);
   const tools = spans.filter((s) => s.attributes["gen_ai.operation.name"] === "execute_tool");
 
+  expect(root.attributes["gen_ai.operation.name"]).toBe("invoke_agent");
+  expect(root.attributes["gen_ai.provider.name"]).toBe("openai");
+  expect(root.attributes["gen_ai.request.model"]).toBe("gpt-4o");
+  expect(String(root.attributes["gen_ai.input.messages"])).toContain("find otel");
+
   expect(steps).toHaveLength(2);
   expect(tools).toHaveLength(1);
   expect(tools[0]!.attributes["gen_ai.tool.name"]).toBe("lookup");
+  expect(tools[0]!.attributes["gen_ai.tool.call.arguments"]).toBe(JSON.stringify({ q: "otel" }));
+  expect(tools[0]!.attributes["gen_ai.tool.call.result"]).toBe(JSON.stringify({ hits: ["otel"] }));
   expect(tools[0]!.parentSpanContext?.spanId).toBe(spanId(steps[0]!));
 
   for (const step of steps) {

@@ -4024,6 +4024,9 @@ test("overlapping evaluations stay isolated and errors clean up their call state
 
 test("executeTool runs the tool inside its span and the tool end finishes that span", async () => {
   context.setGlobalContextManager(new AlsContextManager(new AsyncLocalStorage<Context>()));
+  // The tool end runs at 2s and the step end at 3s, so the tool span's end time shows which one
+  // ended it.
+  vi.useFakeTimers({ toFake: ["Date"], now: 1_000 });
 
   try {
     const { spanBatches, overrides } = makeCapture();
@@ -4052,12 +4055,14 @@ test("executeTool runs the tool inside its span and the tool end finishes that s
       },
     });
 
+    vi.setSystemTime(2_000);
     integ.onToolExecutionEnd?.({
       callId,
       toolCall,
       toolExecutionMs: 5,
       toolOutput: { type: "tool-result", output: { ok: true } },
     });
+    vi.setSystemTime(3_000);
     integ.onStepEnd?.({
       callId,
       stepNumber: 0,
@@ -4082,7 +4087,9 @@ test("executeTool runs the tool inside its span and the tool end finishes that s
     expect(spanId(tools[0]!)).toBe(activeSpanId);
     expect(tools[0]!.parentSpanContext?.spanId).toBe(spanId(step));
     expect(tools[0]!.attributes["gen_ai.tool.name"]).toBe("lookup");
+    expect(tools[0]!.endTime).toEqual([2, 0]);
   } finally {
+    vi.useRealTimers();
     context.disable();
   }
 });
@@ -4133,48 +4140,176 @@ test("a step that ends without onStepStart gets a span that starts with the trac
   expect(steps[0]!.attributes["gen_ai.usage.input_tokens"]).toBe(2);
 });
 
-test("ai@7 relabels the gateway provider to Vercel AI Gateway on every span", async () => {
-  const { spanBatches, overrides } = makeCapture();
-  const integ = telemetryDev(baseOptions, overrides);
-  const callId = "call-gateway";
-  const gatewayModel = { provider: "gateway", modelId: "openai/gpt-4o" } as const;
-  const toolCall = { toolCallId: "t-gateway", toolName: "lookup", input: {} };
+type V7Integration = ReturnType<typeof telemetryDev>;
 
-  integ.onStart?.({
-    callId,
-    operationId: "ai.generateText",
-    provider: "gateway",
-    modelId: "openai/gpt-4o",
-    messages: [{ role: "user", content: "hi" }],
-  });
-  integ.onStepStart?.({ callId, stepNumber: 0, provider: "gateway", modelId: "openai/gpt-4o" });
-  integ.onToolExecutionStart?.({ callId, toolCall });
-  integ.onToolExecutionEnd?.({
-    callId,
-    toolCall,
-    toolExecutionMs: 5,
-    toolOutput: { type: "tool-result", output: {} },
-  });
-  integ.onStepEnd?.({
-    callId,
-    stepNumber: 0,
-    model: gatewayModel,
-    text: "hello",
-    finishReason: "stop",
-    response: { id: "r-gateway", modelId: "openai/gpt-4o" },
-    usage: { inputTokens: 1, outputTokens: 1 },
-  });
-  await integ.onEnd?.({
-    callId,
-    text: "hello",
-    finishReason: "stop",
-    usage: { inputTokens: 1, outputTokens: 1 },
-  });
+const gateway = (modelId: string) => ({ provider: "gateway", modelId });
 
-  const withProvider = spanBatches[0]!.filter((s) => "gen_ai.provider.name" in s.attributes);
-  expect(withProvider.length).toBeGreaterThanOrEqual(2);
+const evaluateInput = {
+  ...gateway("openai/gpt-4o"),
+  state: { response: "Paris" },
+  questions: { correct: { type: "boolean", question: "Is this correct?" } },
+};
 
-  for (const s of withProvider) {
-    expect(s.attributes["gen_ai.provider.name"]).toBe("Vercel AI Gateway");
-  }
-});
+const evaluateOutput = {
+  answers: { correct: { type: "boolean", probability: 1 } },
+  usage: { inputTokens: 1, outputTokens: 1 },
+};
+
+// Each run starts the call and its step with the gateway provider. `finish` ends both, and the
+// error table fails the call while the step is still open instead.
+const gatewayRuns = [
+  {
+    operation: "generateText",
+    start: (integ: V7Integration, callId: string) => {
+      integ.onStart?.({
+        callId,
+        operationId: "ai.generateText",
+        ...gateway("openai/gpt-4o"),
+        prompt: "hi",
+      });
+      integ.onStepStart?.({ callId, stepNumber: 0, ...gateway("openai/gpt-4o") });
+    },
+    finish: async (integ: V7Integration, callId: string) => {
+      integ.onStepEnd?.({
+        callId,
+        stepNumber: 0,
+        model: gateway("openai/gpt-4o"),
+        text: "hello",
+        finishReason: "stop",
+        response: { id: "r-gateway-text", modelId: "openai/gpt-4o" },
+        usage: { inputTokens: 1, outputTokens: 1 },
+      });
+      await integ.onEnd?.({
+        callId,
+        text: "hello",
+        finishReason: "stop",
+        usage: { inputTokens: 1, outputTokens: 1 },
+      });
+    },
+  },
+  {
+    operation: "generateObject",
+    start: (integ: V7Integration, callId: string) => {
+      integ.onStart?.({
+        callId,
+        operationId: "ai.generateObject",
+        ...gateway("openai/gpt-4o"),
+        prompt: "name?",
+      });
+      integ.onObjectStepStart?.({ callId, ...gateway("openai/gpt-4o") });
+    },
+    finish: async (integ: V7Integration, callId: string) => {
+      integ.onObjectStepEnd?.({
+        callId,
+        finishReason: "stop",
+        response: { id: "r-gateway-object", modelId: "openai/gpt-4o" },
+        usage: { inputTokens: 1, outputTokens: 1 },
+        objectText: "{}",
+      });
+      await integ.onEnd?.({
+        callId,
+        object: {},
+        finishReason: "stop",
+        usage: { inputTokens: 1, outputTokens: 1 },
+      });
+    },
+  },
+  {
+    operation: "embed",
+    start: (integ: V7Integration, callId: string) => {
+      const embedModel = gateway("openai/text-embedding-3-small");
+      integ.onStart?.({ callId, operationId: "ai.embed", ...embedModel, value: "a" });
+      integ.onEmbedStart?.({ callId, embedCallId: "e-gateway", ...embedModel });
+    },
+    finish: async (integ: V7Integration, callId: string) => {
+      integ.onEmbedEnd?.({ callId, embedCallId: "e-gateway", usage: { tokens: 1 } });
+      await integ.onEnd?.({ callId, usage: { tokens: 1 } });
+    },
+  },
+  {
+    operation: "rerank",
+    start: (integ: V7Integration, callId: string) => {
+      const rerankModel = gateway("cohere/rerank-v3.5");
+      integ.onStart?.({
+        callId,
+        operationId: "ai.rerank",
+        ...rerankModel,
+        documents: ["a", "b"],
+        query: "q",
+      });
+      integ.onRerankStart?.({ callId, ...rerankModel });
+    },
+    finish: async (integ: V7Integration, callId: string) => {
+      integ.onRerankEnd?.({ callId });
+      await integ.onEnd?.({ callId, ranking: [{ index: 0, score: 1 }] });
+    },
+  },
+  {
+    operation: "evaluate",
+    start: (integ: V7Integration, callId: string) => {
+      integ.experimental_onEvaluateStart?.({
+        callId,
+        operationId: "ai.evaluate",
+        ...evaluateInput,
+      });
+      integ.experimental_onEvaluationModelCallStart?.({
+        callId,
+        operationId: "ai.evaluate.doEvaluate",
+        ...evaluateInput,
+      });
+    },
+    finish: async (integ: V7Integration, callId: string) => {
+      integ.experimental_onEvaluationModelCallEnd?.({
+        callId,
+        operationId: "ai.evaluate.doEvaluate",
+        ...evaluateInput,
+        ...evaluateOutput,
+      });
+      await integ.experimental_onEvaluateEnd?.({
+        callId,
+        operationId: "ai.evaluate",
+        ...evaluateInput,
+        ...evaluateOutput,
+      });
+    },
+  },
+];
+
+const expectGatewayRootAndStep = (spans: readonly ReadableSpan[]) => {
+  const roots = spans.filter((s) => s.kind === SpanKind.INTERNAL);
+  const steps = spans.filter((s) => s.kind === SpanKind.CLIENT);
+  expect(roots).toHaveLength(1);
+  expect(steps).toHaveLength(1);
+  expect(roots[0]!.attributes["gen_ai.provider.name"]).toBe("Vercel AI Gateway");
+  expect(steps[0]!.attributes["gen_ai.provider.name"]).toBe("Vercel AI Gateway");
+};
+
+test.each(gatewayRuns)(
+  "ai@7 $operation relabels the gateway provider on the root and step spans",
+  async ({ operation, start, finish }) => {
+    const { spanBatches, overrides } = makeCapture();
+    const integ = telemetryDev(baseOptions, overrides);
+    const callId = `gateway-${operation}`;
+
+    start(integ, callId);
+    await finish(integ, callId);
+
+    expectGatewayRootAndStep(spanBatches[0]!);
+  },
+);
+
+// A step that ends takes the root's provider, so only a step an error leaves open shows the label
+// from its own start event.
+test.each(gatewayRuns)(
+  "ai@7 $operation relabels the gateway provider on a step an error leaves open",
+  async ({ operation, start }) => {
+    const { spanBatches, overrides } = makeCapture();
+    const integ = telemetryDev(baseOptions, overrides);
+    const callId = `gateway-${operation}-error`;
+
+    start(integ, callId);
+    await integ.onError?.({ callId, error: new Error("provider down") });
+
+    expectGatewayRootAndStep(spanBatches[0]!);
+  },
+);
