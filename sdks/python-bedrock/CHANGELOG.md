@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.5](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.2.4...python-bedrock-v0.2.5) (2026-11-05)
+
+
+### Documentation
+
+* **sdk:** use current models in the READMEs and examples ([#210](https://github.com/telemetry-dev/telemetry/issues/210)) ([a3e9a59](https://github.com/telemetry-dev/telemetry/commit/a3e9a5936ba6eca37f440fdd0a755c340831fc2d))
+
 ## [0.2.4](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.2.3...python-bedrock-v0.2.4) (2026-11-03)
 
 

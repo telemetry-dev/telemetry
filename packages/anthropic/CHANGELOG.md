@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.6](https://github.com/telemetry-dev/telemetry/compare/anthropic-v0.2.5...anthropic-v0.2.6) (2026-11-05)
+
+
+### Features
+
+* **sdk-anthropic:** support @anthropic-ai/sdk 1.x ([#206](https://github.com/telemetry-dev/telemetry/issues/206)) ([14ef48b](https://github.com/telemetry-dev/telemetry/commit/14ef48b7f5d1eb9ecabb8b790e8945ba10fdee91))
+
 ## [0.2.5](https://github.com/telemetry-dev/telemetry/compare/anthropic-v0.2.4...anthropic-v0.2.5) (2026-11-05)
 
 

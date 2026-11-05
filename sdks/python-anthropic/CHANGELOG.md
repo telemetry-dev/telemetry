@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.5](https://github.com/telemetry-dev/telemetry/compare/python-anthropic-v0.2.4...python-anthropic-v0.2.5) (2026-11-05)
+
+
+### Features
+
+* **sdk-anthropic:** support anthropic 2.x in the Python integration ([#204](https://github.com/telemetry-dev/telemetry/issues/204)) ([d8f0877](https://github.com/telemetry-dev/telemetry/commit/d8f0877ee625f66b23eee052ba22f785b614a2fd))
+
+
+### Documentation
+
+* **sdk:** use current models in the READMEs and examples ([#210](https://github.com/telemetry-dev/telemetry/issues/210)) ([a3e9a59](https://github.com/telemetry-dev/telemetry/commit/a3e9a5936ba6eca37f440fdd0a755c340831fc2d))
+
 ## [0.2.4](https://github.com/telemetry-dev/telemetry/compare/python-anthropic-v0.2.3...python-anthropic-v0.2.4) (2026-11-03)
 
 
