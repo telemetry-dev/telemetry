@@ -1,0 +1,73 @@
+{
+  "name": "@telemetry-dev/openai-agents",
+  "version": "0.1.0",
+  "description": "OpenAI Agents SDK telemetry integration for telemetry.dev: agent runs, model calls, tool calls, and sandbox commands as OpenTelemetry traces.",
+  "keywords": [
+    "agents",
+    "genai",
+    "llm",
+    "observability",
+    "openai",
+    "openai-agents",
+    "opentelemetry",
+    "sandbox",
+    "telemetry",
+    "tracing"
+  ],
+  "homepage": "https://telemetry.dev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/telemetry-dev/telemetry.git",
+    "directory": "packages/openai-agents"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "default": "./dist/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.mts",
+        "import": "./dist/index.mjs",
+        "default": "./dist/index.mjs"
+      },
+      "./package.json": "./package.json"
+    }
+  },
+  "scripts": {
+    "build": "pnpm exec vp pack",
+    "dev": "pnpm exec vp pack --watch",
+    "test": "vp test",
+    "check": "vp check",
+    "prepublishOnly": "vp run build"
+  },
+  "dependencies": {
+    "@telemetry-dev/sdk": "workspace:^"
+  },
+  "devDependencies": {
+    "@openai/agents": "0.21.0",
+    "@opentelemetry/sdk-trace-base": "catalog:",
+    "@types/node": "^25.5.0",
+    "@typescript/native-preview": "7.0.0-dev.20260328.1",
+    "openai": "catalog:",
+    "typescript": "^6.0.2",
+    "vite-plus": "0.1.20",
+    "vitest": "catalog:",
+    "zod": "catalog:"
+  },
+  "peerDependencies": {
+    "@openai/agents": ">=0.21.0 <1"
+  }
+}
