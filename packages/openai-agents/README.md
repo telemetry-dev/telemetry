@@ -1,8 +1,15 @@
 # @telemetry-dev/openai-agents
 
 OpenAI Agents SDK integration for [telemetry.dev](https://telemetry.dev). It sends each agent run
-to telemetry.dev as one trace: the agent and its turns, each model call with its token usage, each
-tool call, and each command that a sandbox agent ran, with its exit code and the sandbox it ran in.
+to telemetry.dev: the agent and its turns, each model call with its token usage, each tool call, and
+each command that a sandbox agent ran, with its exit code and the sandbox it ran in.
+
+Each run is one trace, unless it starts inside an active OpenTelemetry span, such as an HTTP request
+span, and joins that span's trace. Runs that share a `groupId` share a session. Outside an active
+span, they land in
+[one trace per session](https://telemetry.dev/docs/sdk/typescript#one-trace-per-session), each run
+as a root span. With `sessionMode: "process"`, runs without a `groupId` share the process's session
+in the same way.
 
 ## Install
 
