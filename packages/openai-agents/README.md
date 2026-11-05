@@ -118,9 +118,10 @@ is still live, has no such span, so the spans of that run have neither.
   `setTraceProcessors` to stop that.
 - With capture off, telemetry.dev still receives span names and timing, model names, token usage,
   agent, tool, handoff, and guardrail names, the MCP server of a tool call, exit codes, sandbox
-  backends and ids, error types, the trace's `groupId` as the session id, and the string, number,
-  and boolean values of trace metadata and of the data of custom spans. Metadata does not go
-  through `mask`.
+  backends and ids, error types, the session id (such as the trace's `groupId`, a
+  `propagateAttributes()` session, or the process session), the user id and metadata of
+  `propagateAttributes()`, and the string, number, and boolean values of trace metadata and of the
+  data of custom spans. Metadata does not go through `mask`.
 
 ## Double counting
 
