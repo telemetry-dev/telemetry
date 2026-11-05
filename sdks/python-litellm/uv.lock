@@ -2889,7 +2889,7 @@ wheels = [
 
 [[package]]
 name = "telemetry-dev"
-version = "0.3.5"
+version = "0.3.6"
 source = { editable = "../python" }
 dependencies = [
     { name = "googleapis-common-protos" },
@@ -2923,7 +2923,7 @@ dev = [
 
 [[package]]
 name = "telemetry-dev-litellm"
-version = "0.2.4"
+version = "0.2.5"
 source = { editable = "." }
 dependencies = [
     { name = "litellm" },

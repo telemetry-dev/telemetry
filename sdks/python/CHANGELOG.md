@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.6](https://github.com/telemetry-dev/telemetry/compare/python-v0.3.5...python-v0.3.6) (2026-11-05)
+
+
+### Documentation
+
+* **sdk:** use current models in the READMEs and examples ([#210](https://github.com/telemetry-dev/telemetry/issues/210)) ([a3e9a59](https://github.com/telemetry-dev/telemetry/commit/a3e9a5936ba6eca37f440fdd0a755c340831fc2d))
+
 ## [0.3.5](https://github.com/telemetry-dev/telemetry/compare/python-v0.3.4...python-v0.3.5) (2026-11-05)
 
 
