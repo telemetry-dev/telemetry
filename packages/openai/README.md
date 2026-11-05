@@ -37,7 +37,7 @@ import { wrapOpenAI } from "@telemetry-dev/openai";
 const openai = wrapOpenAI(new OpenAI({ apiKey: process.env.OPENAI_API_KEY }));
 
 await openai.chat.completions.create({
-  model: "gpt-4o-mini",
+  model: "gpt-6-luna",
   messages: [{ role: "user", content: "Tell me a joke about OpenTelemetry" }],
 });
 ```
@@ -56,7 +56,7 @@ const openai = new OpenAI();
 
 try {
   await openai.responses.create({
-    model: "gpt-4o-mini",
+    model: "gpt-6-luna",
     input: "Tell me a joke about OpenTelemetry",
   });
 } finally {

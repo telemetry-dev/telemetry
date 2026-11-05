@@ -33,7 +33,7 @@ from telemetry_dev_google_genai import wrap_google_genai
 client = wrap_google_genai(genai.Client(api_key="..."))
 
 client.models.generate_content(
-    model="gemini-2.5-flash",
+    model="gemini-3.8-flash",
     contents=[{"role": "user", "parts": [{"text": "Tell me a joke about OpenTelemetry"}]}],
 )
 ```
@@ -51,7 +51,7 @@ client = genai.Client(api_key="...")
 
 try:
     client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents="Tell me a joke about OpenTelemetry",
     )
 finally:

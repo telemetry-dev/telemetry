@@ -165,7 +165,7 @@ const COMMANDS: Readonly<Record<string, Command>> = {
     examples: [
       `${BIN} traces --errors --since 2h`,
       `${BIN} traces --name checkout --env production`,
-      `${BIN} traces --model gpt-5 --since 2026-10-29 --until 2026-10-30`,
+      `${BIN} traces --model gpt-6-luna --since 2026-10-29 --until 2026-10-30`,
       `${BIN} traces --tool search_docs --errors --since 1d`,
       `${BIN} traces --session conv_8f2 --json`,
     ],

@@ -34,7 +34,7 @@ const answer = observe(
   async function answer(question: string) {
     const generation = startSpan("chat-completion", {
       type: "generation",
-      model: "gpt-4o",
+      model: "gpt-6-luna",
       provider: "openai",
       input: [{ role: "user", content: question }],
     });
@@ -158,7 +158,7 @@ const prompt = await getPrompt("support/reply", { label: "production" });
 const messages = prompt.compile({ customer_message, tone });
 
 const response = await withPrompt(prompt, () =>
-  openai.chat.completions.create({ model: prompt.model?.name ?? "gpt-4o", messages }),
+  openai.chat.completions.create({ model: prompt.model?.name ?? "gpt-6-luna", messages }),
 );
 
 // Pin one version, as in a test:
@@ -258,7 +258,7 @@ import { init, runExperiment } from "@telemetry-dev/sdk";
 init({ environment: "experiment" });
 
 const result = await runExperiment({
-  name: "reply-v13-gpt-4o",
+  name: "reply-v13-gpt-6-luna",
   dataset: "support-golden",
   task: (item) => replyToCustomer(item.input),
   evaluators: ["correctness", "helpfulness"],

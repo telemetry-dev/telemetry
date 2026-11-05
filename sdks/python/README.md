@@ -30,9 +30,9 @@ def lookup_weather(city: str) -> dict:
 
 with propagate_attributes(user_id="user_123", session_id="session_456"):
     with start_span(
-        "chat gpt-4o",
+        "chat gpt-6-luna",
         type="generation",
-        model="gpt-4o",
+        model="gpt-6-luna",
         provider="openai",
         input=[{"role": "user", "content": "Plan a day trip"}],
     ):
@@ -216,7 +216,7 @@ messages = prompt.compile(customer_message=customer_message, tone=tone)
 
 with telemetry_dev.with_prompt(prompt):
     response = client.chat.completions.create(
-        model=prompt.model["name"] if prompt.model else "gpt-4o", messages=messages
+        model=prompt.model["name"] if prompt.model else "gpt-6-luna", messages=messages
     )
 
 # Pin one version, as in a test:
@@ -335,7 +335,7 @@ import telemetry_dev
 telemetry_dev.init(environment="experiment")
 
 result = telemetry_dev.run_experiment(
-    name="reply-v13-gpt-4o",
+    name="reply-v13-gpt-6-luna",
     dataset="support-golden",
     task=lambda item: reply_to_customer(item.input),
     evaluators=["correctness", "helpfulness"],
@@ -587,7 +587,7 @@ trace.set_tracer_provider(provider)
 
 client = Anthropic()
 client.messages.create(
-    model="claude-sonnet-4-6",
+    model="claude-haiku-5-5",
     max_tokens=256,
     messages=[{"role": "user", "content": "Say hello."}],
 )

@@ -51,7 +51,7 @@ const bedrock = wrapBedrock(new BedrockRuntimeClient({ region: "us-east-1" }));
 
 await bedrock.send(
   new ConverseCommand({
-    modelId: "anthropic.claude-3-5-haiku-20241022-v1:0",
+    modelId: "global.anthropic.claude-haiku-5-5",
     messages: [{ role: "user", content: [{ text: "Hello" }] }],
   }),
 );

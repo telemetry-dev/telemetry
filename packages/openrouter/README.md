@@ -36,7 +36,7 @@ const openRouter = wrapOpenRouter(new OpenRouter({ apiKey: process.env.OPENROUTE
 
 await openRouter.chat.send({
   chatRequest: {
-    model: "openai/gpt-4o-mini",
+    model: "openai/gpt-6-luna",
     messages: [{ role: "user", content: "Tell me a joke about OpenTelemetry" }],
   },
 });
@@ -56,7 +56,7 @@ const openRouter = new OpenRouter({ apiKey: process.env.OPENROUTER_API_KEY });
 try {
   await openRouter.responses.send({
     responsesRequest: {
-      model: "openai/gpt-4o-mini",
+      model: "openai/gpt-6-luna",
       input: "Tell me a joke about OpenTelemetry",
     },
   });

@@ -38,7 +38,7 @@ Use the exported functions as drop-in replacements when you do not want global m
 from telemetry_dev_litellm import completion
 
 response = completion(
-    model="gpt-4o-mini",
+    model="openai/gpt-6-luna",
     messages=[{"role": "user", "content": "Say hi"}],
 )
 ```
@@ -52,7 +52,7 @@ import litellm
 from telemetry_dev_litellm import instrument_litellm, uninstrument_litellm
 
 instrument_litellm()
-response = litellm.completion(model="gpt-4o-mini", messages=[...])
+response = litellm.completion(model="openai/gpt-6-luna", messages=[...])
 uninstrument_litellm()
 ```
 

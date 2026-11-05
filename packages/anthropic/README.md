@@ -29,7 +29,7 @@ init({ serviceName: "anthropic-worker" });
 
 const anthropic = wrapAnthropic(new Anthropic());
 const response = await anthropic.messages.create({
-  model: "claude-sonnet-4-6",
+  model: "claude-haiku-5-5",
   max_tokens: 256,
   messages: [{ role: "user", content: "Say hello." }],
 });

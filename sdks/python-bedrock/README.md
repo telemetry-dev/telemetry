@@ -54,7 +54,7 @@ telemetry_dev.init(
 bedrock = wrap_bedrock(boto3.client("bedrock-runtime", region_name="us-east-1"))
 
 bedrock.converse(
-    modelId="anthropic.claude-3-5-haiku-20241022-v1:0",
+    modelId="global.anthropic.claude-haiku-5-5",
     messages=[{"role": "user", "content": [{"text": "Hello"}]}],
 )
 

@@ -31,9 +31,9 @@ def main() -> None:
         with start_span("trip-assistant", type="agent"):
             # A generation span with model + usage (cost is computed server-side from tokens).
             with start_span(
-                "chat gpt-4o",
+                "chat gpt-6-luna",
                 type="generation",
-                model="gpt-4o",
+                model="gpt-6-luna",
                 provider="openai",
                 input=[{"role": "user", "content": "Plan a day trip to Kyoto"}],
             ):

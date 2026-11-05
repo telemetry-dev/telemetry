@@ -72,7 +72,7 @@ provider.register();
 
 const anthropic = new Anthropic();
 await anthropic.messages.create({
-  model: "claude-sonnet-4-6",
+  model: "claude-haiku-5-5",
   max_tokens: 256,
   messages: [{ role: "user", content: "Say hello." }],
 });
