@@ -425,8 +425,12 @@ test("report.mjs fails the job for a failed experiment before the last, when the
   ]);
 
   expect(failedFirst.code).toBe(1);
+  // The reasons: the pass mark that correctness is under, and the failed runs. helpfulness passed.
+  // A workflow command encodes % as %25, and GitHub shows the annotation with %.
   expect(failedFirst.stdout).toContain(
-    "::error title=telemetry.dev experiment::The check of the experiment reply-v13-gpt-4o failed.",
+    "::error title=telemetry.dev experiment::The check of the experiment reply-v13-gpt-4o failed. " +
+      "correctness is 85%25, and the check needs 90%25 or more. " +
+      "2 of 120 runs failed, and a failed run has no score for the pass marks.\n",
   );
   expect(failedFirst.stdout).toContain(
     "::error title=telemetry.dev experiment::The experiment reply-stopped did not complete. Its status is stopped.",
@@ -462,6 +466,93 @@ test("report.mjs fails the job for a failed experiment before the last, when the
   // Only the note without a reason gives the init() advice, in TypeScript and in Python.
   expect(offCi.summary.match(/init\(/g)).toHaveLength(2);
   expect(offCi.summary.match(/no traces/g)).toHaveLength(2);
+});
+
+test("report.mjs names the cause of a failed check when the SDK makes the script exit with 1", async () => {
+  // In the CI mode, runExperiment rejects for a failed check, thus the script exits with 1.
+  const failed = { ...result, ci: true, runsPerItem: 1, traced: true, itemsFailed: 0 };
+  const scoreFailed = await report({ INPUT_COMMENT: "false" }, [failed]);
+  // A check that fails only for a failed run, with each score over its pass mark.
+  const runFailed = await report({ INPUT_COMMENT: "false" }, [
+    { ...failed, itemsFailed: 1, scores: failed.scores.filter((score) => score.passed !== false) },
+  ]);
+  // A script that crashes after a later experiment passed exits with 1 for a cause that the
+  // results do not show.
+  const crashed = await report({ INPUT_COMMENT: "false" }, [
+    failed,
+    { ...failed, name: "reply-short", checkStatus: "passed", scores: [] },
+  ]);
+
+  // The last step of the action fails the job with the exit code of the script.
+  expect(scoreFailed.code).toBe(0);
+  expect(scoreFailed.stdout).toBe(
+    "::error title=telemetry.dev experiment::The check of the experiment reply-v13-gpt-4o failed. " +
+      "correctness is 85%25, and the check needs 90%25 or more.\n",
+  );
+  // The last step of the action reads annotated to leave out its error about the exit code.
+  expect(scoreFailed.outputs.annotated).toBe("true");
+  expect(scoreFailed.summary).not.toContain("exited with code");
+  expect(runFailed.stdout).toBe(
+    "::error title=telemetry.dev experiment::The check of the experiment reply-v13-gpt-4o failed. " +
+      "1 of 120 runs failed, and a failed run has no score for the pass marks.\n",
+  );
+  expect(crashed.stdout).toContain(
+    "::error title=telemetry.dev experiment::The check of the experiment reply-v13-gpt-4o failed.",
+  );
+  expect(crashed.outputs.annotated).toBeUndefined();
+  expect(crashed.summary).toContain("The experiment script exited with code 1.");
+
+  // A value just under its mark keeps the decimals that the table rounds away. A mark of 1 or less
+  // is a pass rate when its score has no rows, and a mark over 1 is a mean.
+  const close = await report({ INPUT_COMMENT: "false" }, [
+    {
+      ...failed,
+      scores: [
+        { ...failed.scores[1]!, value: 3.96, minScore: 4, passed: false },
+        { ...failed.scores[1]!, name: "similarity", value: 0.79996, minScore: 0.8, passed: false },
+        { ...failed.scores[0]!, value: 0.8958, passed: false },
+        {
+          ...failed.scores[2]!,
+          name: "grounded",
+          kind: null,
+          value: null,
+          minScore: 0.95,
+          passed: false,
+        },
+        { ...failed.scores[2]!, name: "tone", kind: null, value: null, minScore: 4, passed: false },
+      ],
+    },
+  ]);
+
+  expect(close.stdout).toContain(
+    "helpfulness is 3.96, and the check needs 4 or more. " +
+      "similarity is 0.79996, and the check needs 0.8 or more. " +
+      "correctness is 89.58%25, and the check needs 90%25 or more. " +
+      "grounded is not scored, and the check needs 95%25 or more. " +
+      "tone is not scored, and the check needs 4 or more.\n",
+  );
+
+  // A script killed after the experiment, such as for memory, keeps the line of its exit code.
+  const killed = await report({ INPUT_COMMENT: "false", EXPERIMENT_EXIT_CODE: "137" }, [failed]);
+
+  expect(killed.stdout).toContain("The check of the experiment reply-v13-gpt-4o failed.");
+  expect(killed.outputs.annotated).toBeUndefined();
+  expect(killed.summary).toContain("The experiment script exited with code 137.");
+
+  // An experiment that did not complete names the error of the server.
+  const allFailed = await report({ INPUT_COMMENT: "false" }, [
+    {
+      ...failed,
+      status: "failed",
+      checkStatus: null,
+      error: "0 of 120 items ran. Each one failed.",
+    },
+  ]);
+
+  expect(allFailed.stdout).toBe(
+    "::error title=telemetry.dev experiment::The experiment reply-v13-gpt-4o did not complete. " +
+      "Its status is failed. 0 of 120 items ran. Each one failed.\n",
+  );
 });
 
 /** The body of the comment that the action posts for the result. */
