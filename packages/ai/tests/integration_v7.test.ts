@@ -4292,9 +4292,9 @@ const expectGatewayRootAndStep = (spans: readonly ReadableSpan[]) => {
 };
 
 test.each(gatewayRuns)(
-  "ai@7 $operation relabels the gateway provider on the root and step spans",
+  "ai@7 $operation relabels the gateway provider on the root and step spans and the step metrics",
   async ({ operation, start, finish }) => {
-    const { spanBatches, overrides } = makeCapture();
+    const { spanBatches, metrics, overrides } = makeCapture();
     const integ = telemetryDev(baseOptions, overrides);
     const callId = `gateway-${operation}`;
 
@@ -4302,6 +4302,11 @@ test.each(gatewayRuns)(
     await finish(integ, callId);
 
     expectGatewayRootAndStep(spanBatches[0]!);
+    expect(metrics.filter((m) => m.metric === "duration")).toHaveLength(1);
+
+    for (const m of metrics) {
+      expect(m.attributes["gen_ai.provider.name"]).toBe("Vercel AI Gateway");
+    }
   },
 );
 
