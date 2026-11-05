@@ -502,7 +502,7 @@ test("report.mjs names the cause of a failed check when the SDK makes the script
   expect(crashed.outputs.annotated).toBeUndefined();
   expect(crashed.summary).toContain("The experiment script exited with code 1.");
 
-  // A value just under its mark keeps the decimals that the table rounds away. A mark of 1 or less
+  // A value just under its mark gets more decimals than the table gives. A mark of 1 or less
   // is a pass rate when its score has no rows, and a mark over 1 is a mean.
   const close = await report({ INPUT_COMMENT: "false" }, [
     {
@@ -510,6 +510,8 @@ test("report.mjs names the cause of a failed check when the SDK makes the script
       scores: [
         { ...failed.scores[1]!, value: 3.96, minScore: 4, passed: false },
         { ...failed.scores[1]!, name: "similarity", value: 0.79996, minScore: 0.8, passed: false },
+        // 0.00155 rounds up to 0.002, over the mark, so it gets a fourth decimal.
+        { ...failed.scores[1]!, name: "brevity", value: 0.00155, minScore: 0.0016, passed: false },
         { ...failed.scores[0]!, value: 0.8958, passed: false },
         {
           ...failed.scores[2]!,
@@ -527,6 +529,7 @@ test("report.mjs names the cause of a failed check when the SDK makes the script
   expect(close.stdout).toContain(
     "helpfulness is 3.96, and the check needs 4 or more. " +
       "similarity is 0.79996, and the check needs 0.8 or more. " +
+      "brevity is 0.0015, and the check needs 0.0016 or more. " +
       "correctness is 89.58%25, and the check needs 90%25 or more. " +
       "grounded is not scored, and the check needs 95%25 or more. " +
       "tone is not scored, and the check needs 4 or more.\n",

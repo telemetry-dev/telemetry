@@ -271,23 +271,23 @@ function value(kind, number) {
 }
 
 /**
- * The reason of a score under its pass mark. The mark is as the user wrote it, and the value gets
- * the decimals that the table rounds away until it no longer reads as the mark. A score with no
- * kind had no rows: a mark of 1 or less on it is a pass rate, as the experiment page reads it.
+ * The reason of a score under its pass mark. The value gets more decimals until it rounds below the
+ * mark, so that a value just under the mark does not read as the mark. A score with no kind had no
+ * rows: a mark of 1 or less on it is a pass rate, as the experiment page reads it.
  */
 function underMark(score) {
   const rate = RATE_KINDS.has(score.kind) || (score.kind == null && score.minScore <= 1);
-  const show = (number, digits) =>
-    rate ? `${+(number * 100).toFixed(digits)}%` : String(+number.toFixed(digits));
-  const mark = show(score.minScore, 10);
+  const rounded = (number, digits) => +(rate ? number * 100 : number).toFixed(digits);
+  const text = (number) => `${number}${rate ? "%" : ""}`;
+  const mark = rounded(score.minScore, 10);
 
   if (typeof score.value !== "number")
-    return `${score.name} is not scored, and the check needs ${mark} or more.`;
+    return `${score.name} is not scored, and the check needs ${text(mark)} or more.`;
 
   let digits = rate ? 2 : 3;
-  while (digits < 17 && show(score.value, digits) === mark) digits += 1;
+  while (digits < 17 && rounded(score.value, digits) >= mark) digits += 1;
 
-  return `${score.name} is ${show(score.value, digits)}, and the check needs ${mark} or more.`;
+  return `${score.name} is ${text(rounded(score.value, digits))}, and the check needs ${text(mark)} or more.`;
 }
 
 function change(kind, delta) {
