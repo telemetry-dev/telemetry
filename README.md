@@ -139,24 +139,25 @@ Streamed output is kept within fixed size limits that each provider package's RE
 
 Each integration links to its installation instructions and API coverage. The link text is the npm or PyPI package name.
 
-| Integration                  | TypeScript                                             | Python                                                   |
-| ---------------------------- | ------------------------------------------------------ | -------------------------------------------------------- |
-| Core SDK                     | [`@telemetry-dev/sdk`](packages/sdk)                   | [`telemetry-dev`](sdks/python)                           |
-| Existing OpenTelemetry setup | [`@telemetry-dev/otel`](packages/otel)                 | [`telemetry-dev`](sdks/python) (`telemetry_dev.otel`)    |
-| OpenAI                       | [`@telemetry-dev/openai`](packages/openai)             | [`telemetry-dev-openai`](sdks/python-openai)             |
-| Anthropic                    | [`@telemetry-dev/anthropic`](packages/anthropic)       | [`telemetry-dev-anthropic`](sdks/python-anthropic)       |
-| Amazon Bedrock               | [`@telemetry-dev/bedrock`](packages/bedrock)           | [`telemetry-dev-bedrock`](sdks/python-bedrock)           |
-| Google GenAI                 | [`@telemetry-dev/google-genai`](packages/google-genai) | [`telemetry-dev-google-genai`](sdks/python-google-genai) |
-| OpenRouter                   | [`@telemetry-dev/openrouter`](packages/openrouter)     | [`telemetry-dev-openrouter`](sdks/python-openrouter)     |
-| Vercel AI SDK                | [`@telemetry-dev/ai-sdk`](packages/ai)                 |                                                          |
-| TanStack AI                  | [`@telemetry-dev/tanstack-ai`](packages/tanstack-ai)   |                                                          |
-| LiteLLM                      |                                                        | [`telemetry-dev-litellm`](sdks/python-litellm)           |
-| MCP                          | [`@telemetry-dev/mcp`](packages/mcp)                   |                                                          |
-| Eve                          | [`@telemetry-dev/eve`](packages/eve)                   |                                                          |
-| Cursor                       | [`@telemetry-dev/cursor`](packages/cursor)             |                                                          |
-| OpenCode                     | [`@telemetry-dev/opencode`](packages/opencode)         |                                                          |
-| Oh My Pi                     | [`@telemetry-dev/omp`](packages/omp)                   |                                                          |
-| Pi                           | [`@telemetry-dev/pi`](packages/pi)                     |                                                          |
+| Integration                  | TypeScript                                               | Python                                                   |
+| ---------------------------- | -------------------------------------------------------- | -------------------------------------------------------- |
+| Core SDK                     | [`@telemetry-dev/sdk`](packages/sdk)                     | [`telemetry-dev`](sdks/python)                           |
+| Existing OpenTelemetry setup | [`@telemetry-dev/otel`](packages/otel)                   | [`telemetry-dev`](sdks/python) (`telemetry_dev.otel`)    |
+| OpenAI                       | [`@telemetry-dev/openai`](packages/openai)               | [`telemetry-dev-openai`](sdks/python-openai)             |
+| Anthropic                    | [`@telemetry-dev/anthropic`](packages/anthropic)         | [`telemetry-dev-anthropic`](sdks/python-anthropic)       |
+| Amazon Bedrock               | [`@telemetry-dev/bedrock`](packages/bedrock)             | [`telemetry-dev-bedrock`](sdks/python-bedrock)           |
+| Google GenAI                 | [`@telemetry-dev/google-genai`](packages/google-genai)   | [`telemetry-dev-google-genai`](sdks/python-google-genai) |
+| OpenRouter                   | [`@telemetry-dev/openrouter`](packages/openrouter)       | [`telemetry-dev-openrouter`](sdks/python-openrouter)     |
+| Vercel AI SDK                | [`@telemetry-dev/ai-sdk`](packages/ai)                   |                                                          |
+| TanStack AI                  | [`@telemetry-dev/tanstack-ai`](packages/tanstack-ai)     |                                                          |
+| OpenAI Agents SDK            | [`@telemetry-dev/openai-agents`](packages/openai-agents) |                                                          |
+| LiteLLM                      |                                                          | [`telemetry-dev-litellm`](sdks/python-litellm)           |
+| MCP                          | [`@telemetry-dev/mcp`](packages/mcp)                     |                                                          |
+| Eve                          | [`@telemetry-dev/eve`](packages/eve)                     |                                                          |
+| Cursor                       | [`@telemetry-dev/cursor`](packages/cursor)               |                                                          |
+| OpenCode                     | [`@telemetry-dev/opencode`](packages/opencode)           |                                                          |
+| Oh My Pi                     | [`@telemetry-dev/omp`](packages/omp)                     |                                                          |
+| Pi                           | [`@telemetry-dev/pi`](packages/pi)                       |                                                          |
 
 Some integrations need no package from this repository, because the tool exports OpenTelemetry
 itself or through a third-party library: Claude Code, Claude Platform, Claude SDK native spans,

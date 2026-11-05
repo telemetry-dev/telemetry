@@ -427,6 +427,40 @@ importers:
         specifier: npm:@voidzero-dev/vite-plus-test@0.1.20
         version: '@voidzero-dev/vite-plus-test@0.1.20(@opentelemetry/api@1.9.1)(@types/node@25.6.0)(@voidzero-dev/vite-plus-core@0.1.20(@types/node@25.6.0)(esbuild@0.27.7)(jiti@2.7.0)(tsx@4.21.0)(typescript@5.9.3)(yaml@2.9.0))(esbuild@0.27.7)(jiti@2.7.0)(jsdom@28.1.0(@noble/hashes@2.2.0))(tsx@4.21.0)(typescript@5.9.3)(yaml@2.9.0)'
 
+  packages/openai-agents:
+    dependencies:
+      '@telemetry-dev/sdk':
+        specifier: workspace:^
+        version: link:../sdk
+    devDependencies:
+      '@openai/agents':
+        specifier: 0.21.0
+        version: 0.21.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(undici@8.9.0)(ws@8.22.1)(zod@4.4.3)
+      '@opentelemetry/sdk-trace-base':
+        specifier: 'catalog:'
+        version: 2.12.0(@opentelemetry/api@1.9.1)
+      '@types/node':
+        specifier: ^25.5.0
+        version: 25.6.0
+      '@typescript/native-preview':
+        specifier: 7.0.0-dev.20260328.1
+        version: 7.0.0-dev.20260328.1
+      openai:
+        specifier: 'catalog:'
+        version: 7.18.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(undici@8.9.0)(ws@8.22.1)(zod@4.4.3)
+      typescript:
+        specifier: ^6.0.2
+        version: 6.0.3
+      vite-plus:
+        specifier: 0.1.20
+        version: 0.1.20(@opentelemetry/api@1.9.1)(@types/node@25.6.0)(@voidzero-dev/vite-plus-core@0.1.20(@types/node@25.6.0)(esbuild@0.27.7)(jiti@2.7.0)(tsx@4.21.0)(typescript@6.0.3)(yaml@2.9.0))(esbuild@0.27.7)(jiti@2.7.0)(jsdom@28.1.0(@noble/hashes@2.2.0))(tsx@4.21.0)(typescript@6.0.3)(yaml@2.9.0)
+      vitest:
+        specifier: npm:@voidzero-dev/vite-plus-test@0.1.20
+        version: '@voidzero-dev/vite-plus-test@0.1.20(@opentelemetry/api@1.9.1)(@types/node@25.6.0)(@voidzero-dev/vite-plus-core@0.1.20(@types/node@25.6.0)(esbuild@0.27.7)(jiti@2.7.0)(tsx@4.21.0)(typescript@6.0.3)(yaml@2.9.0))(esbuild@0.27.7)(jiti@2.7.0)(jsdom@28.1.0(@noble/hashes@2.2.0))(tsx@4.21.0)(typescript@6.0.3)(yaml@2.9.0)'
+      zod:
+        specifier: 'catalog:'
+        version: 4.4.3
+
   packages/opencode:
     dependencies:
       '@opentelemetry/api':
@@ -549,7 +583,7 @@ importers:
     devDependencies:
       '@earendil-works/pi-coding-agent':
         specifier: 0.82.1
-        version: 0.82.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)
+        version: 0.82.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.22.1)(zod@4.4.3)
       '@opentelemetry/sdk-logs':
         specifier: 'catalog:'
         version: 0.223.0(@opentelemetry/api@1.9.1)
@@ -1577,6 +1611,29 @@ packages:
     resolution: {integrity: sha512-zjZfZfsVjQpQ3KML55G8MDY/HKnvZ/cPrjwcKQyyXzTk/rTGqT9KvQM3buhq8uSWIVugA/oEoC452vAa9xxQHQ==}
     engines: {bun: '>=1.3.14'}
 
+  '@openai/agents-core@0.21.0':
+    resolution: {integrity: sha512-P2jJhc85xrKpe9GUOHAVfPHqK52my49fD1CI0LnfYEvBUwZxJXQI6lgSwby9nWhvQECveM9OvBUglAXuArsHXw==}
+    peerDependencies:
+      zod: ^4.0.0
+    peerDependenciesMeta:
+      zod:
+        optional: true
+
+  '@openai/agents-openai@0.21.0':
+    resolution: {integrity: sha512-Y1u1ek6FwKx8j+T7gRYcm4kKyN0irqsyZm0XUDZ+g+8s15tu4EhNwNJ92zOHGx7Vjkr2RugWBxTeNspHjw/lQw==}
+    peerDependencies:
+      zod: ^4.0.0
+
+  '@openai/agents-realtime@0.21.0':
+    resolution: {integrity: sha512-nI0jGkSdivlXzS7HXAB1EVplaeSyoAvfM2ofHheJDJdshs3UQl3x405nmTflKWye+wQrqemK4uxL06NIhgvjHg==}
+    peerDependencies:
+      zod: ^4.0.0
+
+  '@openai/agents@0.21.0':
+    resolution: {integrity: sha512-NpJ74/dGbpYZiRYF474pCaBpxqh4A8+WHbZmaEZVQpRqieZAVH+MV4fesR9MtRGUZfpW5B91zuHzIilQp2iSxQ==}
+    peerDependencies:
+      zod: ^4.0.0
+
   '@opencode-ai/plugin@1.18.9':
     resolution: {integrity: sha512-0kFX9Usj+3N+WupIe9VnEdDNzMNbW4/C5GeIzdj02/t5kQoXsNrFpW3Br9aABebazcaYsQEWdlaLV0zQISy3OA==}
     peerDependencies:
@@ -2199,10 +2256,12 @@ packages:
   '@smithy/core@3.29.1':
     resolution: {integrity: sha512-qoiY4nrk5OCu1+eIR1VB8l5DmON/oKiqrd5zZFAhXJXjJlLWQusKEW/SkBDAtGDcPaz86m9kfcE1lngU0GlM6A==}
     engines: {node: '>=18.0.0'}
+    deprecated: Deprecated due to a bug in custom logger data redaction. See https://github.com/aws/aws-sdk-js-v3/issues/8393.
 
   '@smithy/core@3.34.1':
     resolution: {integrity: sha512-dLcOUxz8YCv1RZUMKq6GbyUf95pLbrqh34bPvpCZ1+CByFF31BEAFewZjsGCnVsZTKdThNENfGyAgk2TJqVwSw==}
     engines: {node: '>=18.0.0'}
+    deprecated: Deprecated due to a bug in custom logger data redaction. See https://github.com/aws/aws-sdk-js-v3/issues/8393.
 
   '@smithy/credential-provider-imds@4.5.2':
     resolution: {integrity: sha512-A9uSdn72ozbRUSit0eib0TW7nXuNPlaeM0zcGkJ+nE6tFcSDbnmtwoxbTCFBukVQcszDAyvsd7+rTduPTXpygg==}
@@ -2310,6 +2369,9 @@ packages:
 
   '@types/turndown@5.0.6':
     resolution: {integrity: sha512-ru00MoyeeouE5BX4gRL+6m/BsDfbRayOskWqUvh7CLGW+UXxHQItqALa38kKnOiZPqJrtzJUgAC2+F0rL1S4Pg==}
+
+  '@types/ws@8.18.2':
+    resolution: {integrity: sha512-67MQl+fpWKVTT1NYdnmo3U4sc/xPo/zQBncVnI74qmQa0z/b+1g6iYqNmGCPbxO+zz2aklb08a0oHfegiVd0/w==}
 
   '@typescript/native-preview-darwin-arm64@7.0.0-dev.20260328.1':
     resolution: {integrity: sha512-BmJGDWC0bSQ2w5O/E+Mw9eTv9RklJ3vjshu7UdD92bUMxc4V4dkBhYj5r0qxbl4f+VFNX7fXvcDDI+9o+Kb6yw==}
@@ -4503,6 +4565,18 @@ packages:
       utf-8-validate:
         optional: true
 
+  ws@8.22.1:
+    resolution: {integrity: sha512-oyL6OPYme/CmiFvNuGzeoxCJ4nOrZE2O1FwM9MWM1AsGri6nLXB2pg+lNA8aLeXMSav0J6eIVS1j6vUPzUtK9g==}
+    engines: {node: '>=10.0.0'}
+    peerDependencies:
+      bufferutil: ^4.0.1
+      utf-8-validate: '>=5.0.2'
+    peerDependenciesMeta:
+      bufferutil:
+        optional: true
+      utf-8-validate:
+        optional: true
+
   xml-name-validator@5.0.0:
     resolution: {integrity: sha512-EvGK8EJ3DhaHfbRlETOWAS5pO9MZITeauHKJyb8wyajUfQUenkIg2MvLDTZ4T/TgIcm3HU0TFBgWWboAZ30UHg==}
     engines: {node: '>=18'}
@@ -4969,9 +5043,9 @@ snapshots:
       enabled: 2.0.0
       kuler: 2.0.0
 
-  '@earendil-works/pi-agent-core@0.82.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)':
+  '@earendil-works/pi-agent-core@0.82.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.22.1)(zod@4.4.3)':
     dependencies:
-      '@earendil-works/pi-ai': 0.82.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)
+      '@earendil-works/pi-ai': 0.82.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.22.1)(zod@4.4.3)
       diff: 8.0.4
       ignore: 7.0.5
       typebox: 1.1.38
@@ -4984,7 +5058,7 @@ snapshots:
       - ws
       - zod
 
-  '@earendil-works/pi-ai@0.82.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)':
+  '@earendil-works/pi-ai@0.82.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.22.1)(zod@4.4.3)':
     dependencies:
       '@anthropic-ai/sdk': 0.91.1(zod@4.4.3)
       '@aws-sdk/client-bedrock-runtime': 3.1048.0
@@ -4994,7 +5068,7 @@ snapshots:
       '@smithy/node-http-handler': 4.7.3
       http-proxy-agent: 7.0.2
       https-proxy-agent: 7.0.6
-      openai: 6.26.0(ws@8.21.3)(zod@4.4.3)
+      openai: 6.26.0(ws@8.22.1)(zod@4.4.3)
       partial-json: 0.1.7
       typebox: 1.1.38
     transitivePeerDependencies:
@@ -5005,10 +5079,10 @@ snapshots:
       - ws
       - zod
 
-  '@earendil-works/pi-coding-agent@0.82.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)':
+  '@earendil-works/pi-coding-agent@0.82.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.22.1)(zod@4.4.3)':
     dependencies:
-      '@earendil-works/pi-agent-core': 0.82.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)
-      '@earendil-works/pi-ai': 0.82.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)
+      '@earendil-works/pi-agent-core': 0.82.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.22.1)(zod@4.4.3)
+      '@earendil-works/pi-ai': 0.82.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.22.1)(zod@4.4.3)
       '@earendil-works/pi-tui': 0.82.1
       '@silvia-odwyer/photon-node': 0.3.4
       chalk: 5.6.2
@@ -5610,6 +5684,67 @@ snapshots:
       '@oh-my-pi/pi-utils': 17.1.8
       '@oh-my-pi/pi-wire': 17.1.8
 
+  '@openai/agents-core@0.21.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(undici@8.9.0)(ws@8.22.1)(zod@4.4.3)':
+    dependencies:
+      '@standard-schema/spec': 1.1.0
+      debug: 4.4.3
+      openai: 7.18.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(undici@8.9.0)(ws@8.22.1)(zod@4.4.3)
+    optionalDependencies:
+      '@modelcontextprotocol/client': 2.4.0
+      zod: 4.4.3
+    transitivePeerDependencies:
+      - '@aws-sdk/credential-provider-node'
+      - '@smithy/hash-node'
+      - '@smithy/signature-v4'
+      - supports-color
+      - undici
+      - ws
+
+  '@openai/agents-openai@0.21.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(undici@8.9.0)(ws@8.22.1)(zod@4.4.3)':
+    dependencies:
+      '@openai/agents-core': 0.21.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(undici@8.9.0)(ws@8.22.1)(zod@4.4.3)
+      openai: 7.18.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(undici@8.9.0)(ws@8.22.1)(zod@4.4.3)
+      zod: 4.4.3
+    transitivePeerDependencies:
+      - '@aws-sdk/credential-provider-node'
+      - '@smithy/hash-node'
+      - '@smithy/signature-v4'
+      - supports-color
+      - undici
+      - ws
+
+  '@openai/agents-realtime@0.21.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(undici@8.9.0)(zod@4.4.3)':
+    dependencies:
+      '@openai/agents-core': 0.21.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(undici@8.9.0)(ws@8.22.1)(zod@4.4.3)
+      '@types/ws': 8.18.2
+      ws: 8.22.1
+      zod: 4.4.3
+    transitivePeerDependencies:
+      - '@aws-sdk/credential-provider-node'
+      - '@smithy/hash-node'
+      - '@smithy/signature-v4'
+      - bufferutil
+      - supports-color
+      - undici
+      - utf-8-validate
+
+  '@openai/agents@0.21.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(undici@8.9.0)(ws@8.22.1)(zod@4.4.3)':
+    dependencies:
+      '@openai/agents-core': 0.21.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(undici@8.9.0)(ws@8.22.1)(zod@4.4.3)
+      '@openai/agents-openai': 0.21.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(undici@8.9.0)(ws@8.22.1)(zod@4.4.3)
+      '@openai/agents-realtime': 0.21.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(undici@8.9.0)(zod@4.4.3)
+      openai: 7.18.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(undici@8.9.0)(ws@8.22.1)(zod@4.4.3)
+      zod: 4.4.3
+    transitivePeerDependencies:
+      - '@aws-sdk/credential-provider-node'
+      - '@smithy/hash-node'
+      - '@smithy/signature-v4'
+      - bufferutil
+      - supports-color
+      - undici
+      - utf-8-validate
+      - ws
+
   '@opencode-ai/plugin@1.18.9':
     dependencies:
       '@ai-sdk/provider': 3.0.8
@@ -6171,6 +6306,10 @@ snapshots:
   '@types/triple-beam@1.3.5': {}
 
   '@types/turndown@5.0.6': {}
+
+  '@types/ws@8.18.2':
+    dependencies:
+      '@types/node': 25.6.0
 
   '@typescript/native-preview-darwin-arm64@7.0.0-dev.20260328.1':
     optional: true
@@ -7639,9 +7778,9 @@ snapshots:
       protobufjs: 7.6.5
     optional: true
 
-  openai@6.26.0(ws@8.21.3)(zod@4.4.3):
+  openai@6.26.0(ws@8.22.1)(zod@4.4.3):
     optionalDependencies:
-      ws: 8.21.3
+      ws: 8.22.1
       zod: 4.4.3
 
   openai@6.45.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(ws@8.21.3)(zod@4.4.3):
@@ -7657,6 +7796,14 @@ snapshots:
       '@smithy/signature-v4': 5.7.3
       undici: 8.9.0
       ws: 8.21.3
+      zod: 4.4.3
+
+  openai@7.18.0(@aws-sdk/credential-provider-node@3.972.83)(@smithy/signature-v4@5.7.3)(undici@8.9.0)(ws@8.22.1)(zod@4.4.3):
+    optionalDependencies:
+      '@aws-sdk/credential-provider-node': 3.972.83
+      '@smithy/signature-v4': 5.7.3
+      undici: 8.9.0
+      ws: 8.22.1
       zod: 4.4.3
 
   option@0.2.4: {}
@@ -7857,7 +8004,7 @@ snapshots:
       '@protobufjs/path': 1.1.2
       '@protobufjs/pool': 1.1.0
       '@protobufjs/utf8': 1.1.2
-      '@types/node': 24.12.4
+      '@types/node': 25.6.0
       long: 5.3.2
 
   proxy-addr@2.0.7:
@@ -8548,6 +8695,8 @@ snapshots:
   ws@8.20.0: {}
 
   ws@8.21.3: {}
+
+  ws@8.22.1: {}
 
   xml-name-validator@5.0.0:
     optional: true

@@ -62,6 +62,11 @@
       "component": "openai",
       "release-type": "node"
     },
+    "packages/openai-agents": {
+      "component": "openai-agents",
+      "release-type": "node",
+      "initial-version": "0.1.0"
+    },
     "packages/opencode": {
       "component": "opencode",
       "release-type": "node"
