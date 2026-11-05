@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.5](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.2.4...sdk-v0.2.5) (2026-11-05)
+
+
+### Bug Fixes
+
+* **sdk:** give the check_failed error the numbers of the action annotation ([#207](https://github.com/telemetry-dev/telemetry/issues/207)) ([47e7669](https://github.com/telemetry-dev/telemetry/commit/47e76698fe59ece9b5915bf0964ef4d9d00bc954))
+* **sdk:** name why the experiment check failed in the action annotation ([#203](https://github.com/telemetry-dev/telemetry/issues/203)) ([997aec9](https://github.com/telemetry-dev/telemetry/commit/997aec97b166321fdc88db079ee0cbf405a25b90))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/otel bumped to 0.2.3
+
 ## [0.2.4](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.2.3...sdk-v0.2.4) (2026-11-03)
 
 

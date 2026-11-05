@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/telemetry-dev/telemetry/compare/otel-v0.2.2...otel-v0.2.3) (2026-11-05)
+
+
+### Features
+
+* **sdk:** deprecate the postOtlp and maybeGzip exports ([#199](https://github.com/telemetry-dev/telemetry/issues/199)) ([7df6d6a](https://github.com/telemetry-dev/telemetry/commit/7df6d6a5742c8ec9897c175feef18fa600152920))
+
 ## [0.2.2](https://github.com/telemetry-dev/telemetry/compare/otel-v0.2.1...otel-v0.2.2) (2026-11-03)
 
 
