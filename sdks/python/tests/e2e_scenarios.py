@@ -1,9 +1,11 @@
 """E2E scenario driver for the cross-SDK conformance suite.
 
 This script EMITS the shared conformance scenario against a real ingest endpoint; the
-ClickHouse row assertions live in apps/ingest/src/sdk_conformance.ts (C1-C26), keyed by the
-session id below. Keep the scenario in lockstep with apps/ingest/tests/sdk_otlp_e2e_test.ts and
-docs/sdk-conformance.md.
+ClickHouse row assertions live in apps/ingest/conformance/sdk_conformance.ts (C1-C26), keyed by
+the session id below. C27-C31 there check the experiment scenario of
+apps/ingest/conformance/fixtures/python_experiment_scenario.py.
+apps/ingest/conformance/python_sdk_otlp.conformance.ts drives this script. Keep the scenario in
+lockstep with apps/ingest/conformance/sdk_otlp.conformance.ts and docs/sdk-conformance.md.
 
 Run:
 
