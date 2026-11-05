@@ -1,11 +1,14 @@
 import { type Attributes, SpanStatusCode } from "@opentelemetry/api";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 
 import {
+  wrapCancelBatch,
   wrapGenerateImage,
   wrapGenerateSpeech,
+  wrapGenerateVideo,
   wrapGetBatchResults,
+  wrapGetBatchStatus,
   wrapStartBatch,
   wrapTranscribe,
 } from "../src/index.ts";
@@ -650,4 +653,103 @@ test("thrown values that cannot be stringified still reach onError", async () =>
   expect((reported[0] as Error).message).toBe(
     "A value that cannot be converted to a string was thrown",
   );
+});
+
+test.each([
+  ["a videos list", { videos: [{}, {}] }, 2],
+  ["a single video", { video: {} }, 1],
+  ["no video", {}, undefined],
+])("video wrapper counts the videos from %s", async (_case, result, count) => {
+  const { spans, overrides } = capture();
+
+  await wrapGenerateVideo(
+    async (_options: { model: { provider: string; modelId: string }; prompt: string }) => result,
+    config,
+    overrides,
+  )({ model: { provider: "google", modelId: "veo-3" }, prompt: "x" });
+
+  expect(spans).toHaveLength(1);
+  expect(spans[0]!.attributes["gen_ai.output.type"]).toBe("video");
+  expect(spans[0]!.attributes["td.ai.output.video_count"]).toBe(count);
+});
+
+test.each([
+  ["durationInSeconds", { text: "hi", durationInSeconds: 3.5 }, 3.5],
+  ["duration without durationInSeconds", { text: "hi", duration: 2 }, 2],
+  ["durationInSeconds over duration", { text: "hi", durationInSeconds: 3.5, duration: 9 }, 3.5],
+  ["a duration that is not finite", { text: "hi", durationInSeconds: Number.NaN }, undefined],
+])("transcription records its duration from %s", async (_case, result, seconds) => {
+  const { spans, overrides } = capture();
+
+  await wrapTranscribe(
+    async (_options: { audio: Uint8Array }) => result,
+    config,
+    overrides,
+  )({
+    audio: new Uint8Array([1]),
+  });
+
+  expect(spans).toHaveLength(1);
+  expect(spans[0]!.attributes["td.ai.transcription.duration_seconds"]).toBe(seconds);
+});
+
+test("media wrappers relabel the gateway provider", async () => {
+  const { spans, overrides } = capture();
+
+  await wrapGenerateImage(
+    async (_options: { model: { provider: string; modelId: string }; prompt: string }) => ({
+      images: [],
+    }),
+    config,
+    overrides,
+  )({ model: { provider: "gateway", modelId: "openai/gpt-image-1" }, prompt: "x" });
+
+  expect(spans[0]!.attributes["gen_ai.provider.name"]).toBe("Vercel AI Gateway");
+});
+
+test.each([
+  ["status", wrapGetBatchStatus, "batch.status", "in_progress"],
+  ["cancel", wrapCancelBatch, "batch.cancel", "cancelled"],
+] as const)(
+  "batch %s wrapper records its operation, batch id, and status",
+  async (_name, wrap, operation, status) => {
+    const { spans, overrides } = capture();
+
+    const result = await wrap(
+      async (_input: { batch: { id: string } }) => ({ id: "batch-1", status }),
+      config,
+      overrides,
+    )({ batch: { id: "batch-1" } });
+
+    expect(result).toEqual({ id: "batch-1", status });
+    expect(spans).toHaveLength(1);
+    expect(spans[0]!.name).toBe(operation);
+    expect(spans[0]!.attributes["gen_ai.operation.name"]).toBe(operation);
+    expect(spans[0]!.attributes["td.ai.batch.id"]).toBe("batch-1");
+    expect(spans[0]!.attributes["td.ai.batch.status"]).toBe(status);
+  },
+);
+
+test("media and batch wrappers return the provider function itself without an api key", () => {
+  vi.stubEnv("TELEMETRY_DEV_API_KEY", undefined);
+
+  try {
+    const options = { environment: "test", serviceName: "test" };
+    const fn = async () => ({});
+
+    for (const wrap of [
+      wrapGenerateImage,
+      wrapGenerateSpeech,
+      wrapTranscribe,
+      wrapGenerateVideo,
+      wrapStartBatch,
+      wrapGetBatchStatus,
+      wrapCancelBatch,
+      wrapGetBatchResults,
+    ]) {
+      expect(wrap(fn, options)).toBe(fn);
+    }
+  } finally {
+    vi.unstubAllEnvs();
+  }
 });
