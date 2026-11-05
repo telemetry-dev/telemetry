@@ -4,12 +4,22 @@ OpenAI Agents SDK integration for [telemetry.dev](https://telemetry.dev). It sen
 to telemetry.dev: the agent and its turns, each model call with its token usage, each tool call, and
 each command that a sandbox agent ran, with its exit code and the sandbox it ran in.
 
-Each run is one trace, unless it starts inside an active OpenTelemetry span, such as an HTTP request
-span, and joins that span's trace. Runs that share a `groupId` share a session. Outside an active
-span, they land in
-[one trace per session](https://telemetry.dev/docs/sdk/typescript#one-trace-per-session), each run
-as a root span. With `sessionMode: "process"`, runs without a `groupId` share the process's session
-in the same way.
+How runs group into traces:
+
+- A run is one trace by default.
+- A run that starts inside an active OpenTelemetry span, such as an HTTP request span, joins that
+  span's trace.
+- Runs that share a `groupId` share a session: the processor sends the `groupId` as the session ID
+  (`gen_ai.conversation.id`). Runs inside the same
+  [`propagateAttributes({ sessionId })`](https://telemetry.dev/docs/sdk/typescript#add-user-session-and-metadata)
+  session (from `@telemetry-dev/sdk`) do too; a `groupId` takes precedence. Outside an active span,
+  the runs of a session land in
+  [one trace per session](https://telemetry.dev/docs/sdk/typescript#one-trace-per-session), each run
+  as a root span.
+- With `telemetryDevProcessor({ sessionMode: "process" })`, runs without a session of their own
+  share the process's
+  [generated session](https://telemetry.dev/docs/sdk/typescript#process-sessions) in the same way.
+  Use this in a CLI or script that holds one conversation per process, not in a long-running server.
 
 ## Install
 
