@@ -1,4 +1,13 @@
-import { ROOT_CONTEXT, SpanKind, TraceFlags } from "@opentelemetry/api";
+import { AsyncLocalStorage } from "node:async_hooks";
+
+import {
+  type Context,
+  context,
+  ROOT_CONTEXT,
+  SpanKind,
+  trace,
+  TraceFlags,
+} from "@opentelemetry/api";
 import {
   AlwaysOffSampler,
   AlwaysOnSampler,
@@ -6,7 +15,7 @@ import {
   SamplingDecision,
   TraceIdRatioBasedSampler,
 } from "@opentelemetry/sdk-trace-base";
-import { sessionSpanContext } from "@telemetry-dev/otel";
+import { AlsContextManager, sessionSpanContext } from "@telemetry-dev/otel";
 import { afterEach, expect, test } from "vitest";
 import { TRUNCATION_MARKER } from "../src/capture.ts";
 
@@ -178,6 +187,30 @@ test("nested spans keep their real parent inside a session", async () => {
   const child = spans.getFinishedSpans().find((s) => s.name === "child")!;
   expect(child.parentSpanContext?.spanId).toBe(root.spanContext().spanId);
   expect(root.parentSpanContext?.spanId).toBe(sessionSpanContext("td_live_test", "s1").spanId);
+});
+
+test("a session root inside a span of the host's own context manager joins that span", async () => {
+  const { spans } = setup();
+  // A host OTel setup (NodeSDK, HTTP instrumentation) keeps its spans in its own store, not ours.
+  const host = {
+    traceId: "0af7651916cd43dd8448eb211c80319c",
+    spanId: "b7ad6b7169203331",
+    traceFlags: TraceFlags.SAMPLED,
+  };
+  const manager = new AlsContextManager(new AsyncLocalStorage<Context>());
+  expect(context.setGlobalContextManager(manager)).toBe(true);
+
+  try {
+    context.with(trace.setSpanContext(ROOT_CONTEXT, host), () => {
+      startSpan("run", { attributes: { "gen_ai.conversation.id": "s1" } }).end();
+    });
+  } finally {
+    context.disable();
+  }
+  await flush();
+  const run = spans.getFinishedSpans().find((s) => s.name === "run")!;
+  expect(run.spanContext().traceId).toBe(host.traceId);
+  expect(run.parentSpanContext?.spanId).toBe(host.spanId);
 });
 
 test("spans without a session id keep separate random traces", async () => {

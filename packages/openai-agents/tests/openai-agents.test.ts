@@ -1,4 +1,5 @@
 import {
+  Agent,
   type Model,
   OpenAIChatCompletionsModel,
   OpenAIResponsesModel,
@@ -14,7 +15,7 @@ import {
 import { SandboxAgent, shell } from "@openai/agents/sandbox";
 import { UnixLocalSandboxClient } from "@openai/agents/sandbox/local";
 import { InMemorySpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
-import { flush } from "@telemetry-dev/sdk";
+import { flush, propagateAttributes, startActiveSpan } from "@telemetry-dev/sdk";
 import OpenAI from "openai";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
@@ -338,6 +339,92 @@ test("two concurrent runs produce two traces whose spans do not cross", async ()
       .map((span) => span.attributes["process.command_line"]);
     expect(commands).toEqual([`echo run_${run}`]);
   }
+});
+
+/** One run of an agent that answers "done", with its root span named `workflowName`. */
+async function runAgent(workflowName: string, groupId?: string): Promise<void> {
+  const model = new OpenAIResponsesModel(
+    scriptedClient([
+      response("resp_1", [message("done")], { input_tokens: 1, output_tokens: 1, total_tokens: 2 }),
+    ]),
+    "gpt-5-mini",
+  );
+
+  await new Runner({ workflowName, groupId }).run(new Agent({ name: "assistant", model }), "go");
+}
+
+const traceOf = (span: ReadableSpan): string => span.spanContext().traceId;
+const sessionOf = (span: ReadableSpan): unknown => span.attributes["gen_ai.conversation.id"];
+
+test("runs that share a groupId land in one session trace", async () => {
+  makeProcessor();
+  await runAgent("a1", "g1");
+  await runAgent("a2", "g1");
+  await runAgent("b", "g2");
+  await runAgent("c");
+  const spans = await exported();
+  const [a1, a2, b, c] = ["a1", "a2", "b", "c"].map((name) => only(spans, named(name)));
+
+  expect(traceOf(a2)).toBe(traceOf(a1));
+  expect(new Set([a1, b, c].map(traceOf)).size).toBe(3);
+  expect([a1, a2, b, c].map(sessionOf)).toEqual(["g1", "g1", "g2", undefined]);
+  // Each run of a session is a root under one parent that is never exported.
+  expect(parentOf(a1)).toEqual(expect.any(String));
+  expect(parentOf(a2)).toBe(parentOf(a1));
+  expect(spans.map((span) => span.spanContext().spanId)).not.toContain(parentOf(a1));
+  expect(parentOf(c)).toBeUndefined();
+});
+
+test("a run inside an active span joins that span's trace, even with a groupId", async () => {
+  makeProcessor();
+  await startActiveSpan("request", async () => {
+    await runAgent("a", "g1");
+    await runAgent("b", "g1");
+  });
+  const spans = await exported();
+  const request = only(spans, named("request"));
+
+  for (const root of [only(spans, named("a")), only(spans, named("b"))]) {
+    expect(traceOf(root)).toBe(traceOf(request));
+    expect(parentOf(root)).toBe(request.spanContext().spanId);
+    expect(sessionOf(root)).toBe("g1");
+  }
+});
+
+test("runs share a propagateAttributes session, and a groupId takes precedence", async () => {
+  makeProcessor();
+  await propagateAttributes({ sessionId: "s1" }, async () => {
+    await runAgent("a");
+    await runAgent("b");
+    await runAgent("c", "g1");
+    await runAgent("d", "g1");
+  });
+  const spans = await exported();
+  const [a, b, c, d] = ["a", "b", "c", "d"].map((name) => only(spans, named(name)));
+
+  expect(traceOf(b)).toBe(traceOf(a));
+  expect(traceOf(d)).toBe(traceOf(c));
+  expect(traceOf(c)).not.toBe(traceOf(a));
+  expect([a, b, c, d].map(sessionOf)).toEqual(["s1", "s1", "g1", "g1"]);
+  const groupTraceSpans = spans.filter((span) => traceOf(span) === traceOf(c));
+  expect(new Set(groupTraceSpans.map(sessionOf))).toEqual(new Set(["g1"]));
+});
+
+test("process sessions group the runs that have no session of their own", async () => {
+  makeProcessor({ sessionMode: "process" });
+  await runAgent("a");
+  await runAgent("b");
+  await runAgent("c", "g1");
+  await runAgent("d", "g1");
+  const spans = await exported();
+  const [a, b, c, d] = ["a", "b", "c", "d"].map((name) => only(spans, named(name)));
+
+  expect(traceOf(b)).toBe(traceOf(a));
+  expect(traceOf(d)).toBe(traceOf(c));
+  expect(traceOf(c)).not.toBe(traceOf(a));
+  expect(sessionOf(a)).toEqual(expect.any(String));
+  expect(sessionOf(b)).toBe(sessionOf(a));
+  expect(sessionOf(c)).toBe("g1");
 });
 
 test("a span whose parent is unknown nests under its trace root", async () => {
