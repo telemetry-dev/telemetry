@@ -7,8 +7,8 @@ settings:
 catalogs:
   default:
     '@anthropic-ai/sdk':
-      specifier: 0.126.0
-      version: 0.126.0
+      specifier: 1.4.0
+      version: 1.4.0
     '@aws-sdk/client-bedrock-agent-runtime':
       specifier: 3.1135.0
       version: 3.1135.0
@@ -125,7 +125,7 @@ importers:
     devDependencies:
       '@anthropic-ai/sdk':
         specifier: 'catalog:'
-        version: 0.126.0(zod@4.4.3)
+        version: 1.4.0(zod@4.4.3)
       '@opentelemetry/sdk-logs':
         specifier: 'catalog:'
         version: 0.223.0(@opentelemetry/api@1.9.1)
@@ -141,6 +141,12 @@ importers:
       '@types/node':
         specifier: 'catalog:'
         version: 24.12.4
+      anthropic-sdk-v0:
+        specifier: npm:@anthropic-ai/sdk@0.126.0
+        version: '@anthropic-ai/sdk@0.126.0(zod@4.4.3)'
+      cross-env:
+        specifier: 'catalog:'
+        version: 10.1.0
       typescript:
         specifier: 'catalog:'
         version: 5.9.3
@@ -705,6 +711,15 @@ packages:
 
   '@anthropic-ai/sdk@0.91.1':
     resolution: {integrity: sha512-LAmu761tSN9r66ixvmciswUj/ZC+1Q4iAfpedTfSVLeswRwnY3n2Nb6Tsk+cLPP28aLOPWeMgIuTuCcMC6W/iw==}
+    hasBin: true
+    peerDependencies:
+      zod: ^3.25.0 || ^4.0.0
+    peerDependenciesMeta:
+      zod:
+        optional: true
+
+  '@anthropic-ai/sdk@1.4.0':
+    resolution: {integrity: sha512-tyuibnhQL57kLOx5oomY4Ld7jOVOPNC5v3IiyRtR3l+Friv66tI4VbuZYF2NMel/T0WMuQMBFOMKDBUbUh8gPA==}
     hasBin: true
     peerDependencies:
       zod: ^3.25.0 || ^4.0.0
@@ -4604,6 +4619,14 @@ snapshots:
   '@anthropic-ai/sdk@0.91.1(zod@4.4.3)':
     dependencies:
       json-schema-to-ts: 3.1.1
+    optionalDependencies:
+      zod: 4.4.3
+
+  '@anthropic-ai/sdk@1.4.0(zod@4.4.3)':
+    dependencies:
+      '@opentelemetry/api': 1.9.1
+      json-schema-to-ts: 3.1.1
+      standardwebhooks: 1.0.0
     optionalDependencies:
       zod: 4.4.3
 

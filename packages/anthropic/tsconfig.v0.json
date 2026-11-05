@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "@anthropic-ai/sdk": ["./node_modules/anthropic-sdk-v0/index.d.mts"],
+      "@anthropic-ai/sdk/*": ["./node_modules/anthropic-sdk-v0/*.d.mts"]
+    }
+  },
+  "include": ["src"]
+}
