@@ -82,8 +82,10 @@ runs:
       env:
         EXIT_CODE: ${{ steps.run.outputs.exit-code }}
         ACTION_ERROR: ${{ steps.run.outputs.error }}
+        ANNOTATED: ${{ steps.report.outputs.annotated }}
       run: |
-        if [ -z "$ACTION_ERROR" ]; then
+        # run.sh and report.mjs annotate the errors that they know the cause of.
+        if [ -z "$ACTION_ERROR" ] && [ "$ANNOTATED" != "true" ]; then
           echo "::error title=telemetry.dev experiment::The experiment script exited with code ${EXIT_CODE:-unknown}."
         fi
         exit "${EXIT_CODE:-1}"

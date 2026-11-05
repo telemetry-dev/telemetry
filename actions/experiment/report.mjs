@@ -43,7 +43,15 @@ const key = createHash("sha256")
   .digest("hex")
   .slice(0, 12);
 const marker = `<!-- telemetry-dev-experiment:${key} -->`;
-const report = render(results, exitCode);
+// In the CI mode, the SDK makes the script exit with an error for a failed check, thus the
+// annotations come from the results whatever the exit code is.
+const failures = results.flatMap(failure);
+// The SDK rejects, and an uncaught rejection exits with 1, right after it writes the line of the
+// failed experiment. Another exit code, or a last line that did not fail, has a cause that only
+// the log of the step shows.
+const explained =
+  failures.length > 0 && (exitCode === 0 || (exitCode === 1 && failure(results.at(-1)).length > 0));
+const report = render(results, exitCode, explained);
 
 if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, `${report}\n`);
 
@@ -52,13 +60,9 @@ const last = results.at(-1);
 if (env.GITHUB_OUTPUT) {
   appendFileSync(
     env.GITHUB_OUTPUT,
-    `check-status=${last?.checkStatus ?? "none"}\nurl=${last ? (httpsUrl(last.url) ?? "") : ""}\n`,
+    `check-status=${last?.checkStatus ?? "none"}\nurl=${last ? (httpsUrl(last.url) ?? "") : ""}\n${explained ? "annotated=true\n" : ""}`,
   );
 }
-
-// A script that goes on after a failed experiment exits with 0, and the last step of the action
-// fails the job only for an exit code that is not 0.
-const failures = exitCode === 0 ? results.flatMap(failure) : [];
 
 for (const message of failures) command("error", message);
 
@@ -78,7 +82,9 @@ if (!["false", "False", "FALSE"].includes(commentInput)) {
   });
 }
 
-if (failures.length > 0) process.exitCode = 1;
+// A script that goes on after a failed experiment exits with 0. For an exit code that is not 0,
+// the last step of the action fails the job.
+if (failures.length > 0 && exitCode === 0) process.exitCode = 1;
 
 function readResults(path) {
   if (!path) return [];
@@ -133,15 +139,29 @@ function failure(experiment) {
 function checkFailure(experiment) {
   if (experiment.status !== "completed")
     return [
-      `The experiment ${experiment.name} did not complete. Its status is ${experiment.status}.`,
+      `The experiment ${experiment.name} did not complete. Its status is ${experiment.status}.${typeof experiment.error === "string" && experiment.error !== "" ? ` ${experiment.error}` : ""}`,
     ];
 
-  return experiment.checkStatus === "failed"
-    ? [`The check of the experiment ${experiment.name} failed.`]
-    : [];
+  if (experiment.checkStatus !== "failed") return [];
+
+  // The reasons as the experiment page gives them: the pass marks that a score is under, and the
+  // failed runs, which fail the check because they have no score.
+  const scores = Array.isArray(experiment.scores) ? experiment.scores : [];
+  const reasons = scores.filter((score) => score.passed === false).map(underMark);
+  const failed = Number(experiment.itemsFailed) || 0;
+
+  if (failed > 0) {
+    reasons.push(
+      `${failed} of ${Number(experiment.itemsDone) || 0} runs failed, and a failed run has no score for the pass marks.`,
+    );
+  }
+
+  return [
+    `The check of the experiment ${experiment.name} failed.${reasons.map((reason) => ` ${reason}`).join("")}`,
+  ];
 }
 
-function render(experiments, code) {
+function render(experiments, code, annotated) {
   const lines = ["### telemetry.dev experiment", ""];
 
   if (leg) {
@@ -224,7 +244,7 @@ function render(experiments, code) {
     lines.push("");
   }
 
-  if (code !== 0 && experiments.length > 0) {
+  if (code !== 0 && experiments.length > 0 && !annotated) {
     lines.push(
       `The experiment script exited with code ${Number.isNaN(code) ? "unknown" : code}.`,
       "",
@@ -248,6 +268,26 @@ function value(kind, number) {
   if (typeof number !== "number") return "—";
 
   return RATE_KINDS.has(kind) ? `${Math.round(number * 100)}%` : number.toFixed(1);
+}
+
+/**
+ * The reason of a score under its pass mark. The value gets more decimals until it rounds below the
+ * mark, so that a value just under the mark does not read as the mark. A score with no kind had no
+ * rows: a mark of 1 or less on it is a pass rate, as the experiment page reads it.
+ */
+function underMark(score) {
+  const rate = RATE_KINDS.has(score.kind) || (score.kind == null && score.minScore <= 1);
+  const rounded = (number, digits) => +(rate ? number * 100 : number).toFixed(digits);
+  const text = (number) => `${number}${rate ? "%" : ""}`;
+  const mark = rounded(score.minScore, 10);
+
+  if (typeof score.value !== "number")
+    return `${score.name} is not scored, and the check needs ${text(mark)} or more.`;
+
+  let digits = rate ? 2 : 3;
+  while (digits < 17 && rounded(score.value, digits) >= mark) digits += 1;
+
+  return `${score.name} is ${text(rounded(score.value, digits))}, and the check needs ${text(mark)} or more.`;
 }
 
 function change(kind, delta) {
