@@ -52,7 +52,7 @@ import { openaiText } from "@tanstack/ai-openai";
 import { telemetryDev } from "@telemetry-dev/tanstack-ai";
 
 const stream = chat({
-  adapter: openaiText("gpt-4o"),
+  adapter: openaiText("gpt-6-luna"),
   messages,
   metadata: { userId: "u_123", sessionId: "s_456", tenant: "acme" },
   middleware: [telemetryDev()],

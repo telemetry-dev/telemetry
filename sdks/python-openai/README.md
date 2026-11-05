@@ -33,7 +33,7 @@ from telemetry_dev_openai import wrap_openai
 client = wrap_openai(OpenAI())
 
 client.chat.completions.create(
-    model="gpt-4o-mini",
+    model="gpt-6-luna",
     messages=[{"role": "user", "content": "Tell me a joke about OpenTelemetry"}],
 )
 ```
@@ -50,7 +50,7 @@ instrument_openai()
 client = OpenAI()
 
 try:
-    client.responses.create(model="gpt-4o-mini", input="Tell me a joke about OpenTelemetry")
+    client.responses.create(model="gpt-6-luna", input="Tell me a joke about OpenTelemetry")
 finally:
     uninstrument_openai()
 ```

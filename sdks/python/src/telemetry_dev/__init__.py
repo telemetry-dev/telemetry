@@ -6,7 +6,7 @@ Quickstart::
 
     telemetry_dev.init()  # reads TELEMETRY_DEV_API_KEY
 
-    with telemetry_dev.start_span("chat gpt-4o", type="generation", model="gpt-4o",
+    with telemetry_dev.start_span("chat gpt-6-luna", type="generation", model="gpt-6-luna",
                                   provider="openai", input=messages) as span:
         ...
         span.update(output=completion, usage={"input_tokens": 11, "output_tokens": 7})

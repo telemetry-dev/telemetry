@@ -32,7 +32,7 @@ from telemetry_dev_anthropic import wrap_anthropic
 
 client = wrap_anthropic(Anthropic())
 message = client.messages.create(
-    model="claude-sonnet-4-6",
+    model="claude-haiku-5-5",
     max_tokens=1024,
     messages=[{"role": "user", "content": "Tell me a joke about OpenTelemetry"}],
 )
@@ -50,7 +50,7 @@ instrument_anthropic()
 try:
     client = Anthropic()
     client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-haiku-5-5",
         max_tokens=1024,
         messages=[{"role": "user", "content": "Hello"}],
     )

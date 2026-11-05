@@ -37,7 +37,7 @@ import { wrapGoogleGenAI } from "@telemetry-dev/google-genai";
 const ai = wrapGoogleGenAI(new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! }));
 
 await ai.models.generateContent({
-  model: "gemini-2.5-flash",
+  model: "gemini-3.8-flash",
   contents: "Tell me a joke about OpenTelemetry",
   config: {
     systemInstruction: "Be concise",

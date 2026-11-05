@@ -34,7 +34,7 @@ from telemetry_dev_openrouter import wrap_open_router
 client = wrap_open_router(OpenRouter(api_key="sk-or-v1-..."))
 
 client.chat.send(
-    model="openai/gpt-4o-mini",
+    model="openai/gpt-6-luna",
     messages=[{"role": "user", "content": "Tell me a joke about OpenTelemetry"}],
 )
 ```
@@ -52,7 +52,7 @@ instrument_openrouter()
 client = OpenRouter(api_key="sk-or-v1-...")
 
 try:
-    client.responses.send(model="openai/gpt-4o-mini", input="Explain OpenTelemetry briefly")
+    client.responses.send(model="openai/gpt-6-luna", input="Explain OpenTelemetry briefly")
 finally:
     uninstrument_openrouter()
 ```
