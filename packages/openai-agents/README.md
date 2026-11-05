@@ -68,12 +68,16 @@ run created its session, `sandbox.backend` (for example `e2b` or `modal`). The `
 `process.exit.code` once the command has exited. A command that exits with a non-zero code is not
 marked as an error, because many commands, such as `grep`, exit non-zero without failing.
 
-To also record the provider's own sandbox id, wrap the sandbox client:
+To also record the provider's own sandbox id, wrap the sandbox client. The run needs a
+`SandboxAgent`; a plain `Agent` ignores the sandbox client.
 
 ```ts
+import { run } from "@openai/agents";
+import { SandboxAgent } from "@openai/agents/sandbox";
 import { E2BSandboxClient } from "@openai/agents-extensions/sandbox/e2b";
 import { instrumentSandboxClient } from "@telemetry-dev/openai-agents";
 
+const agent = new SandboxAgent({ name: "Coder", instructions: "Run the tests." });
 const client = instrumentSandboxClient(new E2BSandboxClient());
 await run(agent, "Run the tests.", { sandbox: { client } });
 ```
@@ -103,6 +107,7 @@ is still live, has no such span, so the spans of that run have neither.
 
 ## Double counting
 
-Each model call already gets a `chat` span from this processor. Do not also pass a client wrapped
-with `wrapOpenAI` from `@telemetry-dev/openai` to `setDefaultOpenAIClient`: each model call would
-then be counted twice.
+Each model call already gets a `chat` span from this processor. Do not also instrument the OpenAI
+client that the Agents SDK uses with `@telemetry-dev/openai`: neither pass a client wrapped with
+`wrapOpenAI` to `setDefaultOpenAIClient`, nor call `instrumentOpenAI()`, which instruments every
+client in the process. Each model call would then be counted twice.
