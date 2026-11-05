@@ -10,7 +10,7 @@ Docs: https://telemetry.dev/docs/integrations/anthropic
 pip install telemetry-dev-anthropic
 ```
 
-Requires Python 3.10 or later and `anthropic` 0.116 or later, below 2.
+Requires Python 3.10 or later and `anthropic` 0.116 or later, below 3.
 
 Initialize the core SDK first. `init()` reads your project API key from the `TELEMETRY_DEV_API_KEY` environment variable, so set it before you start the app:
 
@@ -65,7 +65,7 @@ finally:
 - `client.messages.stream(...)` context managers, sync and async
 - `client.messages.parse(...)`, sync and async
 - `client.beta.messages.create(...)`, `stream(...)`, and `parse(...)`, sync and async
-- `client.beta.messages.tool_runner(...)`: each model request in the tool loop records its own generation span
+- `client.beta.messages.tool_runner(...)`: each model request in the tool loop records its own generation span. With `anthropic` 2.2 or later, the loop runs over a thread that the server keeps by default, so from the second request on, the span's input has only the new messages and no tool definitions. Pass `thread=False` to `tool_runner(...)` to send, and record, the full history on each request.
 
 The integration maps native Anthropic request and response shapes directly into telemetry.dev fields. It does not normalize messages into another schema.
 

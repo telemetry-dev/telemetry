@@ -1543,7 +1543,8 @@ def test_beta_create_records_generation_span(memory: SimpleNamespace) -> None:
         betas=["context-management-2025-06-27"],
     )
 
-    assert requests[0].url.params.get("beta") == "true"
+    # anthropic 2.x no longer adds ?beta=true; each version sends the header.
+    assert requests[0].headers["anthropic-beta"] == "context-management-2025-06-27"
     a = attrs(only_span(memory))
     assert a["gen_ai.operation.name"] == "chat"
     assert a["gen_ai.provider.name"] == "anthropic"
