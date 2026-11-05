@@ -866,12 +866,7 @@ function checkResult(result: ExperimentResult, runsPerItem: number): void {
 
   if (result.checkStatus !== "failed") return;
 
-  const failed = result.scores
-    .filter((score) => score.passed === false)
-    .map(
-      (score) =>
-        `${score.name} is ${formatScore(score.kind, score.value)}, under the pass mark ${formatScore(score.kind, score.minScore)}`,
-    );
+  const failed = result.scores.filter((score) => score.passed === false).map(underMark);
 
   if (result.itemsFailed > 0) failed.unshift(itemsFailedText(result, runsPerItem));
 
@@ -889,6 +884,31 @@ function checkResult(result: ExperimentResult, runsPerItem: number): void {
  */
 function itemsFailedText(result: ExperimentResult, runsPerItem: number): string {
   return `${result.itemsFailed} of ${result.itemsDone} ${runsPerItem > 1 ? "runs" : "items"} failed`;
+}
+
+/**
+ * A score under its pass mark, with the numbers of the annotation of the action. The mark has 10
+ * decimals. The value has 2 decimals for a rate and 3 otherwise, and one more while it rounds to
+ * the mark or above it, up to 17, so that a value just under the mark does not read as the mark.
+ * A rate shows both as percents. A score with no kind had no values: a mark of 1 or less on it is
+ * a pass rate, as the action reads it.
+ */
+function underMark(score: ExperimentScore): string {
+  const rate =
+    (score.kind !== null && RATE_KINDS.has(score.kind)) ||
+    (score.kind === null && score.minScore !== null && score.minScore <= 1);
+  const rounded = (number: number, digits: number) =>
+    +(rate ? number * 100 : number).toFixed(digits);
+  const text = (number: number) => `${number}${rate ? "%" : ""}`;
+  const mark = score.minScore === null ? null : rounded(score.minScore, 10);
+  const markText = mark === null ? "no score" : text(mark);
+
+  if (score.value === null) return `${score.name} is no score, under the pass mark ${markText}`;
+
+  let digits = rate ? 2 : 3;
+  while (mark !== null && digits < 17 && rounded(score.value, digits) >= mark) digits += 1;
+
+  return `${score.name} is ${text(rounded(score.value, digits))}, under the pass mark ${markText}`;
 }
 
 function describe(result: ExperimentResult, runsPerItem: number): string {

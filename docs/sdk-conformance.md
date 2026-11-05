@@ -379,11 +379,20 @@ when the ingest refused an export of the client with 401 or 403 since an export 
 and then `tracesError`, the message of that export error. The action fails the job for a failed
 experiment only when its line has `ci` true, and notes runs without traces in the job summary.
 
-The SDKs print one line when the experiment starts and the result when it ends. The result and the
-`check_failed` error show a rate as a whole percent and any other score, with its pass mark, to one
-decimal as `toFixed(1)` of JavaScript does: it rounds the exact float value, a half away from zero,
-thus the float 4.35 gives 4.3 and 4.25 gives 4.3. A run with no
-enabled client, or in an environment other than `experiment`, logs a warning.
+The SDKs print one line when the experiment starts and the result when it ends. The result shows a
+rate as a whole percent and any other score, with its pass mark, to one decimal as `toFixed(1)` of
+JavaScript does: it rounds the exact float value, a half away from zero, thus the float 4.35 gives
+4.3 and 4.25 gives 4.3. The `check_failed` error names each score under its pass mark with the
+numbers of the annotation of the experiment action, so that their numbers agree. For this error, a
+score is a rate when its kind is `pass_fail` or `up_down`, or when it has no kind and its mark is 1
+or less, and both numbers of a rate are 100 times the score. The mark is `toFixed(10)` of the mark.
+The value is `toFixed` of the value with 2 decimals for a rate and 3 for any other score, plus one
+more decimal while it rounds to the mark or above it, up to 17. Each is then a JavaScript number as
+`String()` writes it, with no trailing zeros and with an exponent under 1e-6 and from 1e21, and a
+rate has a `%`. Thus a rate of 0.8958 against 0.9 is "89.58%, under the pass mark 90%", a mean of
+0.79996 against 0.8 is "0.79996, under the pass mark 0.8", a mean of 0.00155 against 0.0016 is
+"0.0015, under the pass mark 0.0016", and a missing value is "no score". A run with no enabled
+client, or in an environment other than `experiment`, logs a warning.
 
 ## The shared scenario
 
