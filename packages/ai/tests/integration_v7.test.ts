@@ -4162,6 +4162,7 @@ const evaluateOutput = {
 const gatewayRuns = [
   {
     operation: "generateText",
+    toolCalls: 1,
     start: (integ: V7Integration, callId: string) => {
       integ.onStart?.({
         callId,
@@ -4172,6 +4173,14 @@ const gatewayRuns = [
       integ.onStepStart?.({ callId, stepNumber: 0, ...gateway("openai/gpt-4o") });
     },
     finish: async (integ: V7Integration, callId: string) => {
+      const toolCall = { toolCallId: "t-gateway", toolName: "lookup", input: { q: "otel" } };
+      integ.onToolExecutionStart?.({ callId, toolCall });
+      integ.onToolExecutionEnd?.({
+        callId,
+        toolCall,
+        toolExecutionMs: 50,
+        toolOutput: { type: "tool-result", output: { hits: 1 } },
+      });
       integ.onStepEnd?.({
         callId,
         stepNumber: 0,
@@ -4283,7 +4292,7 @@ const gatewayRuns = [
 ];
 
 const expectGatewayRootAndStep = (spans: readonly ReadableSpan[]) => {
-  const roots = spans.filter((s) => s.kind === SpanKind.INTERNAL);
+  const roots = spans.filter((s) => s.kind === SpanKind.INTERNAL && s.name !== "execute_tool");
   const steps = spans.filter((s) => s.kind === SpanKind.CLIENT);
   expect(roots).toHaveLength(1);
   expect(steps).toHaveLength(1);
@@ -4292,8 +4301,8 @@ const expectGatewayRootAndStep = (spans: readonly ReadableSpan[]) => {
 };
 
 test.each(gatewayRuns)(
-  "ai@7 $operation relabels the gateway provider on the root and step spans and the step metrics",
-  async ({ operation, start, finish }) => {
+  "ai@7 $operation relabels the gateway provider on the root and step spans and the metrics",
+  async ({ operation, start, finish, toolCalls = 0 }) => {
     const { spanBatches, metrics, overrides } = makeCapture();
     const integ = telemetryDev(baseOptions, overrides);
     const callId = `gateway-${operation}`;
@@ -4302,7 +4311,12 @@ test.each(gatewayRuns)(
     await finish(integ, callId);
 
     expectGatewayRootAndStep(spanBatches[0]!);
-    expect(metrics.filter((m) => m.metric === "duration")).toHaveLength(1);
+    const durations = metrics.filter((m) => m.metric === "duration");
+    const toolDurations = durations.filter(
+      (m) => m.attributes["gen_ai.operation.name"] === "execute_tool",
+    );
+    expect(durations).toHaveLength(1 + toolCalls);
+    expect(toolDurations).toHaveLength(toolCalls);
 
     for (const m of metrics) {
       expect(m.attributes["gen_ai.provider.name"]).toBe("Vercel AI Gateway");
