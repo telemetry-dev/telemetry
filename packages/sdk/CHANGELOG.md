@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.6](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.2.5...sdk-v0.2.6) (2026-11-07)
+
+
+### Bug Fixes
+
+* **sdk:** do not retry a 429 quota_exceeded of the evals routes ([#213](https://github.com/telemetry-dev/telemetry/issues/213)) ([c2eddb5](https://github.com/telemetry-dev/telemetry/commit/c2eddb5bb8e81031cecb9760dcee08c2f8de5420))
+
 ## [0.2.5](https://github.com/telemetry-dev/telemetry/compare/sdk-v0.2.4...sdk-v0.2.5) (2026-11-05)
 
 

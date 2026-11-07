@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.7](https://github.com/telemetry-dev/telemetry/compare/python-v0.3.6...python-v0.3.7) (2026-11-07)
+
+
+### Bug Fixes
+
+* **sdk:** do not retry a 429 quota_exceeded of the evals routes ([#213](https://github.com/telemetry-dev/telemetry/issues/213)) ([c2eddb5](https://github.com/telemetry-dev/telemetry/commit/c2eddb5bb8e81031cecb9760dcee08c2f8de5420))
+
 ## [0.3.6](https://github.com/telemetry-dev/telemetry/compare/python-v0.3.5...python-v0.3.6) (2026-11-05)
 
 
