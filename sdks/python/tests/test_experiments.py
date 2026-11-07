@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 import telemetry_dev
+import telemetry_dev._api as api_module
 import telemetry_dev._experiments as experiments_module
 from telemetry_dev import (
     ExperimentError,
@@ -639,6 +640,55 @@ def test_a_create_that_gets_a_429_goes_again_after_its_retry_after() -> None:
     assert api.routes().count("POST /v1/experiments") == 2
     # Without the header, the first retry waits 1 second.
     assert time.monotonic() - started >= 2
+
+
+@pytest.mark.parametrize(
+    ("route", "code", "message", "headers"),
+    [
+        (
+            "POST /v1/experiments",
+            "quota_exceeded",
+            "Monthly ingestion quota exceeded; upgrade your plan to continue.",
+            {"retry-after": "1468800"},
+        ),
+        (
+            f"POST /v1/experiments/{EXPERIMENT_ID}/items",
+            "quota_exceeded",
+            "Lifetime gift ingestion budget exhausted; subscribe to continue. This budget does "
+            "not reset monthly.",
+            {},
+        ),
+        (
+            "POST /v1/experiments",
+            "rate_limited",
+            "Too many requests for this project",
+            {"retry-after": "61"},
+        ),
+    ],
+    ids=[
+        "a create that gets a 429 quota_exceeded until next month",
+        "an item post that gets a 429 quota_exceeded with no retry-after",
+        "a create that gets a 429 with a retry-after of 61 seconds",
+    ],
+)
+def test_a_429_that_a_retry_cannot_pass_raises_at_once_with_the_message_of_the_server(
+    monkeypatch: pytest.MonkeyPatch, route: str, code: str, message: str, headers: dict[str, str]
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(api_module, "time", clock)
+
+    def refuse(request: ApiRequest) -> Reply | None:
+        if request.route != route:
+            return None
+        return answer_with(429, {"error": {"code": code, "message": message}}, headers)
+
+    with fake_api(override=refuse) as api:
+        with pytest.raises(ExperimentError) as caught:
+            experiment(api)
+
+    assert (caught.value.code, caught.value.message, caught.value.status) == (code, message, 429)
+    assert api.routes().count(route) == 1
+    assert clock.now == 0
 
 
 def test_waits_until_the_server_evaluators_end_the_experiment() -> None:

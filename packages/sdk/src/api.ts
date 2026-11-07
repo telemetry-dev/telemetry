@@ -21,7 +21,7 @@ export interface Api {
 }
 
 /** An error class with the shape of `PromptError`: a code, a message, and the HTTP status. */
-export type ApiErrorType<E extends Error> = new (
+export type ApiErrorType<E extends ApiError> = new (
   code: string,
   message: string,
   status?: number,
@@ -42,11 +42,16 @@ interface RequestOptions {
   attempts?: number;
 }
 
-type Attempt =
-  | { ok: true; body: unknown }
-  | { ok: false; error: Error; status?: number; retryAfterMs?: number };
+type ApiError = Error & { readonly code: string };
 
-/** A longer Retry-After waits only this long: the API counts requests by the minute. */
+type Failure = { ok: false; error: ApiError; status?: number; retryAfterMs?: number };
+
+type Attempt = { ok: true; body: unknown } | Failure;
+
+/**
+ * The longest wait before a retry: the API counts requests by the minute. A 429 with a longer
+ * Retry-After fails at once, and a 503 with a longer one waits only this long.
+ */
 const MAX_RETRY_AFTER_MS = 60_000;
 /** IMF-fixdate, the HTTP date that servers send: `Sun, 06 Nov 1994 08:49:37 GMT`. */
 const HTTP_DATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
@@ -75,9 +80,10 @@ export function resolveApi(options: ApiOptions): Api {
  * Sends one JSON request to the telemetry.dev API and returns the JSON of the response. A response
  * that is not 2xx fails with the `{ error: { code, message } }` of its body, or `http_<status>`.
  * A failure that `options.idempotent` allows tries again, after the Retry-After of the response
- * or after 1 and then 2 seconds.
+ * or after 1 and then 2 seconds. A 429 `quota_exceeded`, or a 429 with a Retry-After past 60
+ * seconds, fails at once.
  */
-export async function request<E extends Error>(
+export async function request<E extends ApiError>(
   api: Api & { apiKey: string },
   ErrorType: ApiErrorType<E>,
   method: "GET" | "POST",
@@ -99,7 +105,7 @@ export async function request<E extends Error>(
 
     if (result.ok) return result.body;
 
-    if (attempt >= attempts || !retryable(result.status, options.idempotent)) throw result.error;
+    if (attempt >= attempts || !retryable(result, options.idempotent)) throw result.error;
 
     await sleep(Math.min(result.retryAfterMs ?? 1000 * attempt, MAX_RETRY_AFTER_MS));
   }
@@ -130,7 +136,7 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-async function send<E extends Error>(
+async function send<E extends ApiError>(
   api: Api & { apiKey: string },
   ErrorType: ApiErrorType<E>,
   method: "GET" | "POST",
@@ -196,8 +202,11 @@ async function send<E extends Error>(
   }
 }
 
-function retryable(status: number | undefined, idempotent: boolean): boolean {
-  if (status === 429) return true;
+function retryable({ error, status, retryAfterMs }: Failure, idempotent: boolean): boolean {
+  if (status === 429) {
+    // A monthly quota resets at the start of next month, and a gift budget never resets.
+    return error.code !== "quota_exceeded" && (retryAfterMs ?? 0) <= MAX_RETRY_AFTER_MS;
+  }
 
   return idempotent && (status === undefined || status >= 500);
 }

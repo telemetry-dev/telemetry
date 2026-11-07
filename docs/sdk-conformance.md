@@ -322,9 +322,12 @@ timeout, a network error, a 429, or a 5xx. The server skips an item run that it 
 makes the experiment tries again only after a 429, which the rate limit answers before any work: the
 server answers 503 when its database work times out, which can be after the commit. A retry waits
 for the `Retry-After` of a 429 or 503 (seconds or an HTTP date), at most 60 seconds, or else 1
-second and then 2 seconds. `POST /v1/scores` makes one request, with no retry. The TypeScript
-request timeouts abort the request: 30 seconds for the experiment requests and 10 seconds for a
-score. The Python timeouts apply to each socket operation of urllib.
+second and then 2 seconds. A 429 with the code `quota_exceeded`, or with a `Retry-After` of more
+than 60 seconds, gets no retry: the request fails at once with the error of the server. A quota
+resets at the start of the next month, or never for a gift budget. `POST /v1/scores` makes one
+request, with no retry. The TypeScript request timeouts abort the request: 30 seconds for the
+experiment requests and 10 seconds for a score. The Python timeouts apply to each socket operation
+of urllib.
 
 Options and limits: `runsPerItem` / `runs_per_item` is an integer from 1 to 5 (default 1).
 `concurrency` is an integer from 1 to 100 (default 4). `evaluators` has at most 20 trimmed names

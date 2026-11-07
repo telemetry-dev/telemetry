@@ -20,7 +20,8 @@ from ._client import get_client
 from ._config import SDK_VERSION, resolve_config
 from ._serialize import json_dumps
 
-# A longer Retry-After waits only this long: the API counts requests by the minute.
+# The longest wait before a retry: the API counts requests by the minute. A 429 with a longer
+# Retry-After fails at once, and a 503 with a longer one waits only this long.
 _MAX_RETRY_AFTER_S = 60.0
 # IMF-fixdate, the HTTP date that servers send: Sun, 06 Nov 1994 08:49:37 GMT.
 _HTTP_DATE = re.compile(r"[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT", re.ASCII)
@@ -52,6 +53,7 @@ def resolve_api(api_key: str | None, base_url: str | None) -> Api:
 @dataclass(frozen=True)
 class _Failure:
     error: Exception
+    code: str | None
     status: int | None
     retry_after: float | None
 
@@ -74,7 +76,8 @@ def request(
     ``http_<status>``. With ``idempotent``, the server takes a repeat at most once, so a timeout, a
     network error, or a 5xx tries again. Other requests try again only after a 429, which the rate
     limit answers before the server does any work: a 503 can come after the work committed. A
-    retry waits for the Retry-After of the response, or for 1 and then 2 seconds. The timeout
+    retry waits for the Retry-After of the response, or for 1 and then 2 seconds. A 429
+    ``quota_exceeded``, or a 429 with a Retry-After past 60 seconds, raises at once. The timeout
     applies to each socket operation of urllib.
     """
     url = f"{api.base_url}{path}"
@@ -92,7 +95,7 @@ def request(
         result = _send(error_type, method, url, path, data, headers, timeout_s)
         if not isinstance(result, _Failure):
             return result
-        if attempt >= attempts or not _retryable(result.status, idempotent):
+        if attempt >= attempts or not _retryable(result, idempotent):
             raise result.error
         time.sleep(min(result.retry_after or float(attempt), _MAX_RETRY_AFTER_S))
         attempt += 1
@@ -128,18 +131,7 @@ opener = urllib.request.build_opener(NoRedirect)
 
 def api_error(error_type: Callable[[str, str, int | None], E], status: int, body: bytes) -> E:
     """The error of a response that is not 2xx: its API code and message, or ``http_<status>``."""
-    try:
-        error = json.loads(body).get("error")
-    except (ValueError, AttributeError):
-        error = None
-    fields = cast("dict[str, Any]", error) if isinstance(error, dict) else {}
-    code = fields.get("code")
-    message = fields.get("message")
-    return error_type(
-        code if isinstance(code, str) else f"http_{status}",
-        message if isinstance(message, str) else f"telemetry.dev returned {status}",
-        status,
-    )
+    return error_type(*_code_and_message(status, body), status)
 
 
 def retry_after(status: int, value: str | None) -> float | None:
@@ -175,8 +167,10 @@ def _send(
             body: bytes = response.read()
     except urllib.error.HTTPError as exc:
         with exc:
+            code, message = _code_and_message(exc.code, exc.read())
             return _Failure(
-                api_error(error_type, exc.code, exc.read()),
+                error_type(code, message, exc.code),
+                code,
                 exc.code,
                 retry_after(exc.code, exc.headers.get("Retry-After")),
             )
@@ -190,14 +184,29 @@ def _send(
             else error_type("network_error", "Could not reach telemetry.dev", None)
         )
         error.__cause__ = exc
-        return _Failure(error, None, None)
+        return _Failure(error, None, None, None)
     try:
         return json.loads(body)
     except ValueError:
         return None
 
 
-def _retryable(status: int | None, idempotent: bool) -> bool:
-    if status == 429:
-        return True
-    return idempotent and (status is None or status >= 500)
+def _code_and_message(status: int, body: bytes) -> tuple[str, str]:
+    try:
+        error = json.loads(body).get("error")
+    except (ValueError, AttributeError):
+        error = None
+    fields = cast("dict[str, Any]", error) if isinstance(error, dict) else {}
+    code = fields.get("code")
+    message = fields.get("message")
+    return (
+        code if isinstance(code, str) else f"http_{status}",
+        message if isinstance(message, str) else f"telemetry.dev returned {status}",
+    )
+
+
+def _retryable(failure: _Failure, idempotent: bool) -> bool:
+    if failure.status == 429:
+        # A monthly quota resets at the start of next month, and a gift budget never resets.
+        return failure.code != "quota_exceeded" and (failure.retry_after or 0) <= _MAX_RETRY_AFTER_S
+    return idempotent and (failure.status is None or failure.status >= 500)
