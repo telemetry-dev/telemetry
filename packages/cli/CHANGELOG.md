@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.7...cli-v0.1.8) (2026-11-07)
+
+
+### Features
+
+* **cli:** list findings since a deploy ([#215](https://github.com/telemetry-dev/telemetry/issues/215)) ([06e9bd6](https://github.com/telemetry-dev/telemetry/commit/06e9bd6ffb40d6de77b94db59d321be58837b907))
+
 ## [0.1.7](https://github.com/telemetry-dev/telemetry/compare/cli-v0.1.6...cli-v0.1.7) (2026-11-03)
 
 
