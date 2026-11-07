@@ -21,6 +21,7 @@
   "sdks/python-litellm": "0.2.5",
   "sdks/python-openai": "0.2.5",
   "sdks/python-openrouter": "0.2.5",
-  "packages/cli": "0.1.7",
-  "actions/experiment": "1.0.3"
+  "packages/cli": "0.1.8",
+  "actions/experiment": "1.0.3",
+  "packages/langchain": "0.1.0"
 }
