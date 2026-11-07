@@ -50,6 +50,11 @@
       "component": "google-genai",
       "release-type": "node"
     },
+    "packages/langchain": {
+      "component": "langchain",
+      "release-type": "node",
+      "initial-version": "0.1.0"
+    },
     "packages/mcp": {
       "component": "mcp",
       "release-type": "node"

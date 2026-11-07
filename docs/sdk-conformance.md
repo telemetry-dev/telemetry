@@ -116,7 +116,8 @@ process-wide bound (TypeScript `batch.maxStreamBytes`, Python `max_stream_bytes`
 while no other stream holds bytes in it, not even the few bytes a started stream holds before any output, a stream may grow to 16 MiB even past it); output past
 either bound is not kept, and its span gets `telemetry.dev.capture.truncated = true`;
 instrumentation scopes `@telemetry-dev/sdk` and `telemetry_dev` (both
-classify as framework `otel`).
+classify as framework `otel`, except a span with a `langchain.run.id` attribute, which
+`@telemetry-dev/langchain` sets and which classifies as framework `langchain`).
 
 The SDK allowlists above drop unknown keys in SDK usage objects. Ingest reports
 `unrecognized_usage_attribute` for unknown numeric `gen_ai.usage.*`, `ai.usage.*`, and

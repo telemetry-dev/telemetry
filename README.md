@@ -150,6 +150,7 @@ Each integration links to its installation instructions and API coverage. The li
 | OpenRouter                   | [`@telemetry-dev/openrouter`](packages/openrouter)     | [`telemetry-dev-openrouter`](sdks/python-openrouter)     |
 | Vercel AI SDK                | [`@telemetry-dev/ai-sdk`](packages/ai)                 |                                                          |
 | TanStack AI                  | [`@telemetry-dev/tanstack-ai`](packages/tanstack-ai)   |                                                          |
+| LangChain and LangGraph      | [`@telemetry-dev/langchain`](packages/langchain)       |                                                          |
 | LiteLLM                      |                                                        | [`telemetry-dev-litellm`](sdks/python-litellm)           |
 | MCP                          | [`@telemetry-dev/mcp`](packages/mcp)                   |                                                          |
 | Eve                          | [`@telemetry-dev/eve`](packages/eve)                   |                                                          |
@@ -160,7 +161,7 @@ Each integration links to its installation instructions and API coverage. The li
 
 Some integrations need no package from this repository, because the tool exports OpenTelemetry
 itself or through a third-party library: Claude Code, Claude Platform, Claude SDK native spans,
-Hermes Agent, OpenClaw, CrewAI, LangChain and LangGraph, and Pydantic AI. Their guides are in
+Hermes Agent, OpenClaw, CrewAI, LangChain and LangGraph in Python, and Pydantic AI. Their guides are in
 [Integrations](https://telemetry.dev/docs/integrations).
 
 Other languages can use an existing OTLP/HTTP exporter.
