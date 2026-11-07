@@ -306,9 +306,12 @@ const result = await runExperiment({
   `missing_api_key`, or `timeout`. A read of the dataset or the result, a post of outputs, and the
   completion go again up to 2 times after a timeout, a network error, a 429, or a 5xx. The server
   skips an item run that it has. The request that makes the experiment goes again only after a
-  429, thus a lost response or a 503 cannot make a second experiment. When the run stops after it
-  made the experiment, runExperiment sends the completion before it rejects: telemetry.dev then
-  ends the experiment with the item runs that it got, or fails it when it got none.
+  429, thus a lost response or a 503 cannot make a second experiment. No request goes again after
+  a 429 `quota_exceeded`, which a cap of the plan gives, or after a 429 whose `Retry-After` is
+  more than 60 seconds: runExperiment rejects at once with the message of the server. When the run
+  stops after it made the experiment, runExperiment sends the completion before it rejects:
+  telemetry.dev then ends the experiment with the item runs that it got, or fails it when it got
+  none.
 - The key needs Run experiments in its Access on the API keys page (the `datasets:read` and
   `experiments:write` scopes). runExperiment uses the same
   API key, base URL, and `fetch` as getPrompt, or its own `apiKey`, `baseUrl`, and `fetch`

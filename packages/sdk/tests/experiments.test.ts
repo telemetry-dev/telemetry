@@ -741,6 +741,49 @@ test("a create that gets a 429 goes again after its Retry-After", async () => {
   expect(Date.now() - started).toBeGreaterThanOrEqual(2_000);
 });
 
+test.each([
+  [
+    "a create that gets a 429 quota_exceeded until next month",
+    "POST /v1/experiments",
+    "quota_exceeded",
+    "Monthly ingestion quota exceeded; upgrade your plan to continue.",
+    { "retry-after": "1468800" },
+  ],
+  [
+    "an item post that gets a 429 quota_exceeded with no Retry-After",
+    `POST /v1/experiments/${EXPERIMENT_ID}/items`,
+    "quota_exceeded",
+    "Lifetime gift ingestion budget exhausted; subscribe to continue. This budget does not reset monthly.",
+    {},
+  ],
+  [
+    "a create that gets a 429 with a Retry-After of 61 seconds",
+    "POST /v1/experiments",
+    "rate_limited",
+    "Too many requests for this project",
+    { "retry-after": "61" },
+  ],
+])("%s fails at once with the message of the server", async (_, route, code, message, headers) => {
+  vi.useFakeTimers();
+
+  try {
+    const api = fakeApi({
+      override: (request) =>
+        `${request.method} ${request.url.pathname}` === route
+          ? Response.json({ error: { code, message } }, { status: 429, headers })
+          : undefined,
+    });
+
+    const outcome = experiment(api).catch((caught: unknown) => caught);
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+    expect(await outcome).toMatchObject({ code, message, status: 429 });
+    expect(routes(api.requests).filter((sent) => sent === route)).toHaveLength(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test("waits until the server evaluators end the experiment", async () => {
   const api = fakeApi({ results: [result({ status: "running", itemsDone: 1 }), result()] });
 
