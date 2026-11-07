@@ -369,6 +369,56 @@ export const logs = () => ({
   ],
 });
 
+/** The findings of `kind`, as the server counts and lists them; `paged` returns the first of two pages. */
+const ofKind = (kind: unknown, paged: boolean, window: unknown) => {
+  const all = findings();
+  const listed = all.findings.filter((finding) => kind === undefined || finding.kind === kind);
+
+  return {
+    window,
+    counts: {
+      alerts: kind === "check" ? 0 : all.counts.alerts,
+      open_alerts: kind === "check" ? 0 : all.counts.open_alerts,
+      checks: kind === "alert" ? 0 : all.counts.checks,
+    },
+    findings: paged ? listed.slice(0, 1) : listed,
+    next_cursor: paged ? "page-2" : null,
+  };
+};
+
+export const findings = () => ({
+  counts: { alerts: 1, open_alerts: 1, checks: 1 },
+  findings: [
+    {
+      kind: "check",
+      id: "5d0f7a1c-2b3e-4f50-8a6b-7c8d9e0f1a2b",
+      at: minutesAgo(12),
+      status: "failed",
+      resolved_at: null,
+      source: "Claims vs tool results",
+      title: "Claims vs tool results",
+      summary: "The reply says the refund went through; no tool call made one.",
+      url: `https://telemetry.dev/o/org_1/p/proj_1/traces/${TRACE_ID}?span=f6`,
+      trace_id: TRACE_ID,
+      span_id: "f6",
+    },
+    {
+      kind: "alert",
+      id: "8e1a2b3c-4d5e-4f60-9a7b-8c9d0e1f2a3b",
+      at: minutesAgo(40),
+      status: "open",
+      resolved_at: null,
+      source: "tool_failure_cluster",
+      title: "lookup_order fails more often",
+      summary: "lookup_order failed on 40% of calls.\u001b]52;c;ZXZpbA==\u0007\u001b[2J",
+      url: "https://telemetry.dev/o/org_1/p/proj_1/alerts/8e1a2b3c-4d5e-4f60-9a7b-8c9d0e1f2a3b",
+      trace_id: null,
+      span_id: null,
+    },
+  ],
+  next_cursor: null,
+});
+
 const totals = (scale: number) => ({
   totalRequests: Math.round(12480 * scale),
   errorCount: Math.round(132 * scale * 1.3),
@@ -653,6 +703,23 @@ const server = () => {
       logs: matching.slice(offset, end),
     };
   });
+  if (serverState.findings) {
+    tool("list_findings", (args) => {
+      const window = resolveWindow(args, 7 * UNIT_MS.d);
+
+      if (window instanceof ToolFailure) return window;
+
+      return serverState.empty
+        ? {
+            window,
+            counts: { alerts: 0, open_alerts: 0, checks: 0 },
+            findings: [],
+            next_cursor: null,
+          }
+        : ofKind(args.kind, args.limit === 1, window);
+    });
+  }
+
   tool("get_usage_summary", () => usage());
   tool("get_span_payload", (args) => {
     // Offsets and counts are in code points, as the server counts them.
@@ -694,8 +761,10 @@ export const serverState = {
   windows: true,
   /** search_traces takes agent and tool; false acts as a server with windows from before them. */
   agentAndTool: true,
-  /** search_traces and search_sessions find nothing, as in a project nothing was sent to yet. */
+  /** search_traces, search_sessions, and list_findings find nothing, as in a project nothing was sent to yet. */
   empty: false,
+  /** The server has list_findings; false acts as a server from before findings. */
+  findings: true,
 };
 
 /**

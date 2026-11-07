@@ -37,6 +37,7 @@ import {
 } from "./terminal.ts";
 import { cachedLatestVersion } from "./update.ts";
 import type {
+  FindingPage,
   LogList,
   PayloadPage,
   ProjectList,
@@ -1583,6 +1584,123 @@ export async function logsCommand(context: Context) {
       );
 
     suggest(context, nextPage(context, result.next_cursor ?? null));
+  });
+}
+
+const KINDS = { alert: "alert", check: "check" } as const;
+
+/**
+ * Lists the window's findings, newest first. Any finding in the window sets exit code 3, so a CI
+ * step or a coding agent can run it after a deploy and act on what it found.
+ */
+export async function findingsCommand(context: Context) {
+  const window = timeWindow(context);
+  const kind = choice(context, "kind", KINDS);
+
+  await withApi(async (api) => {
+    const project = await resolveProject(api, context);
+
+    const result = await api
+      .call<FindingPage>(
+        "list_findings",
+        {
+          project_id: project.id,
+          kind,
+          ...window.args,
+          limit: limit(context),
+          cursor: string(context, "cursor"),
+        },
+        "Loading findings",
+      )
+      .catch((error: unknown) => {
+        // A deployment from before findings answers with its MCP SDK's protocol error, which has
+        // no telemetry.dev code.
+        if (error instanceof CliError && /Tool list_findings not found/.test(error.message)) {
+          throw new CliError(
+            `This telemetry.dev deployment doesn't have findings yet. Use ${BIN} traces --errors instead.`,
+            { code: "server_unsupported" },
+          );
+        }
+
+        throw error;
+      });
+
+    const { counts } = result;
+    const total = counts.alerts + counts.checks;
+
+    if (total > 0) process.exitCode = EXIT.findings;
+
+    if (json(context)) return printJson(result);
+
+    const count = (n: number, one: string, many: string) =>
+      `${formatInteger(n)} ${n === 1 ? one : many}`;
+
+    // The server counts 0 for the kind that --kind leaves out, so only the asked kinds show.
+    const byKind = [
+      kind !== "check" &&
+        `${count(counts.alerts, "alert", "alerts")} (${formatInteger(counts.open_alerts)} open)`,
+      kind !== "alert" && count(counts.checks, "failed check", "failed checks"),
+    ].filter((part) => part !== false);
+
+    out(
+      style.dim(
+        [`${count(total, "finding", "findings")} ${windowText(result.window)}`, ...byKind].join(
+          " · ",
+        ),
+      ),
+    );
+
+    if (result.findings.length === 0) {
+      nothing("Nothing found wrong in this window.");
+
+      return noteCapped(context, result.window);
+    }
+
+    const lines = table(
+      [
+        { header: "WHEN" },
+        { header: "KIND" },
+        { header: "STATUS" },
+        { header: "FINDING", flex: true },
+      ],
+      result.findings.map((finding) => [
+        { text: formatTimestamp(finding.at), paint: dim },
+        oneLine(finding.kind),
+        {
+          text: oneLine(finding.status),
+          paint: finding.status === "resolved" ? style.green : style.red,
+        },
+        oneLine(finding.summary ? `${finding.title}: ${finding.summary}` : finding.title),
+      ]),
+    ).split("\n");
+
+    // A link goes on its own line under its finding, outside the columns, so it never takes the
+    // finding's width. Line 0 is the header, so row i is line i + 1.
+    out();
+    out(
+      lines
+        .flatMap((line, index) => {
+          const link = index === 0 ? undefined : dashboardLink(result.findings[index - 1]?.url);
+
+          return link === undefined ? [line] : [line, style.dim(`  ${link}`)];
+        })
+        .join("\n"),
+    );
+
+    noteCapped(context, result.window);
+
+    const check = result.findings.find((finding) => finding.trace_id !== null);
+
+    suggest(
+      context,
+      check?.trace_id
+        ? labelled(
+            "Inspect the newest failed check",
+            suggestion(context, "trace", [check.trace_id]),
+          )
+        : undefined,
+      nextPage(context, result.next_cursor),
+    );
   });
 }
 

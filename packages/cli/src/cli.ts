@@ -4,6 +4,7 @@ import { parseArgs } from "node:util";
 import { VERSION } from "./api.ts";
 import {
   type Context,
+  findingsCommand,
   home,
   jsonText,
   loginCommand,
@@ -233,6 +234,33 @@ const COMMANDS: Readonly<Record<string, Command>> = {
       `${BIN} logs --range 30d --json`,
     ],
     run: logsCommand,
+  },
+  findings: {
+    summary: "List alerts and failed checks; exit 3 when there are any",
+    usage: `${BIN} findings [options]`,
+    options: {
+      since: {
+        ...since,
+        description:
+          "Start of the window, such as the time of a deploy: 30m, 2h, or 7d ago, a date, or a time (default 7d)",
+      },
+      until,
+      kind: {
+        type: "string",
+        value: "alert|check",
+        description: "Only alerts, or only failed checks",
+      },
+      limit,
+      cursor,
+      project,
+      json,
+    },
+    examples: [
+      `${BIN} findings --since 2h`,
+      `${BIN} findings --since 2026-11-06T14:00:00Z   # since a deploy, in CI or an agent's shell`,
+      `${BIN} findings --kind check --json`,
+    ],
+    run: findingsCommand,
   },
   usage: {
     summary: "Summarize requests, errors, latency, tokens, and cost",

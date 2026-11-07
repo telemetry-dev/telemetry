@@ -161,3 +161,27 @@ export type UsageSummary = {
   }[];
   breakdown_limit: number;
 };
+
+export type Finding = {
+  kind: "alert" | "check";
+  id: string;
+  /** When the alert opened or the check failed. */
+  at: string;
+  status: "open" | "resolved" | "failed";
+  resolved_at: string | null;
+  /** The alert rule's kind, or the evaluator's name. */
+  source: string;
+  title: string;
+  summary: string | null;
+  /** The alert's page, or the trace at the span that was checked. */
+  url: string;
+  trace_id: string | null;
+  span_id: string | null;
+};
+
+export type FindingPage = {
+  window: Window;
+  counts: { alerts: number; open_alerts: number; checks: number };
+  findings: Finding[];
+  next_cursor: string | null;
+};

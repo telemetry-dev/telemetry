@@ -5,6 +5,8 @@ export const EXIT = {
   ok: 0,
   failure: 1,
   usage: 2,
+  /** `findings` found at least one finding in its window. */
+  findings: 3,
   auth: 4,
   interrupted: 130,
 } as const;
