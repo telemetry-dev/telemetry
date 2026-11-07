@@ -62,19 +62,30 @@ telemetry sessions --range 7d --errors   # conversations with a failed trace
 telemetry logs --level error
 telemetry usage --range 30d --by user
 telemetry payload <trace-id> <span-id> --field output
+telemetry findings --since 2h            # alerts and failed checks; exits 3 when there are any
 ```
 
 Run `telemetry <command> --help` to see each command's options and examples. Options go after the command: `telemetry traces --json`, not `telemetry --json traces`.
 
-In human output, `telemetry trace` shows a summary above the span tree. It lists up to 5 of the failed spans where failures began, with their path. It also lists up to 5 of the operations that ran more than once, with their wall time, which counts overlapping calls once. In the span tree, each failed span has its id and error under it, for `telemetry payload`. When they list results, `traces` and `sessions` end with a likely next command on stderr. `trace` ends with the `payload` command that reads the full error, when a span where a failure began has an error message and the sign-in can read payloads.
+In human output, `telemetry trace` shows a summary above the span tree. It lists up to 5 of the failed spans where failures began, with their path. It also lists up to 5 of the operations that ran more than once, with their wall time, which counts overlapping calls once. In the span tree, each failed span has its id and error under it, for `telemetry payload`. When they list results, `traces`, `sessions`, and `findings` end with a likely next command on stderr. `trace` ends with the `payload` command that reads the full error, when a span where a failure began has an error message and the sign-in can read payloads.
 
 A command reads its project from `--project <name|id>`. Without that option, it uses `TELEMETRY_DEV_PROJECT`, then the default that you set with `telemetry use`. If the workspace has only one project, the command uses it.
 
 List commands return 20 results by default. Use `--limit` to return from 1 to 50 results. When more results are available, the command prints the same command with `--cursor` for the next page. On Windows, when an option holds text that no quoting keeps as typed, such as `%` or `$`, it prints only the `--cursor` to add. Keep the other options as they are when you pass `--cursor`. Only `--limit` may change between pages.
 
+### Findings
+
+`telemetry findings` lists what telemetry.dev found wrong in the project, newest first: alerts that opened, such as a runaway trace or a tool failure cluster, and failed checks, which are fail scores from an automatic pass/fail evaluator such as an LLM judge. Each finding has a link to its alert page, or to the trace at the span that was checked. Without `--since`, it lists the last 7 days. `--kind alert` or `--kind check` lists one kind.
+
+The command exits with 3 when the window has at least one finding, also with `--json`, and with 0 when it has none. To check a deploy from CI or a coding agent, pass the time of the deploy:
+
+```sh
+telemetry findings --since 2026-11-06T14:00:00Z --json
+```
+
 ### Time windows
 
-`traces`, `sessions`, and `logs` take `--since` and `--until` to choose the time they search:
+`traces`, `sessions`, `logs`, and `findings` take `--since` and `--until` to choose the time they search:
 
 ```sh
 telemetry traces --errors --since 2h
@@ -102,15 +113,15 @@ A duration has up to five digits. The CLI sends a date or a time without a zone 
 
 Add `--json` to any command for machine-readable output on stdout. Messages and progress go to stderr, so `telemetry traces --json > traces.json` writes only data. List commands print the MCP tool's result as returned, with the fields that the [MCP server documentation](https://telemetry.dev/docs/platform/mcp-server) describes.
 
-The results of `traces`, `sessions`, and `logs` include the window that telemetry.dev searched, with both ends resolved to ISO times. `capped_by_retention` is true when the window starts at the start of the project's retention, so older data wasn't searched. That is also the case for `traces` without `--since`, which searches the whole retention:
+The results of `traces`, `sessions`, `logs`, and `findings` include the window that telemetry.dev searched, with both ends resolved to ISO times. `capped_by_retention` is true when the window starts at the start of the project's retention, so older data wasn't searched. That is also the case for `traces` without `--since`, which searches the whole retention:
 
 ```json
 "window": { "since": "2026-10-30T12:00:00.000Z", "until": "2026-10-30T14:00:00.000Z", "capped_by_retention": false }
 ```
 
-`logs` results also have `next_cursor`, which is `null` on the last page, and `range_days` is `null` when the command used `--since` or `--until`.
+`logs` and `findings` results also have `next_cursor`, which is `null` on the last page. In `logs` results, `range_days` is `null` when the command used `--since` or `--until`.
 
-An older telemetry.dev deployment may ignore `--since`, `--until`, the `traces` filters, and `logs --cursor` and return unfiltered results, or the first page of logs again. So when the CLI sends one of them and the result has no `window`, or no `next_cursor` for `logs --cursor`, the command fails with `server_unsupported` and prints no results. A deployment that refuses `--agent` or `--tool` because it doesn't know them also fails with `server_unsupported`; one that refuses another argument fails with `tool_error`.
+An older telemetry.dev deployment may ignore `--since`, `--until`, the `traces` filters, and `logs --cursor` and return unfiltered results, or the first page of logs again. So when the CLI sends one of them and the result has no `window`, or no `next_cursor` for `logs --cursor`, the command fails with `server_unsupported` and prints no results. A deployment that refuses `--agent` or `--tool` because it doesn't know them also fails with `server_unsupported`; one that refuses another argument fails with `tool_error`. `findings` on a deployment from before findings also fails with `server_unsupported`.
 
 `telemetry trace` and `telemetry payload` read every page of a trace or a captured text, up to a limit: 2,000 spans for a trace, and 1,000,000 characters for each payload field. Their JSON output has `complete: false` when the limit cut it short, and human output says so on stderr.
 
@@ -121,6 +132,7 @@ Captured text comes from your users, models, and tools. telemetry.dev removes AN
 | 0         | Success                                                         |
 | 1         | The request failed                                              |
 | 2         | The command or its options were not valid                       |
+| 3         | `findings` found at least one finding in its window             |
 | 4         | You are not signed in, the sign-in expired, or access is denied |
 | 130       | Interrupted with Ctrl-C                                         |
 
@@ -154,7 +166,7 @@ Branch on `code`, not on `message`, whose wording can change. `hint` is a comman
 | `server_error`         | 1    | telemetry.dev failed to complete the request; try again                          |
 | `tool_error`           | 1    | telemetry.dev returned another error; `message` says what it was                 |
 | `result_too_large`     | 1    | The result was too large to read; narrow it with filters or `--limit`            |
-| `server_unsupported`   | 1    | The deployment doesn't support an option used and would have ignored it          |
+| `server_unsupported`   | 1    | The deployment doesn't support the command, or an option it would have ignored   |
 | `request_failed`       | 1    | The request failed for another reason                                            |
 | `failed`               | 1    | The command failed for another reason                                            |
 | `internal`             | 1    | An unexpected error, such as a configuration file the CLI couldn't read or write |

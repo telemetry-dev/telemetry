@@ -26,6 +26,7 @@ import {
   beforeTool,
   calls,
   EMAIL,
+  findings,
   logs,
   PARALLEL_TRACE_ID,
   PAYLOADS,
@@ -92,6 +93,7 @@ beforeEach(async () => {
     windows: true,
     agentAndTool: true,
     empty: false,
+    findings: true,
   });
 
   return () => rm(home, { recursive: true, force: true });
@@ -145,6 +147,12 @@ test("human output never passes terminal escapes from captured text, and --json 
     expect(result.stdout + result.stderr).toContain("eval-runner");
     expect(result.stdout + result.stderr).not.toMatch(CONTROL);
   }
+
+  // Alert summaries quote tool and model names that the application chose.
+  const found = await run("findings");
+  expect(found.code).toBe(3);
+  expect(found.stdout).toContain("lookup_order failed on 40% of calls.");
+  expect(found.stdout).not.toMatch(CONTROL);
 
   const json = await run("traces", "--json");
   expect(json.code).toBe(0);
@@ -1815,4 +1823,56 @@ test("the sign-in lock is taken over at once, without lost writes, when its hold
     expect(await recorded()).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     expect(await readdir(home)).toEqual([sessionFile(fixture.url)]);
   });
+});
+
+test("findings lists what went wrong since a time and exits 3, or 0 when nothing did", async () => {
+  await signIn(PROJECTS[0]);
+
+  const human = await run("findings", "--since", "2026-11-06T14:00:00Z");
+  expect(human.code).toBe(3);
+  expect(human.stdout).toMatch(/^2 findings from .* · 1 alert \(1 open\) · 1 failed check\n/);
+  expect(human.stdout).toContain(
+    "lookup_order fails more often: lookup_order failed on 40% of calls.",
+  );
+  expect(human.stdout).toContain(`/traces/${TRACE_ID}?span=f6`);
+  expect(human.stderr).toContain(`Inspect the newest failed check: telemetry trace ${TRACE_ID}`);
+  expect(calls.at(-1)).toMatchObject({
+    tool: "list_findings",
+    args: { project_id: PROJECTS[0]!.id, since: "2026-11-06T14:00:00Z" },
+  });
+
+  // JSON is the tool's result, and the exit code still says something was found.
+  // The counts of the kind that --kind leaves out are not data, so they don't show.
+  const checks = await run("findings", "--since", "2h", "--kind", "check");
+  expect(checks.stdout).toMatch(/^1 finding from [^·]* · 1 failed check\n/);
+
+  const paged = await run("findings", "--limit", "1");
+  expect(paged.code).toBe(3);
+  expect(paged.stderr).toContain("More: telemetry findings --limit 1 --cursor=page-2");
+
+  const json = await run("findings", "--since", "2h", "--kind", "check", "--json");
+  expect(json.code).toBe(3);
+  expect(JSON.parse(json.stdout)).toMatchObject({
+    findings: findings()
+      .findings.filter((finding) => finding.kind === "check")
+      .map(({ id }) => ({ id })),
+  });
+  expect(calls.at(-1)?.args).toMatchObject({ kind: "check", since: "2h" });
+
+  serverState.empty = true;
+  const quiet = await run("findings", "--since", "2h");
+  expect(quiet).toMatchObject({ code: 0 });
+  expect(quiet.stderr).toContain("Nothing found wrong in this window.");
+
+  const bad = await run("findings", "--kind", "alerts");
+  expect(bad.code).toBe(2);
+});
+
+test("findings against a deployment from before findings says so instead of a raw tool error", async () => {
+  await signIn(PROJECTS[0]);
+  serverState.findings = false;
+
+  const json = await run("findings", "--json");
+  expect(json).toMatchObject({ code: 1, stdout: "" });
+  expect(JSON.parse(json.stderr).error).toMatchObject({ code: "server_unsupported" });
 });
