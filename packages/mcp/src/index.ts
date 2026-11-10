@@ -18,6 +18,11 @@ interface McpTransport {
 }
 
 export interface InstrumentMcpTransportOptions {
+  /**
+   * Record tool call arguments and results, failed results included, on `tools/call` spans.
+   * Defaults to true; the core SDK's captureInput, captureOutput, and mask still apply. Set false
+   * to keep tool payloads out even when the core SDK captures content.
+   */
   capturePayloads?: boolean;
   propagateBaggage?: boolean;
 }
@@ -354,7 +359,8 @@ function finishResponse(
       setFailure(pending, "tool_error");
     }
 
-    if (pending.capturePayloads && pending.method === "tools/call" && result?.isError !== true) {
+    // A failed result's content says what went wrong, so it is kept like a successful one.
+    if (pending.capturePayloads && pending.method === "tools/call") {
       pending.handle.update({ output: message.message.result });
     }
   }
@@ -424,7 +430,7 @@ export function instrumentMcpTransport<T extends McpTransport>(
   const incoming = new Map<JsonRpcId, PendingRequest>();
   const sendingResponses = new Set<PendingRequest>();
   const dispatching = new WeakSet<object>();
-  const capturePayloads = options.capturePayloads === true;
+  const capturePayloads = options.capturePayloads !== false;
   const propagateBaggage = options.propagateBaggage === true;
   let onmessage = target.onmessage;
 

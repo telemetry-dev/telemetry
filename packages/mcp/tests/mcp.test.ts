@@ -35,10 +35,13 @@ interface JsonRecord {
   [key: string]: JsonValue | undefined;
 }
 
-function setup(): InMemorySpanExporter {
+function setup(
+  capture: { captureInput?: boolean; captureOutput?: boolean } = {},
+): InMemorySpanExporter {
   const spans = new InMemorySpanExporter();
   init(
     {
+      ...capture,
       apiKey: "td_live_test",
       serviceName: "mcp-tests",
       environment: "test",
@@ -69,11 +72,11 @@ afterEach(async () => {
   await shutdown();
 });
 
-test("instruments both v2 transport directions with propagation and opt-in payloads", async () => {
+test("instruments both v2 transport directions with propagation and payloads", async () => {
   const spans = setup();
   const [clientRaw, serverRaw] = InMemoryTransport.createLinkedPair();
-  const client = instrumentMcpTransport(clientRaw, { capturePayloads: true });
-  const server = instrumentMcpTransport(serverRaw, { capturePayloads: true });
+  const client = instrumentMcpTransport(clientRaw);
+  const server = instrumentMcpTransport(serverRaw);
   expect(instrumentMcpTransport(client)).toBe(clientRaw);
 
   client.onmessage = () => undefined;
@@ -294,6 +297,57 @@ test.each([
   expect(serverSpan.status.code).toBe(serverFault ? SpanStatusCode.ERROR : SpanStatusCode.UNSET);
 });
 
+test.each([
+  { name: "capturePayloads false", capture: {}, payloads: false, args: false, result: false },
+  {
+    name: "core captureInput false",
+    capture: { captureInput: false },
+    payloads: true,
+    args: false,
+    result: true,
+  },
+  {
+    name: "core captureOutput false",
+    capture: { captureOutput: false },
+    payloads: true,
+    args: true,
+    result: false,
+  },
+])("$name keeps tool payloads out", async ({ capture, payloads, args, result }) => {
+  const spans = setup(capture);
+
+  const [client, server] = InMemoryTransport.createLinkedPair().map((transport) =>
+    instrumentMcpTransport(transport, payloads ? {} : { capturePayloads: false }),
+  );
+
+  client.onmessage = () => undefined;
+  server.onmessage = () => {
+    void server.send({
+      jsonrpc: "2.0",
+      id: 5,
+      result: { content: [{ type: "text", text: "ok" }] },
+    });
+  };
+
+  await client.start();
+  await server.start();
+  await client.send({
+    jsonrpc: "2.0",
+    id: 5,
+    method: "tools/call",
+    params: { name: "weather", arguments: { city: "Paris" } },
+  });
+
+  for (const span of await exported(spans, 2)) {
+    expect(span.attributes["gen_ai.tool.call.arguments"]).toBe(
+      args ? '{"city":"Paris"}' : undefined,
+    );
+    expect(span.attributes["gen_ai.tool.call.result"]).toBe(
+      result ? '{"content":[{"type":"text","text":"ok"}]}' : undefined,
+    );
+  }
+});
+
 test("marks CallToolResult errors and closes pending requests", async () => {
   const spans = setup();
 
@@ -317,6 +371,10 @@ test("marks CallToolResult errors and closes pending requests", async () => {
   const toolSpans = await exported(spans, 2);
   expect(toolSpans.every((span) => span.attributes["error.type"] === "tool_error")).toBe(true);
   expect(toolSpans.every((span) => span.status.code === SpanStatusCode.ERROR)).toBe(true);
+  expect(toolSpans.map((span) => span.attributes["gen_ai.tool.call.result"])).toEqual([
+    '{"content":[{"type":"text","text":"failed"}],"isError":true}',
+    '{"content":[{"type":"text","text":"failed"}],"isError":true}',
+  ]);
 
   await shutdown();
   const closeSpans = setup();
