@@ -153,11 +153,13 @@ def _to_ns(value: TimeInput) -> int | None:
 
 # Error classes that provider SDKs raise for any failed request, whose name says nothing about the
 # cause: openai's and anthropic's APIStatusError (anthropic's for a stream's error event), and
-# google-genai's APIError, ClientError, and ServerError. botocore's ClientError carries its code
-# in `response`. Plain Exception is here for errors that carry a code. The TypeScript SDK keeps
-# the same rule in `errorTypeOf` (packages/otel/src/errors.ts); change both together.
+# google-genai's APIError, ClientError, and ServerError. botocore's ClientError, and its
+# EventStreamError for a Bedrock stream's exception, carry their code in `response`. Plain
+# Exception is here for errors that carry a code, such as the failures that the integrations build
+# from a response body with `code` and `type` attributes. The TypeScript SDK keeps the same rule in
+# `errorTypeOf` (packages/otel/src/errors.ts); change both together.
 _GENERIC_ERROR_NAMES = frozenset(
-    {"Exception", "APIError", "APIStatusError", "ClientError", "ServerError"}
+    {"Exception", "APIError", "APIStatusError", "ClientError", "ServerError", "EventStreamError"}
 )
 
 
@@ -227,10 +229,16 @@ def _error_type(error: BaseException) -> str:
         return code
     if status is not None:
         return str(status)
+    aws_code = _text(_nested(_attribute(error, "response"), "Error", "Code"))
+    if aws_code is not None:
+        # botocore names a Bedrock stream's exception by its event, such as
+        # modelStreamErrorException; the TypeScript SDK records its class,
+        # ModelStreamErrorException.
+        aws_code = aws_code[0].upper() + aws_code[1:]
     return (
         _text(_attribute(error, "type"))
         or _text(_nested(body, "error", "type"))
-        or _text(_nested(_attribute(error, "response"), "Error", "Code"))
+        or aws_code
         or name
     )
 

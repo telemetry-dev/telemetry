@@ -3950,10 +3950,10 @@ def test_responses_failed_event_marks_span_error(
 
     failed_span, error_span = finished_spans(memory)
     assert failed_span.status.status_code is StatusCode.ERROR
-    assert attrs(failed_span)["error.type"] == "RuntimeError"
+    assert attrs(failed_span)["error.type"] == "response.failed"
     assert attrs(failed_span)["gen_ai.response.status"] == "failed"
     assert error_span.status.status_code is StatusCode.ERROR
-    assert attrs(error_span)["error.type"] == "RuntimeError"
+    assert attrs(error_span)["error.type"] == "transport_error"
     exception = next(event for event in error_span.events if event.name == "exception")
     assert exception.attributes is not None
     assert exception.attributes["exception.message"] == "stream disconnected (transport_error)"

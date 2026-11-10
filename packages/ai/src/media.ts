@@ -158,6 +158,7 @@ function wrapMedia<F extends Callable>(
       if (failed) {
         attempt(() => {
           const failure = failureRecord(config, error, "Media generation failed");
+          attempt(() => span.setAttribute("error.type", failure.errorType));
           attempt(() => span.setStatus({ code: SpanStatusCode.ERROR, message: failure.message }));
           attempt(() => span.recordException(failure.exception));
         });

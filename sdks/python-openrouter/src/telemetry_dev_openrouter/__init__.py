@@ -303,44 +303,56 @@ def _responses_usage(raw: Any) -> dict[str, int | float] | None:
     )
 
 
-def _response_failed_error(response: Any) -> RuntimeError:
+def _failure_code(value: Any) -> str | int | None:
+    # OpenRouter's numeric codes are HTTP statuses, which the core SDK records as one.
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return value if isinstance(value, str) else None
+
+
+def _provider_failure(message: str, code: str | int | None, kind: str | None) -> Exception:
+    # A failure that OpenRouter reports in a response body or a stream event, not as an HTTP
+    # error. The core SDK records its `code` in error.type (a number counts as an HTTP status, such
+    # as 429), else its `type`, because a plain Exception names no cause; see _error_type in
+    # telemetry_dev/_spans.py.
+    error = Exception(message)
+    vars(error).update(code=code, type=kind)
+    return error
+
+
+def _response_failed_error(response: Any) -> Exception:
     error = _field(response, "error")
     if error is None:
-        return RuntimeError("response.failed")
-    code = _error_code(_field(error, "code"))
+        return _provider_failure("response.failed", None, "response.failed")
+    raw_code = _field(error, "code")
+    code = _error_code(raw_code)
     message = _string(_field(error, "message"))
-    if code and message:
-        return RuntimeError(f"response.failed: {code}: {message}")
-    if code:
-        return RuntimeError(f"response.failed: {code}")
-    if message:
-        return RuntimeError(f"response.failed: {message}")
-    return RuntimeError("response.failed")
+    text = ": ".join(part for part in ("response.failed", code, message) if part)
+    return _provider_failure(text, _failure_code(raw_code), "response.failed")
 
 
-def _response_stream_error(event: Any) -> RuntimeError:
-    code = _error_code(_field(event, "code"))
+def _response_stream_error(event: Any) -> Exception:
+    raw_code = _field(event, "code")
+    code = _error_code(raw_code)
     message = _string(_field(event, "message"))
-    if code and message:
-        return RuntimeError(f"response.error: {code}: {message}")
-    if code:
-        return RuntimeError(f"response.error: {code}")
-    if message:
-        return RuntimeError(f"response.error: {message}")
-    return RuntimeError("response.error")
+    text = ": ".join(part for part in ("response.error", code, message) if part)
+    return _provider_failure(text, _failure_code(raw_code), "response.error")
 
 
-def _chunk_error(chunk: Any) -> RuntimeError | None:
+def _chunk_error(chunk: Any) -> Exception | None:
     error = _field(chunk, "error")
     if error is None:
         return None
-    code = _error_code(_field(error, "code"))
+    raw_code = _field(error, "code")
+    code = _error_code(raw_code)
     message = _string(_field(error, "message"))
     if code and message:
-        return RuntimeError(f"stream error {code}: {message}")
-    if message:
-        return RuntimeError(f"stream error: {message}")
-    return RuntimeError(f"stream error {code}" if code else "stream error")
+        text = f"stream error {code}: {message}"
+    elif message:
+        text = f"stream error: {message}"
+    else:
+        text = f"stream error {code}" if code else "stream error"
+    return _provider_failure(text, _failure_code(raw_code), "stream error")
 
 
 def _responses_response(

@@ -903,8 +903,43 @@ function mediaResponseFields(response: unknown, outputType: "image" | "video"): 
     responseId: readString(record.responseId) ?? operationName,
     output: uris.length > 0 ? uris.map((uri) => ({ type: outputType, uri })) : undefined,
     attributes,
-    error: record.error,
+    error: operationError(record.error),
   };
+}
+
+// google.rpc.Code names by number. The error of a long-running operation is a google.rpc.Status,
+// which carries only the number, such as 8 for RESOURCE_EXHAUSTED.
+const RPC_CODE_NAMES = [
+  "OK",
+  "CANCELLED",
+  "UNKNOWN",
+  "INVALID_ARGUMENT",
+  "DEADLINE_EXCEEDED",
+  "NOT_FOUND",
+  "ALREADY_EXISTS",
+  "PERMISSION_DENIED",
+  "RESOURCE_EXHAUSTED",
+  "FAILED_PRECONDITION",
+  "ABORTED",
+  "OUT_OF_RANGE",
+  "UNIMPLEMENTED",
+  "INTERNAL",
+  "UNAVAILABLE",
+  "DATA_LOSS",
+  "UNAUTHENTICATED",
+];
+
+// errorTypeOf records the code name in error.type, else "operation.failed".
+function operationError(value: unknown): Error | undefined {
+  if (value === undefined || value === null) return undefined;
+
+  const status = asRecord(value);
+  const code = readNumber(status?.code);
+
+  return Object.assign(new Error(readString(status?.message) ?? "video operation failed"), {
+    code: code === undefined ? undefined : RPC_CODE_NAMES[code],
+    type: "operation.failed",
+  });
 }
 
 function imageResponseFields(response: unknown): SpanFields {

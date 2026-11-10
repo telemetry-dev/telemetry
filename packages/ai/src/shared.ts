@@ -1,5 +1,5 @@
 import type { Exception } from "@opentelemetry/api";
-import { jsonAttr } from "@telemetry-dev/otel";
+import { errorTypeOf, jsonAttr } from "@telemetry-dev/otel";
 
 import type { ResolvedConfig, TelemetryDevOptions } from "./config.ts";
 
@@ -59,15 +59,18 @@ export function contentAttr(
 }
 
 /**
- * What a failed wrapper call records as its span status message and exception. Without a mask
- * that is the error itself; with one it is the masked message, or `fallback` when the mask omits
- * it or throws, and no stack trace, which repeats the message.
+ * What a failed wrapper call records as its span's `error.type`, status message, and exception.
+ * `errorType` follows errorTypeOf and is also the exception's type. Without a mask the message is
+ * the error itself; with one it is the masked message, or `fallback` when the mask omits it or
+ * throws, and no stack trace, which repeats the message.
  */
 export function failureRecord(
   config: Pick<ResolvedConfig, "mask" | "onError">,
   error: unknown,
   fallback: string,
-): { message: string; exception: Exception } {
+): { errorType: string; message: string; exception: Exception } {
+  const errorType = errorTypeOf(error);
+
   if (!config.mask) {
     let message = fallback;
 
@@ -77,19 +80,23 @@ export function failureRecord(
       // An error whose string conversion throws is still recorded, with the fallback text.
     }
 
-    return { message, exception: error instanceof Error ? error : message };
+    let exception: Exception = message;
+
+    try {
+      if (error instanceof Error) {
+        exception = { name: errorType, message: error.message, stack: error.stack };
+      }
+    } catch {
+      // A throwing message or stack getter leaves the status message as the exception.
+    }
+
+    return { errorType, message, exception };
   }
 
-  let name: string | undefined;
   let detail: string | undefined;
 
   try {
-    if (error instanceof Error) {
-      name = typeof error.name === "string" && error.name.length > 0 ? error.name : undefined;
-      detail = error.message;
-    } else {
-      detail = unknownErrorMessage(error);
-    }
+    detail = error instanceof Error ? error.message : unknownErrorMessage(error);
   } catch {
     detail = undefined;
   }
@@ -97,7 +104,7 @@ export function failureRecord(
   const message =
     (detail ? contentAttr(config, "exception.message", detail) : undefined) || fallback;
 
-  return { message, exception: { name: name ?? "Error", message } };
+  return { errorType, message, exception: { name: errorType, message } };
 }
 
 /** Reports to onError without throwing, including for thrown values String() cannot convert. */

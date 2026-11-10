@@ -58,11 +58,20 @@ repository, not this SDK workspace. Paths below refer to that product repository
 apply the same way. An error with an HTTP status (400–599) and a code that is not only digits records the code,
 such as openai's `insufficient_quota` on a `RateLimitError`. A generic provider error class
 (TypeScript `Error`, `APIError`, `ApiError`, `AI_APICallError`, `AI_StreamProviderError`; Python
-`Exception`, `APIError`, `APIStatusError`, `ClientError`, `ServerError`) records its code, else its
-HTTP status as a string (`429`), else the provider's error type (`overloaded_error` from an
-Anthropic stream; Python also reads botocore's `response.Error.Code`). TypeScript records the AI
-SDK's `AI_RetryError` as its last error. A thrown value that is not an Error keeps the fallback it
-had before: `Error` in the core SDKs, `tool_error` or `error` in the AI SDK integration.
+`Exception`, `APIError`, `APIStatusError`, `ClientError`, `ServerError`, `EventStreamError`) records
+its code, else its HTTP status as a string (`429`), else the provider's error type
+(`overloaded_error` from an Anthropic stream; Python also reads botocore's `response.Error.Code`,
+with its first letter in upper case, so a Bedrock stream's `modelStreamErrorException` records
+`ModelStreamErrorException` as in TypeScript). TypeScript records the AI SDK's `AI_RetryError` as
+its last error. A thrown value that is not an Error keeps the fallback it had before: `Error` in the
+core SDKs, `tool_error` or `error` in the AI SDK integration.
+
+A failure that a provider reports in a response body or a stream event, not as an HTTP error, is
+recorded with the same rule: the integrations build it as a plain `Error` (TypeScript) or
+`Exception` (Python) with the provider's `code` and a `type` that names the failure. Thus a
+`response.failed` with `rate_limit_exceeded` records `rate_limit_exceeded`, one without a code
+records `response.failed`, an OpenRouter numeric code records it as an HTTP status (`502`), and a
+failed Google video operation records the `google.rpc.Code` name of its status (`RESOURCE_EXHAUSTED`).
 
 `SpanHandle.serializeContent(value, key)` / `SpanHandle.serialize_content(value, key)` returns
 what `input` / `output` would emit for `value` under `key`: mask → JSON stringify → truncate. It

@@ -670,6 +670,8 @@ def test_generate_videos_terminal_operation_error_ends_span(
     span = only_span(memory)
     assert span.status.status_code is StatusCode.ERROR
     assert attrs(span)["google_genai.response.operation_done"] is True
+    assert attrs(span)["error.type"] == "INTERNAL"
+    assert dict(span.events[0].attributes or {})["exception.message"] == "generation failed"
 
 
 SUPPORT_PROMPT = telemetry_dev.ChatPrompt(

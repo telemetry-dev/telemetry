@@ -1550,34 +1550,22 @@ def _response_event_has_output(event: Any) -> bool:
     return isinstance(delta, str) and bool(delta)
 
 
-def _response_failed_error(response: Any) -> RuntimeError:
+def _response_failed_error(response: Any) -> Exception:
     error = _field(response, "error")
-    if error is None:
-        return RuntimeError("response.failed")
-    code = _string(_field(error, "code"))
-    message = _string(_field(error, "message"))
-    if code and message:
-        return RuntimeError(f"response.failed: {code}: {message}")
-    if code:
-        return RuntimeError(f"response.failed: {code}")
-    if message:
-        return RuntimeError(f"response.failed: {message}")
-    return RuntimeError("response.failed")
+    code = _string(_field(error, "code")) if error is not None else None
+    message = _string(_field(error, "message")) if error is not None else None
+    text = ": ".join(part for part in ("response.failed", code, message) if part)
+    return _provider_failure(text, code, "response.failed")
 
 
-def _response_stream_error(event: Any) -> RuntimeError:
+def _response_stream_error(event: Any) -> Exception:
     code = _string(_field(event, "code"))
     message = _string(_field(event, "message"))
-    if code and message:
-        return RuntimeError(f"response.error: {code}: {message}")
-    if code:
-        return RuntimeError(f"response.error: {code}")
-    if message:
-        return RuntimeError(f"response.error: {message}")
-    return RuntimeError("response.error")
+    text = ": ".join(part for part in ("response.error", code, message) if part)
+    return _provider_failure(text, code, "response.error")
 
 
-def _responses_event_failure(event: Any) -> RuntimeError | None:
+def _responses_event_failure(event: Any) -> Exception | None:
     try:
         event_type = _field(event, "type")
     except Exception:
@@ -1586,13 +1574,23 @@ def _responses_event_failure(event: Any) -> RuntimeError | None:
         try:
             return _response_failed_error(_field(event, "response"))
         except Exception:
-            return RuntimeError("response.failed")
+            return _provider_failure("response.failed", None, "response.failed")
     if event_type == "error":
         try:
             return _response_stream_error(event)
         except Exception:
-            return RuntimeError("response.error")
+            return _provider_failure("response.error", None, "response.error")
     return None
+
+
+def _provider_failure(message: str, code: str | int | None, kind: str | None) -> Exception:
+    # A failure that the provider reports in a response body or a stream event, not as an HTTP
+    # error. The core SDK records its `code` in error.type (a number counts as an HTTP status, such
+    # as 429), else its `type`, because a plain Exception names no cause; see _error_type in
+    # telemetry_dev/_spans.py.
+    error = Exception(message)
+    vars(error).update(code=code, type=kind)
+    return error
 
 
 def _hook_response_close(inner: Any, finish: Callable[[], None]) -> None:
@@ -2433,7 +2431,7 @@ def _media_stream_error(event: Any, event_type: str) -> BaseException | None:
         or f"OpenAI media stream ended with {event_type}"
     )
     code = _string(_field(raw_error, "code")) or _string(_field(event, "code"))
-    return RuntimeError(f"{code}: {message}" if code else message)
+    return _provider_failure(f"{code}: {message}" if code else message, code, event_type)
 
 
 def _media_event_failure(event: Any) -> BaseException | None:
@@ -2447,7 +2445,9 @@ def _media_event_failure(event: Any) -> BaseException | None:
         return _media_stream_error(event, event_type)
     except Exception:
         if event_type.endswith(".failed"):
-            return RuntimeError(f"OpenAI media stream ended with {event_type}")
+            return _provider_failure(
+                f"OpenAI media stream ended with {event_type}", None, event_type
+            )
         return None
 
 

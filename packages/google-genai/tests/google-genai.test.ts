@@ -3452,6 +3452,28 @@ test("generateVideos traces submit and tracked polling idempotently", async () =
   expect(exported.every((span) => span.attributes["gen_ai.output.type"] === "video")).toBe(true);
 });
 
+test("a failed video operation records its google.rpc code name as error.type", async () => {
+  const spans = setupSpans();
+  const operation = { name: "operations/video-quota", done: false };
+  const client = {
+    models: { generateVideos: (_params: unknown) => Promise.resolve(operation) },
+    operations: {
+      get: (_params: unknown) =>
+        Promise.resolve({ name: operation.name, done: true, error: { code: 8, message: "quota" } }),
+    },
+  };
+
+  wrapGoogleGenAI(client);
+  const submitted = await client.models.generateVideos({ model: "veo", prompt: "ocean" });
+  await client.operations.get({ operation: submitted });
+
+  const span = (await finishedSpans(spans, 2))[1]!;
+  const exception = span.events.find((event) => event.name === "exception");
+  expect(span.status.code).toBe(SPAN_STATUS_ERROR);
+  expect(span.attributes["error.type"]).toBe("RESOURCE_EXHAUSTED");
+  expect(exception?.attributes?.["exception.message"]).toBe("quota");
+});
+
 test("video operation tracking is identity-only and client-local", async () => {
   const spans = setupSpans();
   const operationName = "operations/shared";

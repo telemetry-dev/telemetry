@@ -1072,7 +1072,7 @@ test("chat stream chunk errors end one error span with partial output", async ()
   await reader.cancel();
   expect(spans.getFinishedSpans()).toHaveLength(1);
   expect(span.status.code).toBe(SPAN_STATUS_ERROR);
-  expect(span.attributes["error.type"]).toBe("Error");
+  expect(span.attributes["error.type"]).toBe("502");
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([
     { role: "assistant", content: "Partial" },
   ]);
@@ -2673,7 +2673,7 @@ test("non-streaming failed Responses record a useful error", async () => {
 
   const span = await exportedSpan(spans);
   expect(span.status.code).toBe(SPAN_STATUS_ERROR);
-  expect(span.attributes["error.type"]).toBe("Error");
+  expect(span.attributes["error.type"]).toBe("server_error");
   expect(span.events[0]?.attributes?.["exception.message"]).toContain(
     "response.failed: server_error: provider failed",
   );
@@ -2706,6 +2706,7 @@ test("failed Responses stream events keep numeric provider error codes", async (
 
   const span = await exportedSpan(spans);
   expect(span.status.code).toBe(SPAN_STATUS_ERROR);
+  expect(span.attributes["error.type"]).toBe("502");
   expect(span.events[0]?.attributes?.["exception.message"]).toBe(
     "response.failed: 502: provider failed",
   );

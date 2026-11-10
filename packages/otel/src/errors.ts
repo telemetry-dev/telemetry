@@ -1,7 +1,9 @@
 // Error classes that provider SDKs throw for any failed request, whose name says nothing about the
 // cause: openai's and Anthropic's APIError (a stream's error event), @google/genai's ApiError, and
 // the AI SDK's APICallError and StreamProviderError. Plain Error is here for errors that carry a
-// code. The Python SDK keeps the same rule in `_error_type`; change both together.
+// code, such as the failures that the integrations build from a response body with `code`,
+// `status`, and `type` fields. The Python SDK keeps the same rule in `_error_type`; change both
+// together.
 const GENERIC_ERROR_NAMES = new Set([
   "Error",
   "APIError",

@@ -1252,7 +1252,7 @@ async def test_failed_media_stream_events_record_errors(
     assert received == ["image_generation.failed"]
     span = only_span(memory)
     assert span.status.status_code == StatusCode.ERROR
-    assert attrs(span)["error.type"] == "RuntimeError"
+    assert attrs(span)["error.type"] == "provider_error"
     assert dict(span.events[0].attributes or {})["exception.message"] == (
         "provider_error: provider failed"
     )
@@ -4798,7 +4798,7 @@ def test_responses_create_failed_body_records_error_span(memory: SimpleNamespace
     span = only_span(memory)
     assert span.status.status_code == StatusCode.ERROR
     a = attrs(span)
-    assert a["error.type"] == "RuntimeError"
+    assert a["error.type"] == "server_error"
     assert a["gen_ai.response.id"] == "resp_failed"
     events = list(span.events)
     assert len(events) == 1
@@ -5125,7 +5125,7 @@ async def test_async_responses_stream_completed_and_failed_events(memory: Simple
     assert completed_attrs["gen_ai.usage.output_tokens"] == 4
     assert completed_attrs["gen_ai.usage.total_tokens"] == 17
     assert failed_span.status.status_code == StatusCode.ERROR
-    assert attrs(failed_span)["error.type"] == "RuntimeError"
+    assert attrs(failed_span)["error.type"] == "server_error"
 
 
 @pytest.mark.parametrize("async_mode", [False, True])

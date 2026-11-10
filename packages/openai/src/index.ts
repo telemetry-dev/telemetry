@@ -331,12 +331,27 @@ function responsesResponse<T>(
   return fields;
 }
 
+// A failure that OpenAI reports in a response body or a stream event, not as an HTTP error. It
+// carries the provider's code, and its kind for when there is no code, so that errorTypeOf records
+// the cause in error.type instead of "Error".
+function providerFailure(
+  message: string,
+  code: string | undefined,
+  kind: string | undefined,
+): Error {
+  return Object.assign(new Error(message), { code, type: kind });
+}
+
 function responseFailedError<T>(response: T): Error {
   const error = asRecord(asRecord(response)?.error);
   const code = readString(error?.code);
   const message = readString(error?.message);
 
-  return new Error(["response.failed", code, message].filter(Boolean).join(": "));
+  return providerFailure(
+    ["response.failed", code, message].filter(Boolean).join(": "),
+    code,
+    "response.failed",
+  );
 }
 
 function responseStreamError<T>(event: T): Error {
@@ -344,7 +359,11 @@ function responseStreamError<T>(event: T): Error {
   const code = readString(e?.code);
   const message = readString(e?.message);
 
-  return new Error(["response.error", code, message].filter(Boolean).join(": "));
+  return providerFailure(
+    ["response.error", code, message].filter(Boolean).join(": "),
+    code,
+    "response.error",
+  );
 }
 
 function responsesEventFailure<T>(event: T): Error | undefined {
@@ -363,7 +382,9 @@ function responsesEventFailure<T>(event: T): Error | undefined {
       ? responseFailedError(asRecord(event)?.response)
       : responseStreamError(event);
   } catch {
-    return new Error(type === "response.failed" ? "response.failed" : "response.error");
+    const kind = type === "response.failed" ? "response.failed" : "response.error";
+
+    return providerFailure(kind, undefined, kind);
   }
 }
 
@@ -492,7 +513,11 @@ function videoResponse<T>(response: T): SpanFields {
     finishReason: status,
     error:
       status === "failed"
-        ? asError(readString(asRecord(r.error)?.message) ?? "video failed")
+        ? providerFailure(
+            readString(asRecord(r.error)?.message) ?? "video failed",
+            readString(asRecord(r.error)?.code),
+            "video.failed",
+          )
         : undefined,
     output: {
       status,
@@ -1991,6 +2016,20 @@ function createObservedMediaStream(
                 e.type === "image_edit.completed" ||
                 e.type === "image_edit.failed"));
 
+          if (
+            operation === "images" &&
+            (e.type === "image_generation.failed" || e.type === "image_edit.failed")
+          ) {
+            const failure = asRecord(e.error);
+            const code = readString(failure?.code) ?? readString(e.code);
+            const message =
+              readString(failure?.message) ??
+              readString(e.message) ??
+              `OpenAI media stream ended with ${e.type}`;
+
+            error = providerFailure(code ? `${code}: ${message}` : message, code, e.type);
+          }
+
           if (operation === "transcriptions" && e.type === "transcript.text.delta") {
             sawTranscriptDelta = true;
           }
@@ -2944,8 +2983,10 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
 
       if (trace) {
         finishTrace(trace, {
-          error: asError(
+          error: providerFailure(
             [readString(error?.code), readString(error?.message)].filter(Boolean).join(": "),
+            readString(error?.code),
+            readString(error?.type),
           ),
         });
       }
@@ -3028,9 +3069,11 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
               : undefined,
             error:
               status === "failed"
-                ? asError(
+                ? providerFailure(
                     readString(asRecord(statusDetails?.error)?.message) ??
                       "Realtime response failed",
+                    readString(asRecord(statusDetails?.error)?.code),
+                    readString(asRecord(statusDetails?.error)?.type) ?? "response.failed",
                   )
                 : undefined,
           },
