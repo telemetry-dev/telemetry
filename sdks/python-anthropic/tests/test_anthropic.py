@@ -1727,7 +1727,13 @@ def provider_clients(
     monkeypatch: pytest.MonkeyPatch, handler: AsyncHandler, sync_handler: SyncHandler
 ) -> dict[str, tuple[Any, Any]]:
     # Bedrock signs requests with botocore; the resource classes under test do not need it.
-    monkeypatch.setattr("anthropic.lib.bedrock._auth.get_auth_headers", no_bedrock_signing)
+    # anthropic 2.7 and later import the signer into the client module when it loads; earlier
+    # versions import it from anthropic.lib.bedrock._auth on each request.
+    bedrock_client = importlib.import_module("anthropic.lib.bedrock._client")
+    if hasattr(bedrock_client, "get_auth_headers"):
+        monkeypatch.setattr(bedrock_client, "get_auth_headers", no_bedrock_signing)
+    else:
+        monkeypatch.setattr("anthropic.lib.bedrock._auth.get_auth_headers", no_bedrock_signing)
 
     def sync_http() -> httpx.Client:
         return httpx.Client(transport=httpx.MockTransport(sync_handler))
