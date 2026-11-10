@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.7](https://github.com/telemetry-dev/telemetry/compare/omp-v0.2.6...omp-v0.2.7) (2026-11-10)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/sdk bumped to 0.2.7
+
 ## [0.2.6](https://github.com/telemetry-dev/telemetry/compare/omp-v0.2.5...omp-v0.2.6) (2026-11-07)
 
 

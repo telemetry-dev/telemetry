@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/telemetry-dev/telemetry/compare/otel-v0.2.3...otel-v0.2.4) (2026-11-10)
+
+
+### Features
+
+* **sdk:** record the provider's error code in error.type ([#220](https://github.com/telemetry-dev/telemetry/issues/220)) ([853e4aa](https://github.com/telemetry-dev/telemetry/commit/853e4aad909609dafb6c9f7defc6aa869cf26ba1))
+
 ## [0.2.3](https://github.com/telemetry-dev/telemetry/compare/otel-v0.2.2...otel-v0.2.3) (2026-11-05)
 
 

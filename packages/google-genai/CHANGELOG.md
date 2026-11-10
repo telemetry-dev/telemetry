@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.7](https://github.com/telemetry-dev/telemetry/compare/google-genai-v0.2.6...google-genai-v0.2.7) (2026-11-10)
+
+
+### Features
+
+* **sdk:** record the provider's error code in error.type ([#220](https://github.com/telemetry-dev/telemetry/issues/220)) ([853e4aa](https://github.com/telemetry-dev/telemetry/commit/853e4aad909609dafb6c9f7defc6aa869cf26ba1))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.2.7
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.2.7
+
 ## [0.2.6](https://github.com/telemetry-dev/telemetry/compare/google-genai-v0.2.5...google-genai-v0.2.6) (2026-11-07)
 
 
