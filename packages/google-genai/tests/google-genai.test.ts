@@ -2948,7 +2948,8 @@ test("API error 400 rethrows ApiError and records error span", async () => {
   ).rejects.toMatchObject({ name: "ApiError", status: 400 });
   const span = await exportedSpan(spans);
   expect(span.status.code).toBe(SPAN_STATUS_ERROR);
-  expect(span.attributes["error.type"]).toBe("ApiError");
+  // ApiError names no cause, so the HTTP status stands in for it.
+  expect(span.attributes["error.type"]).toBe("400");
 });
 
 test("non-Error unary failures end spans and preserve the thrown values", async () => {

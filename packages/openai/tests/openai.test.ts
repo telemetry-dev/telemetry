@@ -477,6 +477,37 @@ test("wrapped chat completion APIPromise keeps parse helper and promise identity
   ]);
 });
 
+test.each([
+  // A RateLimitError whose code says the account is out of quota, not rate limited.
+  { status: 429, code: "insufficient_quota", expected: "insufficient_quota" },
+  { status: 400, code: "context_length_exceeded", expected: "context_length_exceeded" },
+  // Without a code, the class name is specific enough (Python parity: type(e).__name__).
+  { status: 500, code: null, expected: "InternalServerError" },
+  // A numeric code, such as Z.ai's 1302 rate limit, names less than the class.
+  { status: 429, code: "1302", expected: "RateLimitError" },
+])(
+  "a $status error with code $code records error.type $expected",
+  async ({ status, code, expected }) => {
+    const spans = setupSpans();
+    const body = { error: { message: "failed", type: "error", code } };
+    const fake = createFakeFetch(
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    await expect(
+      clientWith(fake.fetch).chat.completions.create({
+        model: "gpt-x",
+        messages: [{ role: "user", content: "Fail" }],
+      }),
+    ).rejects.toMatchObject({ status });
+
+    expect((await exportedSpan(spans)).attributes["error.type"]).toBe(expected);
+  },
+);
+
 test("chat completions record one error span when the OpenAI API returns 4xx", async () => {
   const spans = setupSpans();
   const fake = createFakeFetch(jsonErrorResponse(400, "bad model"));
@@ -492,11 +523,10 @@ test("chat completions record one error span when the OpenAI API returns 4xx", a
   expect(span.status.code).toBe(SPAN_STATUS_ERROR);
   expect(span.attributes["gen_ai.operation.name"]).toBe("chat");
   expect(span.attributes["gen_ai.request.model"]).toBe("gpt-bad");
-  // The SDK falls back to the constructor name when err.name is the generic "Error"
-  // (openai's APIError subclasses never override name) — Python parity: type(e).__name__.
-  expect(span.attributes["error.type"]).toBe("BadRequestError");
+  // The error code from the response body names the failure.
+  expect(span.attributes["error.type"]).toBe("bad_request");
   const exception = span.events.find((event) => event.name === "exception");
-  expect(exception?.attributes?.["exception.type"]).toBe("BadRequestError");
+  expect(exception?.attributes?.["exception.type"]).toBe("bad_request");
   expect(exception?.attributes?.["exception.message"]).toContain("bad model");
   expect(exception?.attributes?.["log.severity_number"]).toBe(17);
 });

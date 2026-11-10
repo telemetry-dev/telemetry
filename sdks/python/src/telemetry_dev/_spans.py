@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextvars import Token
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict, cast
 from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from opentelemetry import context as otel_context
@@ -151,10 +151,94 @@ def _to_ns(value: TimeInput) -> int | None:
     return int(value)
 
 
+# Error classes that provider SDKs raise for any failed request, whose name says nothing about the
+# cause: openai's and anthropic's APIStatusError (anthropic's for a stream's error event), and
+# google-genai's APIError, ClientError, and ServerError. botocore's ClientError carries its code
+# in `response`. Plain Exception is here for errors that carry a code. The TypeScript SDK keeps
+# the same rule in `errorTypeOf` (packages/otel/src/errors.ts); change both together.
+_GENERIC_ERROR_NAMES = frozenset(
+    {"Exception", "APIError", "APIStatusError", "ClientError", "ServerError"}
+)
+
+
+def _text(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _error_code(value: object) -> str | None:
+    # Some providers send numeric codes, such as Z.ai's "1302" for a rate limit, and openai's SDK
+    # turns OpenRouter's numeric code into a string. A number names no cause the way a class does.
+    code = _text(value)
+    return None if code is None or code.isdigit() else code
+
+
+def _http_status(value: object) -> int | None:
+    return (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and 400 <= value <= 599
+        else None
+    )
+
+
+def _nested(value: object, *keys: str) -> object:
+    for key in keys:
+        if not isinstance(value, Mapping):
+            return None
+        value = cast("Mapping[str, object]", value).get(key)
+    return value
+
+
+def _attribute(error: BaseException, name: str) -> object:
+    # A property of a third-party exception can raise anything; recording the error must not.
+    try:
+        return getattr(error, name, None)
+    except Exception:
+        return None
+
+
+def _error_type(error: BaseException) -> str:
+    """The error.type of a failure: the provider's error code when the error carries one.
+
+    - An error with an HTTP status and a code that is not only digits (openai's
+      `insufficient_quota`, `context_length_exceeded`) gives the code.
+    - A generic provider error class gives its code, else its HTTP status (`429`), else the
+      provider's error type (anthropic's `overloaded_error` from a stream).
+    - Any other error gives its class name.
+    """
+    name = type(error).__name__
+    body = _attribute(error, "body")
+    code = _error_code(_attribute(error, "code")) or _error_code(_nested(body, "error", "code"))
+    status = next(
+        (
+            status
+            for status in (
+                _http_status(_attribute(error, attribute))
+                for attribute in ("status_code", "code", "status")
+            )
+            if status is not None
+        ),
+        None,
+    )
+    if code is not None and status is not None:
+        return code
+    if name not in _GENERIC_ERROR_NAMES:
+        return name
+    if code is not None:
+        return code
+    if status is not None:
+        return str(status)
+    return (
+        _text(_attribute(error, "type"))
+        or _text(_nested(body, "error", "type"))
+        or _text(_nested(_attribute(error, "response"), "Error", "Code"))
+        or name
+    )
+
+
 def _record_error_on_span(
     client: Client, span: Span, state: _SpanState, error: BaseException
 ) -> None:
-    error_type = type(error).__name__
+    error_type = _error_type(error)
     span.set_attribute(ATTR_ERROR_TYPE, error_type)
     span.set_status(Status(StatusCode.ERROR))
     attributes: dict[str, otel_types.AttributeValue] = {

@@ -1,3 +1,5 @@
+import { errorTypeOf } from "@telemetry-dev/otel";
+
 export function errorDetails(error: unknown, fallbackType = "Error") {
   const details = { type: fallbackType, message: "Unknown error" };
 
@@ -7,7 +9,8 @@ export function errorDetails(error: unknown, fallbackType = "Error") {
     if (error !== null && typeof error === "object") {
       const { name, message } = error as { name?: unknown; message?: unknown };
 
-      if (typeof name === "string" && name.length > 0) details.type = name;
+      if (error instanceof Error) details.type = errorTypeOf(error, fallbackType);
+      else if (typeof name === "string" && name.length > 0) details.type = name;
 
       if (typeof message === "string") details.message = message;
     }

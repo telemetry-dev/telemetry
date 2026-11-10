@@ -10,6 +10,7 @@ import {
 } from "@opentelemetry/api";
 import {
   createGenerationEmitter,
+  errorTypeOf,
   type GenerationEmitter,
   type GenerationEmitterOverrides,
   jsonAttr,
@@ -557,7 +558,7 @@ function createV7Hooks(
     fallback = "Tool execution failed",
   ): ProviderToolFailure => {
     try {
-      if (value instanceof Error && value.name.length > 0) errorType = value.name;
+      errorType = errorTypeOf(value, errorType);
     } catch {
       return { errorType, message: fallback };
     }

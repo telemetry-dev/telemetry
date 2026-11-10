@@ -2341,9 +2341,9 @@ def test_async_stream_early_break_closes_inner_iterator(memory: SimpleNamespace)
 
 @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
 def test_api_error_records_error_and_reraises(memory: SimpleNamespace, async_mode: bool) -> None:
-    error = errors.APIError(
-        400,
-        {"error": {"message": "bad", "status": "INVALID_ARGUMENT", "code": 400}},
+    error = errors.ClientError(
+        429,
+        {"error": {"message": "slow down", "status": "RESOURCE_EXHAUSTED", "code": 429}},
     )
     client, _transport = client_with_transport([error])
     wrapped = wrap_google_genai(client)
@@ -2361,6 +2361,8 @@ def test_api_error_records_error_and_reraises(memory: SimpleNamespace, async_mod
 
     span = only_span(memory)
     assert span.status.status_code == StatusCode.ERROR
+    # ClientError names no cause, so the HTTP status stands in for it.
+    assert attrs(span)["error.type"] == "429"
 
 
 @pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])

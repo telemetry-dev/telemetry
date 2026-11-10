@@ -10,6 +10,7 @@ import {
 } from "@opentelemetry/api";
 import {
   createGenerationEmitter,
+  errorTypeOf,
   type GenerationEmitter,
   type GenerationEmitterOverrides,
   jsonAttr,
@@ -443,7 +444,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
               e.error instanceof Error ? e.error.message : unknownErrorMessage(e.error),
             ) ?? "Tool execution failed";
 
-          const errorType = e.error instanceof Error ? e.error.name : "tool_error";
+          const errorType = errorTypeOf(e.error, "tool_error");
           span.setStatus({ code: SpanStatusCode.ERROR });
           span.setAttribute("error.type", errorType);
           span.addEvent("exception", {

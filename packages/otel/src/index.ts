@@ -33,6 +33,8 @@ export {
 
 export { diag, reportError, setLogLevel } from "./debug.ts";
 
+export { errorTypeOf } from "./errors.ts";
+
 export {
   createGenerationEmitter,
   type GenerationEmitter,

@@ -17,6 +17,7 @@ import {
   TraceIdRatioBasedSampler,
 } from "@opentelemetry/sdk-trace-base";
 import { AlsContextManager, sessionSpanContext } from "@telemetry-dev/otel";
+import { APICallError, RetryError, StreamProviderError } from "ai";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { expect, test, vi } from "vitest";
 
@@ -2749,6 +2750,60 @@ test("onError marks root and open step failed and a later onEnd for the same cal
   expect(step.attributes["gen_ai.operation.name"]).toBe("chat");
   expect(step.attributes["gen_ai.provider.name"]).toBe("openai");
   expect(step.attributes["gen_ai.request.model"]).toBe("gpt-4o");
+});
+
+const apiCallError = (statusCode: number, data: unknown) =>
+  new APICallError({
+    message: "failed",
+    url: "https://api.example.com",
+    requestBodyValues: {},
+    statusCode,
+    data,
+  });
+
+test.each([
+  {
+    name: "a retried quota error gives the provider's code",
+    error: new RetryError({
+      message: "Failed after 3 attempts",
+      reason: "maxRetriesExceeded",
+      errors: [
+        apiCallError(429, { error: { type: "insufficient_quota", code: "insufficient_quota" } }),
+      ],
+    }),
+    expected: "insufficient_quota",
+  },
+  {
+    name: "an API call error without a code gives its HTTP status",
+    error: apiCallError(529, { type: "error", error: { type: "overloaded_error" } }),
+    expected: "529",
+  },
+  {
+    name: "a stream error without a status gives the provider's type",
+    error: new StreamProviderError({
+      message: "Overloaded",
+      type: "overloaded_error",
+      isRetryable: true,
+    }),
+    expected: "overloaded_error",
+  },
+])("onError: $name", async ({ error, expected }) => {
+  const { spanBatches, overrides } = makeCapture();
+  const integ = telemetryDev(baseOptions, overrides);
+  const callId = "call-provider-error";
+
+  integ.onStart?.({
+    callId,
+    operationId: "ai.generateText",
+    provider: "openai",
+    modelId: "gpt-4o",
+  });
+  integ.onStepStart?.({ callId, provider: "openai", modelId: "gpt-4o", stepNumber: 0 });
+  await integ.onError?.({ callId, error });
+
+  const spans = spanBatches[0]!;
+  expect(spans.find((s) => s.kind === SpanKind.CLIENT)!.attributes["error.type"]).toBe(expected);
+  expect(spans.find((s) => s.kind === SpanKind.INTERNAL)!.attributes["error.type"]).toBe(expected);
 });
 
 test("onAbort ends the open step, keeps root UNSET, and emits generation.summary aborted", async () => {

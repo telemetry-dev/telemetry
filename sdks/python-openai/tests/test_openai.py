@@ -552,6 +552,31 @@ def test_streamed_image_edit_maps_aggregate_output_tokens_to_image(memory: Simpl
     assert attrs(span)["gen_ai.usage.image.output_tokens"] == 9
 
 
+@pytest.mark.parametrize(
+    ("status", "code", "expected"),
+    [
+        # A RateLimitError whose code says the account is out of quota, not rate limited.
+        (429, "insufficient_quota", "insufficient_quota"),
+        (400, "context_length_exceeded", "context_length_exceeded"),
+        # Without a code, the class name is specific enough.
+        (500, None, "InternalServerError"),
+        # A numeric code, such as Z.ai's 1302 rate limit or OpenRouter's 429, names less.
+        (429, "1302", "RateLimitError"),
+        (429, 429, "RateLimitError"),
+    ],
+)
+def test_api_error_records_the_provider_error_code(
+    memory: SimpleNamespace, status: int, code: str | int | None, expected: str
+) -> None:
+    body = {"error": {"message": "failed", "type": "error", "code": code}}
+    client = wrap_openai(sync_client(lambda _request: httpx.Response(status, json=body)))
+
+    with pytest.raises(openai.APIStatusError):
+        client.chat.completions.create(model="gpt-x", messages=cast(Any, CHAT_MESSAGES))
+
+    assert attrs(only_span(memory))["error.type"] == expected
+
+
 @pytest.mark.parametrize("completed", [True, False])
 def test_image_stream_is_flagged_only_without_a_terminal_event(
     memory: SimpleNamespace, completed: bool

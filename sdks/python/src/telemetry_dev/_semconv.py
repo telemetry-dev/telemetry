@@ -7,8 +7,8 @@ SCOPE_NAME = "telemetry_dev"
 SpanType = Literal["span", "generation", "tool", "agent", "embedding"]
 LogLevel = Literal["debug", "info", "warn", "warning", "error"]
 
-# Plain spans ALWAYS map to "function" — an operation-less span carrying a propagated
-# gen_ai.conversation.id would otherwise be classified as "llm" by the ingest heuristic.
+# Plain spans ALWAYS map to "function": without one, the ingest guesses "llm" from other gen_ai.*
+# keys on the span, such as a gen_ai.agent.name the caller set.
 SPAN_TYPE_TO_OPERATION: dict[str, str] = {
     "span": "function",
     "generation": "chat",
