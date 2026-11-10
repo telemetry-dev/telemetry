@@ -112,8 +112,8 @@ python trace.py
 The core SDKs and most integrations capture inputs and outputs by default.
 To disable input and output capture, set `captureInput: false` and `captureOutput: false` in TypeScript `init()`.
 For Python, use `capture_input=False` and `capture_output=False`.
-Some integrations work differently: MCP captures no tool arguments or results unless you pass
-`capturePayloads: true`, the AI SDK integration follows AI SDK's `recordInputs` and `recordOutputs`,
+Some integrations work differently: MCP also drops tool arguments and results when you pass
+`capturePayloads: false`, the AI SDK integration follows AI SDK's `recordInputs` and `recordOutputs`,
 Cursor reads `captureInput` and `captureOutput` from its own config file, and TanStack AI has no
 capture setting of its own and records chat messages, tool payloads, and error messages.
 Disabling output capture omits message content; response IDs and models, finish reasons, usage,

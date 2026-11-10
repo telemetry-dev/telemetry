@@ -64,7 +64,7 @@ Request spans also carry `mcp.client.name` and `mcp.client.version`, from the `c
 
 ## Payload capture
 
-Tool arguments and successful tool results are not captured by default. Enable them with `instrumentMcpTransport(transport, { capturePayloads: true })`. Core `@telemetry-dev/sdk` capture and masking settings still apply.
+`tools/call` spans record the tool arguments and the tool result, including a result with `isError: true`. Core `@telemetry-dev/sdk` settings still apply: `captureInput: false` drops the arguments, `captureOutput: false` drops the result, and `mask` runs on both. To leave tool payloads out while the core SDK captures other content, pass `instrumentMcpTransport(transport, { capturePayloads: false })`. Error codes and the JSON-RPC error message are recorded either way; `captureOutput: false` and `mask` do not apply to them.
 
 Trace context propagates by default. OpenTelemetry baggage remains local unless you enable it with `instrumentMcpTransport(transport, { propagateBaggage: true })`.
 
