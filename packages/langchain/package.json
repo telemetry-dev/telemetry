@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/langchain",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "LangChain.js and LangGraph.js instrumentation for telemetry.dev: a callback handler that records chains, graph nodes, model calls, tools, and retrievers as OpenTelemetry GenAI spans.",
   "keywords": [
     "genai",

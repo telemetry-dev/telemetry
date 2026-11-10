@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.7](https://github.com/telemetry-dev/telemetry/compare/bedrock-v0.2.6...bedrock-v0.2.7) (2026-11-10)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.2.7
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.2.7
+
 ## [0.2.6](https://github.com/telemetry-dev/telemetry/compare/bedrock-v0.2.5...bedrock-v0.2.6) (2026-11-07)
 
 

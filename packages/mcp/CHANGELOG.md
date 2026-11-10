@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.0](https://github.com/telemetry-dev/telemetry/compare/mcp-v0.2.6...mcp-v0.3.0) (2026-11-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* **mcp:** instrumentMcpTransport() without capturePayloads now records tool arguments and results. Pass capturePayloads: false, or turn off captureInput and captureOutput, to keep the old behavior.
+
+### Features
+
+* **mcp:** capture tool arguments and results by default ([#219](https://github.com/telemetry-dev/telemetry/issues/219)) ([9de1520](https://github.com/telemetry-dev/telemetry/commit/9de1520a3cfeb84ad2c3d0d4501ffdbe9a0522f6))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.2.7
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.2.7
+
 ## [0.2.6](https://github.com/telemetry-dev/telemetry/compare/mcp-v0.2.5...mcp-v0.2.6) (2026-11-07)
 
 

@@ -26,7 +26,7 @@ from google.genai.models import AsyncModels, Models
 from google.genai.operations import AsyncOperations, Operations
 from telemetry_dev._serialize import json_dumps
 
-__version__ = "0.2.5"
+__version__ = "0.2.6"
 
 ProviderResolver = Callable[[object | None], str]
 RequestMapper = Callable[[Any, Any, Any], tuple[str, dict[str, Any]]]
