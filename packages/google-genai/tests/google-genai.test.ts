@@ -2948,7 +2948,8 @@ test("API error 400 rethrows ApiError and records error span", async () => {
   ).rejects.toMatchObject({ name: "ApiError", status: 400 });
   const span = await exportedSpan(spans);
   expect(span.status.code).toBe(SPAN_STATUS_ERROR);
-  expect(span.attributes["error.type"]).toBe("ApiError");
+  // ApiError names no cause, so the HTTP status stands in for it.
+  expect(span.attributes["error.type"]).toBe("400");
 });
 
 test("non-Error unary failures end spans and preserve the thrown values", async () => {
@@ -3449,6 +3450,28 @@ test("generateVideos traces submit and tracked polling idempotently", async () =
     ),
   ).toEqual(["gen_ai.output.messages"]);
   expect(exported.every((span) => span.attributes["gen_ai.output.type"] === "video")).toBe(true);
+});
+
+test("a failed video operation records its google.rpc code name as error.type", async () => {
+  const spans = setupSpans();
+  const operation = { name: "operations/video-quota", done: false };
+  const client = {
+    models: { generateVideos: (_params: unknown) => Promise.resolve(operation) },
+    operations: {
+      get: (_params: unknown) =>
+        Promise.resolve({ name: operation.name, done: true, error: { code: 8, message: "quota" } }),
+    },
+  };
+
+  wrapGoogleGenAI(client);
+  const submitted = await client.models.generateVideos({ model: "veo", prompt: "ocean" });
+  await client.operations.get({ operation: submitted });
+
+  const span = (await finishedSpans(spans, 2))[1]!;
+  const exception = span.events.find((event) => event.name === "exception");
+  expect(span.status.code).toBe(SPAN_STATUS_ERROR);
+  expect(span.attributes["error.type"]).toBe("RESOURCE_EXHAUSTED");
+  expect(exception?.attributes?.["exception.message"]).toBe("quota");
 });
 
 test("video operation tracking is identity-only and client-local", async () => {

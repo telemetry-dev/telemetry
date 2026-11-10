@@ -552,6 +552,31 @@ def test_streamed_image_edit_maps_aggregate_output_tokens_to_image(memory: Simpl
     assert attrs(span)["gen_ai.usage.image.output_tokens"] == 9
 
 
+@pytest.mark.parametrize(
+    ("status", "code", "expected"),
+    [
+        # A RateLimitError whose code says the account is out of quota, not rate limited.
+        (429, "insufficient_quota", "insufficient_quota"),
+        (400, "context_length_exceeded", "context_length_exceeded"),
+        # Without a code, the class name is specific enough.
+        (500, None, "InternalServerError"),
+        # A numeric code, such as Z.ai's 1302 rate limit or OpenRouter's 429, names less.
+        (429, "1302", "RateLimitError"),
+        (429, 429, "RateLimitError"),
+    ],
+)
+def test_api_error_records_the_provider_error_code(
+    memory: SimpleNamespace, status: int, code: str | int | None, expected: str
+) -> None:
+    body = {"error": {"message": "failed", "type": "error", "code": code}}
+    client = wrap_openai(sync_client(lambda _request: httpx.Response(status, json=body)))
+
+    with pytest.raises(openai.APIStatusError):
+        client.chat.completions.create(model="gpt-x", messages=cast(Any, CHAT_MESSAGES))
+
+    assert attrs(only_span(memory))["error.type"] == expected
+
+
 @pytest.mark.parametrize("completed", [True, False])
 def test_image_stream_is_flagged_only_without_a_terminal_event(
     memory: SimpleNamespace, completed: bool
@@ -1227,7 +1252,7 @@ async def test_failed_media_stream_events_record_errors(
     assert received == ["image_generation.failed"]
     span = only_span(memory)
     assert span.status.status_code == StatusCode.ERROR
-    assert attrs(span)["error.type"] == "RuntimeError"
+    assert attrs(span)["error.type"] == "provider_error"
     assert dict(span.events[0].attributes or {})["exception.message"] == (
         "provider_error: provider failed"
     )
@@ -4773,7 +4798,7 @@ def test_responses_create_failed_body_records_error_span(memory: SimpleNamespace
     span = only_span(memory)
     assert span.status.status_code == StatusCode.ERROR
     a = attrs(span)
-    assert a["error.type"] == "RuntimeError"
+    assert a["error.type"] == "server_error"
     assert a["gen_ai.response.id"] == "resp_failed"
     events = list(span.events)
     assert len(events) == 1
@@ -5100,7 +5125,7 @@ async def test_async_responses_stream_completed_and_failed_events(memory: Simple
     assert completed_attrs["gen_ai.usage.output_tokens"] == 4
     assert completed_attrs["gen_ai.usage.total_tokens"] == 17
     assert failed_span.status.status_code == StatusCode.ERROR
-    assert attrs(failed_span)["error.type"] == "RuntimeError"
+    assert attrs(failed_span)["error.type"] == "server_error"
 
 
 @pytest.mark.parametrize("async_mode", [False, True])

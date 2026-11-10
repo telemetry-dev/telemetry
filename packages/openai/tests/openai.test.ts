@@ -477,6 +477,37 @@ test("wrapped chat completion APIPromise keeps parse helper and promise identity
   ]);
 });
 
+test.each([
+  // A RateLimitError whose code says the account is out of quota, not rate limited.
+  { status: 429, code: "insufficient_quota", expected: "insufficient_quota" },
+  { status: 400, code: "context_length_exceeded", expected: "context_length_exceeded" },
+  // Without a code, the class name is specific enough (Python parity: type(e).__name__).
+  { status: 500, code: null, expected: "InternalServerError" },
+  // A numeric code, such as Z.ai's 1302 rate limit, names less than the class.
+  { status: 429, code: "1302", expected: "RateLimitError" },
+])(
+  "a $status error with code $code records error.type $expected",
+  async ({ status, code, expected }) => {
+    const spans = setupSpans();
+    const body = { error: { message: "failed", type: "error", code } };
+    const fake = createFakeFetch(
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    await expect(
+      clientWith(fake.fetch).chat.completions.create({
+        model: "gpt-x",
+        messages: [{ role: "user", content: "Fail" }],
+      }),
+    ).rejects.toMatchObject({ status });
+
+    expect((await exportedSpan(spans)).attributes["error.type"]).toBe(expected);
+  },
+);
+
 test("chat completions record one error span when the OpenAI API returns 4xx", async () => {
   const spans = setupSpans();
   const fake = createFakeFetch(jsonErrorResponse(400, "bad model"));
@@ -492,11 +523,10 @@ test("chat completions record one error span when the OpenAI API returns 4xx", a
   expect(span.status.code).toBe(SPAN_STATUS_ERROR);
   expect(span.attributes["gen_ai.operation.name"]).toBe("chat");
   expect(span.attributes["gen_ai.request.model"]).toBe("gpt-bad");
-  // The SDK falls back to the constructor name when err.name is the generic "Error"
-  // (openai's APIError subclasses never override name) — Python parity: type(e).__name__.
-  expect(span.attributes["error.type"]).toBe("BadRequestError");
+  // The error code from the response body names the failure.
+  expect(span.attributes["error.type"]).toBe("bad_request");
   const exception = span.events.find((event) => event.name === "exception");
-  expect(exception?.attributes?.["exception.type"]).toBe("BadRequestError");
+  expect(exception?.attributes?.["exception.type"]).toBe("bad_request");
   expect(exception?.attributes?.["exception.message"]).toContain("bad model");
   expect(exception?.attributes?.["log.severity_number"]).toBe(17);
 });
@@ -3227,9 +3257,9 @@ test("responses create failed body records error while completed body stays OK",
   const failed = finished.find((span) => span.attributes["gen_ai.response.id"] === "resp_failed");
   const success = finished.find((span) => span.attributes["gen_ai.response.id"] === "resp_ok");
   expect(failed?.status.code).toBe(SPAN_STATUS_ERROR);
-  expect(failed?.attributes["error.type"]).toBe("Error");
+  expect(failed?.attributes["error.type"]).toBe("server_error");
   const exception = failed?.events.find((event) => event.name === "exception");
-  expect(exception?.attributes?.["exception.type"]).toBe("Error");
+  expect(exception?.attributes?.["exception.type"]).toBe("server_error");
   expect(exception?.attributes?.["exception.message"]).toBe(
     "response.failed: server_error: model exploded",
   );
@@ -3986,9 +4016,9 @@ test("responses streams record error status from bare error events", async () =>
   expect(events).toEqual([errorEvent]);
   const span = await exportedSpan(spans);
   expect(span.status.code).toBe(SPAN_STATUS_ERROR);
-  expect(span.attributes["error.type"]).toBe("Error");
+  expect(span.attributes["error.type"]).toBe("rate_limit_exceeded");
   const exception = span.events.find((event) => event.name === "exception");
-  expect(exception?.attributes?.["exception.type"]).toBe("Error");
+  expect(exception?.attributes?.["exception.type"]).toBe("rate_limit_exceeded");
   expect(exception?.attributes?.["exception.message"]).toBe(
     "response.error: rate_limit_exceeded: try later",
   );
@@ -4040,7 +4070,7 @@ test("responses streams record error status from response.failed terminal events
   expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["failed"]);
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([]);
   const exception = span.events.find((event) => event.name === "exception");
-  expect(exception?.attributes?.["exception.type"]).toBe("Error");
+  expect(exception?.attributes?.["exception.type"]).toBe("server_error");
   expect(exception?.attributes?.["exception.message"]).toBe(
     "response.failed: server_error: stream failed",
   );
@@ -4775,6 +4805,33 @@ test.each([true, false])(
     expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(completed ? undefined : true);
   },
 );
+
+test("a failed image stream records the provider's code as error.type", async () => {
+  const spans = setupSpans();
+  const failed = { type: "image_generation.failed", code: "provider_error", message: "failed" };
+  const source = new Stream(async function* () {
+    yield failed;
+  }, new AbortController());
+  const client = wrapOpenAI({
+    chat: { completions: { create() {} } },
+    responses: { create() {} },
+    embeddings: { create() {} },
+    images: { generate: async (_params: unknown) => source },
+  });
+
+  const stream = await client.images!.generate({
+    model: "gpt-image-1",
+    prompt: "otter",
+    stream: true,
+  });
+  expect(await collectStream(stream as Stream<unknown>)).toEqual([failed]);
+
+  const span = await exportedSpan(spans);
+  const exception = span.events.find((event) => event.name === "exception");
+  expect(span.status.code).toBe(SPAN_STATUS_ERROR);
+  expect(span.attributes["error.type"]).toBe("provider_error");
+  expect(exception?.attributes?.["exception.message"]).toBe("provider_error: failed");
+});
 
 test("endpoint modality fills aggregate image and transcription output usage", async () => {
   const spans = setupSpans();
@@ -5531,6 +5588,43 @@ test("realtime caps reconstructed output before a trace timeout", async () => {
   wrapped.close();
 });
 
+test("a failed realtime response records the provider's code as error.type", async () => {
+  const spans = setupSpans();
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const sent: Array<{ response?: object }> = [];
+  const wrapped = wrapOpenAIRealtime({
+    send(event: unknown) {
+      sent.push(event as { response?: object });
+    },
+    close() {},
+    on(event: string, listener: (...args: unknown[]) => void) {
+      listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+    },
+    off() {},
+  });
+  const emit = (value: unknown) => listeners.get("event")?.forEach((listener) => listener(value));
+
+  wrapped.send({ type: "response.create" });
+  emit({ type: "response.created", response: { id: "failed", ...sent[0]?.response } });
+  emit({
+    type: "response.done",
+    response: {
+      id: "failed",
+      status: "failed",
+      status_details: {
+        type: "failed",
+        error: { type: "server_error", code: "rate_limit_exceeded", message: "slow down" },
+      },
+      output: [],
+    },
+  });
+
+  const span = await exportedSpan(spans);
+  expect(span.status.code).toBe(SPAN_STATUS_ERROR);
+  expect(span.attributes["error.type"]).toBe("rate_limit_exceeded");
+  wrapped.close();
+});
+
 test("realtime terminal output supersedes truncated deltas", async () => {
   const spans = setupSpans();
   const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
@@ -5868,6 +5962,7 @@ test("realtime wrapper keeps recoverable API errors scoped and handles remote cl
 
   const failed = await finishedSpans(spans, 2);
   expect(failed[1]?.status.code).toBe(SPAN_STATUS_ERROR);
+  expect(failed[1]?.attributes["error.type"]).toBe("invalid_response");
 
   wrapped.send({ type: "response.create" });
   const sentEvent = sent.at(-1) as { event_id?: unknown } | undefined;

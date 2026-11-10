@@ -7,8 +7,8 @@ import { type CaptureConfig, prepareCaptureValue, truncate } from "./capture.ts"
 export type SpanType = "span" | "generation" | "tool" | "agent" | "embedding";
 
 // Operation names are taken verbatim by the ingest's deriveOperation. Plain spans always get an
-// explicit "function": without one, the propagated gen_ai.conversation.id would trip the ingest's
-// hasGenAi heuristic and misclassify them as "llm".
+// explicit "function": without one, the ingest guesses "llm" from other gen_ai.* keys on the span,
+// such as a gen_ai.agent.name the caller set.
 export const SPAN_TYPE_OPERATIONS = {
   span: "function",
   generation: "chat",

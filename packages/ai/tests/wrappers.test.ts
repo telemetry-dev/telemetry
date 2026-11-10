@@ -627,6 +627,7 @@ test("failures whose string conversion throws are still recorded", async () => {
       const exception = span.events.find((event) => event.name === "exception");
 
       expect(span.status).toEqual({ code: SpanStatusCode.ERROR, message: expected[index] });
+      expect(span.attributes["error.type"]).toBe("RangeError");
       expect(exception?.attributes).toMatchObject({
         "exception.type": "RangeError",
         "exception.message": "disk full",

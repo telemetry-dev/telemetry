@@ -21,6 +21,7 @@ import {
 import {
   activeContext,
   DURATION_BUCKETS,
+  errorTypeOf,
   omitUndefined,
   OUTPUT_CHUNK_HISTOGRAM,
   type OutputChunkHistogram,
@@ -159,15 +160,7 @@ function resolveParent(parent: ParentRef | undefined): Context {
 
 function applyError(span: Span, error: unknown, capture: FieldCaptureConfig): void {
   const err = error instanceof Error ? error : undefined;
-
-  // Prefer the specific subclass name (Python parity: type(error).__name__) — many SDK
-  // error classes (e.g. openai's BadRequestError) never override the inherited "Error" name.
-  const errorType =
-    err === undefined
-      ? "Error"
-      : err.name !== "Error" && err.name.length > 0
-        ? err.name
-        : (err.constructor?.name ?? "Error") || "Error";
+  const errorType = errorTypeOf(error);
 
   span.setStatus({ code: SpanStatusCode.ERROR });
   span.setAttribute("error.type", errorType);

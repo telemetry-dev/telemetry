@@ -506,7 +506,7 @@ def test_converse_stream_accumulates_and_errors(
     with pytest.raises(EventStreamError):
         list(response["stream"])
     error_span = memory.span_exporter.get_finished_spans()[1]
-    assert error_span.attributes["error.type"] == "EventStreamError"
+    assert error_span.attributes["error.type"] == "ModelStreamErrorException"
     assert error_span.attributes["aws.error.code"] == "modelStreamErrorException"
     assert error_span.attributes["gen_ai.response.id"] == "stream-error-2"
     assert error_span.attributes["aws.http.status_code"] == 424

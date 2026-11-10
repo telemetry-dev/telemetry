@@ -468,15 +468,49 @@ def _media_request_fields(output_type: str | None) -> RequestMapper:
     return mapper
 
 
+# google.rpc.Code names by number. The error of a long-running operation is a google.rpc.Status,
+# which carries only the number, such as 8 for RESOURCE_EXHAUSTED.
+_RPC_CODE_NAMES = (
+    "OK",
+    "CANCELLED",
+    "UNKNOWN",
+    "INVALID_ARGUMENT",
+    "DEADLINE_EXCEEDED",
+    "NOT_FOUND",
+    "ALREADY_EXISTS",
+    "PERMISSION_DENIED",
+    "RESOURCE_EXHAUSTED",
+    "FAILED_PRECONDITION",
+    "ABORTED",
+    "OUT_OF_RANGE",
+    "UNIMPLEMENTED",
+    "INTERNAL",
+    "UNAVAILABLE",
+    "DATA_LOSS",
+    "UNAUTHENTICATED",
+)
+
+
+def _operation_error(status: Any) -> Exception:
+    # The core SDK records the code name in error.type, else "operation.failed", because a plain
+    # Exception names no cause; see _error_type in telemetry_dev/_spans.py.
+    code = _field(status, "code")
+    error = Exception(_string(_field(status, "message")) or "video operation failed")
+    vars(error).update(
+        code=_RPC_CODE_NAMES[code]
+        if isinstance(code, int) and not isinstance(code, bool) and 0 <= code < len(_RPC_CODE_NAMES)
+        else None,
+        type="operation.failed",
+    )
+    return error
+
+
 def _media_response_fields(response: Any, output_type: str | None = None) -> dict[str, Any]:
     operation_name = _string(_field(response, "name"))
     operation_error = _field(response, "error")
-    error_message = _string(_field(operation_error, "message"))
     fields: dict[str, Any] = {
         "response_id": _string(_field(response, "id")) or operation_name,
-        "error": RuntimeError(error_message or "video operation failed")
-        if operation_error
-        else None,
+        "error": _operation_error(operation_error) if operation_error else None,
     }
     attrs: dict[str, Any] = {}
     done = _field(response, "done")

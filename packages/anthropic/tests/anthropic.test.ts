@@ -690,6 +690,26 @@ test("messages.create streaming preserves events and records aggregated text usa
   ).toBe(true);
 });
 
+test("an error event mid-stream records the provider's error type", async () => {
+  const spans = setupSpans();
+  const overloaded = {
+    type: "error",
+    error: { type: "overloaded_error", message: "Overloaded" },
+  };
+  const fake = createFakeFetch(namedSseResponse([streamEvents()[0]!, overloaded]));
+
+  const stream = await clientWith(fake.fetch).messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "Say hello" }],
+    stream: true,
+  });
+
+  // The SDK throws its generic APIError, whose class names no cause.
+  await expect(collectStream(stream)).rejects.toMatchObject({ type: "overloaded_error" });
+  expect((await exportedSpan(spans)).attributes["error.type"]).toBe("overloaded_error");
+});
+
 test("stream capture retains no output when output capture is disabled", async () => {
   const spans = setupSpans(undefined, false);
   const capture = vi.spyOn(telemetrySdk, "boundedCaptureDetails");

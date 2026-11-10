@@ -1227,6 +1227,22 @@ def test_masked_stream_close_omits_partial_output(make: Any) -> None:
     assert a["telemetry.dev.capture.truncated"] is True
 
 
+def test_error_event_mid_stream_records_the_provider_error_type(memory: SimpleNamespace) -> None:
+    overloaded = {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}
+    client = wrapped_sync_client(
+        lambda _request: named_sse_response([stream_events()[0], overloaded])
+    )
+    stream = client.messages.create(
+        model="claude-sonnet-4-6", max_tokens=64, messages=MESSAGES, stream=True
+    )
+
+    # The SDK raises its generic APIStatusError, with the 200 status of the stream.
+    with pytest.raises(anthropic.APIStatusError):
+        list(stream)
+
+    assert attrs(only_span(memory))["error.type"] == "overloaded_error"
+
+
 def test_mid_stream_read_error_records_error_span(memory: SimpleNamespace) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return failing_sync_sse_response(stream_events()[:3], "sync stream broke")

@@ -1146,12 +1146,12 @@ def test_chat_stream_chunk_error_sets_error_status(memory: SimpleNamespace) -> N
     span = only_span(memory)
     a = attrs(span)
     assert span.status.status_code == StatusCode.ERROR
-    assert a["error.type"] == "RuntimeError"
+    assert a["error.type"] == "502"
     events_recorded = list(span.events)
     assert len(events_recorded) == 1
     assert events_recorded[0].name == "exception"
     event_attrs = dict(events_recorded[0].attributes or {})
-    assert event_attrs["exception.type"] == "RuntimeError"
+    assert event_attrs["exception.type"] == "502"
     assert event_attrs["exception.message"] == "stream error 502: upstream blew up"
     assert json.loads(str(a["gen_ai.output.messages"])) == [{"role": "assistant", "content": "Hel"}]
 
@@ -1427,7 +1427,7 @@ def test_responses_failed_status_sets_error(memory: SimpleNamespace) -> None:
     span = only_span(memory)
     a = attrs(span)
     assert span.status.status_code == StatusCode.ERROR
-    assert a["error.type"] == "RuntimeError"
+    assert a["error.type"] == "server_error"
     assert list(cast(Any, a["gen_ai.response.finish_reasons"])) == ["failed"]
 
 
@@ -1488,12 +1488,12 @@ def test_responses_stream_failed_event_retains_error_code(
 
     span = only_span(memory)
     assert span.status.status_code == StatusCode.ERROR
-    assert attrs(span)["error.type"] == "RuntimeError"
+    assert attrs(span)["error.type"] == str(code)
     events_recorded = list(span.events)
     assert len(events_recorded) == 1
     assert events_recorded[0].name == "exception"
     event_attrs = dict(events_recorded[0].attributes or {})
-    assert event_attrs["exception.type"] == "RuntimeError"
+    assert event_attrs["exception.type"] == str(code)
     assert event_attrs["exception.message"] == f"response.failed: {code}: model blew up"
 
 
@@ -1516,7 +1516,7 @@ def test_responses_stream_error_event_retains_numeric_code(memory: SimpleNamespa
     events_recorded = list(span.events)
     assert len(events_recorded) == 1
     event_attrs = dict(events_recorded[0].attributes or {})
-    assert event_attrs["exception.type"] == "RuntimeError"
+    assert event_attrs["exception.type"] == "502"
     assert event_attrs["exception.message"] == "response.error: 502: provider disconnected"
 
 

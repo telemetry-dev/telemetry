@@ -535,20 +535,42 @@ function responsesResponse<T>(response: T, includeOutput = true): SpanFields {
   return fields;
 }
 
+// A failure that OpenRouter reports in a response body or a stream event, not as an HTTP error.
+// errorTypeOf records its string code, else its numeric code (an HTTP status, such as 429), else
+// its kind, in error.type instead of "Error".
+function providerFailure(
+  prefix: string,
+  code: number | string | undefined,
+  message: string | undefined,
+  kind: string,
+): Error {
+  return Object.assign(new Error([prefix, code, message].filter(Boolean).join(": ")), {
+    code: typeof code === "string" ? code : undefined,
+    status: typeof code === "number" ? code : undefined,
+    type: kind,
+  });
+}
+
 function responseFailedError<T>(response: T): Error {
   const error = asRecord(asRecord(response)?.error);
-  const code = readNumber(error?.code) ?? readString(error?.code);
-  const message = readString(error?.message);
 
-  return new Error(["response.failed", code, message].filter(Boolean).join(": "));
+  return providerFailure(
+    "response.failed",
+    readNumber(error?.code) ?? readString(error?.code),
+    readString(error?.message),
+    "response.failed",
+  );
 }
 
 function responseStreamError<T>(event: T): Error {
   const e = asRecord(event);
-  const code = readNumber(e?.code) ?? readString(e?.code);
-  const message = readString(e?.message);
 
-  return new Error(["response.error", code, message].filter(Boolean).join(": "));
+  return providerFailure(
+    "response.error",
+    readNumber(e?.code) ?? readString(e?.code),
+    readString(e?.message),
+    "response.error",
+  );
 }
 
 function embeddingsRequest(request: JsonRecord): RequestMapping {
@@ -771,7 +793,7 @@ function recordChatChunk<T>(chunk: T, states: Map<number, ChatChoiceState>, budg
 
   return {
     ...update,
-    error: new Error(["chat stream error", code, message].filter(Boolean).join(": ")),
+    error: providerFailure("chat stream error", code, message, "stream error"),
   };
 }
 

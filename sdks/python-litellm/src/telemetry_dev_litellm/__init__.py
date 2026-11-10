@@ -751,12 +751,21 @@ def _rerank_response(response: Any) -> dict[str, Any]:
     }
 
 
-def _response_error(response: Any) -> RuntimeError | None:
+def _provider_failure(message: str, code: str | None, kind: str) -> Exception:
+    # A failure that the provider reports in a response body or a stream event, not as an HTTP
+    # error. The core SDK records its `code` in error.type, else its `type`, because a plain
+    # Exception names no cause; see _error_type in telemetry_dev/_spans.py.
+    error = Exception(message)
+    vars(error).update(code=code, type=kind)
+    return error
+
+
+def _response_error(response: Any) -> Exception | None:
     if _string(_field(response, "status")) != "failed" and _field(response, "error") is None:
         return None
     raw_error = _field(response, "error")
     message = _string(_field(raw_error, "message")) or "LiteLLM Responses API request failed"
-    return RuntimeError(message)
+    return _provider_failure(message, _string(_field(raw_error, "code")), "response.failed")
 
 
 def _responses_response(response: Any) -> dict[str, Any]:
@@ -1908,7 +1917,7 @@ class _InstrumentedResponsesStream:
             code = _string(_field(raw_error, "code")) or _string(_field(event, "code"))
             if code is not None:
                 message = f"{message} ({code})"
-            self._finish(error=RuntimeError(message))
+            self._finish(error=_provider_failure(message, code, "response.error"))
 
     def _finish(self, response: Any = None, error: BaseException | None = None) -> None:
         if self._finished:
