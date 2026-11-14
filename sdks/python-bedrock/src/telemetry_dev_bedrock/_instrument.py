@@ -45,7 +45,7 @@ if hasattr(os, "register_at_fork") and "_install_fork_hook" not in globals():
     os.register_at_fork(after_in_child=_reset_install_lock_in_child)
 
 
-def wrap_bedrock(client: _T, *, capture_agent_trace: bool = False) -> _T:
+def wrap_bedrock(client: _T, *, capture_agent_trace: bool = True) -> _T:
     with _install_lock:
         if getattr(client, _WRAPPED_ATTR, False):
             return client
@@ -70,7 +70,7 @@ def wrap_bedrock(client: _T, *, capture_agent_trace: bool = False) -> _T:
         return client
 
 
-def instrument_bedrock(*, capture_agent_trace: bool = False) -> None:
+def instrument_bedrock(*, capture_agent_trace: bool = True) -> None:
     with _install_lock:
         global _original_api_call, _patched_api_call
         if _original_api_call is not None:

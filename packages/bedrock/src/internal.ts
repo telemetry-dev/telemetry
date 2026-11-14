@@ -428,11 +428,13 @@ const LEGACY_CAPTURE_POLICY: NonNullable<SpanHandle["capturePolicy"]> = {
 };
 
 /**
- * A stream state's share of the shared stream bound. After the first value that does not fit,
- * it accepts nothing more, so the kept output is a prefix of the stream.
+ * A stream state's share of the shared stream bound. After the first output value that does not
+ * fit, it accepts nothing more, so the kept output is a prefix of the stream; metadata that does
+ * not fit leaves it open.
  */
 export class StreamRetention {
   private readonly capture = new StreamCapture();
+  private metadataBytes = 0;
   truncated = false;
 
   accept<T>(value: T): boolean {
@@ -449,6 +451,26 @@ export class StreamRetention {
     }
 
     this.capture.bytes += measured.bytes;
+
+    return true;
+  }
+
+  /**
+   * As accept, for metadata that sits next to the output, such as agent traces: it may use at
+   * most half of the bound, and a value that does not fit is dropped without closing the
+   * retention, so the output that comes later still fits.
+   */
+  acceptMetadata<T>(value: T): boolean {
+    if (this.truncated) return false;
+    const limit = this.capture.limit;
+    const room = Math.min(limit - this.capture.bytes, Math.floor(limit / 2) - this.metadataBytes);
+
+    if (room <= 0) return false;
+    const measured = boundedCaptureDetails(value, { maxBytes: room });
+
+    if (measured.truncated) return false;
+    this.capture.bytes += measured.bytes;
+    this.metadataBytes += measured.bytes;
 
     return true;
   }

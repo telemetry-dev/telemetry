@@ -2086,9 +2086,60 @@ def test_masked_agent_stream_drops_return_control_only_beyond_the_record_bound(
     assert not any("inv-oversized" in value or "Short answer" in value for value in seen)
 
 
-@pytest.mark.parametrize("later_text", [False, True])
-def test_masked_agent_stream_withholds_text_only_when_text_was_rejected(
-    make: Any, monkeypatch: pytest.MonkeyPatch, later_text: bool
+@pytest.mark.parametrize(
+    "traces",
+    [
+        pytest.param(
+            [
+                {"trace": {"sessionId": "first"}},
+                {"trace": {"sessionId": "t" * 50_000}},
+                {"trace": {"sessionId": "after"}},
+            ],
+            id="a trace larger than the bound",
+        ),
+        pytest.param(
+            [{"trace": {"sessionId": str(index) * 2_000}} for index in range(20)],
+            id="traces that would leave no room for the answer",
+        ),
+    ],
+)
+def test_masked_agent_stream_keeps_the_answer_after_traces_that_do_not_fit(
+    make: Any, monkeypatch: pytest.MonkeyPatch, traces: list[dict[str, Any]]
+) -> None:
+    seen: list[str] = []
+
+    def mask(value: Any, _context: Any) -> Any:
+        seen.append(json.dumps(value))
+        return value
+
+    memory = make(mask=mask)
+    answer = "Complete answer " + "a" * 10_000
+    events: list[dict[str, Any]] = [*traces, {"chunk": {"bytes": answer.encode()}}]
+    client = _client("bedrock-agent-runtime")
+    _stub_api_call(
+        client, [{"completion": FakeEventStream(events), "sessionId": "sess-1"}], monkeypatch
+    )
+    wrap_bedrock(client)
+
+    response = client.invoke_agent(  # type: ignore[attr-defined]
+        agentId="agent-1", agentAliasId="alias", sessionId="sess-1", inputText="hi"
+    )
+    assert list(response["completion"]) == events
+
+    span = memory.span_exporter.get_finished_spans()[0]
+    # The traces that did not fit are dropped, and the capture says so.
+    assert span.attributes["telemetry.dev.capture.truncated"] is True
+    kept = [trace["sessionId"] for trace in _json_attr(span, "td.metadata.agent_trace")]
+    # The kept traces are the ones before the first that did not fit.
+    assert 0 < len(kept) < len(traces)
+    assert kept == [event["trace"]["sessionId"] for event in traces[: len(kept)]]
+    output = _json_attr(span, "gen_ai.output.messages")
+    assert output[0]["parts"][0]["content"] == answer
+    assert any("Complete answer" in value for value in seen)
+
+
+def test_masked_agent_stream_withholds_text_when_a_text_chunk_is_rejected(
+    make: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seen: list[str] = []
 
@@ -2099,15 +2150,13 @@ def test_masked_agent_stream_withholds_text_only_when_text_was_rejected(
     memory = make(mask=mask)
     events: list[dict[str, Any]] = [
         {"chunk": {"bytes": b"Complete answer"}},
-        {"trace": {"sessionId": "t" * 50_000}},
+        {"chunk": {"bytes": b"x" * 50_000}},
     ]
-    if later_text:
-        events.append({"chunk": {"bytes": b" and more"}})
     client = _client("bedrock-agent-runtime")
     _stub_api_call(
         client, [{"completion": FakeEventStream(events), "sessionId": "sess-1"}], monkeypatch
     )
-    wrap_bedrock(client, capture_agent_trace=True)
+    wrap_bedrock(client)
 
     response = client.invoke_agent(  # type: ignore[attr-defined]
         agentId="agent-1", agentAliasId="alias", sessionId="sess-1", inputText="hi"
@@ -2116,13 +2165,8 @@ def test_masked_agent_stream_withholds_text_only_when_text_was_rejected(
 
     span = memory.span_exporter.get_finished_spans()[0]
     assert span.attributes["telemetry.dev.capture.truncated"] is True
-    if later_text:
-        assert "gen_ai.output.messages" not in span.attributes
-        assert not any("Complete answer" in value for value in seen)
-    else:
-        output = _json_attr(span, "gen_ai.output.messages")
-        assert output[0]["parts"][0]["content"] == "Complete answer"
-        assert any("Complete answer" in value for value in seen)
+    assert "gen_ai.output.messages" not in span.attributes
+    assert not any("Complete answer" in value for value in seen)
 
 
 _COMPLETE = {"chunk": {"bytes": b"Complete answer"}}
@@ -2915,7 +2959,7 @@ def test_agent_failure_metadata_follows_the_capture_flags_without_trace_capture(
     ]
     client = _client("bedrock-agent-runtime")
     _stub_api_call(client, [{"completion": FakeEventStream(events)}], monkeypatch)
-    wrap_bedrock(client)
+    wrap_bedrock(client, capture_agent_trace=False)
 
     response = client.invoke_agent(  # type: ignore[attr-defined]
         agentId="agent-1", agentAliasId="alias", sessionId="sess-1"
@@ -2927,6 +2971,143 @@ def test_agent_failure_metadata_follows_the_capture_flags_without_trace_capture(
     assert span.attributes["td.metadata.failure"] == "true"
     assert span.attributes["td.metadata.failure_code"] == "500"
     assert span.attributes.get("td.metadata.failure_reason") == reason
+
+
+def test_agent_records_returned_action_results_and_inline_instruction(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _client("bedrock-agent-runtime")
+    result = {"functionResult": {"actionGroup": "orders", "function": "refund", "responseBody": {}}}
+    _stub_api_call(
+        client,
+        [
+            {"completion": FakeEventStream([{"chunk": {"bytes": b"done"}}])},
+            {"completion": FakeEventStream([{"chunk": {"bytes": b"ok"}}])},
+        ],
+        monkeypatch,
+    )
+    wrap_bedrock(client)
+
+    list(
+        client.invoke_agent(  # type: ignore[attr-defined]
+            agentId="agent-1",
+            agentAliasId="alias",
+            sessionId="sess-1",
+            sessionState={"invocationId": "inv-1", "returnControlInvocationResults": [result]},
+        )["completion"]
+    )
+    list(
+        client.invoke_inline_agent(  # type: ignore[attr-defined]
+            sessionId="sess-1",
+            agentName="support",
+            foundationModel="anthropic.claude-sonnet-4-5",
+            instruction="Refund only delivered orders.",
+            inputText="refund A1",
+        )["completion"]
+    )
+
+    agent, inline = memory.span_exporter.get_finished_spans()
+    assert _json_attr(agent, "gen_ai.input.messages") == [
+        {
+            "role": "tool",
+            "parts": [{"type": "tool_call_response", "id": "inv-1", "response": result}],
+        }
+    ]
+    assert inline.attributes["gen_ai.system_instructions"] == "Refund only delivered orders."
+    assert _json_attr(inline, "gen_ai.input.messages") == [
+        {"role": "user", "parts": [{"type": "text", "content": "refund A1"}]}
+    ]
+
+
+def test_invoke_model_stream_keeps_streamed_tool_calls_next_to_the_text(
+    memory: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def stream(*chunks: dict[str, Any]) -> dict[str, Any]:
+        return {"body": FakeEventStream([{"chunk": {"bytes": _body(chunk)}} for chunk in chunks])}
+
+    client = _client("bedrock-runtime")
+    _stub_api_call(
+        client,
+        [
+            stream(
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "Refunding"},
+                },
+                {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "refund",
+                        "input": {},
+                    },
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "input_json_delta", "partial_json": '{"order'},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "input_json_delta", "partial_json": '":"A1"}'},
+                },
+                {
+                    "type": "content_block_start",
+                    "index": 2,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_2",
+                        "name": "ping",
+                        "input": {},
+                    },
+                },
+            ),
+            stream(
+                {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "Booking"}}},
+                {
+                    "contentBlockStart": {
+                        "contentBlockIndex": 1,
+                        "start": {"toolUse": {"toolUseId": "t1", "name": "book"}},
+                    }
+                },
+                {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": 1,
+                        "delta": {"toolUse": {"input": '{"seat":'}},
+                    }
+                },
+                {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": 1,
+                        "delta": {"toolUse": {"input": '"4C"}'}},
+                    }
+                },
+            ),
+        ],
+        monkeypatch,
+    )
+    wrap_bedrock(client)
+
+    for model_id in ("anthropic.claude-sonnet-4-5", "amazon.nova-pro-v1:0"):
+        response = client.invoke_model_with_response_stream(  # type: ignore[attr-defined]
+            modelId=model_id, contentType="application/json", body=_body({"messages": []})
+        )
+        list(response["body"])
+
+    claude, nova = memory.span_exporter.get_finished_spans()
+    assert _json_attr(claude, "gen_ai.output.messages")[0]["parts"] == [
+        {"type": "text", "content": "Refunding"},
+        {"type": "tool_call", "id": "toolu_1", "name": "refund", "arguments": {"order": "A1"}},
+        {"type": "tool_call", "id": "toolu_2", "name": "ping", "arguments": {}},
+    ]
+    assert _json_attr(nova, "gen_ai.output.messages")[0]["parts"] == [
+        {"type": "text", "content": "Booking"},
+        {"type": "tool_call", "id": "t1", "name": "book", "arguments": {"seat": "4C"}},
+    ]
 
 
 def test_agent_retrieve_rag_flow_and_global_instrument(
@@ -2980,7 +3161,7 @@ def test_agent_retrieve_rag_flow_and_global_instrument(
         ],
         monkeypatch,
     )
-    wrap_bedrock(client, capture_agent_trace=True)
+    wrap_bedrock(client)
 
     list(
         client.invoke_agent(
@@ -2998,6 +3179,8 @@ def test_agent_retrieve_rag_flow_and_global_instrument(
 
     spans = memory.span_exporter.get_finished_spans()
     assert spans[0].attributes["gen_ai.usage.input_tokens"] == 3
+    # Trace capture is on by default.
+    assert len(_json_attr(spans[0], "td.metadata.agent_trace")) == 1
     assert spans[0].attributes["gen_ai.provider.name"] == "amazon-bedrock"
     assert spans[0].attributes["td.metadata.return_control"] == "true"
     assert spans[0].attributes["gen_ai.usage.output_tokens"] == 4

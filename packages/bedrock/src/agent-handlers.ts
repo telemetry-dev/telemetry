@@ -24,16 +24,38 @@ import {
   type StreamState,
 } from "./internal.ts";
 
-export function agentInputMessages<T>(inputText: T): JsonValue {
+/**
+ * The user's text and, after a return of control, the results of the actions the app ran, which
+ * the request carries in `returnControlInvocationResults` of its session state.
+ */
+export function agentInputMessages<T, S>(inputText: T, sessionState?: S): JsonValue {
   const text = stringValue(inputText);
+  const state: unknown = sessionState;
+  const session = isRecord(state) ? state : undefined;
+  const results = arrayValue<JsonValue>(session?.returnControlInvocationResults);
+  const invocationId = stringValue(session?.invocationId);
 
-  return text ? [{ role: "user", parts: [{ type: "text", content: text }] }] : undefined;
+  const messages: JsonValue[] = [
+    ...(results && results.length > 0
+      ? [
+          {
+            role: "tool",
+            parts: results.map((result) =>
+              omitUndefined({ type: "tool_call_response", id: invocationId, response: result }),
+            ),
+          },
+        ]
+      : []),
+    ...(text ? [{ role: "user", parts: [{ type: "text", content: text }] }] : []),
+  ];
+
+  return messages.length > 0 ? messages : undefined;
 }
 
 export function agentRequestFields(input: JsonRecord): SpanFields {
   return omitUndefined({
     provider: PROVIDER,
-    input: agentInputMessages(input.inputText),
+    input: agentInputMessages(input.inputText, input.sessionState),
     agentId: stringValue(input.agentId),
     metadata: omitUndefined({
       bedrock_agent_alias_id: stringValue(input.agentAliasId),
@@ -45,7 +67,8 @@ export function agentRequestFields(input: JsonRecord): SpanFields {
 
 export function inlineAgentRequestFields(input: JsonRecord): SpanFields {
   return omitUndefined({
-    input: agentInputMessages(input.inputText),
+    input: agentInputMessages(input.inputText, input.inlineSessionState),
+    systemInstructions: stringValue(input.instruction),
     model: stringValue(input.foundationModel),
     provider: PROVIDER,
     agentName: stringValue(input.agentName),
@@ -68,6 +91,7 @@ export class AgentStreamState implements StreamState {
   private sawReturnControl = false;
   private returnControlRejected = false;
   private readonly traces: unknown[] = [];
+  private tracesCut = false;
   private error: Error | undefined;
   private errorFields: SpanFields | undefined;
   private citationCount = 0;
@@ -152,7 +176,8 @@ export class AgentStreamState implements StreamState {
         throw cause;
       }
 
-      if (this.retention.accept(sanitizedFiles)) this.outputFiles.push(...sanitizedFiles);
+      if (this.retention.acceptMetadata(sanitizedFiles)) this.outputFiles.push(...sanitizedFiles);
+      else this.metadataLost = true;
     }
 
     const traceEvent = isRecord(raw.trace) ? raw.trace : undefined;
@@ -160,7 +185,7 @@ export class AgentStreamState implements StreamState {
     if (traceEvent) {
       this.traceEventCount += 1;
 
-      if (this.options.captureAgentTrace) {
+      if (this.options.captureAgentTrace !== false && !this.tracesCut) {
         let retained: JsonValue;
 
         try {
@@ -172,7 +197,9 @@ export class AgentStreamState implements StreamState {
           throw cause;
         }
 
-        if (this.retention.accept(retained)) this.traces.push(retained);
+        // Once one trace is dropped, later ones are too, so the kept traces are a prefix.
+        if (this.retention.acceptMetadata(retained)) this.traces.push(retained);
+        else this.tracesCut = this.metadataLost = true;
       }
 
       // Summaries are read only where the API puts them, so content and unknown branches can't
@@ -239,7 +266,9 @@ export class AgentStreamState implements StreamState {
       citation_count: this.citationCount || undefined,
       output_files: this.outputFiles.length > 0 ? this.outputFiles : undefined,
       agent_trace:
-        this.options.captureAgentTrace && this.traces.length > 0 ? this.traces : undefined,
+        this.options.captureAgentTrace !== false && this.traces.length > 0
+          ? this.traces
+          : undefined,
     });
 
     return mergeFields(

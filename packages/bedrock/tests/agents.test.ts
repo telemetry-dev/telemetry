@@ -2,6 +2,7 @@ import {
   BedrockAgentRuntimeClient,
   InvokeAgentCommand,
   InvokeFlowCommand,
+  InvokeInlineAgentCommand,
   RerankCommand,
   RetrieveAndGenerateCommand,
   RetrieveAndGenerateStreamCommand,
@@ -21,6 +22,7 @@ import {
 } from "../src/agents.ts";
 import {
   FakeClient,
+  STREAM_LIMIT,
   bytes,
   collect,
   jsonAttr,
@@ -68,7 +70,6 @@ test("InvokeAgent aggregates trace usage and return control", async () => {
         $metadata: { requestId: "agent-req" },
       },
     ]),
-    { captureAgentTrace: true },
   );
 
   const response = (await client.send(
@@ -95,12 +96,60 @@ test("InvokeAgent aggregates trace usage and return control", async () => {
   expect(span.attributes["gen_ai.response.id"]).toBe("agent-req");
   expect(span.attributes["td.metadata.return_control"]).toBe("true");
   expect(span.attributes["td.metadata.citation_count"]).toBe("1");
+  // Trace capture is on by default.
+  expect(jsonAttr(span, "td.metadata.agent_trace")).toHaveLength(1);
   expect(jsonAttr(span, "td.metadata.output_files")).toEqual([
     { name: "chart.png", type: "image/png" },
   ]);
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual({
     returnControl: { invocationId: "inv-1", invocationInputs: [{ function: "lookup" }] },
   });
+});
+
+test("InvokeAgent records returned action results and an inline agent's instruction", async () => {
+  const spans = setup();
+  const result = {
+    functionResult: { actionGroup: "orders", function: "refund", responseBody: {} },
+  };
+
+  const client = wrapBedrockAgents(
+    new FakeClient([
+      { completion: streamOf([{ chunk: { bytes: bytes("done") } }]) },
+      { completion: streamOf([{ chunk: { bytes: bytes("ok") } }]) },
+    ]),
+  );
+
+  const first = (await client.send(
+    new InvokeAgentCommand({
+      agentId: "agent-1",
+      agentAliasId: "a",
+      sessionId: "s",
+      sessionState: { invocationId: "inv-1", returnControlInvocationResults: [result] },
+    }),
+  )) as { completion: AsyncIterable<unknown> };
+
+  await collect(first.completion);
+
+  const second = (await client.send(
+    new InvokeInlineAgentCommand({
+      sessionId: "s",
+      agentName: "support",
+      foundationModel: "anthropic.claude-sonnet-4-5",
+      instruction: "Refund only delivered orders.",
+      inputText: "refund A1",
+    }),
+  )) as { completion: AsyncIterable<unknown> };
+
+  await collect(second.completion);
+
+  const [agent, inline] = spans.getFinishedSpans();
+  expect(jsonAttr(agent, "gen_ai.input.messages")).toEqual([
+    { role: "tool", parts: [{ type: "tool_call_response", id: "inv-1", response: result }] },
+  ]);
+  expect(inline.attributes["gen_ai.system_instructions"]).toBe("Refund only delivered orders.");
+  expect(jsonAttr(inline, "gen_ai.input.messages")).toEqual([
+    { role: "user", parts: [{ type: "text", content: "refund A1" }] },
+  ]);
 });
 
 // Content markers end in _TEXT; UNKNOWN_SECRET sits only in fields the trace shape doesn't know.
@@ -445,6 +494,7 @@ test.each([
           ]),
         },
       ]),
+      { captureAgentTrace: false },
     );
 
     const response = (await client.send(
@@ -548,10 +598,32 @@ test.each([
   },
 );
 
-test("masked InvokeAgent withholds text when a chunk after the metadata bound is rejected", async () => {
+test.each([
+  [
+    "a trace larger than the bound",
+    [
+      { trace: { sessionId: "first" } },
+      { trace: { sessionId: "t".repeat(50_000) } },
+      { trace: { sessionId: "after" } },
+    ],
+    STREAM_LIMIT,
+  ],
+  [
+    "traces that would leave no room for the answer",
+    Array.from({ length: 20 }, (_, index) => ({ trace: { sessionId: `${index}`.repeat(2_000) } })),
+    STREAM_LIMIT,
+  ],
+  [
+    "traces under an odd bound",
+    Array.from({ length: 20 }, (_, index) => ({ trace: { sessionId: `${index}`.repeat(2_000) } })),
+    STREAM_LIMIT + 1,
+  ],
+])("masked InvokeAgent keeps the answer after %s", async (_kind, traces, limit) => {
   const seen: string[] = [];
 
   const spans = setup({
+    // Another stream holds 1 byte of the budget.
+    batch: { maxStreamBytes: limit + 1 },
     mask: (value) => {
       seen.push(JSON.stringify(value));
 
@@ -559,17 +631,14 @@ test("masked InvokeAgent withholds text when a chunk after the metadata bound is
     },
   });
 
+  const answer = `Complete answer ${"a".repeat(10_000)}`;
+
   const client = wrapBedrockAgents(
     new FakeClient([
       {
-        completion: streamOf([
-          { chunk: { bytes: bytes("Complete answer") } },
-          { trace: { sessionId: "t".repeat(50_000) } },
-          { chunk: { bytes: bytes(" and more") } },
-        ]),
+        completion: streamOf([...traces, { chunk: { bytes: bytes(answer) } }]),
       },
     ]),
-    { captureAgentTrace: true },
   );
 
   const response = (await client.send(
@@ -579,9 +648,17 @@ test("masked InvokeAgent withholds text when a chunk after the metadata bound is
   await collect(response.completion);
 
   const [span] = spans.getFinishedSpans();
+  // The traces that did not fit are dropped, and the capture says so.
   expect(span.attributes["telemetry.dev.capture.truncated"]).toBe(true);
-  expect(span.attributes["gen_ai.output.messages"]).toBeUndefined();
-  expect(seen.some((value) => value.includes("Complete answer"))).toBe(false);
+  const kept = jsonAttr(span, "td.metadata.agent_trace").map(
+    (trace: { sessionId: string }) => trace.sessionId,
+  );
+  // The kept traces are the ones before the first that did not fit.
+  expect(kept.length).toBeGreaterThan(0);
+  expect(kept.length).toBeLessThan(traces.length);
+  expect(kept).toEqual(traces.slice(0, kept.length).map((event) => event.trace.sessionId));
+  expect(jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content).toBe(JSON.stringify(answer));
+  expect(seen.some((value) => value.includes("Complete answer"))).toBe(true);
 });
 
 function mapperBroke(): never {
@@ -718,7 +795,7 @@ test.each([
           $metadata: { requestId: "agent-req" },
         },
       ]),
-      { captureAgentTrace },
+      { captureAgentTrace: captureAgentTrace ?? false },
     );
 
     const response = (await client.send(
