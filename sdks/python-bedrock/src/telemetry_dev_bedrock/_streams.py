@@ -502,13 +502,14 @@ class InvokeModelStreamState(StreamState):
             # Invocation metrics have no documented compaction exclusion.
             if base_key in self.final_usage or base_key not in self.usage:
                 usage[key] = usage.get(key, 0) + value
+        tool_calls = _tool_calls_from_provider_chunks(self.chunks)
         output: Any = self.chunks
-        if text:
+        if text or tool_calls:
             output = [
                 clean(
                     {
                         "role": "assistant",
-                        "parts": [{"type": "text", "content": text}],
+                        "parts": ([{"type": "text", "content": text}] if text else []) + tool_calls,
                         "finish_reason": self.finish_reason,
                     }
                 )
@@ -568,6 +569,9 @@ class AgentStreamState(StreamState):
         self.saw_return_control = False
         self.return_control_rejected = False
         self.traces: list[Any] = []
+        self.traces_cut = False
+        self.metadata_bytes = 0
+        self.metadata_items = 0
         # Metadata bypasses the capture flags and the mask, so trace content is filtered here,
         # and a mask that cannot see it withholds it.
         client = telemetry_dev.get_client()
@@ -607,7 +611,7 @@ class AgentStreamState(StreamState):
         trace = event.get("trace") if isinstance(event.get("trace"), dict) else None
         if trace:
             self.trace_count += 1
-            if self.capture_trace:
+            if self.capture_trace and not self.traces_cut:
                 try:
                     retained = _project_trace(trace, _TRACE_PART, self.trace_capture)
                 except Exception:
@@ -615,9 +619,47 @@ class AgentStreamState(StreamState):
                     # text is, so later text is still kept.
                     self.metadata_lost = True
                     raise
-                if self.budget.accept(retained):
+                # Once one trace is dropped, later ones are too, so the kept traces are a prefix.
+                if self._accept_metadata(retained):
                     self.traces.append(retained)
+                else:
+                    self.traces_cut = True
+                    self.metadata_lost = True
             self._collect_trace(trace)
+
+    def _accept_metadata(self, value: Any) -> bool:
+        """As ``budget.accept``, for agent traces: they may use at most half of the bound's bytes
+        and items, and a value that does not fit is dropped without marking the budget
+        truncated, so the text that comes later still fits."""
+        budget = self.budget
+        if budget.truncated:
+            return False
+        room = min(
+            budget.max_bytes - budget.bytes_used, budget.max_bytes // 2 - self.metadata_bytes
+        )
+        # Older cores also bound a stream budget's items.
+        item_room = min(
+            budget.max_items - budget.items_used, budget.max_items // 2 - self.metadata_items
+        )
+        if room <= 0 or item_room <= 0:
+            return False
+        measure = telemetry_dev.CaptureBudget(max_bytes=room, max_items=item_room)
+        if not measure.accept(value):
+            return False
+        total = budget.bytes_used + measure.bytes_used
+        # Older cores have no reserve_bytes and bound each budget on its own.
+        reserve = getattr(budget, "reserve_bytes", None)
+        if callable(reserve):
+            if not reserve(total):
+                return False
+        elif total > budget.max_bytes:
+            return False
+        else:
+            budget.bytes_used = total
+        budget.items_used += measure.items_used
+        self.metadata_bytes += measure.bytes_used
+        self.metadata_items += measure.items_used
+        return True
 
     def finish(self, *, partial: bool) -> dict[str, Any]:
         # A stream cut short may stop inside a character; that is already an incomplete capture.
@@ -999,15 +1041,75 @@ def _int_value(value: Any) -> int | None:
         return None
 
 
+def _tool_calls_from_provider_chunks(chunks: list[Any]) -> list[dict[str, Any]]:
+    """The streamed tool calls, by content block: Anthropic Claude ``content_block_start`` with a
+    ``tool_use`` block and ``input_json_delta``, or Amazon Nova ``contentBlockStart.start.toolUse``
+    and ``contentBlockDelta.delta.toolUse.input``. The arguments arrive as JSON text in pieces."""
+    calls: dict[int, dict[str, Any]] = {}
+    for value in chunks:
+        if not isinstance(value, dict):
+            continue
+        nova_start = _dict(value.get("contentBlockStart"))
+        nova_delta = _dict(value.get("contentBlockDelta"))
+        index = value.get("index")
+        if not isinstance(index, int):
+            index = nova_start.get("contentBlockIndex", nova_delta.get("contentBlockIndex"))
+        if not isinstance(index, int):
+            continue
+        block = _dict(value.get("content_block"))
+        nova_tool = _dict(_dict(nova_start.get("start")).get("toolUse"))
+        if value.get("type") == "content_block_start" and block.get("type") == "tool_use":
+            calls[index] = {"id": block.get("id"), "name": block.get("name"), "pieces": []}
+        elif nova_tool:
+            calls[index] = {
+                "id": nova_tool.get("toolUseId"),
+                "name": nova_tool.get("name"),
+                "pieces": [],
+            }
+        elif index in calls:
+            delta = _dict(value.get("delta"))
+            nova_piece = _dict(_dict(nova_delta.get("delta")).get("toolUse")).get("input")
+            piece = (
+                delta.get("partial_json")
+                if value.get("type") == "content_block_delta"
+                and delta.get("type") == "input_json_delta"
+                else nova_piece
+            )
+            if isinstance(piece, str):
+                calls[index]["pieces"].append(piece)
+    parts: list[dict[str, Any]] = []
+    for call in calls.values():
+        arguments: Any = {}
+        # Joined once: appending to the stored string would copy it for every piece.
+        raw = "".join(call["pieces"])
+        if raw:
+            try:
+                arguments = json.loads(raw)
+            except json.JSONDecodeError:
+                arguments = raw
+        parts.append(
+            clean(
+                {
+                    "type": "tool_call",
+                    "id": call["id"],
+                    "name": call["name"],
+                    "arguments": arguments,
+                }
+            )
+        )
+    return parts
+
+
+def _dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def _text_from_provider_chunk(value: Any) -> str:
     if not isinstance(value, dict):
         return ""
     delta = value.get("delta") if isinstance(value.get("delta"), dict) else {}
-    block_delta = (
-        value.get("content_block_delta")
-        if isinstance(value.get("content_block_delta"), dict)
-        else {}
-    )
+    # Amazon Nova nests its text delta under contentBlockDelta.
+    block_delta = _dict(value.get("content_block_delta")) or _dict(value.get("contentBlockDelta"))
     nested = block_delta.get("delta") if isinstance(block_delta.get("delta"), dict) else {}
     for candidate in (
         value.get("outputText"),

@@ -151,19 +151,33 @@ def _apply_response(_params: dict[str, Any], response: dict[str, Any]) -> dict[s
     )
 
 
-def _agent_input(text: Any) -> list[dict[str, Any]] | None:
-    return (
-        [{"role": "user", "parts": [{"type": "text", "content": text}]}]
-        if isinstance(text, str)
-        else None
-    )
+def _agent_input(text: Any, session_state: Any = None) -> list[dict[str, Any]] | None:
+    """The user's text and, after a return of control, the results of the actions the app ran,
+    which the request carries in ``returnControlInvocationResults`` of its session state."""
+    session = session_state if isinstance(session_state, dict) else {}
+    results = session.get("returnControlInvocationResults")
+    invocation_id = session.get("invocationId")
+    messages: list[dict[str, Any]] = []
+    if isinstance(results, list) and results:
+        messages.append(
+            {
+                "role": "tool",
+                "parts": [
+                    clean({"type": "tool_call_response", "id": invocation_id, "response": result})
+                    for result in results
+                ],
+            }
+        )
+    if isinstance(text, str) and text:
+        messages.append({"role": "user", "parts": [{"type": "text", "content": text}]})
+    return messages or None
 
 
 def _agent_request(params: dict[str, Any]) -> dict[str, Any]:
     return clean(
         {
             "provider": PROVIDER,
-            "input": _agent_input(params.get("inputText")),
+            "input": _agent_input(params.get("inputText"), params.get("sessionState")),
             "agent_id": params.get("agentId"),
             "metadata": clean(
                 {
@@ -182,7 +196,8 @@ def _inline_agent_request(params: dict[str, Any]) -> dict[str, Any]:
         {
             "provider": PROVIDER,
             "model": params.get("foundationModel"),
-            "input": _agent_input(params.get("inputText")),
+            "input": _agent_input(params.get("inputText"), params.get("inlineSessionState")),
+            "system_instructions": params.get("instruction"),
             "agent_name": params.get("agentName"),
             "metadata": clean({"bedrock_session_id": params.get("sessionId")}) or None,
         }

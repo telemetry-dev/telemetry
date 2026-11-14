@@ -291,6 +291,8 @@ export class InvokeModelStreamState implements StreamState {
   readonly retention = new StreamRetention();
   private readonly chunks: unknown[] = [];
   private text = "";
+  // Streamed tool calls by content block index, so a stream with text keeps them too.
+  private readonly toolCalls = new Map<number, StreamedToolCall>();
   private usage: SpanFields["usage"];
   private finalUsage: NonNullable<SpanFields["usage"]> = {};
   private startUsage: NonNullable<SpanFields["usage"]> = {};
@@ -333,6 +335,7 @@ export class InvokeModelStreamState implements StreamState {
     if (this.retention.accept(parsed)) {
       this.chunks.push(parsed);
       this.text += textFromProviderChunk(parsed);
+      feedToolCall(this.toolCalls, parsed);
     }
 
     this.outputRecorded = true;
@@ -423,15 +426,26 @@ export class InvokeModelStreamState implements StreamState {
     }
     return mergeFields(
       omitUndefined({
-        output: this.text
-          ? [
-              {
-                role: "assistant",
-                parts: [{ type: "text", content: this.text }],
-                finish_reason: this.finishReason,
-              },
-            ]
-          : this.chunks,
+        output:
+          this.text || this.toolCalls.size > 0
+            ? [
+                {
+                  role: "assistant",
+                  parts: [
+                    ...(this.text ? [{ type: "text", content: this.text }] : []),
+                    ...[...this.toolCalls.values()].map((call) =>
+                      omitUndefined({
+                        type: "tool_call",
+                        id: call.id,
+                        name: call.name,
+                        arguments: call.input ? (parseJson(call.input) ?? call.input) : {},
+                      }),
+                    ),
+                  ],
+                  finish_reason: this.finishReason,
+                },
+              ]
+            : this.chunks,
         finishReason: this.finishReason,
         usage,
         attributes: this.compaction.attributes,
@@ -440,6 +454,67 @@ export class InvokeModelStreamState implements StreamState {
       this.errorFields,
     );
   }
+}
+
+interface StreamedToolCall {
+  id: string | undefined;
+  name: string | undefined;
+  input: string;
+}
+
+/**
+ * Adds a chunk's part of a tool call: Anthropic Claude `content_block_start` with a `tool_use`
+ * block and `input_json_delta`, or Amazon Nova `contentBlockStart.start.toolUse` and
+ * `contentBlockDelta.delta.toolUse.input`. The arguments arrive as JSON text in pieces.
+ */
+function feedToolCall<T>(calls: Map<number, StreamedToolCall>, value: T): void {
+  if (!isRecord(value)) return;
+  const claudeBlock = isRecord(value.content_block) ? value.content_block : undefined;
+  const claudeDelta = isRecord(value.delta) ? value.delta : undefined;
+  const novaStart = isRecord(value.contentBlockStart) ? value.contentBlockStart : undefined;
+  const novaDelta = isRecord(value.contentBlockDelta) ? value.contentBlockDelta : undefined;
+  const index =
+    numberValue(value.index) ??
+    numberValue(novaStart?.contentBlockIndex) ??
+    numberValue(novaDelta?.contentBlockIndex);
+
+  if (index === undefined) return;
+
+  if (value.type === "content_block_start" && claudeBlock?.type === "tool_use") {
+    calls.set(index, {
+      id: stringValue(claudeBlock.id),
+      name: stringValue(claudeBlock.name),
+      input: "",
+    });
+
+    return;
+  }
+
+  const novaToolStart = isRecord(novaStart?.start) ? novaStart.start.toolUse : undefined;
+
+  if (isRecord(novaToolStart)) {
+    calls.set(index, {
+      id: stringValue(novaToolStart.toolUseId),
+      name: stringValue(novaToolStart.name),
+      input: "",
+    });
+
+    return;
+  }
+
+  const call = calls.get(index);
+
+  if (!call) return;
+  const novaToolDelta = isRecord(novaDelta?.delta) ? novaDelta.delta.toolUse : undefined;
+
+  const piece =
+    value.type === "content_block_delta" && claudeDelta?.type === "input_json_delta"
+      ? stringValue(claudeDelta.partial_json)
+      : isRecord(novaToolDelta)
+        ? stringValue(novaToolDelta.input)
+        : undefined;
+
+  if (piece) call.input += piece;
 }
 
 function textFromProviderChunk<T>(value: T): string {

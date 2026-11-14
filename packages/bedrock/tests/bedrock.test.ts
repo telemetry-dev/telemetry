@@ -1402,6 +1402,85 @@ test("InvokeModelWithResponseStream normalizes Nova contentBlockDelta chunks", a
   expect(jsonAttr(span, "gen_ai.output.messages")[0].parts[0].content).toBe("Nova done");
 });
 
+test("InvokeModelWithResponseStream keeps streamed tool calls next to the text", async () => {
+  const spans = setup();
+  const chunk = (value: unknown) => ({ chunk: { bytes: bytes(value) } });
+
+  const client = wrapBedrock(
+    new FakeClient([
+      {
+        body: streamOf([
+          chunk({
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "Refunding" },
+          }),
+          chunk({
+            type: "content_block_start",
+            index: 1,
+            content_block: { type: "tool_use", id: "toolu_1", name: "refund", input: {} },
+          }),
+          chunk({
+            type: "content_block_delta",
+            index: 1,
+            delta: { type: "input_json_delta", partial_json: '{"order' },
+          }),
+          chunk({
+            type: "content_block_delta",
+            index: 1,
+            delta: { type: "input_json_delta", partial_json: '":"A1"}' },
+          }),
+          chunk({
+            type: "content_block_start",
+            index: 2,
+            content_block: { type: "tool_use", id: "toolu_2", name: "ping", input: {} },
+          }),
+        ]),
+      },
+      {
+        body: streamOf([
+          chunk({ contentBlockDelta: { contentBlockIndex: 0, delta: { text: "Booking" } } }),
+          chunk({
+            contentBlockStart: {
+              contentBlockIndex: 1,
+              start: { toolUse: { toolUseId: "t1", name: "book" } },
+            },
+          }),
+          chunk({
+            contentBlockDelta: { contentBlockIndex: 1, delta: { toolUse: { input: '{"seat":' } } },
+          }),
+          chunk({
+            contentBlockDelta: { contentBlockIndex: 1, delta: { toolUse: { input: '"4C"}' } } },
+          }),
+        ]),
+      },
+    ]),
+  );
+
+  for (const modelId of ["anthropic.claude-sonnet-4-5", "amazon.nova-pro-v1:0"]) {
+    const response = (await client.send(
+      new InvokeModelWithResponseStreamCommand({
+        modelId,
+        contentType: "application/json",
+        body: bytes({ messages: [] }),
+      }),
+    )) as { body: AsyncIterable<unknown> };
+
+    await collect(response.body);
+  }
+
+  const [claude, nova] = spans.getFinishedSpans();
+  expect(jsonAttr(claude, "gen_ai.output.messages")[0].parts).toEqual([
+    { type: "text", content: "Refunding" },
+    { type: "tool_call", id: "toolu_1", name: "refund", arguments: { order: "A1" } },
+    { type: "tool_call", id: "toolu_2", name: "ping", arguments: {} },
+  ]);
+  expect(jsonAttr(nova, "gen_ai.output.messages")[0].parts).toEqual([
+    { type: "text", content: "Booking" },
+    { type: "tool_call", id: "t1", name: "book", arguments: { seat: "4C" } },
+  ]);
+});
+
 test("InvokeModelWithResponseStream records modeled stream errors with partial output", async () => {
   const spans = setup();
 
