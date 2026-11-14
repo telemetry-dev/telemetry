@@ -110,8 +110,8 @@ event-dispatch time.
 
 ## Content capture
 
-Prompt input, assistant text output, tool arguments, and tool results follow the telemetry.dev SDK
-`captureInput` and `captureOutput` settings. Both default to `true`. Use `mask` to redact values
+Prompt input, the session's system prompt (on each `chat` span), assistant text output, tool
+arguments, and tool results follow the telemetry.dev SDK `captureInput` and `captureOutput` settings. Both default to `true`. Use `mask` to redact values
 before capture and `maxAttributeLength` to bound serialized attributes.
 
 The SDK records an exception message only when both `captureInput` and `captureOutput` are on, and

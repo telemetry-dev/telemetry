@@ -36,6 +36,10 @@ export interface TelemetryDevHooks {
     output: { message: object; parts: object[] },
   ) => Promise<void>;
   event: (input: { event: object }) => Promise<void>;
+  "experimental.chat.system.transform": (
+    input: { sessionID?: string; model?: { providerID?: string; id?: string } },
+    output: { system: string[] },
+  ) => Promise<void>;
   "tool.execute.before": (
     input: { tool: string; sessionID: string; callID: string },
     output: { args: JsonValue },
@@ -218,9 +222,15 @@ export function telemetryDevPlugin(
 
     const agentSpans = new Map<string, SpanHandle>();
     /** Open assistant-message chat spans, keyed by messageID. */
-    const openChats = new Map<string, { span: SpanHandle; sessionID: string }>();
+    const openChats = new Map<string, { span: SpanHandle; sessionID: string; model: string }>();
     /** The session's currently open chat span, so tool spans nest under it. */
     const chatBySession = new Map<string, SpanHandle>();
+    // The system prompt of each session's latest call to each model, until the session goes idle.
+    // Keyed by model too: opencode generates a session's title on its small model while the
+    // first chat call runs, and that call's prompt must not replace the chat's.
+    const systemBySession = new Map<string, Map<string, string[]>>();
+    const systemFor = (open: { sessionID: string; model: string }) =>
+      systemBySession.get(open.sessionID)?.get(open.model);
     /** Child (task/subagent) session -> parent session, from session.created. */
     const parentSession = new Map<string, string>();
     const pendingTools = new Map<`${string}:${string}`, PendingTool>();
@@ -257,6 +267,7 @@ export function telemetryDevPlugin(
       for (const [messageID, open] of openChats) {
         if (open.sessionID !== sessionID) continue;
         open.span.end({
+          systemInstructions: systemFor(open),
           error: sessionError(open.span, failure),
           finishReason: failure ? undefined : "incomplete",
         });
@@ -305,6 +316,8 @@ export function telemetryDevPlugin(
           span.end({ error: sessionError(span, failure) });
           agentSpans.delete(sessionID);
         }
+
+        systemBySession.delete(sessionID);
       }
 
       void flush().catch((error) => reportError(onError, error));
@@ -377,6 +390,7 @@ export function telemetryDevPlugin(
                     attributes: conversationAttributes(sessionID),
                   }),
                   sessionID,
+                  model: `${stringField(info, "providerID")}/${model}`,
                 };
                 openChats.set(messageID, open);
                 chatBySession.set(sessionID, open.span);
@@ -390,6 +404,9 @@ export function telemetryDevPlugin(
               if (chatBySession.get(sessionID) === open.span) chatBySession.delete(sessionID);
               open.span.end({
                 endTime: completed,
+                // Read at the end: opencode can create the message before the call's system
+                // prompt is built, and the session's next call starts after this one ends.
+                systemInstructions: systemFor(open),
                 finishReason: stringField(info, "finish"),
                 // Zero is a valid cost (free model/provider paths); never drop it.
                 costUsd: numberField(info, "cost"),
@@ -581,6 +598,19 @@ export function telemetryDevPlugin(
         }
       },
 
+      "experimental.chat.system.transform": async (input, output) => {
+        try {
+          // The array itself: plugins that run later can still change it, and opencode sends
+          // the changed array to the model.
+          if (!input.sessionID || !Array.isArray(output.system)) return;
+          let byModel = systemBySession.get(input.sessionID);
+          if (!byModel) systemBySession.set(input.sessionID, (byModel = new Map()));
+          byModel.set(`${input.model?.providerID}/${input.model?.id}`, output.system);
+        } catch (error) {
+          reportError(onError, error);
+        }
+      },
+
       dispose: async () => {
         try {
           // Disposal is not gated on session idle; apply each session's
@@ -590,6 +620,7 @@ export function telemetryDevPlugin(
           for (const [messageID, open] of openChats) {
             const failure = pendingErrors.get(open.sessionID);
             open.span.end({
+              systemInstructions: systemFor(open),
               error: sessionError(open.span, failure),
               finishReason: failure ? undefined : "incomplete",
             });
@@ -607,6 +638,7 @@ export function telemetryDevPlugin(
           }
 
           agentSpans.clear();
+          systemBySession.clear();
           parentSession.clear();
           pendingTools.clear();
           toolCallByPart.clear();

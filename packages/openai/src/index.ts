@@ -1,5 +1,4 @@
 import {
-  boundedCapture,
   boundedCaptureDetails,
   captureEnabled,
   MAX_RECORD_BYTES,
@@ -28,6 +27,7 @@ const wrappedRealtimeConnections = new WeakSet<object>();
 let realtimeEventSequence = 0;
 const REALTIME_CORRELATION_KEY = "__telemetry_dev_response_id";
 const REALTIME_TRACE_TIMEOUT_MS = 5 * 60_000;
+const REALTIME_MAX_NEW_ITEMS = 1_000;
 const REALTIME_MAX_IN_FLIGHT = 100;
 // Output and content indices past this are not kept, and the capture is marked cut.
 const REALTIME_CAPTURE_MAX_ITEMS = 1_000;
@@ -123,7 +123,7 @@ function readOwn(
 }
 
 function sanitizeResponsesCapture(value: unknown, maxBytes = MAX_RECORD_BYTES) {
-  return boundedCapture(value, {
+  return boundedCaptureDetails(value, {
     maxBytes,
     skip(key, item, parent, path) {
       const type = readString(asRecord(parent)?.type) ?? path.at(-1);
@@ -2928,6 +2928,26 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
   let listenersAttached = true;
   let closed = false;
   let traceSequence = 0;
+  // The session's instructions, which a response uses unless response.create overrides them.
+  // Once the app sets them, server session events no longer replace them: an event the server
+  // sent before it applied the app's session.update still carries the old value.
+  let sessionInstructions: unknown;
+  let appSetInstructions = false;
+  // Items the app added to the conversation since the last response, such as the user's message
+  // and function_call_output results: the new input of the next response.
+  // Kept within one record's bytes, the most the span can export.
+  let newItems: unknown[] = [];
+  let newItemsBytes = 0;
+  let newItemsDropped = false;
+
+  // App responses sent without a correlation key, whose response.created is not the server's.
+  let uncorrelatedResponses = 0;
+
+  const clearNewItems = () => {
+    newItems = [];
+    newItemsBytes = 0;
+    newItemsDropped = false;
+  };
 
   const removeTrace = (trace: RealtimeTrace) => {
     clearTimeout(trace.timer);
@@ -2994,6 +3014,15 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
       return;
     }
 
+    if (event.type === "session.created" || event.type === "session.updated") {
+      const session = asRecord(event.session);
+
+      if (session?.instructions !== undefined && !appSetInstructions)
+        sessionInstructions = session.instructions;
+
+      return;
+    }
+
     const response = asRecord(event.response);
 
     if (event.type === "response.created" && response) {
@@ -3012,6 +3041,17 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
       }
 
       const id = readString(response.id);
+
+      // The server started this response itself, such as on voice activity, and it used the
+      // items the app added. The app's own responses carry a correlation key, also once their
+      // trace has timed out or been evicted.
+      if (
+        !trace &&
+        !Object.keys(metadata ?? {}).some((key) => key.startsWith(REALTIME_CORRELATION_KEY))
+      ) {
+        if (uncorrelatedResponses > 0) uncorrelatedResponses -= 1;
+        else clearNewItems();
+      }
 
       if (trace && id) {
         const existing = active.get(id);
@@ -3114,6 +3154,26 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
   connection.send = (value: unknown) => {
     const event = asRecord(value);
 
+    if (event?.type === "session.update") {
+      const session = asRecord(event.session);
+
+      if (session?.instructions !== undefined) {
+        sessionInstructions = session.instructions;
+        appSetInstructions = true;
+      }
+    }
+
+    if (event?.type === "conversation.item.create" && event.item !== undefined) {
+      if (!captureEnabled("input")) clearNewItems();
+      else if (newItems.length < REALTIME_MAX_NEW_ITEMS && newItemsBytes < MAX_RECORD_BYTES) {
+        // Kept without audio and image data, which the capture leaves out anyway.
+        const item = sanitizeResponsesCapture(event.item, MAX_RECORD_BYTES - newItemsBytes);
+        newItems.push(item.value);
+        newItemsBytes += item.bytes;
+        if (item.truncated) newItemsDropped = true;
+      } else newItemsDropped = true;
+    }
+
     if (event?.type !== "response.create") {
       originalSend(value);
 
@@ -3130,6 +3190,19 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
     const model = readString(response.model) ?? options?.model;
     const metadata = asRecord(response.metadata) ?? {};
 
+    // A response with its own input items, or one outside the default conversation, leaves the
+    // items the app added for the next response that continues the conversation.
+    const ownInput = Array.isArray(response.input);
+    const continuesConversation = !ownInput && response.conversation !== "none";
+    const items = ownInput
+      ? response.input
+      : continuesConversation && newItems.length > 0
+        ? newItems
+        : undefined;
+    const itemsDropped = continuesConversation && newItemsDropped;
+
+    if (continuesConversation) clearNewItems();
+
     const correlationKey = Array.from({ length: 16 }, (_, index) =>
       index === 0 ? REALTIME_CORRELATION_KEY : `${REALTIME_CORRELATION_KEY}_${index}`,
     ).find((key) => !(key in metadata));
@@ -3144,6 +3217,7 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
       span.end({
         error: new Error("OpenAI Realtime response metadata has no room for telemetry correlation"),
       });
+      uncorrelatedResponses += 1;
       originalSend(value);
 
       return;
@@ -3158,16 +3232,30 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
 
     const correlationId = globalThis.crypto.randomUUID();
 
-    const inputCapture = captureEnabled("input")
-      ? sanitizeResponsesCapture(response.instructions)
-      : undefined;
+    const instructions = response.instructions ?? sessionInstructions;
 
-    const span = startRequestSpan(`chat ${model ?? "unknown"}`, {
+    const systemCapture =
+      captureEnabled("input") && instructions !== undefined
+        ? sanitizeResponsesCapture(instructions)
+        : undefined;
+
+    const inputCapture =
+      captureEnabled("input") && items !== undefined ? sanitizeResponsesCapture(items) : undefined;
+
+    const inputCut = inputCapture?.truncated === true || itemsDropped;
+    // A mask cannot inspect a value that was cut, so it is omitted.
+    const masked = captureMaskedBeforeStart();
+
+    const span = startSpan(`chat ${model ?? "unknown"}`, {
       type: "generation",
       model,
       provider: options?.provider ?? "openai",
-      input: inputCapture?.value,
-      attributes: inputCapture?.truncated ? { "telemetry.dev.capture.truncated": true } : undefined,
+      systemInstructions: systemCapture?.truncated && masked ? undefined : systemCapture?.value,
+      input: inputCut && masked ? undefined : inputCapture?.value,
+      attributes:
+        systemCapture?.truncated || inputCut
+          ? { "telemetry.dev.capture.truncated": true }
+          : undefined,
     });
 
     const trace = {} as RealtimeTrace;

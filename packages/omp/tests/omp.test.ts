@@ -141,6 +141,33 @@ afterEach(async () => {
   await resetForTesting();
 });
 
+test("the chat span records the session's system prompt, and a failing host keeps the span", async () => {
+  const errors: unknown[] = [];
+  const harness = makeHarness({ onError: (error) => errors.push(error) });
+  const withPrompt = makeContext();
+  withPrompt.getSystemPrompt = () => ["You are omp.", "Follow AGENTS.md."];
+  const failing = makeContext();
+  failing.getSystemPrompt = () => {
+    throw new Error("host failed");
+  };
+
+  await harness.emit({ type: "message_end", message: assistantMessage() }, withPrompt);
+  await harness.emit(
+    { type: "message_end", message: assistantMessage({ responseId: "r2" }) },
+    failing,
+  );
+  await flush();
+
+  const [first, second] = harness.exporters.spans.getFinishedSpans();
+  expect(JSON.parse(String(first!.attributes["gen_ai.system_instructions"]))).toEqual([
+    "You are omp.",
+    "Follow AGENTS.md.",
+  ]);
+  expect(second!.attributes["gen_ai.system_instructions"]).toBeUndefined();
+  expect(second!.attributes["gen_ai.operation.name"]).toBe("chat");
+  expect(errors).toHaveLength(1);
+});
+
 test("willContinue agent_end keeps one invoke_agent span until the terminal agent_end", async () => {
   const harness = makeHarness();
   const failed = assistantMessage({ stopReason: "error", errorMessage: "overloaded", content: [] });

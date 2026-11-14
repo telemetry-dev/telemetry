@@ -133,6 +133,37 @@ test("chat.message starts an invoke_agent span with prompt text and conversation
   expect(span.status.code).not.toBe(SpanStatusCode.ERROR);
 });
 
+test("the chat span records the system prompt opencode built for the call", async () => {
+  const harness = await makeHarness();
+  await chatMessage(harness.hooks);
+  const system = ["You are opencode.", "Follow AGENTS.md."];
+  const transform = harness.hooks["experimental.chat.system.transform"];
+  await transform?.(
+    {
+      sessionID: "session-1",
+      model: { providerID: "anthropic", id: "claude-sonnet-4-5" },
+    } as never,
+    { system },
+  );
+  // The session's title is generated on the small model while the chat call runs.
+  await transform?.(
+    { sessionID: "session-1", model: { providerID: "anthropic", id: "claude-haiku-4-5" } } as never,
+    { system: ["Generate a title."] },
+  );
+  // A plugin that runs later adds to the prompt, and the model receives that too.
+  system.push("Added by another plugin.");
+  await event(harness.hooks, "message.updated", { info: assistantMessage() });
+  await event(harness.hooks, "session.idle", { sessionID: "session-1" });
+  await flush();
+
+  const chat = spanByName(harness.exporters, "chat claude-sonnet-4-5");
+  expect(JSON.parse(String(chat.attributes["gen_ai.system_instructions"]))).toEqual([
+    "You are opencode.",
+    "Follow AGENTS.md.",
+    "Added by another plugin.",
+  ]);
+});
+
 test("completed assistant message creates one normalized, retroactive chat span", async () => {
   const harness = await makeHarness();
   await chatMessage(harness.hooks);
@@ -532,11 +563,19 @@ test("open chat spans are closed when the session settles without completing", a
   await event(harness.hooks, "message.updated", {
     info: assistantMessage({ time: { created: 1_700_000_000_000 } }),
   });
+  await harness.hooks["experimental.chat.system.transform"]?.(
+    {
+      sessionID: "session-1",
+      model: { providerID: "anthropic", id: "claude-sonnet-4-5" },
+    } as never,
+    { system: ["You are opencode."] },
+  );
   await event(harness.hooks, "session.idle", { sessionID: "session-1" });
   await flush();
 
   const chat = spanByName(harness.exporters, "chat claude-sonnet-4-5");
   expect(chat.attributes["gen_ai.response.finish_reasons"]).toEqual(["incomplete"]);
+  expect(chat.attributes["gen_ai.system_instructions"]).toBe('["You are opencode."]');
 });
 
 test("nonterminal session.error keeps the trace alive until the session settles", async () => {

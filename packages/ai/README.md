@@ -147,8 +147,11 @@ the `user.id` span attribute and `sessionId` as `gen_ai.conversation.id`; any re
 keys ride along as `td.metadata.<key>` attributes. Calls that share a `sessionId` share one trace;
 a call without one is its own trace.
 
-AI SDK records inputs and outputs by default. This includes provider-tool arguments and results,
-which can contain shell commands, code, search data, or MCP payloads. To suppress payload capture:
+AI SDK records inputs and outputs by default. Each step's `chat` span records the step's
+instructions (the call's `instructions`, or a `prepareStep` override; `system` on `ai@6`) as
+`gen_ai.system_instructions`, next to its input messages. Inputs also include tool arguments and
+results, including provider tools, which can contain shell commands, code, search data, or MCP
+payloads. To suppress payload capture:
 
 ```ts
 telemetry: {
@@ -158,7 +161,8 @@ telemetry: {
 }
 ```
 
-These flags omit prompt, response, tool-argument, tool-result, and detailed error payloads. Tool
+These flags omit prompt, instructions, response, tool-argument, tool-result, and detailed error
+payloads. Tool
 identity, status, error type, token usage, and other non-payload metadata are still recorded. On
 text generation steps, model warning messages are reduced to a generic "Model warning" unless both
 input and output recording are enabled; a warning that supplies a string `type` still records it

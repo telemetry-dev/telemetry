@@ -36,6 +36,8 @@ export interface TelemetryDevExtensionContext {
   model: { id?: string; provider?: string } | undefined;
   /** Read-only session manager exposing the session id. */
   sessionManager: { getSessionId(): string | undefined };
+  /** The session's current system prompt. Optional, so a host without it still loads. */
+  getSystemPrompt?(): string[];
 }
 
 /**
@@ -363,6 +365,14 @@ export function telemetryDevExtension(
       const duration = numberField(message, "duration");
       const errorMessage = stringField(message, "errorMessage");
       const stopReason = stringField(message, "stopReason");
+      let systemInstructions: string[] | undefined;
+
+      try {
+        systemInstructions = ctx.getSystemPrompt?.();
+      } catch (error) {
+        // Losing the prompt does not lose the chat span.
+        reportError(onError, error);
+      }
 
       const span = startSpan(model ? `chat ${model}` : "chat", {
         type: "generation",
@@ -374,6 +384,7 @@ export function telemetryDevExtension(
         usage: usageFields(message),
         finishReason: stopReason,
         timeToFirstChunkMs: numberField(message, "ttft"),
+        systemInstructions,
         output: textContent(message.content),
         error: stopReason === "error" ? failureError(stopReason, errorMessage) : undefined,
         attributes: spanAttributes(ctx),

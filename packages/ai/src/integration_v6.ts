@@ -60,6 +60,8 @@ interface V6StartEvent {
 
 interface V6StepStartEvent {
   stepNumber: number;
+  // The step's system prompt: the call's, or a prepareStep override.
+  system?: JsonValue;
   messages?: JsonValue;
 }
 
@@ -172,7 +174,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
 
   const steps = new Map<
     number,
-    { span?: Span; ctx: Context; startedAt: Date; messages?: JsonValue }
+    { span?: Span; ctx: Context; startedAt: Date; system?: JsonValue; messages?: JsonValue }
   >();
 
   const toolStarts = new Map<string, Date>();
@@ -286,6 +288,7 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
           span,
           ctx: trace.setSpan(rootCtx, span),
           startedAt,
+          system: e.system,
           messages: e.messages,
         });
       } catch (err) {
@@ -349,6 +352,10 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
             "gen_ai.usage.reasoning.output_tokens": reasoningTokens ?? undefined,
             "gen_ai.response.finish_reasons": e.finishReason ? [e.finishReason] : undefined,
             "gen_ai.output.type": "text",
+            "gen_ai.system_instructions":
+              step.system !== undefined
+                ? maskedAttr("gen_ai.system_instructions", step.system)
+                : undefined,
             "gen_ai.input.messages": maskedAttr("gen_ai.input.messages", step.messages),
             "gen_ai.output.messages": maskedAttr("gen_ai.output.messages", e.text),
           }),
