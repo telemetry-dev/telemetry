@@ -1954,7 +1954,12 @@ def test_responses_stream_early_close_retains_items_content_annotations_and_argu
         next(stream)
     stream.close()
 
-    assert json.loads(str(attrs(only_span(memory))["gen_ai.output.messages"])) == [
+    output = json.loads(str(attrs(only_span(memory))["gen_ai.output.messages"]))
+    # openrouter 1.3 serializes every URL citation with the constant "uncited": true; the
+    # integration keeps the SDK's own objects, so the field comes and goes with the SDK version.
+    for annotation in output[1]["content"][0]["annotations"]:
+        assert annotation.pop("uncited", True) is True
+    assert output == [
         {
             "id": "function_1",
             "type": "function_call",
