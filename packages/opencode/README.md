@@ -94,7 +94,7 @@ invoke_agent                        (session turn)
 
 ## Content capture
 
-Prompt text and tool arguments/results are captured by default. Configure `captureInput`, `captureOutput`, or `mask` through `telemetryDevPlugin` to disable or redact content before export:
+Prompt text, the system prompt of each model call (from opencode's `experimental.chat.system.transform` hook, on the `chat` span), and tool arguments/results are captured by default. When opencode generates a session's title on the same model as the first chat call, which it does when it has no smaller model for the provider, that chat span can show the title prompt instead. Configure `captureInput`, `captureOutput`, or `mask` through `telemetryDevPlugin` to disable or redact content before export:
 
 ```ts
 export const TelemetryDev = telemetryDevPlugin({

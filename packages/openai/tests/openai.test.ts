@@ -5353,6 +5353,122 @@ test("realtime wrapper traces response lifecycle, modality usage, and is idempot
   expect(String(span.attributes["gen_ai.output.messages"])).toContain("spoken");
 });
 
+test("realtime records the session instructions and the items the app added, with tool results", async () => {
+  const spans = setupSpans();
+  const listeners: Array<(value: unknown) => void> = [];
+  const sent: Array<{ response?: object }> = [];
+
+  const wrapped = wrapOpenAIRealtime({
+    send(event: unknown) {
+      sent.push(event as { response?: object });
+    },
+    close() {},
+    on(_event: string, listener: (value: unknown) => void) {
+      listeners.push(listener);
+    },
+    off() {},
+  });
+
+  const emit = (value: unknown) => {
+    for (const listener of listeners) listener(value);
+  };
+
+  const respond = (id: string) => {
+    emit({ type: "response.created", response: { id, ...sent.at(-1)!.response } });
+    emit({ type: "response.done", response: { id, status: "completed", output: [] } });
+  };
+
+  const userMessage = {
+    type: "message",
+    role: "user",
+    content: [
+      { type: "input_text", text: "refund order A1" },
+      { type: "input_audio", audio: "USER_AUDIO" },
+    ],
+  };
+
+  const toolResult = { type: "function_call_output", call_id: "call_1", output: '{"ok":true}' };
+
+  const userText = (text: string) => ({
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text }],
+  });
+
+  wrapped.send({
+    type: "session.update",
+    session: { instructions: "Refund delivered orders only." },
+  });
+  // The server's session.created can arrive after the app's update and still carry its default.
+  emit({ type: "session.created", session: { instructions: "Server default." } });
+  wrapped.send({ type: "conversation.item.create", item: userMessage });
+  wrapped.send({ type: "response.create" });
+  respond("resp_1");
+  wrapped.send({ type: "conversation.item.create", item: toolResult });
+  // An out-of-band response outside the conversation leaves the new items for the next one.
+  wrapped.send({
+    type: "response.create",
+    response: { conversation: "none", instructions: "Classify the intent." },
+  });
+  respond("resp_cls");
+  wrapped.send({ type: "response.create", response: { instructions: "Confirm the refund." } });
+  respond("resp_2");
+  wrapped.send({ type: "conversation.item.create", item: userText("thanks") });
+  // A response with its own input records that input and leaves the new items too.
+  wrapped.send({ type: "response.create", response: { input: [userText("summarize")] } });
+  respond("resp_3");
+  wrapped.send({ type: "response.create" });
+  respond("resp_4");
+  wrapped.send({ type: "conversation.item.create", item: userText("again") });
+  // A late event of an app response whose span already ended does not take the new items.
+  emit({
+    type: "response.created",
+    response: { id: "resp_old", metadata: { __telemetry_dev_response_id: "ended" } },
+  });
+  wrapped.send({ type: "response.create" });
+  respond("resp_late");
+  wrapped.send({ type: "conversation.item.create", item: userText("kept") });
+  // An app response with no room for a correlation key is not one the server started.
+  const fullMetadata = Object.fromEntries(Array.from({ length: 16 }, (_, i) => [`k${i}`, "v"]));
+  wrapped.send({
+    type: "response.create",
+    response: { conversation: "none", metadata: fullMetadata },
+  });
+  emit({ type: "response.created", response: { id: "resp_full", metadata: fullMetadata } });
+  wrapped.send({ type: "response.create" });
+  respond("resp_kept");
+  wrapped.send({ type: "conversation.item.create", item: userText("bye") });
+  // The server starts a response itself, which uses the new items.
+  emit({ type: "response.created", response: { id: "resp_vad" } });
+  wrapped.send({ type: "response.create" });
+  respond("resp_5");
+
+  const [first, classify, second, third, fourth, late, , kept, fifth] = await finishedSpans(
+    spans,
+    9,
+  );
+
+  expect(first!.attributes["gen_ai.system_instructions"]).toBe("Refund delivered orders only.");
+  expect(jsonAttr(first!, "gen_ai.input.messages")).toEqual([
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "refund order A1" }, { type: "input_audio" }],
+    },
+  ]);
+  expect(classify!.attributes["gen_ai.system_instructions"]).toBe("Classify the intent.");
+  expect(classify!.attributes["gen_ai.input.messages"]).toBeUndefined();
+  expect(second!.attributes["gen_ai.system_instructions"]).toBe("Confirm the refund.");
+  expect(jsonAttr(second!, "gen_ai.input.messages")).toEqual([toolResult]);
+  expect(jsonAttr(third!, "gen_ai.input.messages")).toEqual([userText("summarize")]);
+  expect(jsonAttr(fourth!, "gen_ai.input.messages")).toEqual([userText("thanks")]);
+  expect(jsonAttr(late!, "gen_ai.input.messages")).toEqual([userText("again")]);
+  expect(jsonAttr(kept!, "gen_ai.input.messages")).toEqual([userText("kept")]);
+  expect(fifth!.attributes["gen_ai.system_instructions"]).toBe("Refund delivered orders only.");
+  expect(fifth!.attributes["gen_ai.input.messages"]).toBeUndefined();
+  expect(JSON.stringify(first!.attributes)).not.toContain("USER_AUDIO");
+});
+
 test("realtime retains bounded completed snapshots when a connection closes before response.done", async () => {
   const spans = setupSpans();
   const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
@@ -5785,7 +5901,7 @@ test("realtime wrapper correlates reversed manual responses and ignores automati
   const finished = await finishedSpans(spans, 2);
 
   const byInput = Object.fromEntries(
-    finished.map((span) => [String(span.attributes["gen_ai.input.messages"]), span]),
+    finished.map((span) => [String(span.attributes["gen_ai.system_instructions"]), span]),
   );
 
   expect(byInput.first?.attributes["gen_ai.response.model"]).toBe("result-a");

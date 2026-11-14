@@ -149,6 +149,8 @@ interface V7StepStartEvent {
   provider: string;
   modelId: string;
   stepNumber: number;
+  // The step's instructions: the call's, or a prepareStep override.
+  instructions?: JsonValue;
   messages?: JsonValue;
   runtimeContext?: Record<string, JsonValue>;
 }
@@ -351,6 +353,7 @@ interface StepState {
   span: Span;
   ctx: Context;
   startedAt: Date;
+  instructions?: JsonValue;
   messages?: JsonValue;
   open: boolean;
 }
@@ -1222,6 +1225,7 @@ function createV7Hooks(
           span,
           ctx: trace.setSpan(state.rootCtx, span),
           startedAt,
+          instructions: e.instructions,
           messages: e.messages,
           open: true,
         });
@@ -1316,6 +1320,10 @@ function createV7Hooks(
             "gen_ai.usage.reasoning.output_tokens": reasoningTokens ?? undefined,
             "gen_ai.response.finish_reasons": e.finishReason ? [e.finishReason] : undefined,
             "gen_ai.output.type": "text",
+            "gen_ai.system_instructions":
+              state.recordInputs && step.instructions !== undefined
+                ? maskedAttr("gen_ai.system_instructions", step.instructions)
+                : undefined,
             "gen_ai.input.messages": state.recordInputs
               ? maskedAttr("gen_ai.input.messages", step.messages)
               : undefined,

@@ -376,7 +376,12 @@ test("the mask rewrites every exported payload", async () => {
   const failing = { toolCallId: "b", toolName: "read", input: { path: "error-secret-in" } };
 
   integ.onStart?.({ model, system: "secret system", prompt: "secret prompt" });
-  integ.onStepStart?.({ stepNumber: 0, model, messages: [{ role: "user", content: "secret" }] });
+  integ.onStepStart?.({
+    stepNumber: 0,
+    model,
+    system: "secret system",
+    messages: [{ role: "user", content: "secret" }],
+  });
   integ.onToolCallFinish?.({
     stepNumber: 0,
     toolCall: read,
@@ -418,10 +423,12 @@ test("the mask rewrites every exported payload", async () => {
     "Model warning: [masked] warning",
   );
   expect(step.attributes["gen_ai.output.messages"]).toBe("[masked] step out");
+  expect(step.attributes["gen_ai.system_instructions"]).toBe("[masked] system");
   expect([...keys].sort()).toEqual([
     "exception.message",
     "gen_ai.input.messages",
     "gen_ai.output.messages",
+    "gen_ai.system_instructions",
     "gen_ai.tool.call.arguments",
     "gen_ai.tool.call.result",
     "log.message",
@@ -1061,6 +1068,7 @@ test("a real ai@6 generateText run with a tool call records the root, both steps
 
   const result = await generateText({
     model: mockModel,
+    system: "look things up",
     prompt: "find otel",
     tools: {
       lookup: tool({
@@ -1104,6 +1112,7 @@ test("a real ai@6 generateText run with a tool call records the root, both steps
 
   for (const step of steps) {
     expect(step.parentSpanContext?.spanId).toBe(spanId(root));
+    expect(step.attributes["gen_ai.system_instructions"]).toBe("look things up");
     expect(step.attributes["gen_ai.usage.input_tokens"]).toBe(4);
   }
 

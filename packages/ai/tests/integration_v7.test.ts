@@ -81,6 +81,7 @@ test("single-step generateText flushes root+child with aggregated onEnd usage an
   integ.onStepStart?.({
     callId,
     stepNumber: 0,
+    instructions: "be brief",
     messages: [{ role: "user", content: "hi" }],
   });
   integ.onStepEnd?.({
@@ -121,6 +122,9 @@ test("single-step generateText flushes root+child with aggregated onEnd usage an
   expect(root.attributes["gen_ai.request.top_p"]).toBe(0.9);
   expect(root.attributes["gen_ai.request.max_tokens"]).toBe(512);
   expect(child.parentSpanContext?.spanId).toBe(spanId(root));
+  // The step's own instructions (a prepareStep override here), not the call's.
+  expect(child.attributes["gen_ai.system_instructions"]).toBe("be brief");
+  expect(root.attributes["gen_ai.system_instructions"]).toBeUndefined();
   expect(child.attributes["gen_ai.usage.input_tokens"]).toBe(10);
   expect(child.attributes["gen_ai.usage.output_tokens"]).toBe(5);
   expect(child.attributes["gen_ai.usage.cache_read.input_tokens"]).toBe(3);
@@ -326,14 +330,15 @@ test("ai@7 step-end fan-out records each step once", async () => {
         warnings: [],
       },
     }),
+    instructions: "answer once",
     prompt: "x",
     telemetry: { integrations: [integ] },
   });
 
   expect(spanBatches).toHaveLength(1);
-  expect(
-    byOperation(spanBatches[0]!, "chat").filter((s) => s.kind === SpanKind.CLIENT),
-  ).toHaveLength(1);
+  const steps = byOperation(spanBatches[0]!, "chat").filter((s) => s.kind === SpanKind.CLIENT);
+  expect(steps).toHaveLength(1);
+  expect(steps[0]!.attributes["gen_ai.system_instructions"]).toBe("answer once");
   expect(metrics.filter((m) => m.metric === "duration")).toHaveLength(1);
 });
 
@@ -1295,10 +1300,11 @@ test("provider result history is not inspected when input recording is disabled"
     operationId: "ai.generateText",
     provider: "openai",
     modelId: "gpt-4o",
+    instructions: "secret instructions",
     messages,
     recordInputs: false,
   });
-  integ.onStepStart?.({ callId, stepNumber: 0, messages });
+  integ.onStepStart?.({ callId, stepNumber: 0, instructions: "secret instructions", messages });
   integ.onLanguageModelCallEnd?.({ callId, content: [providerResult] });
   integ.onStepEnd?.({
     callId,
@@ -1322,6 +1328,7 @@ test("provider result history is not inspected when input recording is disabled"
   expect(tools).toHaveLength(1);
   expect(tools[0]!.attributes["gen_ai.tool.call.arguments"]).toBeUndefined();
   expect(JSON.stringify(spanBatches)).not.toContain("history-secret");
+  expect(JSON.stringify(spanBatches)).not.toContain("secret instructions");
 });
 
 test("a poisoned latest history input does not reuse stale provider-tool arguments", async () => {
@@ -3414,7 +3421,12 @@ test("the mask rewrites every exported payload", async () => {
     instructions: "secret instructions",
     messages: history,
   });
-  integ.onStepStart?.({ callId: "text", stepNumber: 0, messages: history });
+  integ.onStepStart?.({
+    callId: "text",
+    stepNumber: 0,
+    instructions: "secret step instructions",
+    messages: history,
+  });
   integ.onLanguageModelCallEnd?.({
     callId: "text",
     content: [
@@ -3596,6 +3608,7 @@ test("the mask rewrites every exported payload", async () => {
     "Model warning: [masked] warning",
   );
   expect(step.attributes["gen_ai.output.messages"]).toBe("[masked] step out");
+  expect(step.attributes["gen_ai.system_instructions"]).toBe("[masked] step instructions");
   expect(spanBatches[1]!.find((s) => s.kind === SpanKind.INTERNAL)!.status.code).toBe(
     SpanStatusCode.ERROR,
   );
@@ -3628,6 +3641,7 @@ test("the mask rewrites every exported payload", async () => {
     "exception.message",
     "gen_ai.input.messages",
     "gen_ai.output.messages",
+    "gen_ai.system_instructions",
     "gen_ai.tool.call.arguments",
     "gen_ai.tool.call.result",
     "log.message",
