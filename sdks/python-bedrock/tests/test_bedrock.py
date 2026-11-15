@@ -2993,6 +2993,8 @@ def test_agent_records_returned_action_results_and_inline_instruction(
             agentId="agent-1",
             agentAliasId="alias",
             sessionId="sess-1",
+            # The agent ignores inputText when the request carries action results.
+            inputText="ignored text",
             sessionState={"invocationId": "inv-1", "returnControlInvocationResults": [result]},
         )["completion"]
     )
@@ -3003,6 +3005,7 @@ def test_agent_records_returned_action_results_and_inline_instruction(
             foundationModel="anthropic.claude-sonnet-4-5",
             instruction="Refund only delivered orders.",
             inputText="refund A1",
+            inlineSessionState={"returnControlInvocationResults": []},
         )["completion"]
     )
 

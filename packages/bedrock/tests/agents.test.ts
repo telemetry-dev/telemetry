@@ -124,6 +124,8 @@ test("InvokeAgent records returned action results and an inline agent's instruct
       agentId: "agent-1",
       agentAliasId: "a",
       sessionId: "s",
+      // The agent ignores inputText when the request carries action results.
+      inputText: "ignored text",
       sessionState: { invocationId: "inv-1", returnControlInvocationResults: [result] },
     }),
   )) as { completion: AsyncIterable<unknown> };
@@ -137,6 +139,7 @@ test("InvokeAgent records returned action results and an inline agent's instruct
       foundationModel: "anthropic.claude-sonnet-4-5",
       instruction: "Refund only delivered orders.",
       inputText: "refund A1",
+      inlineSessionState: { returnControlInvocationResults: [] },
     }),
   )) as { completion: AsyncIterable<unknown> };
 

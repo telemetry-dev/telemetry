@@ -152,14 +152,15 @@ def _apply_response(_params: dict[str, Any], response: dict[str, Any]) -> dict[s
 
 
 def _agent_input(text: Any, session_state: Any = None) -> list[dict[str, Any]] | None:
-    """The user's text and, after a return of control, the results of the actions the app ran,
-    which the request carries in ``returnControlInvocationResults`` of its session state."""
+    """The user's text or, after a return of control, the results of the actions the app ran,
+    which the request carries in ``returnControlInvocationResults`` of its session state. The
+    agent ignores ``inputText`` when the request carries those results (InvokeAgent and
+    InvokeInlineAgent API reference), so the text is left out then."""
     session = session_state if isinstance(session_state, dict) else {}
     results = session.get("returnControlInvocationResults")
     invocation_id = session.get("invocationId")
-    messages: list[dict[str, Any]] = []
     if isinstance(results, list) and results:
-        messages.append(
+        return [
             {
                 "role": "tool",
                 "parts": [
@@ -167,10 +168,10 @@ def _agent_input(text: Any, session_state: Any = None) -> list[dict[str, Any]] |
                     for result in results
                 ],
             }
-        )
+        ]
     if isinstance(text, str) and text:
-        messages.append({"role": "user", "parts": [{"type": "text", "content": text}]})
-    return messages or None
+        return [{"role": "user", "parts": [{"type": "text", "content": text}]}]
+    return None
 
 
 def _agent_request(params: dict[str, Any]) -> dict[str, Any]:
