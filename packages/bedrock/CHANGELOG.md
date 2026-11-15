@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.0](https://github.com/telemetry-dev/telemetry/compare/bedrock-v0.2.7...bedrock-v0.3.0) (2026-11-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* **sdk-bedrock:** captureAgentTrace (TypeScript) and capture_agent_trace (Python) now default to true, so a call with enableTrace sends td.metadata.agent_trace. Pass captureAgentTrace: false or capture_agent_trace=False to keep only trace usage and counts.
+
+### Features
+
+* **sdk-bedrock:** capture agent instructions, tool results, and streamed tool calls ([#223](https://github.com/telemetry-dev/telemetry/issues/223)) ([7dd1252](https://github.com/telemetry-dev/telemetry/commit/7dd1252f142c282f0117979e8c65c1083ab4ecbc))
+
+
+### Bug Fixes
+
+* **sdk:** record the input bedrock agents and realtime responses really get ([#227](https://github.com/telemetry-dev/telemetry/issues/227)) ([81d1c63](https://github.com/telemetry-dev/telemetry/commit/81d1c63f28a8a228f81748b6422133852815efe6))
+
 ## [0.2.7](https://github.com/telemetry-dev/telemetry/compare/bedrock-v0.2.6...bedrock-v0.2.7) (2026-11-10)
 
 

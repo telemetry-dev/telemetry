@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.8](https://github.com/telemetry-dev/telemetry/compare/opencode-v0.2.7...opencode-v0.2.8) (2026-11-15)
+
+
+### Features
+
+* **sdk:** record system prompts on chat spans in more integrations ([#224](https://github.com/telemetry-dev/telemetry/issues/224)) ([4f282c6](https://github.com/telemetry-dev/telemetry/commit/4f282c6d4680926b2125ac2832d17095f9c8429a))
+
 ## [0.2.7](https://github.com/telemetry-dev/telemetry/compare/opencode-v0.2.6...opencode-v0.2.7) (2026-11-10)
 
 
