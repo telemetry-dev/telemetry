@@ -2476,6 +2476,11 @@ interface RealtimeOutputState {
   stopped: boolean;
 }
 
+/** An event id for a response.create, which the server names in its error when it rejects one. */
+function realtimeEventId(): string {
+  return `event_telemetry_${Date.now().toString(36)}_${(realtimeEventSequence += 1).toString(36)}`;
+}
+
 interface RealtimeTrace {
   span: SpanHandle;
   end: (fields?: SpanFields) => void;
@@ -2487,6 +2492,26 @@ interface RealtimeTrace {
   correlationKey: string;
   timer: ReturnType<typeof setTimeout>;
   output?: RealtimeOutputState;
+  tookItems: boolean;
+}
+
+/** An app response.create sent without a correlation key. */
+interface RealtimeUncorrelatedSend {
+  eventId: string;
+  tookItems: boolean;
+}
+
+/** An item the app added to the conversation, as captured, with its captured size. */
+interface RealtimeNewItem {
+  value: unknown;
+  bytes: number;
+}
+
+/** The new items a response.create took as its input, and the request that took them. */
+interface RealtimeTake {
+  owner: RealtimeTrace | RealtimeUncorrelatedSend;
+  items: RealtimeNewItem[];
+  dropped: boolean;
 }
 
 type RealtimeListener = (...args: unknown[]) => void;
@@ -2936,20 +2961,79 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
   // Items the app added to the conversation since the last response, such as the user's message
   // and function_call_output results: the new input of the next response.
   // Kept within one record's bytes, the most the span can export.
-  let newItems: unknown[] = [];
+  let newItems: RealtimeNewItem[] = [];
   let newItemsBytes = 0;
   let newItemsDropped = false;
 
-  // App responses sent without a correlation key, whose response.created is not the server's.
-  let uncorrelatedResponses = 0;
+  // App responses sent without a correlation key, oldest first, whose response.created is not
+  // the server's. The event id matches the server's error when it rejects one. Past the cap, the
+  // oldest are only counted, so each response.created still pairs with its own send.
+  const uncorrelatedSends: RealtimeUncorrelatedSend[] = [];
+  let evictedUncorrelatedSends = 0;
+  // The items the latest response.create took, until the server starts it. If the server rejects
+  // it or the send throws, no response used them, and they go back to the next one. Any later
+  // take, or a response the server starts itself, may have used them, so it forgets them: they
+  // are then left out of the record rather than recorded twice or out of order.
+  let lastTake: RealtimeTake | undefined;
 
   const clearNewItems = () => {
     newItems = [];
     newItemsBytes = 0;
     newItemsDropped = false;
+    lastTake = undefined;
+  };
+
+  const forgetTake = (owner: RealtimeTake["owner"] | undefined) => {
+    if (lastTake && lastTake.owner === owner) lastTake = undefined;
+  };
+
+  // The latest take's items may not be the whole input of the response that uses them.
+  const markTakeIncomplete = () => {
+    if (!lastTake) return;
+
+    lastTake.dropped = true;
+
+    if ("span" in lastTake.owner)
+      lastTake.owner.span.update({ attributes: { "telemetry.dev.capture.truncated": true } });
+  };
+
+  // The server did not start this request, so no response used the items it took. Since the
+  // take, only the items the app added after it are new, so the taken ones go first. An earlier
+  // request's items cannot come back: the later request that may use them is marked instead.
+  const restoreTake = (owner: RealtimeTake["owner"]) => {
+    if (!lastTake) return;
+
+    if (lastTake.owner !== owner) {
+      if (owner.tookItems) markTakeIncomplete();
+
+      return;
+    }
+
+    const { items: taken } = lastTake;
+    const later = newItems;
+    const dropped = lastTake.dropped || newItemsDropped;
+
+    clearNewItems();
+    newItemsDropped = dropped;
+
+    for (const item of [...taken, ...later]) {
+      if (
+        newItems.length >= REALTIME_MAX_NEW_ITEMS ||
+        newItemsBytes + item.bytes > MAX_RECORD_BYTES
+      ) {
+        // Closed like a full queue, so a newer item cannot follow the ones left out.
+        newItemsBytes = MAX_RECORD_BYTES;
+        newItemsDropped = true;
+        break;
+      }
+
+      newItems.push(item);
+      newItemsBytes += item.bytes;
+    }
   };
 
   const removeTrace = (trace: RealtimeTrace) => {
+    forgetTake(trace);
     clearTimeout(trace.timer);
     pending.delete(trace.correlationId);
 
@@ -2999,9 +3083,20 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
 
       if (!requestEventId) return;
 
+      const uncorrelated = uncorrelatedSends.findIndex((send) => send.eventId === requestEventId);
+
+      if (uncorrelated >= 0) {
+        restoreTake(uncorrelatedSends.splice(uncorrelated, 1)[0]!);
+
+        return;
+      }
+
       const trace = pendingByEventId.get(requestEventId);
 
       if (trace) {
+        // Before response.created, an error for the request means the server did not start it.
+        if (pending.has(trace.correlationId)) restoreTake(trace);
+
         finishTrace(trace, {
           error: providerFailure(
             [readString(error?.code), readString(error?.message)].filter(Boolean).join(": "),
@@ -3049,8 +3144,14 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
         !trace &&
         !Object.keys(metadata ?? {}).some((key) => key.startsWith(REALTIME_CORRELATION_KEY))
       ) {
-        if (uncorrelatedResponses > 0) uncorrelatedResponses -= 1;
-        else clearNewItems();
+        // A response the server started itself would also match a pending send here, and it
+        // may have used the latest take's items, so a rejection no longer gives them back.
+        if (evictedUncorrelatedSends > 0 || uncorrelatedSends.length > 0) {
+          if (evictedUncorrelatedSends > 0) evictedUncorrelatedSends -= 1;
+          else uncorrelatedSends.shift();
+
+          if (lastTake) lastTake = { ...lastTake, items: [], dropped: true };
+        } else clearNewItems();
       }
 
       if (trace && id) {
@@ -3065,6 +3166,7 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
         }
 
         pending.delete(trace.correlationId);
+        forgetTake(trace);
         active.set(id, trace);
       }
 
@@ -3147,6 +3249,9 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
 
   const onClose = () => {
     closed = true;
+    lastTake = undefined;
+    uncorrelatedSends.length = 0;
+    evictedUncorrelatedSends = 0;
     finishAll(new Error("OpenAI Realtime connection closed before response.done"));
     detachListeners();
   };
@@ -3168,7 +3273,7 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
       else if (newItems.length < REALTIME_MAX_NEW_ITEMS && newItemsBytes < MAX_RECORD_BYTES) {
         // Kept without audio and image data, which the capture leaves out anyway.
         const item = sanitizeResponsesCapture(event.item, MAX_RECORD_BYTES - newItemsBytes);
-        newItems.push(item.value);
+        newItems.push({ value: item.value, bytes: item.bytes });
         newItemsBytes += item.bytes;
         if (item.truncated) newItemsDropped = true;
       } else newItemsDropped = true;
@@ -3194,14 +3299,26 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
     // items the app added for the next response that continues the conversation.
     const ownInput = Array.isArray(response.input);
     const continuesConversation = !ownInput && response.conversation !== "none";
-    const items = ownInput
-      ? response.input
-      : continuesConversation && newItems.length > 0
-        ? newItems
-        : undefined;
-    const itemsDropped = continuesConversation && newItemsDropped;
+    const taken = continuesConversation ? { items: newItems, dropped: newItemsDropped } : undefined;
 
     if (continuesConversation) clearNewItems();
+
+    const items = ownInput
+      ? response.input
+      : taken && taken.items.length > 0
+        ? taken.items.map((item) => item.value)
+        : undefined;
+    const itemsDropped = taken?.dropped === true;
+    const tookItems = taken !== undefined && (taken.items.length > 0 || taken.dropped);
+    const suppliedId = readString(event.event_id);
+
+    // An event id the wrapper already tracks would match another request's error.
+    const suppliedEventId =
+      suppliedId &&
+      !pendingByEventId.has(suppliedId) &&
+      !uncorrelatedSends.some((send) => send.eventId === suppliedId)
+        ? suppliedId
+        : undefined;
 
     const correlationKey = Array.from({ length: 16 }, (_, index) =>
       index === 0 ? REALTIME_CORRELATION_KEY : `${REALTIME_CORRELATION_KEY}_${index}`,
@@ -3217,18 +3334,32 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
       span.end({
         error: new Error("OpenAI Realtime response metadata has no room for telemetry correlation"),
       });
-      uncorrelatedResponses += 1;
-      originalSend(value);
+      const send = { eventId: suppliedEventId ?? realtimeEventId(), tookItems };
+
+      uncorrelatedSends.push(send);
+
+      if (uncorrelatedSends.length > (options?.maxInFlight ?? REALTIME_MAX_IN_FLIGHT)) {
+        forgetTake(uncorrelatedSends.shift());
+        evictedUncorrelatedSends += 1;
+      }
+
+      if (taken) lastTake = { owner: send, ...taken };
+
+      try {
+        originalSend(suppliedEventId ? value : { ...event, event_id: send.eventId });
+      } catch (cause) {
+        const index = uncorrelatedSends.indexOf(send);
+
+        if (index >= 0) uncorrelatedSends.splice(index, 1);
+
+        restoreTake(send);
+        throw cause;
+      }
 
       return;
     }
 
-    const suppliedEventId = readString(event.event_id);
-
-    const requestEventId =
-      suppliedEventId && !pendingByEventId.has(suppliedEventId)
-        ? suppliedEventId
-        : `event_telemetry_${Date.now().toString(36)}_${(realtimeEventSequence += 1).toString(36)}`;
+    const requestEventId = suppliedEventId ?? realtimeEventId();
 
     const correlationId = globalThis.crypto.randomUUID();
 
@@ -3275,6 +3406,7 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
       correlationId,
       correlationKey,
       timer,
+      tookItems,
       output: captureEnabled("output")
         ? {
             items: new Map(),
@@ -3298,6 +3430,8 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
     pending.set(correlationId, trace);
     pendingByEventId.set(requestEventId, trace);
 
+    if (taken) lastTake = { owner: trace, ...taken };
+
     try {
       originalSend({
         ...event,
@@ -3311,6 +3445,7 @@ export function wrapOpenAIRealtime<T extends OpenAIRealtimeEmitter>(
         },
       });
     } catch (cause) {
+      restoreTake(trace);
       finishTrace(trace, { error: asError(cause) });
       throw cause;
     }

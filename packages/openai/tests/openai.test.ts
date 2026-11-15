@@ -5469,6 +5469,216 @@ test("realtime records the session instructions and the items the app added, wit
   expect(JSON.stringify(first!.attributes)).not.toContain("USER_AUDIO");
 });
 
+test("realtime gives the items of a response.create the server rejected to the next response", async () => {
+  const spans = setupSpans();
+  const listeners: Array<(value: unknown) => void> = [];
+  const sent: Array<{ event_id?: string; response?: object }> = [];
+  let failNextSend = false;
+
+  const wrapped = wrapOpenAIRealtime(
+    {
+      send(event: unknown) {
+        if (failNextSend) {
+          failNextSend = false;
+          throw new Error("socket closed");
+        }
+
+        sent.push(event as { event_id?: string; response?: object });
+      },
+      close() {},
+      on(_event: string, listener: (value: unknown) => void) {
+        listeners.push(listener);
+      },
+      off() {},
+    },
+    { maxInFlight: 2 },
+  );
+
+  const emit = (value: unknown) => {
+    for (const listener of listeners) listener(value);
+  };
+
+  const reject = (eventId: string) =>
+    emit({
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        code: "conversation_already_has_active_response",
+        event_id: eventId,
+      },
+    });
+
+  const add = (text: string) =>
+    wrapped.send({
+      type: "conversation.item.create",
+      item: { type: "message", role: "user", content: [{ type: "input_text", text }] },
+    });
+
+  const inputs = new Map<string, unknown>();
+  const truncated = new Map<string, boolean>();
+
+  const respond = (id: string) => {
+    wrapped.send({ type: "response.create" });
+    emit({ type: "response.created", response: { id, ...sent.at(-1)!.response } });
+    emit({ type: "response.done", response: { id, status: "completed", output: [] } });
+  };
+
+  const fullMetadata = Object.fromEntries(Array.from({ length: 16 }, (_, i) => [`k${i}`, "v"]));
+
+  // Rejected, then retried: the retry records the items in the order the app added them.
+  add("a1");
+  wrapped.send({ type: "response.create", event_id: "evt_a" });
+  add("a2");
+  reject("evt_a");
+  respond("resp_a");
+
+  // A response the server started before the rejection used the items.
+  add("b1");
+  wrapped.send({ type: "response.create", event_id: "evt_b" });
+  emit({ type: "response.created", response: { id: "resp_vad_b" } });
+  reject("evt_b");
+  respond("resp_b");
+
+  // Of two rejected requests, only the latest gives its items back: the earlier ones may have
+  // been used by the later request, so they are left out, and the input is marked cut.
+  add("c1");
+  wrapped.send({ type: "response.create", event_id: "evt_c1" });
+  add("c2");
+  wrapped.send({ type: "response.create", event_id: "evt_c2" });
+  reject("evt_c1");
+  reject("evt_c2");
+  respond("resp_c");
+
+  // A rejected request with no room for a correlation key gives its items back too, and no
+  // longer counts as the app's next response.created.
+  add("d1");
+  wrapped.send({ type: "response.create", response: { metadata: fullMetadata } });
+  reject(sent.at(-1)!.event_id!);
+  add("d2");
+  respond("resp_d");
+  add("e1");
+  wrapped.send({ type: "response.create", response: { metadata: fullMetadata } });
+  reject(sent.at(-1)!.event_id!);
+  emit({ type: "response.created", response: { id: "resp_vad_e" } });
+  respond("resp_e");
+
+  // A send that throws never reached the server.
+  add("f1");
+  failNextSend = true;
+  expect(() => wrapped.send({ type: "response.create" })).toThrow("socket closed");
+  add("g1");
+  failNextSend = true;
+  expect(() =>
+    wrapped.send({ type: "response.create", response: { metadata: fullMetadata } }),
+  ).toThrow("socket closed");
+  respond("resp_f");
+
+  // Past maxInFlight, an uncorrelated send is still paired with its own response.created.
+  for (let i = 0; i < 3; i += 1)
+    wrapped.send({
+      type: "response.create",
+      response: { conversation: "none", metadata: fullMetadata },
+    });
+
+  emit({ type: "response.created", response: { id: "resp_u1", metadata: fullMetadata } });
+  emit({ type: "response.created", response: { id: "resp_u2", metadata: fullMetadata } });
+  add("h1");
+  emit({ type: "response.created", response: { id: "resp_u3", metadata: fullMetadata } });
+  respond("resp_h");
+
+  // An error for a request the server already started does not touch a later request's items.
+  add("i1");
+  wrapped.send({ type: "response.create" });
+  emit({ type: "response.created", response: { id: "resp_i", ...sent.at(-1)!.response } });
+  const startedEventId = sent.at(-1)!.event_id!;
+  add("i2");
+  wrapped.send({ type: "response.create", event_id: "evt_j" });
+  reject(startedEventId);
+  reject("evt_j");
+  respond("resp_k");
+
+  // A response the server started while an uncorrelated send is pending may have used the items.
+  wrapped.send({
+    type: "response.create",
+    response: { conversation: "none", metadata: fullMetadata },
+  });
+  add("l1");
+  wrapped.send({ type: "response.create", event_id: "evt_l" });
+  emit({ type: "response.created", response: { id: "resp_vad_l" } });
+  reject("evt_l");
+  respond("resp_l");
+
+  // A later request that the server starts after an earlier one was rejected used both
+  // requests' items, but only its own are known, so its input is marked cut.
+  add("n1");
+  wrapped.send({ type: "response.create", event_id: "evt_n1" });
+  add("n2");
+  wrapped.send({ type: "response.create", event_id: "evt_n2" });
+  const pipelined = sent.at(-1)!.response;
+  reject("evt_n1");
+  emit({ type: "response.created", response: { id: "resp_n", ...pipelined } });
+  emit({ type: "response.done", response: { id: "resp_n", status: "completed", output: [] } });
+
+  // A rejected request that took no items leaves nothing out.
+  wrapped.send({ type: "response.create", event_id: "evt_p1" });
+  add("p2");
+  wrapped.send({ type: "response.create", event_id: "evt_p2" });
+  reject("evt_p1");
+  reject("evt_p2");
+  respond("resp_p");
+
+  // Items cut while a request was pending stay marked when the request's items come back.
+  wrapped.send({ type: "response.create", event_id: "evt_q" });
+  add("q".repeat(17 * 1024 * 1024));
+  reject("evt_q");
+  respond("resp_q");
+
+  // When the items coming back no longer fit, newer items are not added after the ones left out.
+  add("r".repeat(9 * 1024 * 1024));
+  wrapped.send({ type: "response.create", event_id: "evt_r" });
+  add("s".repeat(9 * 1024 * 1024));
+  reject("evt_r");
+  add("t");
+  respond("resp_r");
+
+  for (const span of await finishedSpans(spans, 33)) {
+    const id = span.attributes["gen_ai.response.id"];
+
+    if (typeof id === "string") {
+      inputs.set(id, span.attributes["gen_ai.input.messages"]);
+      truncated.set(id, span.attributes["telemetry.dev.capture.truncated"] === true);
+    }
+  }
+
+  const texts = (id: string) =>
+    inputs.get(id) === undefined
+      ? undefined
+      : (JSON.parse(String(inputs.get(id))) as Array<{ content: Array<{ text: string }> }>).map(
+          (item) => item.content[0]!.text,
+        );
+
+  expect(texts("resp_a")).toEqual(["a1", "a2"]);
+  expect(texts("resp_b")).toBeUndefined();
+  expect(texts("resp_c")).toEqual(["c2"]);
+  expect(truncated.get("resp_c")).toBe(true);
+  expect(truncated.get("resp_a")).toBe(false);
+  expect(texts("resp_d")).toEqual(["d1", "d2"]);
+  expect(texts("resp_e")).toBeUndefined();
+  expect(texts("resp_f")).toEqual(["f1", "g1"]);
+  expect(texts("resp_h")).toEqual(["h1"]);
+  expect(texts("resp_k")).toEqual(["i2"]);
+  expect(truncated.get("resp_k")).toBe(false);
+  expect(texts("resp_l")).toBeUndefined();
+  expect(truncated.get("resp_l")).toBe(true);
+  expect(texts("resp_n")).toEqual(["n2"]);
+  expect(truncated.get("resp_n")).toBe(true);
+  expect(texts("resp_p")).toEqual(["p2"]);
+  expect(truncated.get("resp_p")).toBe(false);
+  expect(truncated.get("resp_q")).toBe(true);
+  expect(texts("resp_r")!.map((text) => text[0])).toEqual(["r"]);
+  expect(truncated.get("resp_r")).toBe(true);
+});
+
 test("realtime retains bounded completed snapshots when a connection closes before response.done", async () => {
   const spans = setupSpans();
   const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
