@@ -469,9 +469,10 @@ def test_an_export_with_no_response_does_not_report_an_earlier_refusal_of_its_th
         telemetry_dev.shutdown()
 
     assert str(errors[0]) == "telemetry.dev trace ingest failed: 401"
-    # The generic message, or the timeout itself from the exporter versions that raise it.
+    # The generic message, or the timeout itself from the exporter versions that raise it. The
+    # timeout's message names the server's port, which can contain "401".
     assert len(errors) == 2
-    assert "401" not in str(errors[1])
+    assert getattr(errors[1], "status", None) is None
 
 
 def test_a_failure_during_a_slow_report_on_another_thread_is_quiet_and_does_not_wait() -> None:
