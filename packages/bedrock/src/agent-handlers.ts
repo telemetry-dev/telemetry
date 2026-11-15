@@ -25,8 +25,10 @@ import {
 } from "./internal.ts";
 
 /**
- * The user's text and, after a return of control, the results of the actions the app ran, which
- * the request carries in `returnControlInvocationResults` of its session state.
+ * The user's text or, after a return of control, the results of the actions the app ran, which
+ * the request carries in `returnControlInvocationResults` of its session state. The agent ignores
+ * `inputText` when the request carries those results (InvokeAgent and InvokeInlineAgent API
+ * reference), so the text is left out then.
  */
 export function agentInputMessages<T, S>(inputText: T, sessionState?: S): JsonValue {
   const text = stringValue(inputText);
@@ -35,21 +37,18 @@ export function agentInputMessages<T, S>(inputText: T, sessionState?: S): JsonVa
   const results = arrayValue<JsonValue>(session?.returnControlInvocationResults);
   const invocationId = stringValue(session?.invocationId);
 
-  const messages: JsonValue[] = [
-    ...(results && results.length > 0
-      ? [
-          {
-            role: "tool",
-            parts: results.map((result) =>
-              omitUndefined({ type: "tool_call_response", id: invocationId, response: result }),
-            ),
-          },
-        ]
-      : []),
-    ...(text ? [{ role: "user", parts: [{ type: "text", content: text }] }] : []),
-  ];
+  if (results && results.length > 0) {
+    return [
+      {
+        role: "tool",
+        parts: results.map((result) =>
+          omitUndefined({ type: "tool_call_response", id: invocationId, response: result }),
+        ),
+      },
+    ];
+  }
 
-  return messages.length > 0 ? messages : undefined;
+  return text ? [{ role: "user", parts: [{ type: "text", content: text }] }] : undefined;
 }
 
 export function agentRequestFields(input: JsonRecord): SpanFields {
