@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.8](https://github.com/telemetry-dev/telemetry/compare/openai-v0.2.7...openai-v0.2.8) (2026-11-15)
+
+
+### Features
+
+* **sdk:** record system prompts on chat spans in more integrations ([#224](https://github.com/telemetry-dev/telemetry/issues/224)) ([4f282c6](https://github.com/telemetry-dev/telemetry/commit/4f282c6d4680926b2125ac2832d17095f9c8429a))
+
+
+### Bug Fixes
+
+* **sdk:** record the input bedrock agents and realtime responses really get ([#227](https://github.com/telemetry-dev/telemetry/issues/227)) ([81d1c63](https://github.com/telemetry-dev/telemetry/commit/81d1c63f28a8a228f81748b6422133852815efe6))
+
 ## [0.2.7](https://github.com/telemetry-dev/telemetry/compare/openai-v0.2.6...openai-v0.2.7) (2026-11-10)
 
 
