@@ -9,7 +9,6 @@ import {
   setTracingDisabled,
   Trace,
   type TracingProcessor,
-  withCustomSpan,
   withTrace,
 } from "@openai/agents";
 import { SandboxAgent, shell } from "@openai/agents/sandbox";
@@ -20,7 +19,7 @@ import OpenAI from "openai";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import { resetForTesting } from "../src/config.ts";
-import { instrumentSandboxClient, telemetryDevProcessor } from "../src/index.ts";
+import { telemetryDevProcessor } from "../src/index.ts";
 
 type Json = Record<string, unknown>;
 
@@ -183,7 +182,6 @@ function chatCompletionsModel(command: string): Model {
 async function runCommand(
   command: string,
   options: {
-    sandboxClient?: UnixLocalSandboxClient;
     workflowName?: string;
     model?: Model;
   } = {},
@@ -196,7 +194,7 @@ async function runCommand(
   });
 
   await new Runner({ workflowName: options.workflowName ?? "workflow" }).run(agent, "go", {
-    sandbox: { client: options.sandboxClient ?? new UnixLocalSandboxClient() },
+    sandbox: { client: new UnixLocalSandboxClient() },
   });
 }
 
@@ -223,7 +221,7 @@ test("a sandbox command becomes a tool span with its exit code, nested under its
   const spans = await exported();
 
   const root = only(spans, named("workflow"));
-  const tool = only(spans, named("exec_command"));
+  const tool = only(spans, named("execute_tool exec_command"));
   const exec = only(spans, named("sandbox.exec"));
   const turn = spans.find((span) => span.spanContext().spanId === parentOf(tool))!;
   const agent = spans.find((span) => span.spanContext().spanId === parentOf(turn))!;
@@ -235,7 +233,9 @@ test("a sandbox command becomes a tool span with its exit code, nested under its
   expect(tool.status.code).not.toBe(2);
   expect(parentOf(exec)).toBe(tool.spanContext().spanId);
   expect(exec.attributes["sandbox.operation"]).toBe("exec");
-  expect(exec.attributes["sandbox.backend"]).toBe("unix_local");
+  expect(only(spans, named("sandbox.create_session")).attributes["sandbox.backend"]).toBe(
+    "unix_local",
+  );
   expect(exec.attributes["process.command_line"]).toBe("sh -c 'exit 3'");
   expect(turn.name).toMatch(/^turn /);
   expect(agent.attributes["gen_ai.operation.name"]).toBe("invoke_agent");
@@ -247,7 +247,7 @@ test("a command that exits 0 records exit code 0", async () => {
   makeProcessor();
   await runCommand("true");
 
-  const tool = only(await exported(), named("exec_command"));
+  const tool = only(await exported(), named("execute_tool exec_command"));
   expect(tool.attributes["process.exit.code"]).toBe(0);
 });
 
@@ -281,7 +281,7 @@ test("with captureInput off, the command is not on the sandbox or tool spans", a
 
   expect(only(spans, named("sandbox.exec")).attributes["process.command_line"]).toBeUndefined();
   expect(
-    only(spans, named("exec_command")).attributes["gen_ai.tool.call.arguments"],
+    only(spans, named("execute_tool exec_command")).attributes["gen_ai.tool.call.arguments"],
   ).toBeUndefined();
 });
 
@@ -296,31 +296,7 @@ test("with capture off, no attribute contains the command or its output", async 
     Object.values(span.attributes).some((value) => JSON.stringify(value).includes(marker)),
   );
   expect(leaked.map((span) => span.name)).toEqual([]);
-  expect(only(spans, named("exec_command")).attributes["process.exit.code"]).toBe(0);
-});
-
-/** A local sandbox client whose sessions carry `sandboxId`, as a hosted backend such as E2B's do. */
-function clientWithId(sandboxId: string): UnixLocalSandboxClient {
-  const client = new UnixLocalSandboxClient();
-  const create = client.create.bind(client);
-  client.create = (async (...args: Parameters<typeof create>) => {
-    const session = await create(...args);
-    session.state.sandboxId = sandboxId;
-
-    return session;
-  }) as typeof client.create;
-
-  return instrumentSandboxClient(client);
-}
-
-test("the provider's sandbox id reaches the session, command, and tool spans", async () => {
-  makeProcessor();
-  await runCommand("true", { sandboxClient: clientWithId("sbx_test") });
-  const spans = await exported();
-
-  for (const name of ["sandbox.create_session", "sandbox.exec", "exec_command"]) {
-    expect(only(spans, named(name)).attributes["sandbox.id"], name).toBe("sbx_test");
-  }
+  expect(only(spans, named("execute_tool exec_command")).attributes["process.exit.code"]).toBe(0);
 });
 
 test("two concurrent runs produce two traces whose spans do not cross", async () => {
@@ -450,48 +426,30 @@ test("a span whose parent is unknown nests under its trace root", async () => {
   expect(step.attributes["td.metadata.attempt"]).toBe("2");
 });
 
-test("two runs under one trace keep their own sandbox ids", async () => {
-  makeProcessor();
-  // Both agents are named "coder", so a lookup by name alone would mix the sandboxes up.
-  await withTrace("batch", () =>
-    Promise.all([
-      runCommand("echo a", { sandboxClient: clientWithId("sbx_a") }),
-      runCommand("echo b", { sandboxClient: clientWithId("sbx_b") }),
-    ]),
-  );
-  const spans = await exported();
-
-  const execs = spans.filter(named("sandbox.exec"));
-  expect(
-    Object.fromEntries(
-      execs.map((span) => [span.attributes["process.command_line"], span.attributes["sandbox.id"]]),
-    ),
-  ).toEqual({ "echo a": "sbx_a", "echo b": "sbx_b" });
-
-  for (const exec of execs) {
-    const tool = spans.find((span) => span.spanContext().spanId === parentOf(exec))!;
-    expect(tool.attributes["sandbox.id"]).toBe(exec.attributes["sandbox.id"]);
-  }
-});
-
-test("instrumentSandboxClient records the id of a resumed session", async () => {
-  makeProcessor();
-  const client = new UnixLocalSandboxClient();
-  client.resume = (async () => ({ state: { sandboxId: "sbx_resumed" } })) as never;
-  instrumentSandboxClient(client);
-
-  await withTrace("resume", () =>
-    withCustomSpan(async () => await client.resume!({} as never), {
+test("a resumed session's span records its backend", async () => {
+  const processor = makeProcessor();
+  const trace = new Trace({ traceId: "trace_77777777777777777777777777777777", name: "resume" });
+  await processor.onTraceStart(trace);
+  const span = new Span(
+    {
+      traceId: trace.traceId,
       data: {
+        type: "custom",
         name: "sandbox.resume_session",
         data: { agent_name: "coder", backend_id: "unix_local" },
       },
-    }),
+    },
+    processor,
   );
-  const span = only(await exported(), named("sandbox.resume_session"));
+  span.start();
+  span.end();
+  await processor.onTraceEnd(trace);
 
-  expect(span.attributes["sandbox.id"]).toBe("sbx_resumed");
-  expect(span.attributes["sandbox.backend"]).toBe("unix_local");
+  const resumed = only(await exported(), named("sandbox.resume_session"));
+  expect(resumed.attributes).toMatchObject({
+    "sandbox.operation": "resume_session",
+    "sandbox.backend": "unix_local",
+  });
 });
 
 test("a mask applies to the command before it is sent", async () => {
@@ -530,22 +488,22 @@ function expectConnected(spans: ReadableSpan[], rootName: string): void {
   expect(orphans.map((span) => span.name)).toEqual([]);
 }
 
-test("a run that throws still exports its root once flushed", async () => {
-  const processor = makeProcessor();
+test("a run that throws exports its root", async () => {
+  makeProcessor();
   const failing = new OpenAIResponsesModel(
     scriptedClient([{ error: { message: "bad request", type: "invalid_request_error" } }], 400),
     "gpt-5-mini",
   );
   await expect(runCommand("true", { model: failing })).rejects.toThrow();
-
-  expect((await exported()).filter(named("workflow"))).toEqual([]);
-  await processor.forceFlush();
   const spans = await exported();
 
   expectConnected(spans, "workflow");
   expect(
     only(spans, (span) => span.attributes["gen_ai.operation.name"] === "chat").status.code,
   ).toBe(2);
+  // The root ends with the run's top-level span, not with the failed model call inside it.
+  const task = only(spans, (span) => span.name.startsWith("task "));
+  expect(only(spans, named("workflow")).endTime).toEqual(task.endTime);
 });
 
 test("spans that end after their trace still reach the root", async () => {
@@ -565,14 +523,12 @@ test("spans that end after their trace still reach the root", async () => {
   await runCommand("true");
 
   await vi.waitFor(async () =>
-    expect((await exported()).filter(named("workflow"))).toHaveLength(1),
+    expect(
+      (await exported()).filter((span) => span.attributes["gen_ai.operation.name"] === "chat"),
+    ).toHaveLength(2),
   );
-  const spans = await exported();
 
-  expectConnected(spans, "workflow");
-  expect(spans.filter((span) => span.attributes["gen_ai.operation.name"] === "chat")).toHaveLength(
-    2,
-  );
+  expectConnected(await exported(), "workflow");
 });
 
 test("an exit line in the output of a running command is not an exit code", async () => {
@@ -601,7 +557,7 @@ test("an exit line in the output of a running command is not an exit code", asyn
   span.end();
   await processor.onTraceEnd(trace);
 
-  const tool = only(await exported(), named("write_stdin"));
+  const tool = only(await exported(), named("execute_tool write_stdin"));
   expect(tool.attributes["process.exit.code"]).toBeUndefined();
 });
 
@@ -646,6 +602,10 @@ test("spans that start after shutdown still join their trace", async () => {
 
   // A server that drains on SIGTERM keeps running after the SDK calls shutdown.
   await processor.shutdown();
+  const atShutdown = await exported();
+  expect(atShutdown.map((span) => span.name).sort()).toEqual(["draining", "in flight"]);
+  expectConnected(atShutdown, "draining");
+
   const late = customSpan(processor, trace, "late", inFlight);
   late.end();
   inFlight.end();
@@ -653,8 +613,11 @@ test("spans that start after shutdown still join their trace", async () => {
   const spans = await exported();
 
   expectConnected(spans, "draining");
-  const parent = only(spans, named("in flight"));
-  expect(parentOf(only(spans, named("late")))).toBe(parent.spanContext().spanId);
+  expect(spans.map((span) => span.name).sort()).toEqual(["draining", "in flight", "late"]);
+  // Shutdown forgot the in-flight span, so the late span nests under the root.
+  expect(parentOf(only(spans, named("late")))).toBe(
+    only(spans, named("draining")).spanContext().spanId,
+  );
 });
 
 test("a span after its trace ended joins the ended root", async () => {
@@ -670,20 +633,88 @@ test("a span after its trace ended joins the ended root", async () => {
   expect(new Set(spans.map((span) => span.spanContext().traceId)).size).toBe(1);
 });
 
-test("the root of a trace that never ends is exported after the idle wait", async () => {
-  vi.useFakeTimers();
+test("past the trace cap, the least recently active root is exported and forgotten", async () => {
+  const processor = makeProcessor();
+  const trace = (n: number) =>
+    new Trace({ traceId: `trace_${n.toString(16).padStart(32, "0")}`, name: `t${n}` });
+  await processor.onTraceStart(trace(0));
+  await processor.onTraceStart(trace(1));
+  // A span start makes t0 more recently active than t1, though t0 started first.
+  customSpan(processor, trace(0), "step").end();
 
-  try {
-    const processor = makeProcessor();
-    const trace = new Trace({ traceId: "trace_33333333333333333333333333333333", name: "threw" });
-    await processor.onTraceStart(trace);
-    customSpan(processor, trace, "step").end();
-    await vi.advanceTimersByTimeAsync(59_000);
-    expect((await exported()).filter(named("threw"))).toEqual([]);
+  for (let n = 2; n < 10_000; n++) await processor.onTraceStart(trace(n));
+  expect((await exported()).filter(named("t1"))).toEqual([]);
 
-    await vi.advanceTimersByTimeAsync(2_000);
-    expectConnected(await exported(), "threw");
-  } finally {
-    vi.useRealTimers();
-  }
+  await processor.onTraceStart(trace(10_000));
+  customSpan(processor, trace(0), "late").end();
+  await processor.onTraceEnd(trace(0));
+  const spans = await exported();
+
+  expect(spans.filter(named("t1"))).toHaveLength(1);
+  expectConnected(
+    spans.filter((span) => span.name !== "t1"),
+    "t0",
+  );
+
+  // t1 was forgotten, so its id starts a new root.
+  const reused = new Trace({ traceId: trace(1).traceId, name: "t1 again" });
+  await processor.onTraceStart(reused);
+  await processor.onTraceEnd(reused);
+  expect((await exported()).filter(named("t1 again"))).toHaveLength(1);
 });
+
+test("a flush leaves the root of a trace with an open span", async () => {
+  const processor = makeProcessor();
+  const busy = new Trace({ traceId: "trace_44444444444444444444444444444444", name: "busy" });
+  const idle = new Trace({ traceId: "trace_55555555555555555555555555555555", name: "idle" });
+  await processor.onTraceStart(busy);
+  await processor.onTraceStart(idle);
+  const step = customSpan(processor, busy, "step");
+  customSpan(processor, idle, "done").end();
+
+  await processor.forceFlush();
+  expect((await exported()).map((span) => span.name).sort()).toEqual(["done", "idle"]);
+
+  step.end();
+  await processor.forceFlush();
+  expect((await exported()).filter(named("busy"))).toHaveLength(1);
+});
+
+test("a failed custom span at the top level leaves the root open", async () => {
+  const processor = makeProcessor();
+  const trace = new Trace({ traceId: "trace_66666666666666666666666666666666", name: "handled" });
+  await processor.onTraceStart(trace);
+  const failed = customSpan(processor, trace, "attempt");
+  failed.setError({ message: "retrying" });
+  failed.end();
+  expect((await exported()).filter(named("handled"))).toEqual([]);
+
+  await processor.onTraceEnd(trace);
+  expectConnected(await exported(), "handled");
+});
+
+test.each(["forceFlush", "shutdown"] as const)(
+  "%s ends the root of a trace whose callback threw after its run",
+  async (method) => {
+    const processor = makeProcessor();
+    await expect(
+      withTrace("after run", async () => {
+        await runAgent("ignored");
+        throw new Error("post-processing failed");
+      }),
+    ).rejects.toThrow("post-processing failed");
+    expect((await exported()).filter(named("after run"))).toEqual([]);
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await processor[method]();
+    const spans = await exported();
+
+    expectConnected(spans, "after run");
+    // The root ends with the run's last span, not at the flush.
+    const ms = ([seconds, nanos]: [number, number]) => seconds * 1e3 + nanos / 1e6;
+    const lastEnd = Math.max(
+      ...spans.filter((span) => span.name !== "after run").map((span) => ms(span.endTime)),
+    );
+    expect(ms(only(spans, named("after run")).endTime)).toBe(lastEnd);
+  },
+);

@@ -57,17 +57,17 @@
     "@telemetry-dev/sdk": "workspace:^"
   },
   "devDependencies": {
-    "@openai/agents": "0.21.0",
+    "@openai/agents": "0.22.0",
     "@opentelemetry/sdk-trace-base": "catalog:",
     "@types/node": "^25.5.0",
     "@typescript/native-preview": "7.0.0-dev.20260328.1",
-    "openai": "catalog:",
+    "openai": "7.60.0",
     "typescript": "^6.0.2",
     "vite-plus": "0.1.20",
     "vitest": "catalog:",
     "zod": "catalog:"
   },
   "peerDependencies": {
-    "@openai/agents": ">=0.21.0 <1"
+    "@openai/agents": ">=0.22.0 <1"
   }
 }

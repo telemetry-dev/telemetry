@@ -14,7 +14,6 @@ import {
   ensureInit,
   type TelemetryDevOpenAIAgentsOptions,
 } from "./config.ts";
-import { SANDBOX_ID_KEY } from "./sandbox.ts";
 
 type AgentsSpan = Span<SpanData>;
 
@@ -24,12 +23,9 @@ type Attrs = NonNullable<SpanFields["attributes"]>;
 // dropped, not exported.
 const MAX_OPEN_SPANS = 10_000;
 
-// How long a trace with no open spans waits for `onTraceEnd` before its root ends anyway, and how
-// long a finished trace is kept afterwards so that late spans still join it. The Agents SDK ends a
-// trace only when its run returns; a run that throws never ends it.
-const IDLE_TRACE_MS = 60_000;
-
-// Bounds the finished traces kept for late spans when runs finish faster than they expire.
+// Bounds the trace roots kept so that spans arriving after their trace ended still find their root.
+// Past the cap the root of the trace whose spans started or ended least recently is forgotten, and
+// ended first if it is still open.
 const MAX_TRACES = 10_000;
 
 // `formatExecResponse` in agents-core writes this line in the header of a shell tool's output,
@@ -42,36 +38,22 @@ const SANDBOX_COMMAND_TOOLS = new Set(["exec_command", "write_stdin"]);
 
 const SANDBOX_SPAN_PREFIX = "sandbox.";
 
-interface SandboxRef {
-  backend?: string;
-  id?: string;
-}
-
-/** Sandbox of each agent in one run, keyed by agent name. */
-type RunSandboxes = Map<string, SandboxRef>;
-
 interface TraceState {
   root: SpanHandle;
-  open: number;
-  /** When `onTraceEnd` arrived. The root ends once this is set and no span is open. */
-  endTime?: Date;
-  lastSpanEnd?: Date;
-  /** The root has ended. The state stays until it expires, so a late span joins the root. */
-  finished: boolean;
-  timer?: ReturnType<typeof setTimeout>;
+  ended: boolean;
+  /** Latest observed span end, used to timestamp the root when the trace never ends. */
+  lastEnd?: Date;
 }
 
-interface SpanState {
+interface OpenSpan {
   handle: SpanHandle;
-  /** The trace state this span was counted in, if any. */
+  /** The root state the span started under; a later trace can reuse the same trace id. */
   trace?: TraceState;
-  /** `shutdown` ended the handle; the SDK's own end of the span only uncounts it. */
-  ended?: boolean;
-  /** Name of the agent this span runs under, for looking up its sandbox. */
-  agent?: string;
-  /** Sandboxes of the run this span belongs to; shared by every span of the run. */
-  sandboxes?: RunSandboxes;
 }
+
+// The top-level spans of a run. Upstream ends them with the run's error even when the trace never
+// ends; a failed custom span at the top level may be handled by the caller.
+const RUN_SPAN_TYPES = new Set(["task", "agent"]);
 
 type JsonRecord = Record<string, unknown>;
 
@@ -140,24 +122,14 @@ function primitiveMetadata(value: unknown): Record<string, string | number | boo
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-function agentOf(data: SpanData): string | undefined {
-  switch (data.type) {
-    case "agent":
-      return data.name;
-    case "turn":
-      return data.agent_name;
-    case "custom":
-      return asString(data.data.agent_name);
-    default:
-      return undefined;
-  }
-}
-
 /** Name and fields known when the span starts. */
 function startOf(data: SpanData): { name: string; options: StartSpanOptions } {
   switch (data.type) {
     case "agent":
-      return { name: data.name, options: { type: "agent", agentName: data.name } };
+      return {
+        name: `invoke_agent ${data.name}`,
+        options: { type: "agent", agentName: data.name },
+      };
     case "task":
       return { name: `task ${data.name}`, options: {} };
     case "turn":
@@ -173,7 +145,10 @@ function startOf(data: SpanData): { name: string; options: StartSpanOptions } {
         options: { type: "generation", model: data.model },
       };
     case "function":
-      return { name: data.name, options: { type: "tool", toolName: data.name } };
+      return {
+        name: `execute_tool ${data.name}`,
+        options: { type: "tool", toolName: data.name },
+      };
     case "handoff":
       return { name: "handoff", options: {} };
     case "guardrail":
@@ -303,25 +278,24 @@ function mergeFields(...parts: SpanFields[]): SpanFields {
   return merged;
 }
 
-const sandboxAttributes = (ref: SandboxRef | undefined): Attrs => ({
-  ...(ref?.backend ? { "sandbox.backend": ref.backend } : {}),
-  ...(ref?.id ? { "sandbox.id": ref.id } : {}),
-});
-
 /**
  * Sends OpenAI Agents SDK traces to telemetry.dev. Register it with `addTraceProcessor`, which
  * keeps the SDK's default OpenAI exporter, or `setTraceProcessors([...])`, which replaces it.
  *
  * Each Agents trace gets one root span, and its spans keep their parents. Model calls are `chat`
  * spans and the only spans with token usage; task, turn, and agent spans repeat the totals of their
- * calls and carry none. Sandbox spans keep their `sandbox.*` names and get `sandbox.backend`,
- * `sandbox.id`, and `sandbox.operation`. The `exec_command` and `write_stdin` tool spans get
- * `process.exit.code` once the command has exited. Command text and working directory are input
- * content: they are sent only when `captureInput` is on, and go through the mask.
+ * calls and carry none. Sandbox spans keep their `sandbox.*` names and get `sandbox.operation`; the
+ * spans that create or resume a session also get `sandbox.backend`. The `exec_command` and
+ * `write_stdin` tool spans get `process.exit.code` once the command has exited. Command text and
+ * working directory are input content: they are sent only when `captureInput` is on, and go
+ * through the mask.
  *
- * The root span ends when the trace has ended and every one of its spans has ended, since other
- * processors can delay span ends past the trace end. A trace of a run that threw ends after
- * `IDLE_TRACE_MS` without open spans, or at the next `forceFlush` or `shutdown`.
+ * The root span ends when the trace ends. A run that throws before the SDK ends its trace leaves
+ * it open, so the root also ends when the run's task or agent span ends with an error, and
+ * `forceFlush` and `shutdown` end the root of every trace with no open span at the end of its last
+ * span. Spans that end after the root still nest under it while the processor holds the root (the
+ * `MAX_TRACES` most recently active traces): telemetry.dev takes a trace's start and end from all
+ * of its spans.
  */
 export function telemetryDevProcessor(
   options: TelemetryDevOpenAIAgentsOptions = {},
@@ -344,86 +318,47 @@ export function telemetryDevProcessor(
   }
 
   const traces = new Map<string, TraceState>();
-  const spans = new Map<string, SpanState>();
+  const spans = new Map<string, OpenSpan>();
   let reportedCap = false;
 
-  function finish(state: TraceState): void {
-    if (state.finished) return;
-    state.finished = true;
-    state.root.end({ endTime: state.endTime ?? state.lastSpanEnd });
+  function endRoot(state: TraceState, endTime?: Date): void {
+    if (state.ended) return;
+    state.ended = true;
+    state.root.end({ endTime });
   }
 
-  function remove(traceId: string, state: TraceState): void {
-    clearTimeout(state.timer);
-
-    if (traces.get(traceId) === state) traces.delete(traceId);
+  /** Moves a trace to the end of the map, which eviction reads as least recently active first. */
+  function touch(traceId: string, state: TraceState): void {
+    traces.delete(traceId);
+    traces.set(traceId, state);
   }
 
-  /** Ends the root or schedules its end or expiry, from the trace's open span count. */
-  function settle(traceId: string, state: TraceState): void {
-    clearTimeout(state.timer);
-    state.timer = undefined;
+  /** Ends, at their last span's end, the roots of traces that have no open span. */
+  function endIdleRoots(): void {
+    const open = new Set<TraceState | undefined>();
 
-    if (state.open > 0) return;
+    for (const { trace } of spans.values()) open.add(trace);
 
-    if (state.endTime) finish(state);
-
-    // An unfinished trace waits for `onTraceEnd`; a finished one waits for late spans.
-    state.timer = setTimeout(() => {
-      try {
-        finish(state);
-        remove(traceId, state);
-      } catch (error) {
-        report(error);
-      }
-    }, IDLE_TRACE_MS);
-    state.timer.unref?.();
-  }
-
-  function uncount(
-    traceId: string,
-    state: TraceState | undefined,
-    endTime: Date | undefined,
-  ): void {
-    if (!state) return;
-    state.open--;
-
-    if (endTime && (!state.lastSpanEnd || endTime > state.lastSpanEnd)) state.lastSpanEnd = endTime;
-    settle(traceId, state);
-  }
-
-  function evictFinished(): void {
-    for (const [traceId, state] of traces) {
-      if (traces.size < MAX_TRACES) return;
-
-      if (state.finished && state.open === 0) remove(traceId, state);
+    for (const state of traces.values()) {
+      if (!open.has(state)) endRoot(state, state.lastEnd);
     }
   }
 
-  function sandboxSpanEnd(span: AgentsSpan, state: SpanState): SpanFields {
+  function sandboxSpanEnd(span: AgentsSpan, handle: SpanHandle): SpanFields {
     const data = span.spanData;
 
     if (data.type !== "custom" || !data.name.startsWith(SANDBOX_SPAN_PREFIX)) return {};
     const backend = asString(data.data.backend_id);
-    const id = asString(data.data[SANDBOX_ID_KEY]);
-    const own: SandboxRef = { ...(backend ? { backend } : {}), ...(id ? { id } : {}) };
-
-    if (state.agent && state.sandboxes && (backend || id)) {
-      state.sandboxes.set(state.agent, { ...state.sandboxes.get(state.agent), ...own });
-    }
-
     const attributes: Attrs = {
       "sandbox.operation": data.name.slice(SANDBOX_SPAN_PREFIX.length),
-      ...sandboxAttributes({ ...sandboxFor(state), ...own }),
+      ...(backend ? { "sandbox.backend": backend } : {}),
     };
 
     if (data.name === "sandbox.exec" && captureEnabled("input")) {
       const command = asString(data.data.cmd);
       const workdir = asString(data.data.workdir);
-      const commandLine =
-        command && state.handle.serializeContent?.(command, "process.command_line");
-      const directory =
-        workdir && state.handle.serializeContent?.(workdir, "process.working_directory");
+      const commandLine = command && handle.serializeContent?.(command, "process.command_line");
+      const directory = workdir && handle.serializeContent?.(workdir, "process.working_directory");
 
       if (commandLine) attributes["process.command_line"] = commandLine;
 
@@ -433,37 +368,31 @@ export function telemetryDevProcessor(
     return { attributes };
   }
 
-  function commandToolEnd(span: AgentsSpan, state: SpanState): SpanFields {
+  function commandToolEnd(span: AgentsSpan): SpanFields {
     const data = span.spanData;
 
     if (data.type !== "function" || !SANDBOX_COMMAND_TOOLS.has(data.name)) return {};
     const exitCode = exitCodeOf(data.output);
-    const attributes: Attrs = sandboxAttributes(sandboxFor(state));
 
     // A non-zero exit is recorded, not raised: `grep` exits 1 when nothing matches.
-    if (exitCode !== undefined) attributes["process.exit.code"] = exitCode;
-
-    return Object.keys(attributes).length > 0 ? { attributes } : {};
+    return exitCode === undefined ? {} : { attributes: { "process.exit.code": exitCode } };
   }
-
-  const sandboxFor = (state: SpanState): SandboxRef | undefined =>
-    state.agent ? state.sandboxes?.get(state.agent) : undefined;
 
   return {
     async onTraceStart(trace: Trace) {
       try {
-        const existing = traces.get(trace.traceId);
-
         // A trace id seen again, such as a resumed run's or a fixed `traceId`, keeps its root while
         // the processor still holds it, even when that root has already ended.
-        if (existing) {
-          existing.endTime = undefined;
-          settle(trace.traceId, existing);
+        if (traces.has(trace.traceId)) return;
 
-          return;
+        // Map order is least recently active first: span starts and ends move a trace to the end.
+        const oldest = traces.size >= MAX_TRACES ? traces.entries().next() : undefined;
+
+        if (oldest && !oldest.done) {
+          const [oldestId, state] = oldest.value;
+          endRoot(state, state.lastEnd);
+          traces.delete(oldestId);
         }
-
-        evictFinished();
 
         const attributes: Attrs = { "openai_agents.trace_id": trace.traceId };
 
@@ -472,9 +401,7 @@ export function telemetryDevProcessor(
           attributes,
           metadata: primitiveMetadata(trace.metadata),
         });
-        const state: TraceState = { root, open: 0, finished: false };
-        traces.set(trace.traceId, state);
-        settle(trace.traceId, state);
+        traces.set(trace.traceId, { root, ended: false });
       } catch (error) {
         report(error);
       }
@@ -484,9 +411,7 @@ export function telemetryDevProcessor(
       try {
         const state = traces.get(trace.traceId);
 
-        if (!state) return;
-        state.endTime = new Date();
-        settle(trace.traceId, state);
+        if (state) endRoot(state);
       } catch (error) {
         report(error);
       }
@@ -503,33 +428,19 @@ export function telemetryDevProcessor(
           return;
         }
 
-        const data = span.spanData;
-        const parent = span.parentId ? spans.get(span.parentId) : undefined;
-        const traceState = traces.get(span.traceId);
-        const { name, options } = startOf(data);
+        const state = traces.get(span.traceId);
+
+        if (state) touch(span.traceId, state);
+
+        const { name, options } = startOf(span.spanData);
+        const parent =
+          (span.parentId ? spans.get(span.parentId)?.handle : undefined) ?? state?.root;
         const handle = startSpan(name, {
           ...options,
-          parent: parent?.handle ?? traceState?.root,
+          parent,
           startTime: toTime(span.startedAt),
         });
-
-        // A task span is one run; an agent span without one is a run without task spans.
-        const sandboxes =
-          data.type === "task" || (data.type === "agent" && !parent?.sandboxes)
-            ? new Map<string, SandboxRef>()
-            : parent?.sandboxes;
-
-        spans.set(span.spanId, {
-          handle,
-          trace: traceState,
-          agent: agentOf(data) ?? parent?.agent,
-          sandboxes,
-        });
-
-        if (traceState) {
-          traceState.open++;
-          settle(span.traceId, traceState);
-        }
+        spans.set(span.spanId, { handle, trace: state });
       } catch (error) {
         report(error);
       }
@@ -537,39 +448,44 @@ export function telemetryDevProcessor(
 
     async onSpanEnd(span: AgentsSpan) {
       try {
-        const state = spans.get(span.spanId);
+        const open = spans.get(span.spanId);
 
-        if (!state) return;
+        if (!open) return;
         spans.delete(span.spanId);
-
-        if (state.ended) {
-          uncount(span.traceId, state.trace, undefined);
-
-          return;
-        }
+        const { handle, trace: state } = open;
 
         const fields = mergeFields(
           endOf(span.spanData),
-          sandboxSpanEnd(span, state),
-          commandToolEnd(span, state),
+          sandboxSpanEnd(span, handle),
+          commandToolEnd(span),
         );
         const error = errorOf(span);
         const endTime = toTime(span.endedAt);
 
-        state.handle.end({ ...fields, ...(error ? { error } : {}), endTime });
-        uncount(span.traceId, state.trace, endTime ?? new Date());
+        handle.end({ ...fields, ...(error ? { error } : {}), endTime });
+
+        if (!state) return;
+        const end = endTime ?? new Date();
+
+        if (!state.lastEnd || end > state.lastEnd) state.lastEnd = end;
+
+        if (traces.get(span.traceId) === state) touch(span.traceId, state);
+
+        // The top-level span of a run that throws (its task span, or its agent span without task
+        // spans) ends with the error, but the trace never ends.
+        if (error && !span.parentId && RUN_SPAN_TYPES.has(span.spanData.type)) endRoot(state, end);
       } catch (error) {
         report(error);
       }
     },
 
-    // Ends the roots of traces whose run threw. A trace that has not ended a span yet may be a
-    // run that is still preparing its first span, so it keeps waiting.
+    // Also ends the roots of traces that threw outside any span, such as a run that failed before
+    // its first span or a `withTrace` callback that threw after its run returned: no span carries
+    // the error, and the trace never ends. A trace between two of its runs is ended too; spans of
+    // the next run still nest under its root.
     async forceFlush() {
       try {
-        for (const state of traces.values()) {
-          if (state.open === 0 && (state.endTime || state.lastSpanEnd)) finish(state);
-        }
+        endIdleRoots();
       } catch (error) {
         report(error);
       }
@@ -577,18 +493,17 @@ export function telemetryDevProcessor(
       await flush();
     },
 
-    // The SDK also calls this on SIGTERM, SIGINT, and unhandled rejections, after which a server
-    // that drains requests keeps running. So spans and traces stay known: later spans join their
-    // parents, and the SDK's own ends of the spans ended here only uncount them.
+    // The SDK also calls this on SIGTERM, SIGINT, and unhandled rejections, so a process that exits
+    // right after still exports what it recorded. Roots stay known: spans of a server that keeps
+    // draining requests still join their trace.
     async shutdown() {
       try {
-        for (const state of spans.values()) {
-          if (state.ended) continue;
-          state.ended = true;
-          state.handle.end();
-        }
+        endIdleRoots();
 
-        for (const state of traces.values()) finish(state);
+        for (const { handle } of spans.values()) handle.end();
+        spans.clear();
+
+        for (const state of traces.values()) endRoot(state);
       } catch (error) {
         report(error);
       }
