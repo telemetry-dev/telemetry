@@ -125,6 +125,11 @@
         },
         {
           "type": "toml",
+          "path": "/sdks/python-openai-agents/uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='telemetry-dev')].version"
+        },
+        {
+          "type": "toml",
           "path": "/sdks/python-openrouter/uv.lock",
           "jsonpath": "$.package[?(@.name.value=='telemetry-dev')].version"
         }
@@ -187,6 +192,19 @@
           "type": "toml",
           "path": "uv.lock",
           "jsonpath": "$.package[?(@.name.value=='telemetry-dev-openai')].version"
+        }
+      ]
+    },
+    "sdks/python-openai-agents": {
+      "component": "python-openai-agents",
+      "package-name": "telemetry-dev-openai-agents",
+      "release-type": "python",
+      "initial-version": "0.1.0",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='telemetry-dev-openai-agents')].version"
         }
       ]
     },

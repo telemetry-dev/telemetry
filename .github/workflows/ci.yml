@@ -66,7 +66,7 @@ jobs:
           python-version: "3.13"
       - name: Install locked Python dependencies
         run: |
-          for package in sdks/python sdks/python-anthropic sdks/python-bedrock sdks/python-google-genai sdks/python-litellm sdks/python-openai sdks/python-openrouter; do
+          for package in sdks/python sdks/python-anthropic sdks/python-bedrock sdks/python-google-genai sdks/python-litellm sdks/python-openai sdks/python-openai-agents sdks/python-openrouter; do
             uv sync --frozen --directory "$package"
           done
       - run: pnpm run py:check
@@ -85,6 +85,7 @@ jobs:
           - sdks/python-google-genai
           - sdks/python-litellm
           - sdks/python-openai
+          - sdks/python-openai-agents
           - sdks/python-openrouter
     steps:
       - uses: actions/checkout@v5

@@ -10,7 +10,7 @@ trap 'rm -rf "$tmp"' EXIT
 
 if [ "$#" -eq 0 ]; then
   set -- sdks/python sdks/python-anthropic sdks/python-bedrock sdks/python-google-genai \
-    sdks/python-litellm sdks/python-openai sdks/python-openrouter
+    sdks/python-litellm sdks/python-openai sdks/python-openai-agents sdks/python-openrouter
 fi
 
 for package in "$@"; do
