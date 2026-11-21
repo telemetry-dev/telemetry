@@ -403,11 +403,14 @@ _PROXY_REQUEST_METADATA_KEYS = frozenset(
     }
 )
 _PROXY_AUTH_METADATA_PREFIX = "user_api_key"
+# Keys the Router writes into the caller's metadata argument for the deployment it picked,
+# dropped on every call: model_info holds whatever fields an admin configured for the
+# deployment, an api_base URL can carry credentials, and kubernetes_pod_routing (LiteLLM 1.110
+# and later) holds the internal service host and pod IP of a pod-discovered deployment.
+_ROUTER_DEPLOYMENT_METADATA_KEYS = frozenset({"model_info", "api_base", "kubernetes_pod_routing"})
 
 # Keys the Router writes into the metadata argument when it picks a deployment and retries,
 # exported on the proxy only with a scalar value, since a hook can write anything under them.
-# model_info and api_base are left out: model_info holds whatever fields an admin configured
-# for the deployment, and an api_base URL can carry credentials.
 _PROXY_ROUTER_METADATA_KEYS = (
     "model_group",
     "model_group_alias",
@@ -452,6 +455,7 @@ def _request_metadata(
         key: value
         for key, value in metadata.items()
         if str(key) not in _PROXY_REQUEST_METADATA_KEYS
+        and str(key) not in _ROUTER_DEPLOYMENT_METADATA_KEYS
         and not str(key).startswith(_PROXY_AUTH_METADATA_PREFIX)
     }
 

@@ -258,7 +258,14 @@ def test_completion_metadata_param_maps_to_td_metadata(
     [
         (
             "/v1/chat/completions",
-            {"messages": CHAT_MESSAGES, "metadata": {"tenant": "acme"}},
+            {
+                "messages": CHAT_MESSAGES,
+                "metadata": {
+                    "tenant": "acme",
+                    "api_base": "https://user:api-base-secret@llm.internal/v1",
+                    "model_info": {"note": "model-info-secret"},
+                },
+            },
             True,
             {},
         ),
@@ -417,7 +424,9 @@ async def test_litellm_proxy_request_exports_only_requester_and_router_metadata(
     assert leaked == []
 
 
-def test_router_fallback_drops_the_failed_call_history(memory: SimpleNamespace) -> None:
+def test_router_drops_the_deployment_config_and_the_failed_call_history(
+    memory: SimpleNamespace,
+) -> None:
     instrument_litellm()
     router = llm.Router(
         model_list=[
@@ -427,7 +436,13 @@ def test_router_fallback_drops_the_failed_call_history(memory: SimpleNamespace) 
             },
             {
                 "model_name": "backup",
-                "litellm_params": {"model": "gpt-4o-mini", "mock_response": "routed"},
+                "litellm_params": {
+                    "model": "openai/gpt-4o-mini",
+                    "api_key": "sk-fake",
+                    "api_base": "https://user:api-base-secret@llm.internal/v1",
+                    "mock_response": "routed",
+                },
+                "model_info": {"note": "model-info-secret"},
             },
         ],
         fallbacks=[{"primary": ["backup"]}],
@@ -436,7 +451,12 @@ def test_router_fallback_drops_the_failed_call_history(memory: SimpleNamespace) 
     router.completion(
         model="primary",
         messages=CHAT_MESSAGES,
-        metadata={"tenant": "acme", "headers": {"cookie": "session=cookie-secret"}},
+        metadata={
+            "tenant": "acme",
+            "headers": {"cookie": "session=cookie-secret"},
+            # What pod discovery writes, which the mock deployments cannot reach.
+            "kubernetes_pod_routing": {"service_host": "llm.internal", "pod_ip": "10.0.0.7"},
+        },
     )
 
     spans = memory.span_exporter.get_finished_spans()
@@ -448,8 +468,22 @@ def test_router_fallback_drops_the_failed_call_history(memory: SimpleNamespace) 
     ]
     exported = [(key, str(value)) for found in attribute_sets for key, value in found.items()]
     assert ("td.metadata.tenant", "acme") in exported
-    assert [key for key, _ in exported if key == "td.metadata.previous_models"] == []
-    assert [key for key, value in exported if "cookie-secret" in value] == []
+    assert ("td.metadata.deployment", "openai/gpt-4o-mini") in exported
+    dropped = {
+        "td.metadata.previous_models",
+        "td.metadata.api_base",
+        "td.metadata.model_info",
+        "td.metadata.kubernetes_pod_routing",
+    }
+    assert [key for key, _ in exported if key in dropped] == []
+    assert [
+        key
+        for key, value in exported
+        if any(
+            secret in value
+            for secret in ("cookie-secret", "api-base-secret", "model-info-secret", "10.0.0.7")
+        )
+    ] == []
 
 
 def test_completion_cache_write_tokens_map_to_cache_creation(
