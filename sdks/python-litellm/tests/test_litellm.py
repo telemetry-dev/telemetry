@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import importlib
 import inspect
 import json
 import math
@@ -33,6 +34,23 @@ from telemetry_dev_litellm import instrument_litellm, uninstrument_litellm, wrap
 
 from . import conftest
 from .conftest import STREAM_LIMIT
+
+
+# From 1.110, LiteLLM's Router walks retries and fallbacks in a Rust core that calls LiteLLM
+# through router_attempt. The core writes its own retry keys into the metadata of each call, and
+# takes positionally only the parameters that POSITIONAL lists.
+def _router_attempt() -> Any:
+    try:
+        return importlib.import_module("litellm.router_attempt")
+    except ImportError:
+        return None
+
+
+ROUTER_ATTEMPT = _router_attempt()
+ROUTER_CORE = ROUTER_ATTEMPT is not None
+ROUTER_TAKES_POSITIONAL_STREAM = (
+    ROUTER_ATTEMPT is None or "stream" in ROUTER_ATTEMPT.POSITIONAL["acompletion"]
+)
 
 llm = cast(Any, litellm)
 # A JSON string of this many characters alone passes the bound of a non-stream capture.
@@ -254,9 +272,7 @@ def test_completion_metadata_param_maps_to_td_metadata(
         ("/v1/responses", {"input": "Say hi", "metadata": {"tenant": "acme"}}, True, {}),
         ("/v1/responses", {"input": "Say hi"}, True, {}),
         # Without a litellm_metadata argument the pre-auth tag merge writes the header's tags
-        # into the body's metadata before the proxy copies it. On chat the Router writes its
-        # retry keys into litellm_metadata, so a hook's values under these names in metadata
-        # reach the span unchanged.
+        # into the body's metadata before the proxy copies it.
         (
             "/v1/chat/completions",
             {"messages": CHAT_MESSAGES, "metadata": {"tenant": "acme"}},
@@ -371,10 +387,17 @@ async def test_litellm_proxy_request_exports_only_requester_and_router_metadata(
     assert client_keys | {"model_group", "deployment"} <= exported <= client_keys | router_keys
     assert a["td.metadata.model_group"] == "gpt-4o-mini"
     assert a["td.metadata.deployment"] == "openai/gpt-4o-mini"
-    if hook_routing_values:
+    if hook_routing_values and not ROUTER_CORE:
+        # On chat this Router writes its retry keys into litellm_metadata and leaves the hook's
+        # values in metadata.
         assert a["td.metadata.max_retries"] == 3
         assert "td.metadata.model_group_size" not in a
         assert "td.metadata.attempted_retries" not in a
+    elif hook_routing_values:
+        # The Router core writes its own values over the hook's.
+        assert a["td.metadata.model_group_size"] == 1
+        assert a["td.metadata.attempted_retries"] == 0
+        assert a["td.metadata.max_retries"] == 2
     leaked = [
         secret
         for secret in (
@@ -4095,7 +4118,7 @@ def test_router_completion_traced(memory: SimpleNamespace) -> None:
     assert parent.span_id == root_context.span_id
 
 
-async def test_wrap_router_acompletion_positional_stream_is_instrumented(
+async def test_wrap_router_acompletion_stream_is_instrumented(
     memory: SimpleNamespace,
 ) -> None:
     router = wrap_router(
@@ -4109,9 +4132,14 @@ async def test_wrap_router_acompletion_positional_stream_is_instrumented(
         )
     )
 
-    stream = await router.acompletion(
-        "gpt-4o-mini", CHAT_MESSAGES, True, mock_response="Router async stream"
-    )
+    if ROUTER_TAKES_POSITIONAL_STREAM:
+        stream = await router.acompletion(
+            "gpt-4o-mini", CHAT_MESSAGES, True, mock_response="Router async stream"
+        )
+    else:
+        stream = await router.acompletion(
+            "gpt-4o-mini", CHAT_MESSAGES, stream=True, mock_response="Router async stream"
+        )
     chunks = [chunk async for chunk in stream]
 
     assert (
