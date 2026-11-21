@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.1](https://github.com/telemetry-dev/telemetry/compare/bedrock-v0.3.0...bedrock-v0.3.1) (2026-11-21)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.2.8
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.2.8
+
 ## [0.3.0](https://github.com/telemetry-dev/telemetry/compare/bedrock-v0.2.7...bedrock-v0.3.0) (2026-11-15)
 
 
