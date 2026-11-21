@@ -244,6 +244,52 @@ function endOf(data: SpanData): SpanFields {
   }
 }
 
+/** A tool call that a model call asked for, as the model's output records it. */
+interface ToolCall {
+  name: string;
+  id: string;
+  arguments?: string;
+}
+
+/**
+ * The tool calls in the output of a model call: Responses API `function_call` items, or the
+ * `tool_calls` of a Chat Completions message. The Agents SDK records the output only when
+ * `traceIncludeSensitiveData` is on, which is its default.
+ */
+function toolCallsOf(data: SpanData): ToolCall[] {
+  const calls: ToolCall[] = [];
+  const add = (name: unknown, id: unknown, args: unknown): void => {
+    const callName = asString(name);
+    const callId = asString(id);
+
+    if (callName && callId) calls.push({ name: callName, id: callId, arguments: asString(args) });
+  };
+
+  if (data.type === "response") {
+    const output = asRecord(data._response)?.output;
+
+    for (const item of Array.isArray(output) ? output : []) {
+      const record = asRecord(item);
+
+      if (record?.type === "function_call") add(record.name, record.call_id, record.arguments);
+    }
+  } else if (data.type === "generation") {
+    const choices = asRecord(data.output?.[0])?.choices;
+
+    for (const choice of Array.isArray(choices) ? choices : []) {
+      const toolCalls = asRecord(asRecord(choice)?.message)?.tool_calls;
+
+      for (const call of Array.isArray(toolCalls) ? toolCalls : []) {
+        const record = asRecord(call);
+        const fn = asRecord(record?.function);
+        add(fn?.name, record?.id, fn?.arguments);
+      }
+    }
+  }
+
+  return calls;
+}
+
 function errorOf(span: AgentsSpan): Error | undefined {
   const error = span.error;
 
@@ -319,6 +365,27 @@ export function telemetryDevProcessor(
 
   const traces = new Map<string, TraceState>();
   const spans = new Map<string, OpenSpan>();
+  // Tool calls that a model call asked for and no tool span has claimed yet, by the Agents span id
+  // of the model call's parent (its turn or agent span), under which the SDK also runs the tools.
+  // The Agents SDK puts no call id on its tool spans, so a tool span takes it from here.
+  const pendingCalls = new Map<string, ToolCall[]>();
+
+  /** Takes the call a tool span ran: the first with its name and arguments, else its name. */
+  function claimCall(span: AgentsSpan): string | undefined {
+    const data = span.spanData;
+
+    if (data.type !== "function" || !span.parentId) return undefined;
+    const calls = pendingCalls.get(span.parentId);
+
+    if (!calls) return undefined;
+    let index = calls.findIndex((call) => call.name === data.name && call.arguments === data.input);
+
+    if (index < 0) index = calls.findIndex((call) => call.name === data.name);
+
+    if (index < 0) return undefined;
+
+    return calls.splice(index, 1)[0]!.id;
+  }
   let reportedCap = false;
 
   function endRoot(state: TraceState, endTime?: Date): void {
@@ -450,14 +517,23 @@ export function telemetryDevProcessor(
       try {
         const open = spans.get(span.spanId);
 
+        // A turn or agent span ends after the tools it ran; its unclaimed calls are not needed.
+        pendingCalls.delete(span.spanId);
+
         if (!open) return;
         spans.delete(span.spanId);
         const { handle, trace: state } = open;
+
+        const calls = toolCallsOf(span.spanData);
+
+        if (calls.length > 0 && span.parentId) pendingCalls.set(span.parentId, calls);
+        const toolCallId = claimCall(span);
 
         const fields = mergeFields(
           endOf(span.spanData),
           sandboxSpanEnd(span, handle),
           commandToolEnd(span),
+          toolCallId ? { toolCallId } : {},
         );
         const error = errorOf(span);
         const endTime = toTime(span.endedAt);
@@ -502,6 +578,7 @@ export function telemetryDevProcessor(
 
         for (const { handle } of spans.values()) handle.end();
         spans.clear();
+        pendingCalls.clear();
 
         for (const state of traces.values()) endRoot(state);
       } catch (error) {
