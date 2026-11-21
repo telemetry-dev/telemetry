@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.7](https://github.com/telemetry-dev/telemetry/compare/python-litellm-v0.2.6...python-litellm-v0.2.7) (2026-11-21)
+
+
+### Bug Fixes
+
+* **sdk-litellm:** keep the router's deployment config out of span metadata ([#230](https://github.com/telemetry-dev/telemetry/issues/230)) ([07f38f6](https://github.com/telemetry-dev/telemetry/commit/07f38f66087cfdbf3544b049575d8743f8590ab2))
+
 ## [0.2.6](https://github.com/telemetry-dev/telemetry/compare/python-litellm-v0.2.5...python-litellm-v0.2.6) (2026-11-10)
 
 
