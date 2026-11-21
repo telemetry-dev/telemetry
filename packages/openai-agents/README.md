@@ -92,6 +92,13 @@ create or resume a session also get `sandbox.backend` (for example `e2b` or `mod
 command that exits with a non-zero code is not marked as an error, because many commands, such as
 `grep`, exit non-zero without failing.
 
+## Tool call ids
+
+The Agents SDK puts no call id on its tool spans, so the processor takes it from the model call
+that asked for the tool: each tool span gets `gen_ai.tool.call.id` from the matching call in the
+output of the model call before it, matched by tool name and arguments. This needs the model's
+output, which the Agents SDK records only with `traceIncludeSensitiveData` on.
+
 ## Content and privacy
 
 - Model inputs and outputs, tool arguments and results, and the command and working directory of
@@ -103,7 +110,7 @@ command that exits with a non-zero code is not marked as an error, because many 
   telemetry.dev instead. With `addTraceProcessor`, the OpenAI exporter still receives content; use
   `setTraceProcessors` to stop that.
 - With capture off, telemetry.dev still receives span names and timing, model names, token usage,
-  agent, tool, handoff, and guardrail names, the MCP server of a tool call, exit codes, sandbox
+  agent, tool, handoff, and guardrail names, tool call ids, the MCP server of a tool call, exit codes, sandbox
   backends, error types, the session id (such as the trace's `groupId`, a
   `propagateAttributes()` session, or the process session), the user id and metadata of
   `propagateAttributes()`, and the string, number, and boolean values of trace metadata and of the

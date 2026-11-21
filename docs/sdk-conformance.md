@@ -169,6 +169,39 @@ or `MetricProducer` API. The first accepted span with intervals reports the limi
 `on_error` and the SDK logger; no undrainable aggregate is retained.
 The metrics use DELTA temporality and the bucket boundaries in `packages/otel/src/metrics.ts`.
 
+## OpenAI Agents SDK
+
+`@telemetry-dev/openai-agents` maps the traces of the OpenAI Agents SDK to spans. A Python
+integration follows the same table. Each Agents trace gets a root span of `type: "span"`, named
+after the trace, with `openai_agents.trace_id` and, when the trace has a `groupId`,
+`gen_ai.conversation.id`. Every other span keeps its Agents parent, or the root when the parent
+is unknown.
+
+| Agents span              | Span name                | `type`       | Fields                                                                                                                                                         |
+| ------------------------ | ------------------------ | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `agent`                  | `invoke_agent {name}`    | `agent`      | `agentName`; `openai_agents.agent.{tools,handoffs,output_type}`                                                                                                |
+| `task`                   | `task {name}`            | `span`       |                                                                                                                                                                |
+| `turn`                   | `turn {n}`               | `span`       | `openai_agents.turn`                                                                                                                                           |
+| `response`, `generation` | `chat {model}`           | `generation` | model, response model and id, usage, input, output; `provider: "openai"` only for `response`                                                                   |
+| `function`               | `execute_tool {name}`    | `tool`       | `toolName`, `toolCallId`, input, output; `openai_agents.mcp.server`                                                                                            |
+| `handoff`                | `handoff {from} -> {to}` | `span`       | `openai_agents.handoff.{from,to}`                                                                                                                              |
+| `guardrail`              | `guardrail {name}`       | `span`       | `openai_agents.guardrail.{name,triggered}`                                                                                                                     |
+| `mcp_tools`              | `mcp_tools {server}`     | `span`       | `openai_agents.mcp.tool_count`                                                                                                                                 |
+| `custom` `sandbox.*`     | its name                 | `span`       | `sandbox.operation`; `sandbox.backend` on session create and resume; `process.command_line` and `process.working_directory` of `sandbox.exec` as input content |
+| other `custom`           | its name                 | `span`       | string, number, and boolean values of its data as metadata                                                                                                     |
+
+Only `chat` spans carry usage: task, turn, and agent spans repeat the totals of their calls.
+`toolCallId` comes from the tool call of the same name and arguments, else the same name, in the
+output of the model call under the same parent; the Agents SDK puts no call id on tool spans.
+The `exec_command` and `write_stdin` tool spans get `process.exit.code` from the
+`Process exited with code N` line in the header of their output; a non-zero code does not mark the
+span failed.
+
+The root ends when the trace ends; when a top-level `task` or `agent` span ends with an error,
+since the Agents SDK does not end the trace of a run that throws; or, for a trace with no open span,
+at a flush or shutdown, at the end of its last span. A processor keeps the roots of the 10,000
+most recently active traces, so spans that end later still nest under them.
+
 ## Prompts
 
 `getPrompt(name, options)` / `get_prompt(name, ...)` send `GET {baseUrl}/v1/prompts?name=<name>`

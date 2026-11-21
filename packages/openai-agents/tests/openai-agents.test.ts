@@ -228,6 +228,7 @@ test("a sandbox command becomes a tool span with its exit code, nested under its
 
   expect(new Set(spans.map((span) => span.spanContext().traceId)).size).toBe(1);
   expect(tool.attributes["gen_ai.operation.name"]).toBe("execute_tool");
+  expect(tool.attributes["gen_ai.tool.call.id"]).toBe("call_1");
   expect(tool.attributes["process.exit.code"]).toBe(3);
   // A non-zero exit is not a failed tool call.
   expect(tool.status.code).not.toBe(2);
@@ -477,6 +478,42 @@ test("Chat Completions model calls carry their model and usage", async () => {
     "gen_ai.usage.output_tokens": 20,
     "gen_ai.usage.cache_read.input_tokens": 40,
     "gen_ai.usage.reasoning.output_tokens": 5,
+  });
+  expect(only(spans, named("execute_tool exec_command")).attributes["gen_ai.tool.call.id"]).toBe(
+    "call_1",
+  );
+});
+
+test("parallel calls of one tool each get their own call id", async () => {
+  makeProcessor();
+  // The first command finishes last, so a match by tool name alone would swap the ids.
+  const model = new OpenAIResponsesModel(
+    scriptedClient([
+      response(
+        "resp_1",
+        [
+          functionCall("sleep 0.3; echo first", "call_first"),
+          functionCall("echo second", "call_second"),
+        ],
+        { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      ),
+      response("resp_2", [message("done")], { input_tokens: 1, output_tokens: 1, total_tokens: 2 }),
+    ]),
+    "gpt-5-mini",
+  );
+  await runCommand("unused", { model });
+  const spans = await exported();
+
+  const idsByCommand = Object.fromEntries(
+    spans.filter(named("sandbox.exec")).map((exec) => {
+      const tool = spans.find((span) => span.spanContext().spanId === parentOf(exec))!;
+
+      return [exec.attributes["process.command_line"], tool.attributes["gen_ai.tool.call.id"]];
+    }),
+  );
+  expect(idsByCommand).toEqual({
+    "sleep 0.3; echo first": "call_first",
+    "echo second": "call_second",
   });
 });
 
