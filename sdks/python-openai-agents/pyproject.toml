@@ -1,6 +1,6 @@
 [project]
 name = "telemetry-dev-openai-agents"
-version = "0.0.0"
+version = "0.1.0"
 description = "OpenAI Agents SDK integration for telemetry.dev Python SDK"
 readme = "README.md"
 license = "MIT"
