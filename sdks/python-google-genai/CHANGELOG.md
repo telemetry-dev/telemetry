@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.7](https://github.com/telemetry-dev/telemetry/compare/python-google-genai-v0.2.6...python-google-genai-v0.2.7) (2026-11-26)
+
+
+### Features
+
+* **sdk:** record tool descriptions and schemas as captured input ([#235](https://github.com/telemetry-dev/telemetry/issues/235)) ([091692b](https://github.com/telemetry-dev/telemetry/commit/091692b3902adceaa88bd1291c6ad2be1cf5dcc2))
+
 ## [0.2.6](https://github.com/telemetry-dev/telemetry/compare/python-google-genai-v0.2.5...python-google-genai-v0.2.6) (2026-11-10)
 
 
