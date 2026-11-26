@@ -404,7 +404,7 @@ wheels = [
 
 [[package]]
 name = "telemetry-dev"
-version = "0.3.9"
+version = "0.3.10"
 source = { editable = "." }
 dependencies = [
     { name = "googleapis-common-protos" },
