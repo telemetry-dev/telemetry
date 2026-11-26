@@ -1,6 +1,6 @@
 [project]
 name = "telemetry-dev-litellm"
-version = "0.2.8"
+version = "0.2.9"
 description = "LiteLLM integration for telemetry.dev Python SDK"
 readme = "README.md"
 license = "MIT"

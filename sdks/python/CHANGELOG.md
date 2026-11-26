@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.10](https://github.com/telemetry-dev/telemetry/compare/python-v0.3.9...python-v0.3.10) (2026-11-26)
+
+
+### Bug Fixes
+
+* **sdk-python:** require telemetry-dev 0.3.9 in the python integrations ([#237](https://github.com/telemetry-dev/telemetry/issues/237)) ([9b34d54](https://github.com/telemetry-dev/telemetry/commit/9b34d54dc36ecf38f36e2ce6259610bafb14377b))
+
 ## [0.3.9](https://github.com/telemetry-dev/telemetry/compare/python-v0.3.8...python-v0.3.9) (2026-11-26)
 
 

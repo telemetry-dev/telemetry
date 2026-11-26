@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.3.1...python-bedrock-v0.3.2) (2026-11-26)
+
+
+### Bug Fixes
+
+* **sdk-python:** require telemetry-dev 0.3.9 in the python integrations ([#237](https://github.com/telemetry-dev/telemetry/issues/237)) ([9b34d54](https://github.com/telemetry-dev/telemetry/commit/9b34d54dc36ecf38f36e2ce6259610bafb14377b))
+
 ## [0.3.1](https://github.com/telemetry-dev/telemetry/compare/python-bedrock-v0.3.0...python-bedrock-v0.3.1) (2026-11-26)
 
 

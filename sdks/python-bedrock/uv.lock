@@ -451,7 +451,7 @@ wheels = [
 
 [[package]]
 name = "telemetry-dev"
-version = "0.3.9"
+version = "0.3.10"
 source = { editable = "../python" }
 dependencies = [
     { name = "googleapis-common-protos" },
@@ -482,7 +482,7 @@ dev = [
 
 [[package]]
 name = "telemetry-dev-bedrock"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
