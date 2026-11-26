@@ -1,4 +1,4 @@
-import type { SpanFields } from "@telemetry-dev/sdk";
+import { captureEnabled, type SpanFields } from "@telemetry-dev/sdk";
 
 import {
   arrayValue,
@@ -29,13 +29,14 @@ export interface NormalizedMessage {
 export function converseRequestFields(input: JsonRecord): SpanFields {
   const inference = isRecord(input.inferenceConfig) ? input.inferenceConfig : {};
   const guardrail = isRecord(input.guardrailConfig) ? input.guardrailConfig : undefined;
+  const attributes = { ...toolDefinitions(input.toolConfig), ...promptAttributes(input.messages) };
 
   return omitUndefined({
     provider: PROVIDER,
     model: stringValue(input.modelId),
     input: normalizeMessages(input.messages),
     systemInstructions: normalizeSystem(input.system),
-    attributes: promptAttributes(input.messages),
+    attributes: Object.keys(attributes).length > 0 ? attributes : undefined,
     temperature: numberValue(inference.temperature),
     topP: numberValue(inference.topP),
     maxTokens: numberValue(inference.maxTokens),
@@ -47,6 +48,40 @@ export function converseRequestFields(input: JsonRecord): SpanFields {
         })
       : undefined,
   });
+}
+
+/**
+ * The tools of `toolConfig` as `gen_ai.tool.definitions`: each tool's name, and with input
+ * capture on its description and the JSON Schema of its input. A system tool is listed as
+ * `system_tool`. The core SDK also strips descriptions and schemas with capture off; this check
+ * keeps them out with a core older than that rule.
+ */
+function toolDefinitions(toolConfig: JsonValue | undefined): SpanFields["attributes"] {
+  const tools = isRecord(toolConfig) ? toolConfig.tools : undefined;
+
+  if (!Array.isArray(tools)) return undefined;
+  const content = captureEnabled("input");
+
+  const definitions = tools.flatMap((tool) => {
+    if (!isRecord(tool)) return [];
+    const system = isRecord(tool.systemTool) ? stringValue(tool.systemTool.name) : undefined;
+
+    if (system !== undefined) return [{ type: "system_tool", name: system }];
+    const spec = isRecord(tool.toolSpec) ? tool.toolSpec : undefined;
+    const name = stringValue(spec?.name);
+
+    if (name === undefined) return [];
+
+    if (!content) return [{ type: "function", name }];
+    const schema = isRecord(spec?.inputSchema) ? spec.inputSchema.json : undefined;
+
+    // JSON.stringify leaves out the fields a tool does not set.
+    return [
+      { type: "function", name, description: stringValue(spec?.description), parameters: schema },
+    ];
+  });
+
+  return definitions.length > 0 ? { "gen_ai.tool.definitions": toolsJson(definitions) } : undefined;
 }
 
 export function converseResponseFields<T>(output: T): SpanFields {
@@ -463,4 +498,16 @@ function blockToPart(block: StreamBlock) {
     content: block.text ?? "",
     citations: block.citations && block.citations.length > 0 ? block.citations : undefined,
   });
+}
+
+/**
+ * The definitions as JSON, or only their types and names when a schema cannot be serialized,
+ * such as one holding a BigInt or a cycle: the wrapper maps the request outside any catch.
+ */
+function toolsJson(definitions: Array<{ type: string; name?: string }>): string {
+  try {
+    return JSON.stringify(definitions);
+  } catch {
+    return JSON.stringify(definitions.map(({ type, name }) => ({ type, name })));
+  }
 }

@@ -29,6 +29,8 @@ import {
   SEVERITY_WARN,
   type TelemetryDevEvent,
   type JsonValue,
+  type ToolDefinition,
+  toolDefinitionsAttr,
 } from "./shared.ts";
 
 type TelemetryDevHook = (event: TelemetryDevEvent) => void | PromiseLike<void>;
@@ -42,6 +44,7 @@ type TelemetryDevHook = (event: TelemetryDevEvent) => void | PromiseLike<void>;
 export interface TelemetryDevIntegration {
   onStart?: TelemetryDevHook;
   onStepStart?: TelemetryDevHook;
+  onLanguageModelCallStart?: TelemetryDevHook;
   onLanguageModelCallEnd?: TelemetryDevHook;
   onStepEnd?: TelemetryDevHook;
   onToolExecutionStart?: TelemetryDevHook;
@@ -153,6 +156,13 @@ interface V7StepStartEvent {
   instructions?: JsonValue;
   messages?: JsonValue;
   runtimeContext?: Record<string, JsonValue>;
+}
+
+// LanguageModelCallStartEvent: `tools` are the step's prepared tools (LanguageModelV4 function
+// tools with a JSON Schema `inputSchema`, and provider tools with an `id`).
+interface V7LanguageModelCallStartEvent {
+  callId: string;
+  tools?: ReadonlyArray<Record<string, JsonValue>>;
 }
 
 interface V7Performance {
@@ -325,6 +335,30 @@ const callIdOf = (event: TelemetryDevEvent): string | undefined =>
   "callId" in event && event.callId?.constructor === String ? String(event.callId) : undefined;
 
 type OpKind = "text" | "object" | "embed" | "rerank" | "evaluate";
+
+/** A provider tool takes its provider's id, such as `anthropic.web_search_20250305`, as type. */
+function preparedToolDefinitions(
+  tools: ReadonlyArray<Record<string, JsonValue>> | undefined,
+): ToolDefinition[] {
+  return (tools ?? []).flatMap((tool) => {
+    const name = tool.name;
+
+    if (typeof name !== "string") return [];
+
+    if (tool.type === "provider") {
+      return [{ type: typeof tool.id === "string" ? tool.id : "provider", name }];
+    }
+
+    return [
+      {
+        type: "function",
+        name,
+        description: typeof tool.description === "string" ? tool.description : undefined,
+        parameters: tool.inputSchema,
+      },
+    ];
+  });
+}
 
 const opKindOf = (operationId: string): OpKind => {
   switch (operationId) {
@@ -1230,6 +1264,27 @@ function createV7Hooks(
           open: true,
         });
         state.currentStepNumber = e.stepNumber;
+      } catch (err) {
+        reportTelemetryError(onError, err);
+      }
+    },
+
+    onLanguageModelCallStart(event) {
+      try {
+        const state = stateOf(event);
+
+        if (!state || state.currentStepNumber === null) return;
+        const e = event as V7LanguageModelCallStartEvent;
+        const step = state.steps.get(state.currentStepNumber);
+        const definitions = toolDefinitionsAttr(
+          config,
+          preparedToolDefinitions(e.tools),
+          state.recordInputs,
+        );
+
+        if (step?.open && definitions !== undefined) {
+          step.span.setAttribute("gen_ai.tool.definitions", definitions);
+        }
       } catch (err) {
         reportTelemetryError(onError, err);
       }

@@ -226,6 +226,18 @@ def test_converse_happy_path(memory: SimpleNamespace, monkeypatch: pytest.Monkey
         ],
         "system": [{"text": "be terse"}],
         "inferenceConfig": {"temperature": 0.1, "topP": 0.9, "maxTokens": 10},
+        "toolConfig": {
+            "tools": [
+                {
+                    "toolSpec": {
+                        "name": "weather",
+                        "description": "Weather for a city",
+                        "inputSchema": {"json": {"type": "object"}},
+                    }
+                },
+                {"cachePoint": {"type": "default"}},
+            ]
+        },
     }
     request_snapshot = copy.deepcopy(request)
     calls = _stub_api_call(
@@ -271,6 +283,14 @@ def test_converse_happy_path(memory: SimpleNamespace, monkeypatch: pytest.Monkey
     assert span.attributes["gen_ai.usage.total_tokens"] == 3 + 1 + 2 + 4
     assert span.attributes["gen_ai.usage.cache_creation.input_tokens"] == 2
     assert span.attributes["td.metadata.server_latency_ms"] == "12"
+    assert _json_attr(span, "gen_ai.tool.definitions") == [
+        {
+            "type": "function",
+            "name": "weather",
+            "description": "Weather for a city",
+            "parameters": {"type": "object"},
+        }
+    ]
     assert _json_attr(span, "gen_ai.input.messages") == [
         {
             "role": "user",

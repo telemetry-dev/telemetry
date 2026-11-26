@@ -246,20 +246,33 @@ def _tool_definitions(value: Any) -> Any:
 
 
 def _offered_tools(tools: Any) -> dict[str, str] | None:
-    # Names are recorded regardless of capture flags, as on tool spans; descriptions and schemas
-    # stay in the input.
-    definitions: list[dict[str, str]] = []
+    """Each request tool as ``gen_ai.tool.definitions``: its type and name, and with input capture
+    on a custom tool's description and input schema as ``parameters``. Names are recorded
+    regardless of capture flags, as on tool spans. The core SDK also strips the description and
+    schema with capture off; this check keeps them out with a core older than that rule."""
+    client = telemetry_dev.get_client()
+    content = client is not None and client.capture_input
+    definitions: list[dict[str, Any]] = []
     for tool in _sequence_items(tools):
         if not isinstance(tool, Mapping):
             continue
         fields = cast(Mapping[str, Any], tool)
         name = _string(fields.get("name"))
         kind = _string(fields.get("type"))
-        if name is not None:
-            definitions.append(
-                {"type": "function" if kind in (None, "custom") else kind, "name": name}
-            )
-    return {"gen_ai.tool.definitions": json_dumps(definitions)} if definitions else None
+        if name is None:
+            continue
+        if kind not in (None, "custom"):
+            definitions.append({"type": kind, "name": name})
+            continue
+        definition: dict[str, Any] = {"type": "function", "name": name}
+        if content:
+            description = _string(fields.get("description"))
+            if description is not None:
+                definition["description"] = description
+            if "input_schema" in fields:
+                definition["parameters"] = _native(fields["input_schema"])
+        definitions.append(definition)
+    return {"gen_ai.tool.definitions": _tools_json(definitions)} if definitions else None
 
 
 def _add_prompt(fields: Mapping[str, Any], messages: object) -> dict[str, Any]:
@@ -1958,3 +1971,14 @@ def uninstrument_anthropic() -> None:
 
 
 __all__ = ["__version__", "instrument_anthropic", "uninstrument_anthropic", "wrap_anthropic"]
+
+
+def _tools_json(definitions: list[dict[str, Any]]) -> str:
+    """The definitions as JSON, or only their types and names when a schema cannot be
+    serialized, such as one holding a cycle: the wrapper maps the request outside any catch."""
+    try:
+        return json_dumps(definitions)
+    except (TypeError, ValueError):
+        return json_dumps(
+            [{key: tool[key] for key in ("type", "name") if key in tool} for tool in definitions]
+        )

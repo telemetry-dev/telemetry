@@ -74,6 +74,10 @@ input, supported sampling parameters, response model and ID, finish reasons, out
 token usage. Embedding spans capture the request input, request and response models, and token
 usage; embedding vectors are intentionally not captured as output.
 
+Generation spans also list the request's tools in `gen_ai.tool.definitions`: each tool's type and
+name, and with `capture_input` on the description and parameters of each function and custom tool
+(a custom tool's input format), which pass through `mask`.
+
 When OpenRouter returns cost information, the integration records `gen_ai.usage.cost` from
 `usage.cost`. If that field is absent, it falls back to
 `usage.cost_details.upstream_inference_cost`. The cost attribute is omitted when neither value is

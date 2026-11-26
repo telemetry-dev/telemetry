@@ -29,6 +29,8 @@ import {
   SEVERITY_WARN,
   type TelemetryDevEvent,
   type JsonValue,
+  type ToolDefinition,
+  toolDefinitionsAttr,
   unknownErrorMessage,
 } from "./shared.ts";
 
@@ -63,6 +65,68 @@ interface V6StepStartEvent {
   // The step's system prompt: the call's, or a prepareStep override.
   system?: JsonValue;
   messages?: JsonValue;
+  // The call's ToolSet, by tool name, and the names that the step offers when it limits them.
+  tools?: Record<string, V6Tool | undefined>;
+  activeTools?: string[];
+}
+
+interface V6Tool {
+  type?: string;
+  id?: string;
+  description?: string;
+  inputSchema?: unknown;
+}
+
+/**
+ * The tools a step offers. ai@6 hands telemetry the tools as the app defined them, so a schema
+ * is recorded when it is readable as JSON Schema without running the app's code: a `jsonSchema()`
+ * schema, or a Standard Schema that converts itself, such as zod 4.
+ */
+function v6ToolDefinitions(event: V6StepStartEvent): ToolDefinition[] {
+  return Object.entries(event.tools ?? {}).flatMap(([name, tool]) => {
+    if (!tool || (event.activeTools && !event.activeTools.includes(name))) return [];
+
+    if (tool.type === "provider") {
+      return [{ type: typeof tool.id === "string" ? tool.id : "provider", name }];
+    }
+
+    return [
+      {
+        type: "function",
+        name,
+        description: typeof tool.description === "string" ? tool.description : undefined,
+        parameters: readableJsonSchema(tool.inputSchema),
+      },
+    ];
+  });
+}
+
+function readableJsonSchema(schema: unknown): unknown {
+  if (typeof schema !== "object" || schema === null) return undefined;
+
+  try {
+    if (Symbol.for("vercel.ai.schema") in schema && "jsonSchema" in schema) {
+      return settled(schema.jsonSchema);
+    }
+    const standard = (
+      schema as {
+        "~standard"?: { jsonSchema?: { input?: (options: { target: string }) => unknown } };
+      }
+    )["~standard"];
+
+    return settled(standard?.jsonSchema?.input?.({ target: "draft-07" }));
+  } catch {
+    return undefined;
+  }
+}
+
+/** A schema the tool already holds. `jsonSchema()` can hold a promise, which JSON writes as `{}`. */
+function settled(schema: unknown): unknown {
+  return typeof schema === "object" &&
+    schema !== null &&
+    typeof (schema as { then?: unknown }).then !== "function"
+    ? schema
+    : undefined;
 }
 
 interface V6StepFinishEvent {
@@ -283,6 +347,11 @@ function createV6Hooks(config: ResolvedConfig, emitter: GenerationEmitter) {
           { startTime: startedAt, kind: SpanKind.CLIENT, attributes: conversationAttributes() },
           rootCtx,
         );
+
+        // ai@6 telemetry always records inputs, so the descriptions and schemas follow the mask.
+        const definitions = toolDefinitionsAttr(config, v6ToolDefinitions(e), true);
+
+        if (definitions !== undefined) span.setAttribute("gen_ai.tool.definitions", definitions);
 
         steps.set(e.stepNumber, {
           span,

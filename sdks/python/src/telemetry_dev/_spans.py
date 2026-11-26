@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import sys
 import threading
@@ -48,6 +49,7 @@ from ._semconv import (
     ATTR_SYSTEM_INSTRUCTIONS,
     ATTR_TIME_TO_FIRST_CHUNK,
     ATTR_TOOL_CALL_ID,
+    ATTR_TOOL_DEFINITIONS,
     ATTR_TOOL_DESCRIPTION,
     ATTR_TOOL_NAME,
     DURATION_BUCKETS,
@@ -61,7 +63,13 @@ from ._semconv import (
     input_key,
     output_key,
 )
-from ._serialize import AttributeValue, coerce_attr_value
+from ._serialize import (
+    AttributeValue,
+    coerce_attr_value,
+    json_dumps,
+    serialize_content,
+    utf16_length,
+)
 
 
 class _NotGiven:
@@ -377,6 +385,15 @@ def _fields_to_attributes(
             # The variables are input, also when the app passes them from prompt_attributes_for().
             if key == ATTR_PROMPT_VARIABLES and not state.capture_input:
                 continue
+            if key == ATTR_TOOL_DEFINITIONS:
+                definitions = _tool_list(value)
+                if definitions is not None:
+                    kept = _tool_definitions(client, state, value, definitions)
+                    if kept is not None:
+                        attrs[key] = kept
+                    continue
+                if not state.capture_input or client.mask is not None:
+                    continue
             attr = coerce_attr_value(
                 value,
                 max_len=sys.maxsize,
@@ -387,6 +404,69 @@ def _fields_to_attributes(
                 attrs[key] = attr
 
     return attrs
+
+
+def _tool_list(value: Any) -> list[Any] | None:
+    """The tools of a ``gen_ai.tool.definitions`` value: JSON text, a list of one JSON text per
+    tool, or a list of tool objects. None for any other value."""
+    try:
+        if isinstance(value, str):
+            parsed = json.loads(value)
+            return cast("list[Any]", parsed) if isinstance(parsed, list) else None
+        if isinstance(value, (list, tuple)):
+            items = cast("Sequence[Any]", value)
+            if all(isinstance(item, str) for item in items):
+                return [json.loads(item) for item in items]
+            return list(items)
+    except (ValueError, RecursionError):
+        pass
+    return None
+
+
+def _tool_definitions(
+    client: Client, state: _SpanState, value: Any, definitions: list[Any]
+) -> str | None:
+    """The ``gen_ai.tool.definitions`` that a span keeps. Tool descriptions and schemas are prompt
+    content: with input capture off only each tool's type and name stay, and with a mask the
+    definitions go through it as input does. Like other content, a list longer than
+    ``max_attribute_length``, 0 included, keeps only the names, since a cut list is not JSON and
+    readers would lose every tool. The names follow the limit of raw attributes, where 0 sets no
+    limit; names that do not fit leave the attribute out."""
+    if state.capture_input:
+        if client.mask is None:
+            try:
+                full = value if isinstance(value, str) else json_dumps(definitions)
+            except (TypeError, ValueError, RecursionError):
+                full = None
+        else:
+            full = serialize_content(
+                definitions,
+                key=ATTR_TOOL_DEFINITIONS,
+                mask=client.mask,
+                max_len=sys.maxsize,
+                on_error=client.on_error,
+            )
+        if full is not None and utf16_length(full) <= client.max_attribute_length:
+            return full
+    names: list[dict[str, str]] = []
+    for definition in definitions:
+        if not isinstance(definition, dict):
+            continue
+        fields = cast("dict[str, Any]", definition)
+        kept = {key: fields[key] for key in ("type", "name") if isinstance(fields.get(key), str)}
+        # OpenAI's Chat Completions form nests the name under ``function``.
+        function = fields.get("function")
+        if "name" not in kept and isinstance(function, dict):
+            nested = cast("dict[str, Any]", function).get("name")
+            if isinstance(nested, str):
+                kept["name"] = nested
+        if kept:
+            names.append(kept)
+    if not names:
+        return None
+    text = json_dumps(names)
+    raw_limit = client.max_attribute_length or sys.maxsize
+    return text if utf16_length(text) <= raw_limit else None
 
 
 def _apply_fields(client: Client, span: Span, state: _SpanState, fields: dict[str, Any]) -> None:

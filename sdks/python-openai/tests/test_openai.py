@@ -5376,3 +5376,84 @@ def test_a_forked_child_does_not_wait_for_an_install_lock_that_a_thread_of_the_p
             pytest.fail("The forked process did not end in 10 s")
         time.sleep(0.01)
     assert os.waitstatus_to_exitcode(waited[1]) == 0
+
+
+@pytest.mark.parametrize(
+    ("api", "capture_input"),
+    [("chat", True), ("chat", False), ("responses", True), ("responses", False)],
+)
+def test_offered_tools_are_recorded_with_descriptions_and_schemas_as_input(
+    make: Callable[..., SimpleNamespace], api: str, capture_input: bool
+) -> None:
+    memory = make(capture_input=capture_input)
+    parameters = {"type": "object", "properties": {"order": {"type": "string"}}}
+    grammar = {"type": "grammar", "syntax": "regex", "definition": "\\d+"}
+    payload = response_payload() if api == "responses" else chat_completion()
+    client = wrap_openai(sync_client(lambda _request: json_response(payload)))
+    if api == "responses":
+        client.responses.create(
+            model="gpt-4.1",
+            input="Refund order 42",
+            tools=cast(
+                Any,
+                [
+                    {
+                        "type": "function",
+                        "name": "issue_refund",
+                        "description": "Refund",
+                        "parameters": parameters,
+                        "strict": True,
+                    },
+                    {
+                        "type": "custom",
+                        "name": "order_id",
+                        "description": "An order id",
+                        "format": grammar,
+                    },
+                    {"type": "web_search"},
+                ],
+            ),
+        )
+    else:
+        client.chat.completions.create(
+            model="gpt-4o",
+            messages=cast(Any, CHAT_MESSAGES),
+            tools=cast(
+                Any,
+                [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "issue_refund",
+                            "description": "Refund",
+                            "parameters": parameters,
+                        },
+                    },
+                    {
+                        "type": "custom",
+                        "custom": {
+                            "name": "order_id",
+                            "description": "An order id",
+                            "format": grammar,
+                        },
+                    },
+                ],
+            ),
+        )
+
+    expected: list[dict[str, Any]] = [
+        {
+            "type": "function",
+            "name": "issue_refund",
+            "description": "Refund",
+            "parameters": parameters,
+        }
+        if capture_input
+        else {"type": "function", "name": "issue_refund"},
+        {"type": "custom", "name": "order_id", "description": "An order id", "parameters": grammar}
+        if capture_input
+        else {"type": "custom", "name": "order_id"},
+    ]
+    if api == "responses":
+        expected.append({"type": "web_search"})
+    assert json.loads(str(attrs(only_span(memory))["gen_ai.tool.definitions"])) == expected

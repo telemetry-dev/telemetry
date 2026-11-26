@@ -149,7 +149,10 @@ a call without one is its own trace.
 
 AI SDK records inputs and outputs by default. Each step's `chat` span records the step's
 instructions (the call's `instructions`, or a `prepareStep` override; `system` on `ai@6`) as
-`gen_ai.system_instructions`, next to its input messages. Inputs also include tool arguments and
+`gen_ai.system_instructions`, next to its input messages, and the tools offered to the model in
+`gen_ai.tool.definitions`: each tool's type and name, and its description and input JSON Schema
+(as `parameters`). On `ai@6`, a schema is recorded when it is a `jsonSchema()` schema or a schema
+that converts itself to JSON Schema, such as zod 4. Inputs also include tool arguments and
 results, including provider tools, which can contain shell commands, code, search data, or MCP
 payloads. To suppress payload capture:
 
@@ -161,8 +164,8 @@ telemetry: {
 }
 ```
 
-These flags omit prompt, instructions, response, tool-argument, tool-result, and detailed error
-payloads. Tool
+These flags omit prompt, instructions, tool description and schema, response, tool-argument,
+tool-result, and detailed error payloads. Tool
 identity, status, error type, token usage, and other non-payload metadata are still recorded. On
 text generation steps, model warning messages are reduced to a generic "Model warning" unless both
 input and output recording are enabled; a warning that supplies a string `type` still records it

@@ -6,7 +6,12 @@ import {
 } from "@langchain/core/messages";
 import type { UsageMetadata } from "@langchain/core/messages";
 import type { LLMResult } from "@langchain/core/outputs";
-import type { GenerationFields, SpanFields, TokenUsage } from "@telemetry-dev/sdk";
+import {
+  captureEnabled,
+  type GenerationFields,
+  type SpanFields,
+  type TokenUsage,
+} from "@telemetry-dev/sdk";
 
 import { plain, plainMessage } from "./plain.ts";
 
@@ -37,7 +42,7 @@ export function generationRequest(
   const tools = toolDefinitions(params?.["tools"]);
 
   return {
-    attributes: tools.length > 0 ? { "gen_ai.tool.definitions": JSON.stringify(tools) } : undefined,
+    attributes: tools.length > 0 ? { "gen_ai.tool.definitions": toolsJson(tools) } : undefined,
     model:
       string(metadata?.["ls_model_name"]) ??
       string(params?.["model"]) ??
@@ -103,36 +108,85 @@ export function toolOutput(output: unknown): unknown {
   return plain(output);
 }
 
+interface ToolDefinition {
+  type: string;
+  name?: string;
+  description?: string;
+  parameters?: unknown;
+}
+
 /**
- * The type and name of each tool in the request, in the provider's format: OpenAI
- * `{type, function: {name}}`, Anthropic `{name}` or a server tool `{type, name}`, Gemini
- * `{functionDeclarations: [{name}]}`, and Bedrock `{toolSpec: {name}}`. Descriptions and schemas
- * stay out, so that the tool list does not depend on content capture.
+ * The tools of a model run in the formats of the providers LangChain calls: OpenAI
+ * (`function`), Anthropic (`input_schema`), Bedrock (`toolSpec`), and Gemini
+ * (`functionDeclarations`). Descriptions and schemas are prompt content and need input capture
+ * on. The core SDK also strips them with capture off; this check keeps them out with a core
+ * older than that rule.
  */
-function toolDefinitions(tools: unknown): Array<{ type: string; name: string }> {
+function toolDefinitions(tools: unknown): ToolDefinition[] {
   if (!Array.isArray(tools)) return [];
+  const content = captureEnabled("input");
+  const definition = (
+    type: string,
+    name: string,
+    description: unknown,
+    parameters: unknown,
+  ): ToolDefinition =>
+    content ? { type, name, description: string(description), parameters } : { type, name };
 
   return tools.flatMap((item: unknown) => {
     const tool = record(item);
     const declarations = tool?.["functionDeclarations"];
 
     if (Array.isArray(declarations)) {
-      return declarations.flatMap((declaration: unknown) => {
-        const name = string(record(declaration)?.["name"]);
+      return declarations.flatMap((item: unknown) => {
+        const declaration = record(item);
+        const name = string(declaration?.["name"]);
 
-        return name ? [{ type: "function", name }] : [];
+        return name
+          ? [
+              definition(
+                "function",
+                name,
+                declaration?.["description"],
+                declaration?.["parameters"],
+              ),
+            ]
+          : [];
       });
     }
 
-    const name =
-      string(record(tool?.["function"])?.["name"]) ??
-      string(record(tool?.["toolSpec"])?.["name"]) ??
-      string(tool?.["name"]);
+    const fn = record(tool?.["function"]);
+    const spec = record(tool?.["toolSpec"]);
+    const name = string(fn?.["name"]) ?? string(spec?.["name"]) ?? string(tool?.["name"]);
 
-    if (!name) return [];
     const type = string(tool?.["type"]);
 
-    return [{ type: type === undefined || type === "custom" ? "function" : type, name }];
+    // A built-in tool without a name, such as OpenAI's `{type: "web_search"}`, by its type.
+    if (!name) return type && type !== "function" && type !== "custom" ? [{ type }] : [];
+
+    // A built-in tool; a Responses-format function tool also has its fields at the top.
+    if (
+      fn === undefined &&
+      spec === undefined &&
+      type !== undefined &&
+      type !== "custom" &&
+      type !== "function"
+    ) {
+      return [{ type, name }];
+    }
+    const source = fn ?? spec ?? tool;
+
+    return [
+      definition(
+        "function",
+        name,
+        source?.["description"],
+        fn?.["parameters"] ??
+          record(spec?.["inputSchema"])?.["json"] ??
+          tool?.["input_schema"] ??
+          tool?.["parameters"],
+      ),
+    ];
   });
 }
 
@@ -189,4 +243,16 @@ function strings(value: unknown): string[] | undefined {
   return Array.isArray(value) && value.length > 0 && value.every((item) => typeof item === "string")
     ? value
     : undefined;
+}
+
+/**
+ * The definitions as JSON, or only their types and names when a schema cannot be serialized,
+ * such as one holding a BigInt or a cycle: the wrapper maps the request outside any catch.
+ */
+function toolsJson(definitions: Array<{ type: string; name?: string }>): string {
+  try {
+    return JSON.stringify(definitions);
+  } catch {
+    return JSON.stringify(definitions.map(({ type, name }) => ({ type, name })));
+  }
 }

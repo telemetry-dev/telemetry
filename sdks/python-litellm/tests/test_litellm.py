@@ -4323,3 +4323,32 @@ def test_a_forked_child_does_not_wait_for_an_install_lock_that_a_thread_of_the_p
             pytest.fail("The forked process did not end in 10 s")
         time.sleep(0.01)
     assert os.waitstatus_to_exitcode(waited[1]) == 0
+
+
+def test_completion_records_the_offered_tools(memory: SimpleNamespace) -> None:
+    instrument_litellm()
+    parameters = {"type": "object", "properties": {"city": {"type": "string"}}}
+    llm.completion(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "weather"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Weather",
+                    "parameters": parameters,
+                },
+            }
+        ],
+        mock_response="Sunny.",
+    )
+
+    assert json_attr(attrs(only_span(memory))["gen_ai.tool.definitions"]) == [
+        {
+            "type": "function",
+            "name": "get_weather",
+            "description": "Weather",
+            "parameters": parameters,
+        }
+    ]
