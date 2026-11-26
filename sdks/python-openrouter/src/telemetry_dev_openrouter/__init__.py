@@ -16,7 +16,7 @@ from openrouter.embeddings import Embeddings
 from openrouter.responses import Responses
 from telemetry_dev._serialize import json_dumps
 
-__version__ = "0.2.6"
+__version__ = "0.2.7"
 
 RequestMapper = Callable[[Mapping[str, Any]], tuple[str, dict[str, Any]]]
 ResponseMapper = Callable[[Any], dict[str, Any]]

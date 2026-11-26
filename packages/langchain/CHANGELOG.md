@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.3](https://github.com/telemetry-dev/telemetry/compare/langchain-v0.1.2...langchain-v0.1.3) (2026-11-26)
+
+
+### Features
+
+* **sdk:** record tool descriptions and schemas as captured input ([#235](https://github.com/telemetry-dev/telemetry/issues/235)) ([091692b](https://github.com/telemetry-dev/telemetry/commit/091692b3902adceaa88bd1291c6ad2be1cf5dcc2))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * devDependencies
+    * @telemetry-dev/sdk bumped to 0.2.9
+  * peerDependencies
+    * @telemetry-dev/sdk bumped to 0.2.9
+
 ## [0.1.2](https://github.com/telemetry-dev/telemetry/compare/langchain-v0.1.1...langchain-v0.1.2) (2026-11-21)
 
 

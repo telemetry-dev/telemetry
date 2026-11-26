@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.2](https://github.com/telemetry-dev/telemetry/compare/openai-agents-v0.1.1...openai-agents-v0.1.2) (2026-11-26)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @telemetry-dev/sdk bumped to 0.2.9
+
 ## [0.1.1](https://github.com/telemetry-dev/telemetry/compare/openai-agents-v0.1.0...openai-agents-v0.1.1) (2026-11-26)
 
 

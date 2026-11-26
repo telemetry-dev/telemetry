@@ -18,7 +18,7 @@ import telemetry_dev
 from opentelemetry import trace
 from telemetry_dev._serialize import json_dumps
 
-__version__ = "0.2.7"
+__version__ = "0.2.8"
 
 RequestMapper = Callable[[tuple[Any, ...], Mapping[str, Any]], tuple[str, dict[str, Any]]]
 ResponseMapper = Callable[[Any], dict[str, Any]]
