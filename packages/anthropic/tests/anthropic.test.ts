@@ -557,10 +557,15 @@ test("messages.create preserves request tools and tool-use blocks in output", as
   });
 
   const span = await exportedSpan(spans);
-  // The dashboard lists these names as the tools offered; schemas stay in the captured input.
+  // With input capture on, a custom tool's description and schema say what the tool accepts.
   expect(jsonAttr(span, "gen_ai.tool.definitions")).toEqual([
-    { type: "function", name: "get_weather" },
-    { type: "function", name: "issue_refund" },
+    {
+      type: "function",
+      name: "get_weather",
+      description: "Get weather",
+      parameters: tool.input_schema,
+    },
+    { type: "function", name: "issue_refund", parameters: { type: "object" } },
     { type: "web_search_20250305", name: "web_search" },
   ]);
   expect(jsonAttr(span, "gen_ai.output.messages")).toEqual([

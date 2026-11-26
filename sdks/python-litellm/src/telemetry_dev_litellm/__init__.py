@@ -16,6 +16,7 @@ from typing import Any, TypeVar, cast
 import litellm
 import telemetry_dev
 from opentelemetry import trace
+from telemetry_dev._serialize import json_dumps
 
 __version__ = "0.2.7"
 
@@ -505,6 +506,39 @@ def _prompt_attributes(messages: object) -> dict[str, Any]:
     return cast("dict[str, Any]", read(messages)) if callable(read) else {}
 
 
+def _tool_definitions(tools: Any) -> dict[str, str] | None:
+    """The request tools, in the OpenAI format, as ``gen_ai.tool.definitions``: each tool's type
+    and name, and with input capture on a function or custom tool's description and its
+    parameters (custom tools: their input format). Chat Completions nests a tool under
+    ``function`` or ``custom``; Responses puts it at the top. A built-in tool without a name is
+    listed by its type. The core SDK also strips descriptions and schemas with capture off; this
+    check keeps them out with a core older than that rule."""
+    client = telemetry_dev.get_client()
+    content = client is not None and client.capture_input
+    definitions: list[dict[str, Any]] = []
+    for tool in _sequence_items(tools):
+        kind = _string(_field(tool, "type"))
+        if kind is None:
+            continue
+        spec = _field(tool, "custom" if kind == "custom" else "function") or tool
+        name = _string(_field(spec, "name"))
+        if kind not in ("function", "custom"):
+            definitions.append({"type": kind} if name is None else {"type": kind, "name": name})
+            continue
+        if name is None:
+            continue
+        definition: dict[str, Any] = {"type": kind, "name": name}
+        if content:
+            description = _string(_field(spec, "description"))
+            if description is not None:
+                definition["description"] = description
+            parameters = _field(spec, "format" if kind == "custom" else "parameters")
+            if parameters is not None:
+                definition["parameters"] = parameters
+        definitions.append(definition)
+    return {"gen_ai.tool.definitions": _tools_json(definitions)} if definitions else None
+
+
 def _completion_request(
     args: tuple[Any, ...], kwargs: Mapping[str, Any]
 ) -> tuple[str, dict[str, Any]]:
@@ -528,7 +562,11 @@ def _completion_request(
             "presence_penalty": _number(kwargs.get("presence_penalty")),
             "output_type": _output_type(kwargs.get("response_format")),
             "metadata": _request_metadata(kwargs),
-            "attributes": _prompt_attributes(_arg(args, kwargs, "messages", 1)) or None,
+            "attributes": {
+                **(_tool_definitions(kwargs.get("tools")) or {}),
+                **_prompt_attributes(_arg(args, kwargs, "messages", 1)),
+            }
+            or None,
         },
     )
 
@@ -598,6 +636,7 @@ def _responses_request(
         input_value, input_budget = _bounded_responses_native(_arg(args, kwargs, "input", 0))
     attributes: dict[str, Any] = {
         "gen_ai.operation.name": "chat",
+        **(_tool_definitions(kwargs.get("tools")) or {}),
         **_prompt_attributes(_arg(args, kwargs, "input", 0)),
     }
     if input_budget is not None and input_budget.truncated:
@@ -2356,3 +2395,14 @@ __all__ = [
     "uninstrument_litellm",
     "wrap_router",
 ]
+
+
+def _tools_json(definitions: list[dict[str, Any]]) -> str:
+    """The definitions as JSON, or only their types and names when a schema cannot be
+    serialized, such as one holding a cycle: the wrapper maps the request outside any catch."""
+    try:
+        return json_dumps(definitions)
+    except (TypeError, ValueError):
+        return json_dumps(
+            [{key: tool[key] for key in ("type", "name") if key in tool} for tool in definitions]
+        )

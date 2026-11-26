@@ -147,10 +147,30 @@ test("Converse normalizes tool calls, tool results, and reasoning", async () => 
           ],
         },
       ],
+      toolConfig: {
+        tools: [
+          {
+            toolSpec: {
+              name: "weather",
+              description: "Weather for a city",
+              inputSchema: { json: { type: "object", properties: { city: { type: "string" } } } },
+            },
+          },
+          { cachePoint: { type: "default" } },
+        ],
+      },
     }),
   );
 
   const span = spans.getFinishedSpans()[0]!;
+  expect(jsonAttr(span, "gen_ai.tool.definitions")).toEqual([
+    {
+      type: "function",
+      name: "weather",
+      description: "Weather for a city",
+      parameters: { type: "object", properties: { city: { type: "string" } } },
+    },
+  ]);
   expect(jsonAttr(span, "gen_ai.input.messages")[1].parts[0]).toEqual({
     type: "tool_call_response",
     id: "tool-1",

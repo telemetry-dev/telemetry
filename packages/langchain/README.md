@@ -59,7 +59,7 @@ A graph span records the input of the graph. If the state of the graph has a `me
 
 Model spans record the request model, the provider (from `ls_provider`), temperature, maximum tokens, top-p, stop sequences, the input and output messages, the response model, response id, finish reason, and token usage from `usage_metadata`. Input token counts include cache reads and cache writes. telemetry.dev calculates the cost from the token usage.
 
-Model spans also record the type and name of each tool bound to the model in `gen_ai.tool.definitions`. This attribute does not include the descriptions or schemas of the tools, and the capture options do not change it.
+Model spans also record each tool bound to the model in `gen_ai.tool.definitions`: its type and name, and with `captureInput` on its description and input schema (as `parameters`), which pass through the mask.
 
 Streamed model calls also record the time to the first chunk and the time between chunks.
 

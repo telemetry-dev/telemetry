@@ -342,6 +342,57 @@ test("ai@7 step-end fan-out records each step once", async () => {
   expect(metrics.filter((m) => m.metric === "duration")).toHaveLength(1);
 });
 
+test.each([true, false])(
+  "ai@7 model calls record the offered tools, with descriptions and schemas when recordInputs=%s",
+  async (recordInputs) => {
+    const { generateText, jsonSchema, tool } = await import("ai");
+    const { MockLanguageModelV4 } = await import("ai/test");
+    const { spanBatches, overrides } = makeCapture();
+    const integ = telemetryDev(baseOptions, overrides);
+    const schema = {
+      type: "object" as const,
+      properties: { order: { type: "string" as const } },
+      required: ["order"],
+      additionalProperties: false,
+    };
+
+    await generateText({
+      model: new MockLanguageModelV4({
+        doGenerate: {
+          content: [{ type: "text", text: "done" }],
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: {
+            inputTokens: { total: 4, noCache: 4, cacheRead: undefined, cacheWrite: undefined },
+            outputTokens: { total: 2, text: 2, reasoning: undefined },
+          },
+          warnings: [],
+        },
+      }),
+      prompt: "refund order 42",
+      tools: {
+        issue_refund: tool({
+          description: "Refund an order paid by card",
+          inputSchema: jsonSchema<{ order: string }>(schema),
+        }),
+      },
+      telemetry: { integrations: [integ], recordInputs },
+    });
+
+    const [step] = byOperation(spanBatches[0]!, "chat").filter((s) => s.kind === SpanKind.CLIENT);
+    const definitions = JSON.parse(String(step!.attributes["gen_ai.tool.definitions"]));
+    expect(definitions).toEqual([
+      recordInputs
+        ? {
+            type: "function",
+            name: "issue_refund",
+            description: "Refund an order paid by card",
+            parameters: schema,
+          }
+        : { type: "function", name: "issue_refund" },
+    ]);
+  },
+);
+
 test("no apiKey is a complete no-op (transport never invoked)", async () => {
   vi.stubEnv("TELEMETRY_DEV_API_KEY", undefined);
 

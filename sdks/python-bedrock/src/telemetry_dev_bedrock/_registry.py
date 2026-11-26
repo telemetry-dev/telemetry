@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import telemetry_dev
+from telemetry_dev._serialize import json_dumps
 
 from ._fields import (
     PROVIDER,
@@ -44,6 +45,40 @@ def _model(params: dict[str, Any]) -> str | None:
     return params.get("modelId") if isinstance(params.get("modelId"), str) else None
 
 
+def _tool_definitions(tool_config: Any) -> dict[str, str]:
+    """The tools of ``toolConfig`` as ``gen_ai.tool.definitions``: each tool's name, and with
+    input capture on its description and the JSON Schema of its input. A system tool is listed
+    as ``system_tool``. The core SDK also strips descriptions and schemas with capture off; this
+    check keeps them out with a core older than that rule."""
+    tools = tool_config.get("tools") if isinstance(tool_config, dict) else None
+    if not isinstance(tools, list):
+        return {}
+    client = telemetry_dev.get_client()
+    content = client is not None and client.capture_input
+    definitions: list[dict[str, Any]] = []
+    for tool in cast("list[Any]", tools):
+        if not isinstance(tool, dict):
+            continue
+        fields = cast("dict[str, Any]", tool)
+        system = fields.get("systemTool")
+        if isinstance(system, dict) and isinstance(system.get("name"), str):
+            definitions.append({"type": "system_tool", "name": system["name"]})
+            continue
+        spec = fields.get("toolSpec")
+        if not isinstance(spec, dict) or not isinstance(spec.get("name"), str):
+            continue
+        spec = cast("dict[str, Any]", spec)
+        definition: dict[str, Any] = {"type": "function", "name": spec["name"]}
+        if content:
+            if isinstance(spec.get("description"), str):
+                definition["description"] = spec["description"]
+            schema = spec.get("inputSchema")
+            if isinstance(schema, dict) and "json" in schema:
+                definition["parameters"] = schema["json"]
+        definitions.append(definition)
+    return {"gen_ai.tool.definitions": _tools_json(definitions)} if definitions else {}
+
+
 def _converse_request(params: dict[str, Any]) -> dict[str, Any]:
     inference = (
         params.get("inferenceConfig") if isinstance(params.get("inferenceConfig"), dict) else {}
@@ -57,7 +92,11 @@ def _converse_request(params: dict[str, Any]) -> dict[str, Any]:
             "model": _model(params),
             "input": normalize_messages(params.get("messages")),
             "system_instructions": normalize_content_list(params.get("system")) or None,
-            "attributes": prompt_attributes(params.get("messages")) or None,
+            "attributes": {
+                **_tool_definitions(params.get("toolConfig")),
+                **prompt_attributes(params.get("messages")),
+            }
+            or None,
             "temperature": inference.get("temperature"),
             "top_p": inference.get("topP"),
             "max_tokens": inference.get("maxTokens"),
@@ -530,3 +569,14 @@ def lookup_operation(service_name: str, operation_name: str) -> OperationSpec | 
     if service is None:
         return None
     return service.get(operation_name)
+
+
+def _tools_json(definitions: list[dict[str, Any]]) -> str:
+    """The definitions as JSON, or only their types and names when a schema cannot be
+    serialized, such as one holding a cycle: the wrapper maps the request outside any catch."""
+    try:
+        return json_dumps(definitions)
+    except (TypeError, ValueError):
+        return json_dumps(
+            [{key: tool[key] for key in ("type", "name") if key in tool} for tool in definitions]
+        )

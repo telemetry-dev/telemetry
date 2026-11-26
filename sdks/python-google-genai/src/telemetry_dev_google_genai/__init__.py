@@ -312,9 +312,14 @@ def _output_type(config: Any) -> str | None:
 
 
 def _tool_definitions(tools: Any) -> str | None:
+    """The request tools as ``gen_ai.tool.definitions``. Descriptions and schemas are prompt
+    content and need input capture on. The core SDK also strips them with capture off; this
+    check keeps them out with a core older than that rule."""
     items = _sequence_items(tools)
     if not items:
         return None
+    client = telemetry_dev.get_client()
+    content = client is not None and client.capture_input
     definitions: list[Any] = []
     for tool in items:
         if callable(tool):
@@ -337,6 +342,10 @@ def _tool_definitions(tools: Any) -> str | None:
             if not isinstance(decl_native, Mapping):
                 continue
             entry: dict[str, Any] = {"type": "function", "name": decl_native.get("name")}
+            if not content:
+                if entry["name"]:
+                    definitions.append(entry)
+                continue
             if decl_native.get("description") is not None:
                 entry["description"] = decl_native.get("description")
             parameters = decl_native.get("parameters")
@@ -355,7 +364,10 @@ def _tool_definitions(tools: Any) -> str | None:
                 definitions.append({"type": type_name})
     if not definitions:
         return None
-    return _json_attr(definitions)
+    # A schema that cannot be serialized leaves the types and names.
+    return _json_attr(definitions) or _json_attr(
+        [{key: tool[key] for key in ("type", "name") if key in tool} for tool in definitions]
+    )
 
 
 def _request_attributes(config: Any) -> dict[str, Any]:

@@ -1,4 +1,5 @@
 import {
+  captureEnabled,
   MAX_RECORD_BYTES,
   startSpan,
   type SpanFields,
@@ -402,6 +403,50 @@ function promptAttributes(messages: unknown): SpanFields["attributes"] {
   return typeof read === "function" ? read(messages) : undefined;
 }
 
+/**
+ * The request tools, in the OpenAI format, as `gen_ai.tool.definitions`: each tool's type and
+ * name, and with input capture on a function or custom tool's description and its parameters
+ * (custom tools: their input format). Chat nests a tool under `function` or `custom`; Responses
+ * puts it at the top. A built-in tool without a name is listed by its type. The core SDK also
+ * strips descriptions and schemas with capture off; this check keeps them out with a core older
+ * than that rule.
+ */
+function toolDefinitions<T>(tools: T): Record<string, string> | undefined {
+  const list = asArray(tools);
+
+  if (!list) return undefined;
+  const content = captureEnabled("input");
+
+  const definitions = list.flatMap((item) => {
+    const tool = asRecord(item);
+    const type = readString(tool?.type);
+
+    if (tool === undefined || type === undefined) return [];
+    const spec = asRecord(type === "custom" ? tool.custom : tool.function) ?? tool;
+    const name = readString(spec.name);
+
+    if (type !== "function" && type !== "custom") {
+      return [name === undefined ? { type } : { type, name }];
+    }
+
+    if (name === undefined) return [];
+
+    if (!content) return [{ type, name }];
+
+    // JSON.stringify leaves out the fields a tool does not set.
+    return [
+      {
+        type,
+        name,
+        description: readString(spec.description),
+        parameters: type === "custom" ? spec.format : spec.parameters,
+      },
+    ];
+  });
+
+  return definitions.length > 0 ? { "gen_ai.tool.definitions": toolsJson(definitions) } : undefined;
+}
+
 function chatRequest(request: JsonRecord): RequestMapping {
   const body = asRecord(request.chatRequest) ?? {};
   const model = readString(body.model);
@@ -421,7 +466,7 @@ function chatRequest(request: JsonRecord): RequestMapping {
       seed: readNumber(body.seed),
       frequencyPenalty: readNumber(body.frequencyPenalty),
       presencePenalty: readNumber(body.presencePenalty),
-      attributes: promptAttributes(body.messages),
+      attributes: { ...toolDefinitions(body.tools), ...promptAttributes(body.messages) },
     },
   };
 }
@@ -491,7 +536,7 @@ function responsesRequest(request: JsonRecord): RequestMapping {
       maxTokens: readNumber(body.maxOutputTokens),
       frequencyPenalty: readNumber(body.frequencyPenalty),
       presencePenalty: readNumber(body.presencePenalty),
-      attributes: promptAttributes(body.input),
+      attributes: { ...toolDefinitions(body.tools), ...promptAttributes(body.input) },
     },
   };
 }
@@ -1832,4 +1877,16 @@ export function uninstrumentOpenRouter(): void {
   for (const restore of restorePatches.reverse()) restore();
   restorePatches = [];
   installed = false;
+}
+
+/**
+ * The definitions as JSON, or only their types and names when a schema cannot be serialized,
+ * such as one holding a BigInt or a cycle: the wrapper maps the request outside any catch.
+ */
+function toolsJson(definitions: Array<{ type: string; name?: string }>): string {
+  try {
+    return JSON.stringify(definitions);
+  } catch {
+    return JSON.stringify(definitions.map(({ type, name }) => ({ type, name })));
+  }
 }

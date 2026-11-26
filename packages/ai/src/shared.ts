@@ -58,6 +58,34 @@ export function contentAttr(
   return jsonAttr(masked);
 }
 
+/** One tool a model call was offered, as `gen_ai.tool.definitions` lists it. */
+export interface ToolDefinition {
+  type: string;
+  name: string;
+  description?: string;
+  /** The JSON Schema of the tool's input. */
+  parameters?: unknown;
+}
+
+/**
+ * The `gen_ai.tool.definitions` of a model call. Each tool's type and name are recorded whatever
+ * `recordInputs` says, as tool spans record their tool's name. Descriptions and schemas are
+ * prompt content: they need `recordInputs` and go through the mask, and a mask that drops or
+ * fails on them leaves the names.
+ */
+export function toolDefinitionsAttr(
+  config: Pick<ResolvedConfig, "mask" | "onError">,
+  tools: ToolDefinition[],
+  recordInputs: boolean,
+): string | undefined {
+  if (tools.length === 0) return undefined;
+  const names = () => JSON.stringify(tools.map(({ type, name }) => ({ type, name })));
+
+  if (!recordInputs) return names();
+
+  return contentAttr(config, "gen_ai.tool.definitions", tools) ?? names();
+}
+
 /**
  * What a failed wrapper call records as its span's `error.type`, status message, and exception.
  * `errorType` follows errorTypeOf and is also the exception's type. Without a mask the message is

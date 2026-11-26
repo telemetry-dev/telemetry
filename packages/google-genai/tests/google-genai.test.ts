@@ -502,6 +502,10 @@ test("function tools map definitions, toolConfig, and functionCall output", asyn
               description: "Get weather",
               parameters: { type: Type.OBJECT, properties: { city: { type: Type.STRING } } },
             },
+            {
+              name: "get_time",
+              parametersJsonSchema: { type: "object", properties: { zone: { type: "string" } } },
+            },
           ],
         },
       ],
@@ -515,6 +519,11 @@ test("function tools map definitions, toolConfig, and functionCall output", asyn
       name: "get_weather",
       description: "Get weather",
       parameters: { type: Type.OBJECT, properties: { city: { type: Type.STRING } } },
+    },
+    {
+      type: "function",
+      name: "get_time",
+      parameters: { type: "object", properties: { zone: { type: "string" } } },
     },
   ]);
   expect(jsonAttr(span, "google_genai.request.tool_config")).toEqual({

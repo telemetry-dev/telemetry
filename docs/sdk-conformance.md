@@ -106,10 +106,19 @@ Counters sum advisor entries in the last 1,000 iterations; longer lists also set
 Streaming replaces cumulative usage snapshots rather than adding them. Absent counters stay absent;
 zero counters remain zero. Advisor tokens do not change executor usage or its model.
 
-Anthropic integrations record each request tool's type and name in `gen_ai.tool.definitions` as a
-JSON array of `{type, name}`, with `type` `function` for custom tools and the tool's own type for
-server tools. They record it regardless of capture flags and `mask`; descriptions and input
-schemas stay in the captured input.
+Model spans list the tools offered to the model in `gen_ai.tool.definitions`, a JSON array of
+`{type, name, description, parameters}`: `type` is `function` for a tool the app defines and the
+provider's own type for a built-in tool, and `parameters` is the JSON Schema of the tool's input.
+The Anthropic, OpenAI, OpenRouter, LiteLLM, Bedrock Converse, Google GenAI, LangChain, and AI SDK
+integrations record it. Each tool's `type` and `name` are recorded regardless of capture flags.
+`description` and `parameters` are prompt content: they are recorded only with input capture on,
+and pass through `mask`. The core SDKs apply the same rule to a raw `gen_ai.tool.definitions`
+attribute, given as JSON text or as an array of one JSON text per tool: with input capture off
+they keep only `type` and `name`, and they also keep only those when the whole list, masked or
+not, is longer than the attribute length limit (0 included, as for other content), so that the
+value stays JSON. The names follow the limit of raw attributes, where 0 sets no limit; when they
+do not fit, the attribute is left out. A value that is not
+such a list is kept as it is with input capture on and no mask, and dropped otherwise.
 
 Shared constants: env vars `TELEMETRY_DEV_API_KEY` / `TELEMETRY_DEV_BASE_URL` (default
 `https://api.telemetry.dev`, for telemetry export and `getPrompt` / `get_prompt`; earlier releases

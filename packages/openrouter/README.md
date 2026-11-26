@@ -90,6 +90,8 @@ Responses spans capture:
 - response model, response ID, output items, status-derived finish reason, and response errors
 - input, output, total, cached-input, and reasoning-output token counts
 
+Chat and Responses spans also list the request's tools in `gen_ai.tool.definitions`: each tool's type and name, and with `captureInput` on the description and parameters of each function and custom tool (a custom tool's input format), which pass through `mask`.
+
 Embedding spans capture:
 
 - request model and input

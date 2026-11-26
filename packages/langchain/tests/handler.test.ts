@@ -259,6 +259,8 @@ test("records the offered tools and each tool call of a reply once", async () =>
     { type: "function", function: { name: "add", description: "Add.", parameters: {} } },
     { name: "multiply", description: "Multiply.", input_schema: {} },
     { type: "web_search_20250305", name: "web_search" },
+    { type: "web_search" },
+    { type: "function", name: "modulo", description: "Modulo.", parameters: {} },
     { functionDeclarations: [{ name: "divide" }, { name: "subtract" }] },
   ];
 
@@ -269,9 +271,11 @@ test("records the offered tools and each tool call of a reply once", async () =>
   const chat = byName(await finished(spans), "chat gemini-test");
 
   expect(JSON.parse(String(chat.attributes["gen_ai.tool.definitions"]))).toEqual([
-    { type: "function", name: "add" },
-    { type: "function", name: "multiply" },
+    { type: "function", name: "add", description: "Add.", parameters: {} },
+    { type: "function", name: "multiply", description: "Multiply.", parameters: {} },
     { type: "web_search_20250305", name: "web_search" },
+    { type: "web_search" },
+    { type: "function", name: "modulo", description: "Modulo.", parameters: {} },
     { type: "function", name: "divide" },
     { type: "function", name: "subtract" },
   ]);

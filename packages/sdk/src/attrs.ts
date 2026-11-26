@@ -182,7 +182,94 @@ export function fieldsToAttributes(
 
     // The variables are input, also when the app passes them from promptAttributesFor().
     if (!cfg.captureInput) delete attrs["td.prompt.variables"];
+
+    const tools = attrs[TOOL_DEFINITIONS_KEY];
+
+    if (tools !== undefined) {
+      const definitions = toolDefinitionsAttribute(tools, cfg);
+
+      if (definitions === undefined) delete attrs[TOOL_DEFINITIONS_KEY];
+      else attrs[TOOL_DEFINITIONS_KEY] = definitions;
+    }
   }
 
   return attrs;
+}
+
+const TOOL_DEFINITIONS_KEY = "gen_ai.tool.definitions";
+
+/**
+ * The `gen_ai.tool.definitions` that a span keeps. Tool descriptions and schemas are prompt
+ * content: with input capture off only each tool's type and name stay, and with a mask the
+ * definitions go through it as input does. Like other content, a list longer than
+ * `maxAttributeLength`, 0 included, keeps only the names, since a cut list is not JSON and
+ * readers would lose every tool. The names follow the limit of raw attributes, where 0 sets no
+ * limit; names that do not fit leave the attribute out. The list is
+ * JSON text, or an array of one JSON text per tool; any other value is dropped with capture off
+ * or a mask.
+ */
+function toolDefinitionsAttribute(
+  value: AttributeValue,
+  cfg: FieldCaptureConfig,
+): AttributeValue | undefined {
+  const definitions = toolList(value);
+
+  if (definitions === undefined) return cfg.captureInput && !cfg.mask ? value : undefined;
+
+  if (cfg.captureInput) {
+    const full = cfg.mask
+      ? prepareCaptureValue(TOOL_DEFINITIONS_KEY, definitions, {
+          ...cfg,
+          maxAttributeLength: Number.POSITIVE_INFINITY,
+        })
+      : typeof value === "string"
+        ? value
+        : jsonAttr(definitions);
+
+    if (full !== undefined && full.length <= cfg.maxAttributeLength) return full;
+  }
+
+  const names = definitions.flatMap((definition: unknown) => {
+    if (typeof definition !== "object" || definition === null) return [];
+    // OpenAI's Chat Completions form nests the name under `function`.
+    const {
+      type,
+      name,
+      function: fn,
+    } = definition as {
+      type?: unknown;
+      name?: unknown;
+      function?: { name?: unknown } | null;
+    };
+    const nested = typeof fn === "object" && fn !== null ? fn.name : undefined;
+    const named = typeof name === "string" ? name : nested;
+    const kept = omitUndefined({
+      type: typeof type === "string" ? type : undefined,
+      name: typeof named === "string" ? named : undefined,
+    });
+
+    return Object.keys(kept).length > 0 ? [kept] : [];
+  });
+  const json = JSON.stringify(names);
+  const rawLimit = cfg.maxAttributeLength || Number.POSITIVE_INFINITY;
+
+  return names.length > 0 && json.length <= rawLimit ? json : undefined;
+}
+
+function toolList(value: AttributeValue): unknown[] | undefined {
+  try {
+    if (typeof value === "string") {
+      const parsed: unknown = JSON.parse(value);
+
+      return Array.isArray(parsed) ? parsed : undefined;
+    }
+
+    if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
+      return value.map((item) => JSON.parse(item as string) as unknown);
+    }
+  } catch {
+    // Not JSON: no names to keep.
+  }
+
+  return undefined;
 }

@@ -462,3 +462,83 @@ def test_mask_failure_diagnostics_do_not_expose_content(
     assert "exception.message" not in event_attrs
     assert "exception.stacktrace" not in event_attrs
     assert "PRIVATE_" not in str(event_attrs)
+
+
+_TOOL_DEFINITIONS = json.dumps(
+    [
+        {
+            "type": "function",
+            "name": "issue_refund",
+            "description": "Refund SECRET orders",
+            "parameters": {"type": "object", "properties": {"order": {"type": "string"}}},
+        },
+        {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+        {"type": "googleSearch"},
+        {"description": "a tool without a name or type"},
+    ],
+    separators=(",", ":"),
+)
+
+
+def test_tool_descriptions_and_schemas_are_kept_only_as_captured_input(make: MakeClient) -> None:
+    raw = {"gen_ai.tool.definitions": _TOOL_DEFINITIONS}
+    off = make(capture_input=False)
+    telemetry_dev.start_span("off", attributes=raw).end()
+    telemetry_dev.start_span("on", attributes=raw, capture_input=True).end()
+    telemetry_dev.start_span(
+        "not-a-list", attributes={"gen_ai.tool.definitions": '{"name":"SECRET"}'}
+    ).end()
+    # One JSON text per tool, and the tool objects themselves.
+    secret = {"type": "function", "name": "issue_refund", "description": "SECRET"}
+    telemetry_dev.start_span(
+        "texts", attributes={"gen_ai.tool.definitions": [json.dumps(secret)]}
+    ).end()
+    # Outside the declared types, but a caller without type checks can pass it.
+    objects = cast("Any", {"gen_ai.tool.definitions": [secret]})
+    telemetry_dev.start_span("objects", attributes=objects).end()
+    nested = [{"type": "function", "function": {"name": "lookup", "description": "SECRET"}}]
+    telemetry_dev.start_span(
+        "nested", attributes={"gen_ai.tool.definitions": json.dumps(nested)}
+    ).end()
+    by_name = {span.name: attrs(span) for span in off.span_exporter.get_finished_spans()}
+    names = (
+        '[{"type":"function","name":"issue_refund"},'
+        '{"type":"web_search_20250305","name":"web_search"},{"type":"googleSearch"}]'
+    )
+
+    assert by_name["off"]["gen_ai.tool.definitions"] == names
+    assert by_name["on"]["gen_ai.tool.definitions"] == _TOOL_DEFINITIONS
+    assert "gen_ai.tool.definitions" not in by_name["not-a-list"]
+    assert by_name["nested"]["gen_ai.tool.definitions"] == '[{"type":"function","name":"lookup"}]'
+    for name in ("texts", "objects"):
+        assert by_name[name]["gen_ai.tool.definitions"] == (
+            '[{"type":"function","name":"issue_refund"}]'
+        )
+    telemetry_dev.shutdown()
+
+    # A list that the attribute limit would cut keeps its names, which still parse.
+    limited = make(max_attribute_length=len(names) + 1)
+    telemetry_dev.start_span("long", attributes=raw).end()
+    assert attrs(only_span(limited))["gen_ai.tool.definitions"] == names
+    telemetry_dev.shutdown()
+
+    # A limit of 0 drops content, but not the names, which it does not limit.
+    zero = make(max_attribute_length=0)
+    telemetry_dev.start_span("zero", attributes=raw).end()
+    assert attrs(only_span(zero))["gen_ai.tool.definitions"] == names
+    telemetry_dev.shutdown()
+
+    # Names that do not fit a limit above 0 leave the attribute out.
+    tiny = make(max_attribute_length=5)
+    telemetry_dev.start_span("tiny", attributes=raw).end()
+    assert "gen_ai.tool.definitions" not in attrs(only_span(tiny))
+    telemetry_dev.shutdown()
+
+    def mask(value: Any, _ctx: MaskContext) -> Any:
+        return json.loads(json.dumps(value).replace("SECRET", "[masked]"))
+
+    masked = make(mask=mask)
+    telemetry_dev.start_span("masked", attributes=raw).end()
+    value = str(attrs(only_span(masked))["gen_ai.tool.definitions"])
+    assert "Refund [masked] orders" in value
+    assert "SECRET" not in value

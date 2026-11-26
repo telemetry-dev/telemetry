@@ -211,10 +211,16 @@ function outputTypeFromConfig(config: UnknownRecord | undefined): string | undef
   return undefined;
 }
 
+/**
+ * The request tools as `gen_ai.tool.definitions`. Descriptions and schemas are prompt content
+ * and need input capture on. The core SDK also strips them with capture off; this check keeps
+ * them out with a core older than that rule.
+ */
 function mapToolDefinitions(tools: unknown): unknown[] | undefined {
   const toolArray = asArray(tools);
 
   if (!toolArray) return undefined;
+  const content = captureEnabled("input");
   const definitions: unknown[] = [];
 
   for (const tool of toolArray) {
@@ -235,9 +241,14 @@ function mapToolDefinitions(tools: unknown): unknown[] | undefined {
       if (!fn) continue;
       const definition = { type: "function", name: fn.name };
 
-      if (fn.description !== undefined) Object.assign(definition, { description: fn.description });
+      if (content && fn.description !== undefined) {
+        Object.assign(definition, { description: fn.description });
+      }
 
-      if (fn.parameters !== undefined) Object.assign(definition, { parameters: fn.parameters });
+      // A declaration gives its schema as `parameters` or as plain JSON Schema.
+      const parameters = fn.parameters ?? fn.parametersJsonSchema;
+
+      if (content && parameters !== undefined) Object.assign(definition, { parameters });
       definitions.push(definition);
     }
 
@@ -256,7 +267,16 @@ function requestAttributesFromConfig(config: UnknownRecord | undefined) {
   const toolDefs = mapToolDefinitions(config.tools);
 
   if (toolDefs) {
-    const serialized = jsonStringify(toolDefs);
+    // A schema that cannot be serialized leaves the types and names.
+    const serialized =
+      jsonStringify(toolDefs) ??
+      jsonStringify(
+        toolDefs.map((tool) => {
+          const { type, name } = tool as { type?: unknown; name?: unknown };
+
+          return { type, name };
+        }),
+      );
 
     if (serialized !== undefined) attributes["gen_ai.tool.definitions"] = serialized;
   }

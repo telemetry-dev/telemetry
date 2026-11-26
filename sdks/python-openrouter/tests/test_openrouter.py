@@ -2846,3 +2846,34 @@ def test_a_forked_child_does_not_wait_for_an_install_lock_that_a_thread_of_the_p
             pytest.fail("The forked process did not end in 10 s")
         time.sleep(0.01)
     assert os.waitstatus_to_exitcode(waited[1]) == 0
+
+
+def test_chat_send_records_the_offered_tools(memory: SimpleNamespace) -> None:
+    parameters = {"type": "object", "properties": {"city": {"type": "string"}}}
+    client = wrap_open_router(sync_client(lambda _request: json_response(chat_payload())))
+    client.chat.send(
+        model="openai/gpt-4o-mini",
+        messages=CHAT_MESSAGES,
+        tools=cast(
+            Any,
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Weather",
+                        "parameters": parameters,
+                    },
+                }
+            ],
+        ),
+    )
+
+    assert json.loads(str(attrs(only_span(memory))["gen_ai.tool.definitions"])) == [
+        {
+            "type": "function",
+            "name": "get_weather",
+            "description": "Weather",
+            "parameters": parameters,
+        }
+    ]

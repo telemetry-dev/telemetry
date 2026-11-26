@@ -182,9 +182,14 @@ single record larger than the bound is still queued when its queue is empty.
 
 `capture_input=False` and `capture_output=False` omit captured content. Provider integrations may
 still record non-content metadata such as response IDs and models, finish reasons, usage, timing,
-and error types. Capture flags do not gate stop sequences, tool descriptions and definitions
-(`gen_ai.tool.description`, `gen_ai.tool.definitions`), caller-supplied metadata or raw attributes;
-redact those separately when needed.
+and error types. Capture flags do not gate stop sequences, a tool span's description
+(`gen_ai.tool.description`), or caller-supplied metadata or raw attributes; redact those separately
+when needed. The one exception is `gen_ai.tool.definitions`, the tools offered to a model: with
+input capture off it keeps only each tool's type and name, and with it on it passes through the
+mask. Tool descriptions and input schemas are prompt content. Like other content, a list longer
+than `max_attribute_length`, 0 included, keeps only the types and names, so that it stays JSON. The
+names follow the limit of raw attributes, where 0 sets no limit, and are left out when they do
+not fit.
 
 `mask` receives input and output content, system instructions, log messages, captured exception
 messages and stack traces, and content that

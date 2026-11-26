@@ -1,5 +1,6 @@
 import {
   boundedCaptureDetails,
+  captureEnabled,
   startSpan,
   type SpanFields,
   type SpanHandle,
@@ -126,11 +127,14 @@ function stopSequences<T>(value: T): string[] | undefined {
 }
 
 /**
- * The type and name of each request tool as `gen_ai.tool.definitions`. Names are recorded
- * regardless of capture flags, as on tool spans; descriptions and schemas stay in the input.
+ * Each request tool as `gen_ai.tool.definitions`: its type and name, and with input capture on
+ * a custom tool's description and input schema as `parameters`. Names are recorded regardless of
+ * capture flags, as on tool spans. The core SDK also strips the description and schema with
+ * capture off; this check keeps them out with a core older than that rule.
  */
 function toolDefinitions<T>(tools: T): Record<string, string> | undefined {
   if (!Array.isArray(tools)) return undefined;
+  const content = captureEnabled("input");
 
   const definitions = tools.flatMap((tool) => {
     const record = asRecord(tool);
@@ -139,12 +143,22 @@ function toolDefinitions<T>(tools: T): Record<string, string> | undefined {
     if (name === undefined) return [];
     const type = readString(record?.type);
 
-    return [{ type: type === undefined || type === "custom" ? "function" : type, name }];
+    if (type !== undefined && type !== "custom") return [{ type, name }];
+
+    if (!content) return [{ type: "function", name }];
+
+    // JSON.stringify leaves out the fields a tool does not set.
+    return [
+      {
+        type: "function",
+        name,
+        description: readString(record?.description),
+        parameters: record?.input_schema,
+      },
+    ];
   });
 
-  return definitions.length > 0
-    ? { "gen_ai.tool.definitions": JSON.stringify(definitions) }
-    : undefined;
+  return definitions.length > 0 ? { "gen_ai.tool.definitions": toolsJson(definitions) } : undefined;
 }
 
 // Cores older than promptAttributesFor record a prompt only inside withPrompt. A namespace read
@@ -1486,4 +1500,16 @@ export function uninstrumentAnthropic(): void {
   for (const restore of restorePatches.reverse()) restore();
   restorePatches = [];
   installed = false;
+}
+
+/**
+ * The definitions as JSON, or only their types and names when a schema cannot be serialized,
+ * such as one holding a BigInt or a cycle: the wrapper maps the request outside any catch.
+ */
+function toolsJson(definitions: Array<{ type: string; name?: string }>): string {
+  try {
+    return JSON.stringify(definitions);
+  } catch {
+    return JSON.stringify(definitions.map(({ type, name }) => ({ type, name })));
+  }
 }

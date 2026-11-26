@@ -664,6 +664,100 @@ test("chat completions preserve tool-call messages in output", async () => {
   expect(span.attributes["gen_ai.response.finish_reasons"]).toEqual(["tool_calls"]);
 });
 
+test.each([
+  { api: "chat", captureInput: true },
+  { api: "chat", captureInput: false },
+  { api: "responses", captureInput: true },
+  { api: "responses", captureInput: false },
+] as const)(
+  "$api records the offered tools, with descriptions and schemas when captureInput=$captureInput",
+  async ({ api, captureInput }) => {
+    const spans = setupSpans(undefined, { captureInput });
+    const parameters = { type: "object", properties: { order: { type: "string" } } };
+    // Each API spells a custom tool's grammar its own way.
+    const grammar = { syntax: "regex", definition: "\\d+" } as const;
+    const format =
+      api === "responses" ? { type: "grammar", ...grammar } : { type: "grammar", grammar };
+    const fake = createFakeFetch(
+      jsonResponse(
+        api === "responses"
+          ? {
+              id: "resp_tools",
+              object: "response",
+              status: "completed",
+              model: "gpt-4.1",
+              output: [],
+              usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+            }
+          : {
+              id: "chatcmpl_tools",
+              object: "chat.completion",
+              created: 1,
+              model: "gpt-4o",
+              choices: [
+                { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+              ],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            },
+      ),
+    );
+    const client = clientWith(fake.fetch);
+
+    if (api === "responses") {
+      await client.responses.create({
+        model: "gpt-4.1",
+        input: "Refund order 42",
+        tools: [
+          {
+            type: "function",
+            name: "issue_refund",
+            description: "Refund",
+            parameters,
+            strict: true,
+          },
+          {
+            type: "custom",
+            name: "order_id",
+            description: "An order id",
+            format: { type: "grammar", ...grammar },
+          },
+          { type: "web_search" },
+        ],
+      });
+    } else {
+      await client.chat.completions.create({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Refund order 42" }],
+        tools: [
+          {
+            type: "function",
+            function: { name: "issue_refund", description: "Refund", parameters },
+          },
+          {
+            type: "custom",
+            custom: {
+              name: "order_id",
+              description: "An order id",
+              format: { type: "grammar", grammar },
+            },
+          },
+        ],
+      });
+    }
+
+    const span = await exportedSpan(spans);
+    expect(jsonAttr(span, "gen_ai.tool.definitions")).toEqual([
+      captureInput
+        ? { type: "function", name: "issue_refund", description: "Refund", parameters }
+        : { type: "function", name: "issue_refund" },
+      captureInput
+        ? { type: "custom", name: "order_id", description: "An order id", parameters: format }
+        : { type: "custom", name: "order_id" },
+      ...(api === "responses" ? [{ type: "web_search" }] : []),
+    ]);
+  },
+);
+
 test("chat completions capture every returned choice with its finish reason", async () => {
   const spans = setupSpans();
 

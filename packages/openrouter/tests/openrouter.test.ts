@@ -2865,3 +2865,73 @@ test("wrapped clients fail open when telemetry is not initialized", async () => 
   expect(fake.requests).toHaveLength(1);
   expect(response).toMatchObject({ id: "no_telemetry" });
 });
+
+test.each([
+  { api: "chat", captureInput: true },
+  { api: "chat", captureInput: false },
+  { api: "responses", captureInput: true },
+  { api: "responses", captureInput: false },
+] as const)(
+  "$api records the offered tools, with descriptions and schemas when captureInput=$captureInput",
+  async ({ api, captureInput }) => {
+    const spans = new InMemorySpanExporter();
+    init(
+      {
+        apiKey: "td_live_test",
+        serviceName: "openrouter-tests",
+        environment: "test",
+        exportMode: "immediate",
+        logLevel: "silent",
+        captureInput,
+        fetch: async () => new Response(null, { status: 200 }),
+      },
+      { spanExporter: spans },
+    );
+    const parameters = { type: "object", properties: { order: { type: "string" } } };
+    const format = { type: "grammar", syntax: "regex", definition: "\\d+" } as const;
+    const fake = createFakeFetcher(
+      jsonResponse(api === "chat" ? chatBody("chat_tools") : responsesBody("resp_tools")),
+    );
+    const client = clientWith(fake.fetcher);
+
+    if (api === "chat") {
+      await client.chat.send({
+        chatRequest: {
+          model: "openai/gpt-4o",
+          messages: [{ role: "user", content: "Refund order 42" }],
+          tools: [
+            {
+              type: "function",
+              function: { name: "issue_refund", description: "Refund", parameters },
+            },
+          ],
+        },
+      });
+    } else {
+      await client.responses.send({
+        responsesRequest: {
+          model: "openai/gpt-4o",
+          input: "Refund order 42",
+          tools: [
+            { type: "function", name: "issue_refund", description: "Refund", parameters },
+            { type: "custom", name: "order_id", description: "An order id", format },
+          ],
+        },
+      });
+    }
+
+    const span = await exportedSpan(spans);
+    expect(jsonAttr(span, "gen_ai.tool.definitions")).toEqual([
+      captureInput
+        ? { type: "function", name: "issue_refund", description: "Refund", parameters }
+        : { type: "function", name: "issue_refund" },
+      ...(api === "responses"
+        ? [
+            captureInput
+              ? { type: "custom", name: "order_id", description: "An order id", parameters: format }
+              : { type: "custom", name: "order_id" },
+          ]
+        : []),
+    ]);
+  },
+);

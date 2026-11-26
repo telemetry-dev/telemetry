@@ -83,7 +83,7 @@ Block, safety, grounding, and URL-context metadata are raw attributes, which the
 
 Unary `generateContent` input, system instructions, output, and AFC history, the `generateContentStream` request, and image and video request content are bounded to 16 MiB each. A value over the bound sets `telemetry.dev.capture.truncated`. Without a mask, the bounded part is kept. With a mask configured, that value is omitted because the mask cannot inspect the complete value. Request input and system instructions are omitted before the span starts, so a custom `sampler` sees the bounded values when no mask is configured. Unary output is omitted only when candidate content was cut; cut grounding, URL-context, or safety metadata sets the attribute but keeps complete content. Streaming AFC history built on a cut request is omitted the same way unless the SDK reports a complete history.
 
-Tool definitions (`gen_ai.tool.definitions`, including tool descriptions and parameter schemas) are request attributes, not captured content: `captureInput`, the mask, and `maxAttributeLength: 0` do not remove them. Like other raw attributes, they are cut at `maxAttributeLength` without a marker, and are sent whole when `maxAttributeLength` is 0 or is not set.
+Tool definitions (`gen_ai.tool.definitions`) always hold each tool's type and name. Tool descriptions and parameter schemas are prompt content: they are recorded only with `captureInput` on, and pass through the mask. When the whole list is longer than `maxAttributeLength`, 0 included, it keeps only each tool's type and name, so that it stays JSON, and it is left out when those do not fit either (0 sets no limit for them).
 
 ## Streaming
 

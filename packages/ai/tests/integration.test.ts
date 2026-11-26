@@ -10,7 +10,7 @@ import {
   TraceIdRatioBasedSampler,
 } from "@opentelemetry/sdk-trace-base";
 import { sessionSpanContext } from "@telemetry-dev/otel";
-import { generateText, tool } from "ai-v6";
+import { generateText, jsonSchema, tool } from "ai-v6";
 import { MockLanguageModelV3 } from "ai-v6/test";
 import { expect, test, vi } from "vitest";
 import { z } from "zod";
@@ -1072,8 +1072,14 @@ test("a real ai@6 generateText run with a tool call records the root, both steps
     prompt: "find otel",
     tools: {
       lookup: tool({
+        description: "Search the docs",
         inputSchema: z.object({ q: z.string() }),
         execute: async ({ q }) => ({ hits: [q] }),
+      }),
+      // A schema that the tool holds as a promise.
+      later: tool({
+        inputSchema: jsonSchema<{ id: string }>(async () => ({ type: "object" })),
+        execute: async () => ({}),
       }),
     },
     stopWhen: () => calls >= 2,
@@ -1114,6 +1120,20 @@ test("a real ai@6 generateText run with a tool call records the root, both steps
     expect(step.parentSpanContext?.spanId).toBe(spanId(root));
     expect(step.attributes["gen_ai.system_instructions"]).toBe("look things up");
     expect(step.attributes["gen_ai.usage.input_tokens"]).toBe(4);
+    // zod 4 converts itself to JSON Schema, so the schema of the offered tool is recorded.
+    expect(JSON.parse(String(step.attributes["gen_ai.tool.definitions"]))).toEqual([
+      {
+        type: "function",
+        name: "lookup",
+        description: "Search the docs",
+        parameters: expect.objectContaining({
+          type: "object",
+          properties: { q: { type: "string" } },
+          required: ["q"],
+        }),
+      },
+      { type: "function", name: "later" },
+    ]);
   }
 
   expect(steps.map((s) => s.attributes["gen_ai.response.finish_reasons"])).toEqual([

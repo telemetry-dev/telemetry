@@ -751,10 +751,15 @@ def test_tool_use_response_output_is_preserved(memory: SimpleNamespace) -> None:
     )
 
     a = attrs(only_span(memory))
-    # The dashboard lists these names as the tools offered; schemas stay in the captured input.
+    # With input capture on, a custom tool's description and schema say what the tool accepts.
     assert json.loads(str(a["gen_ai.tool.definitions"])) == [
-        {"type": "function", "name": "get_weather"},
-        {"type": "function", "name": "issue_refund"},
+        {
+            "type": "function",
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": tool["input_schema"],
+        },
+        {"type": "function", "name": "issue_refund", "parameters": {"type": "object"}},
         {"type": "web_search_20250305", "name": "web_search"},
     ]
     assert json.loads(str(a["gen_ai.output.messages"])) == [
@@ -816,7 +821,12 @@ def test_beta_create_records_tool_objects_as_the_definitions_it_sends(
     assert captured["tools"] == requests[0]["tools"]
     assert captured["tools"][0]["name"] == "get_weather"
     assert json.loads(str(a["gen_ai.tool.definitions"])) == [
-        {"type": "function", "name": "get_weather"}
+        {
+            "type": "function",
+            "name": "get_weather",
+            "description": captured["tools"][0]["description"],
+            "parameters": captured["tools"][0]["input_schema"],
+        }
     ]
 
 

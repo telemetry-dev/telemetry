@@ -516,6 +516,88 @@ describe("capture integration", () => {
     ).toBeUndefined();
   });
 
+  test("keeps tool descriptions and schemas only as captured input", async () => {
+    const definitions = JSON.stringify([
+      {
+        type: "function",
+        name: "issue_refund",
+        description: "Refund SECRET orders",
+        parameters: { type: "object", properties: { order: { type: "string" } } },
+      },
+      { type: "web_search_20250305", name: "web_search", max_uses: 3 },
+      { type: "googleSearch" },
+      { description: "a tool without a name or type" },
+    ]);
+    const attributes = { "gen_ai.tool.definitions": definitions };
+    const off = setup({ captureInput: false });
+    startSpan("off", { attributes }).end();
+    startSpan("on", { attributes, captureInput: true }).end();
+    startSpan("not-a-list", {
+      attributes: { "gen_ai.tool.definitions": '{"name":"SECRET"}' },
+    }).end();
+    // One JSON text per tool, as an attribute array.
+    startSpan("texts", {
+      attributes: {
+        "gen_ai.tool.definitions": [
+          '{"type":"function","name":"issue_refund","description":"SECRET"}',
+        ],
+      },
+    }).end();
+    startSpan("nested", {
+      attributes: {
+        "gen_ai.tool.definitions":
+          '[{"type":"function","function":{"name":"lookup","description":"SECRET"}}]',
+      },
+    }).end();
+    await flush();
+    const byName = (name: string) =>
+      off.spans.getFinishedSpans().find((span) => span.name === name)!.attributes;
+    const names =
+      '[{"type":"function","name":"issue_refund"},' +
+      '{"type":"web_search_20250305","name":"web_search"},{"type":"googleSearch"}]';
+
+    expect(byName("off")["gen_ai.tool.definitions"]).toBe(names);
+    expect(byName("on")["gen_ai.tool.definitions"]).toBe(definitions);
+    expect(byName("not-a-list")["gen_ai.tool.definitions"]).toBeUndefined();
+    expect(byName("texts")["gen_ai.tool.definitions"]).toBe(
+      '[{"type":"function","name":"issue_refund"}]',
+    );
+    expect(byName("nested")["gen_ai.tool.definitions"]).toBe(
+      '[{"type":"function","name":"lookup"}]',
+    );
+    await shutdown();
+
+    // A list that the attribute limit would cut keeps its names, which still parse.
+    const limited = setup({ maxAttributeLength: names.length + 1 });
+    startSpan("long", { attributes }).end();
+    await flush();
+    expect(limited.spans.getFinishedSpans()[0]!.attributes["gen_ai.tool.definitions"]).toBe(names);
+    await shutdown();
+
+    // A limit of 0 drops content, but not the names, which it does not limit.
+    const zero = setup({ maxAttributeLength: 0 });
+    startSpan("zero", { attributes }).end();
+    await flush();
+    expect(zero.spans.getFinishedSpans()[0]!.attributes["gen_ai.tool.definitions"]).toBe(names);
+    await shutdown();
+
+    // Names that do not fit a limit above 0 leave the attribute out.
+    const tiny = setup({ maxAttributeLength: 5 });
+    startSpan("tiny", { attributes }).end();
+    await flush();
+    expect(tiny.spans.getFinishedSpans()[0]!.attributes["gen_ai.tool.definitions"]).toBeUndefined();
+    await shutdown();
+
+    const masked = setup({
+      mask: (value) => JSON.parse(JSON.stringify(value).replaceAll("SECRET", "[masked]")),
+    });
+    startSpan("masked", { attributes }).end();
+    await flush();
+    const value = String(masked.spans.getFinishedSpans()[0]!.attributes["gen_ai.tool.definitions"]);
+    expect(value).toContain("Refund [masked] orders");
+    expect(value).not.toContain("SECRET");
+  });
+
   test("applies the attribute limit to metadata", async () => {
     const { spans } = setup({ maxAttributeLength: 50 });
     startSpan("meta", { metadata: { blob: "z".repeat(200) } }).end();

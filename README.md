@@ -119,7 +119,7 @@ capture setting of its own and records chat messages, tool payloads, and error m
 Disabling output capture omits message content; response IDs and models, finish reasons, usage,
 timing, and errors may still be recorded when providers supply them. For streamed OpenAI chat,
 usage requires provider support or the documented stream-usage option in the OpenAI integration.
-Capture flags do not gate stop sequences, tool descriptions and definitions (`gen_ai.tool.description`, `gen_ai.tool.definitions`), or caller-supplied metadata or raw attributes; redact those separately when needed.
+Model spans list the tools offered to the model in `gen_ai.tool.definitions`. Each tool's type and name are always recorded; its description and input schema are prompt content, so they need input capture on and pass through the mask. Capture flags do not gate stop sequences, a tool span's description (`gen_ai.tool.description`), or caller-supplied metadata or other raw attributes; redact those separately when needed.
 The core SDKs record exception messages and stack traces only when both input and output capture are on, and pass them through the mask.
 Streamed output is kept within fixed size limits that each provider package's README lists, and
 [Privacy](https://telemetry.dev/docs/platform/privacy) describes what is sent and how to redact it.
