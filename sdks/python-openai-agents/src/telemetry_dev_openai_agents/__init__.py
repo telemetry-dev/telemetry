@@ -19,7 +19,7 @@ import telemetry_dev
 from agents.tracing import Span, Trace, TracingProcessor
 from opentelemetry import trace as otel_trace
 
-__version__ = "0.0.0"
+__version__ = "0.1.0"
 
 __all__ = ["TelemetryDevProcessor", "__version__"]
 

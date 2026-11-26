@@ -1,6 +1,6 @@
 {
   "name": "@telemetry-dev/openai-agents",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenAI Agents SDK telemetry integration for telemetry.dev: agent runs, model calls, tool calls, and sandbox commands as OpenTelemetry traces.",
   "keywords": [
     "agents",
