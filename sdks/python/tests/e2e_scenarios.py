@@ -249,7 +249,8 @@ def main() -> int:
                     "anthropic.advisor.usage.cache_creation_input_tokens": 13,
                 },
             ).end()
-            # C25: offered tool names are kept with input capture off; the description is not.
+            # C25: offered tool names are kept with input capture off; descriptions and schemas,
+            # in the input or in the raw attribute, are not.
             start_span(
                 "tool-offer",
                 type="generation",
@@ -260,9 +261,19 @@ def main() -> int:
                 },
                 capture_input=False,
                 attributes={
-                    "gen_ai.tool.definitions": (
-                        '[{"type":"function","name":"issue_refund"},'
-                        '{"type":"web_search_20250305","name":"web_search"}]'
+                    "gen_ai.tool.definitions": json.dumps(
+                        [
+                            {
+                                "type": "function",
+                                "name": "issue_refund",
+                                "description": "PRIVATE_TOOL_DESCRIPTION",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"PRIVATE_TOOL_SCHEMA": {}},
+                                },
+                            },
+                            {"type": "web_search_20250305", "name": "web_search"},
+                        ]
                     ),
                 },
             ).end()
